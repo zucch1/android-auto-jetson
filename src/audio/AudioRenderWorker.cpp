@@ -32,6 +32,11 @@ struct AudioRenderWorker::SettlementDiagnostics {
         std::uint64_t events_lifetime;
         std::uint64_t frames_lifetime;
     };
+    struct Underrun {
+        std::uint64_t underruns_lifetime;
+        std::int64_t late_ns;
+        std::int64_t depth_ns;
+    };
     struct SinkStall {
         core::Nanoseconds start;
         core::Nanoseconds end;
@@ -50,6 +55,7 @@ struct AudioRenderWorker::SettlementDiagnostics {
     std::optional<IdleSkip> skipped;
     std::optional<IdleResume> resumed;
     std::optional<CatchUp> caught_up;
+    std::optional<Underrun> underrun;
 
     explicit SettlementDiagnostics(const AudioTelemetryCallbacks& callbacks) noexcept
         : telemetry(callbacks) {}
@@ -86,6 +92,17 @@ struct AudioRenderWorker::SettlementDiagnostics {
                 audio_catch_up_json(caught_up->frames, caught_up->total, caught_up->rate,
                                     caught_up->events_lifetime, caught_up->frames_lifetime));
         }
+        if (underrun) {
+            // Playout underrun: a chunk arrived late_ms after its slot, so the
+            // role was re-anchored depth_ms after that arrival. The elapsed
+            // hole is skipped (media_timing frames_skipped), the refill is
+            // silence (frames_silence).
+            telemetry.log_media("audio_playout_underrun",
+                "{\"event\":\"audio_playout_underrun\",\"underruns_lifetime\":" +
+                std::to_string(underrun->underruns_lifetime) + ",\"late_ms\":" +
+                format_ms(core::Nanoseconds{underrun->late_ns}) + ",\"depth_ms\":" +
+                format_ms(core::Nanoseconds{underrun->depth_ns}) + "}");
+        }
         if (skipped) {
             telemetry.log_media("audio_idle_skipped",
                 "{\"event\":\"audio_idle_skipped\",\"id\":" + std::to_string(skipped->id) +
@@ -120,13 +137,32 @@ AudioRenderWorker::AudioRenderWorker(RouterConfig config,
                                      AudioTelemetryCallbacks telemetry,
                                      OpenRouter open,
                                      IdleClock idle_clock,
-                                     std::chrono::milliseconds ack_release_timeout)
+                                     std::chrono::milliseconds ack_release_timeout,
+                                     AudioCreditPolicy credit)
     : telemetry_(std::move(telemetry)),
       idle_clock_(std::move(idle_clock)),
       ack_release_timeout_(std::max(std::chrono::milliseconds{1}, ack_release_timeout)),
-      thread_([this, config = std::move(config), open = std::move(open)] {
-          run(config, open);
-      }) {}
+      credit_window_(std::clamp<std::uint32_t>(credit.window, 1, AudioCreditPolicy::kMaxWindow)) {
+    for (std::size_t index = 0; index < credits_.size(); ++index) { seed_credits_locked(index); }
+    // Started last: every member above is initialized before run() reads it.
+    thread_ = std::thread([this, config = std::move(config), open = std::move(open)] {
+        run(config, open);
+    });
+}
+
+void AudioRenderWorker::note_unacked_locked(std::size_t index) {
+    ++unacked_[index];
+    max_unacked_seen_ = std::max(max_unacked_seen_, unacked_[index]);
+}
+
+void AudioRenderWorker::seed_credits_locked(std::size_t index) {
+    credits_[index].assign(credit_window_ - 1, envelope(index));
+}
+
+std::uint64_t AudioRenderWorker::max_unacked_seen() const {
+    std::lock_guard lock(mutex_);
+    return max_unacked_seen_;
+}
 
 AudioRenderWorker::~AudioRenderWorker() { (void)finish(); }
 
@@ -165,8 +201,8 @@ AudioRenderWorker::submit(const protocol::MessageView& message, channels::AvDeli
     const auto reject = [&](diagnostics::QueueReason reason, std::size_t units) {
         last_queue_rejection_ = diagnostics::QueueRejection{
             diagnostics::QueueSource::audio_worker, reason, message.header.channel,
-            role_slots_[*role], kRoleSlots, role_bytes_[*role], capacity(*role).bytes,
-            role_units_[*role], capacity(*role).units, bytes, units, 1,
+            role_slots_[*role], role_slot_cap(), role_bytes_[*role], role_capacity(*role).bytes,
+            role_units_[*role], role_capacity(*role).units, bytes, units, 1,
             credits_[*role].empty() ? 0 : credits_[*role].size() - 1};
         last_queue_rejection_->reserved_bytes =
             last_queue_rejection_->remaining_permits * envelope(*role).bytes;
@@ -202,6 +238,7 @@ AudioRenderWorker::submit(const protocol::MessageView& message, channels::AvDeli
     maybe_bypass_locked(monotonic_now());
     if (bypass_since_ && bypass_epoch_ == session_epoch_) {
         ++bypass_dropped_;
+        note_unacked_locked(*role);
         completed_.push_back(id);
         auto observation = credit_event(channels::AvCreditEvent::granted, id);
         observation.message_sequence = message.header.sequence;
@@ -218,13 +255,13 @@ AudioRenderWorker::submit(const protocol::MessageView& message, channels::AvDeli
                        (*role == 0 ? 1 : 6);
     const auto permits = credits_[*role].empty() ? 0 : credits_[*role].size() - 1;
     const auto promised = envelope(*role);
-    if (role_slots_[*role] + permits >= kRoleSlots ||
-        role_bytes_[*role] + permits * promised.bytes + bytes > capacity(*role).bytes ||
-        role_units_[*role] + permits * promised.units + units > capacity(*role).units) {
+    if (role_slots_[*role] + permits >= role_slot_cap() ||
+        role_bytes_[*role] + permits * promised.bytes + bytes > role_capacity(*role).bytes ||
+        role_units_[*role] + permits * promised.units + units > role_capacity(*role).units) {
         return reject(
-            role_slots_[*role] + permits >= kRoleSlots
+            role_slots_[*role] + permits >= role_slot_cap()
                 ? diagnostics::QueueReason::slots
-                : role_bytes_[*role] + permits * promised.bytes + bytes > capacity(*role).bytes
+                : role_bytes_[*role] + permits * promised.bytes + bytes > role_capacity(*role).bytes
                       ? diagnostics::QueueReason::bytes
                       : diagnostics::QueueReason::weighted_units,
             units);
@@ -250,6 +287,7 @@ AudioRenderWorker::submit(const protocol::MessageView& message, channels::AvDeli
     role_units_[*role] += units;
     // This arrival consumed the role's oldest outstanding credit.
     if (!credits_[*role].empty()) { credits_[*role].pop_front(); }
+    note_unacked_locked(*role);
     // Each parent makes exactly one ACK decision. A credit reserves the
     // FULL supported next envelope, independently of this parent's size.
     deferred_[*role].push_back(DeferredCredit{id, envelope(*role), monotonic_now(), false,
@@ -270,7 +308,8 @@ void AudioRenderWorker::invalidate(protocol::ChannelRole role, std::uint64_t gen
     if (!index) { return; }
     if (generations_[*index] == generation) { return; }
     if (router_) { router_->cancel_pending(role); }
-    credits_[*index].clear();
+    seed_credits_locked(*index);
+    unacked_[*index] = 0;
     generations_[*index] = generation;
     const auto stale = [&](const auto& entry) {
         return entry.id.role == role && entry.id.generation != generation;
@@ -298,6 +337,8 @@ void AudioRenderWorker::begin_session() {
     discard_if(queued_, [](const auto&) { return true; });
     completed_.clear();
     credits_ = {};
+    for (std::size_t index = 0; index < credits_.size(); ++index) { seed_credits_locked(index); }
+    unacked_ = {};
     deferred_ = {};
     generations_ = {};
     last_queue_rejection_.reset();
@@ -338,6 +379,9 @@ AudioRenderWorker::take_completion_with_epoch(std::uint64_t& session_epoch,
         completion = completed_.front();
         record_credit_locked(credit_event(channels::AvCreditEvent::taken, *completion));
         completed_.pop_front();
+        if (const auto index = audio_index(completion->role); index && unacked_[*index] != 0) {
+            --unacked_[*index];
+        }
         session_epoch = session_epoch_;
     }
     publish_bypass_logs(lock);
@@ -493,8 +537,8 @@ void AudioRenderWorker::record_credit_locked(const channels::AvObservation& valu
     AvCreditState state{};
     for (std::size_t i = 0; i < state.roles.size(); ++i) {
         state.roles[i] = {role_slots_[i], role_bytes_[i], role_units_[i], credits_[i].size(),
-                          deferred_[i].size(), 0, kRoleSlots, capacity(i).bytes,
-                          capacity(i).units, envelope(i).bytes};
+                          deferred_[i].size(), 0, role_slot_cap(), role_capacity(i).bytes,
+                          role_capacity(i).units, envelope(i).bytes};
         for (const auto& pending : deferred_[i]) {
             if (value.pending == pending.id) { state.pending_deferred = true; }
         }
@@ -582,9 +626,9 @@ void AudioRenderWorker::release(const Job& job) {
 
 bool AudioRenderWorker::can_credit(std::size_t index, Reservation next) const {
     const auto permits = credits_[index].size() + 1;
-    return role_slots_[index] + permits <= kRoleSlots &&
-           role_bytes_[index] + permits * next.bytes <= capacity(index).bytes &&
-           role_units_[index] + permits * next.units <= capacity(index).units;
+    return role_slots_[index] + permits <= role_slot_cap() &&
+           role_bytes_[index] + permits * next.bytes <= role_capacity(index).bytes &&
+           role_units_[index] + permits * next.units <= role_capacity(index).units;
 }
 
 void AudioRenderWorker::grant_deferred(SettlementDiagnostics& diagnostics) {
@@ -715,6 +759,11 @@ void AudioRenderWorker::exit_bypass_locked(const char* outcome) {
         ++(parent.rendered_any ? bypass_partial_ : bypass_discarded_);
     }
     bypass_in_flight_.clear();
+    // Every arrival during the bypass was released at once: the phone holds
+    // its whole window again.
+    for (std::size_t index = 0; index < credits_.size(); ++index) {
+        if (credits_[index].empty()) { seed_credits_locked(index); }
+    }
     dropped_total_ += bypass_dropped_;
     bypass_logs_.push_back(
         "{\"event\":\"audio_stall_bypass\",\"phase\":\"end\",\"outcome\":\"" +
@@ -788,9 +837,23 @@ void AudioRenderWorker::run(RouterConfig config, const OpenRouter& open) {
         std::lock_guard lock(mutex_);
         router_ = &local_router;
     }
-    const auto emit_media_timing = [this](const auto& stats) {
+    // Counters of the routes a sink reopen replaced, so media_timing reports
+    // the receiver's life rather than the current route.
+    RouterStats lifetime{};
+    std::uint64_t sink_reopens = 0;
+    const auto timing_context = [&](std::uint64_t max_unacked) {
+        MediaTimingContext context;
+        context.sink_reopens = sink_reopens;
+        if (config.playout.enabled) { context.playout_target = config.playout.depth; }
+        context.credit_window = credit_window_;
+        context.max_unacked_seen = max_unacked;
+        return context;
+    };
+    const auto emit_media_timing = [&](const RouterStats& route) {
+        const auto stats = accumulate_router_stats(lifetime, route);
         if (stats.frames_written == 0 || !telemetry_.log_media) { return; }
-        telemetry_.log_media("media_timing", media_timing_json(stats));
+        telemetry_.log_media("media_timing",
+                             media_timing_json(stats, timing_context(max_unacked_seen())));
     };
     std::uint64_t chunks = 0;
     for (;;) {
@@ -848,6 +911,7 @@ void AudioRenderWorker::run(RouterConfig config, const OpenRouter& open) {
         const auto before = local_router.report().stats.frames_written;
         const auto idle_before = local_router.report().stats.frames_idle_skipped;
         const auto caught_up_before = local_router.report().stats.frames_caught_up;
+        const auto underruns_before = local_router.report().stats.playout_underruns;
         lock.unlock();
         const auto step_started = monotonic_now();
         const auto result = local_router.render_step();
@@ -882,6 +946,11 @@ void AudioRenderWorker::run(RouterConfig config, const OpenRouter& open) {
         }
         in_flight_ = false;
         const auto stats = local_router.report().stats;
+        if (stats.playout_underruns > underruns_before) {
+            diagnostics.underrun = SettlementDiagnostics::Underrun{
+                lifetime.playout_underruns + stats.playout_underruns,
+                stats.playout_underrun_late.count, stats.playout_depth.count};
+        }
         // #155: the router trimmed this step's post-stall backlog (it happened
         // whatever the epoch, so it is always counted).
         if (stats.frames_caught_up > caught_up_before) {
@@ -1038,6 +1107,8 @@ void AudioRenderWorker::run(RouterConfig config, const OpenRouter& open) {
             // Arrivals keep dropping and ACKing while the failed sink is
             // replaced; the new route anchors on its first arrival.
             local_router.close();
+            lifetime = accumulate_router_stats(lifetime, local_router.report().stats);
+            ++sink_reopens;
             auto reopened = open(config);
             lock.lock();
             ++consecutive_reopens_;

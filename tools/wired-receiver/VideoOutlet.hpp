@@ -119,9 +119,24 @@ public:
         return idr_dispatching_.load(std::memory_order_acquire);
     }
 
+    // Wireless playout (credit window + playout, 2026-11-20): video is held this long after it arrives
+    // before it is forwarded, matching the audio playout buffer so audio and
+    // video still leave the receiver together. The frame keeps its arrival
+    // timestamp, so the display's video_presented latency includes the delay
+    // exactly as audio_write_completed's does. Zero (wired) forwards at once.
+    void set_presentation_delay(std::chrono::nanoseconds delay) {
+        std::lock_guard lock(mutex_);
+        delay_ = std::max(std::chrono::nanoseconds{0}, delay);
+    }
+
+    [[nodiscard]] std::size_t delayed_units() const {
+        std::lock_guard lock(mutex_);
+        return delayed_.size();
+    }
+
     [[nodiscard]] bool has_pending() const {
         std::lock_guard lock(mutex_);
-        return !pending_queue_.empty();
+        return !pending_queue_.empty() || !delayed_.empty();
     }
 
     [[nodiscard]] std::size_t pending_units() const {
@@ -152,6 +167,10 @@ public:
 
     [[nodiscard]] core::Result<void> service_pending() {
         std::unique_lock lock(mutex_);
+        if (idr_dispatching_.load(std::memory_order_acquire)) { return {}; }
+        if (auto released = release_due_locked(lock, now_locked()); !released) {
+            return released.error();
+        }
         if (idr_dispatching_.load(std::memory_order_acquire) ||
             pending_queue_.empty() || !producer_.has_value()) {
             return {};
@@ -165,6 +184,7 @@ public:
 
     void reset() noexcept {
         std::lock_guard lock(mutex_);
+        clear_delayed_locked("reset");
         clear_pending_locked(/*abandon_partial=*/true, "reset");
         idr_coordinator_.reset();
         had_backpressure_ = false;
@@ -178,6 +198,29 @@ public:
 
     [[nodiscard]] core::Result<void> on_message(const protocol::MessageView& message) override {
         std::unique_lock lock(mutex_);
+        if (delay_.count() == 0 && delayed_.empty()) { return deliver_locked(lock, message); }
+        const auto now = now_locked();
+        if (auto released = release_due_locked(lock, now); !released) { return released.error(); }
+        // Bounded hold: past it the oldest unit leaves early rather than grow.
+        while (!delayed_.empty() && (delayed_.size() >= kMaxDelayedUnits ||
+                                     delayed_bytes_ + message.payload.size() > kMaxDelayedBytes)) {
+            if (auto released = release_front_locked(lock); !released) { return released.error(); }
+        }
+        if (delay_.count() == 0) {
+            while (!delayed_.empty()) {
+                if (auto released = release_front_locked(lock); !released) { return released.error(); }
+            }
+            return deliver_locked(lock, message);
+        }
+        delayed_bytes_ += message.payload.size();
+        delayed_.push_back(DelayedMessage{message.header,
+            {message.payload.begin(), message.payload.end()}, now + delay_});
+        return {};
+    }
+
+private:
+    [[nodiscard]] core::Result<void> deliver_locked(std::unique_lock<std::mutex>& lock,
+                                                    const protocol::MessageView& message) {
         if (!producer_.has_value()) {
             ++dropped_before_consumer_;
             record_drop("no_consumer", frame_cadence(message.header.video_profile));
@@ -277,6 +320,7 @@ public:
         return {};
     }
 
+public:
     void install(ipc::VideoProducer producer) {
         std::lock_guard lock(mutex_);
         clear_pending_locked(/*abandon_partial=*/false, "consumer_replaced");
@@ -311,6 +355,7 @@ public:
 
     void close() noexcept {
         std::lock_guard lock(mutex_);
+        clear_delayed_locked("closed");
         clear_pending_locked(/*abandon_partial=*/false, "closed");
         emit_drops(true);
         idr_coordinator_.reset();
@@ -326,6 +371,38 @@ public:
     }
 
 private:
+    struct DelayedMessage final {
+        protocol::MessageHeader header{};
+        std::vector<std::byte> payload{};
+        std::chrono::steady_clock::time_point due{};
+    };
+    // 180 ms at 60 fps is 11 units; the byte bound covers IDR-heavy bursts.
+    static constexpr std::size_t kMaxDelayedUnits = 64;
+    static constexpr std::size_t kMaxDelayedBytes = std::size_t{32} * 1024 * 1024;
+
+    [[nodiscard]] core::Result<void> release_front_locked(std::unique_lock<std::mutex>& lock) {
+        auto item = std::move(delayed_.front());
+        delayed_.pop_front();
+        delayed_bytes_ -= item.payload.size();
+        return deliver_locked(lock, protocol::MessageView{item.header, item.payload});
+    }
+
+    [[nodiscard]] core::Result<void> release_due_locked(std::unique_lock<std::mutex>& lock,
+                                                        std::chrono::steady_clock::time_point now) {
+        while (!delayed_.empty() && delayed_.front().due <= now &&
+               !idr_dispatching_.load(std::memory_order_acquire)) {
+            if (auto released = release_front_locked(lock); !released) { return released.error(); }
+        }
+        return {};
+    }
+
+    void clear_delayed_locked(const char* drop_reason) noexcept {
+        const auto cadence = frame_cadence(profile_);
+        for (std::size_t i = 0; i < delayed_.size(); ++i) { record_drop(drop_reason, cadence); }
+        delayed_.clear();
+        delayed_bytes_ = 0;
+    }
+
     struct PendingAccessUnit final {
         std::uint64_t sequence{};
         std::uint64_t timestamp_ns{};
@@ -667,6 +744,9 @@ private:
     std::uint64_t dropped_before_consumer_{};
     std::optional<std::chrono::steady_clock::time_point> producer_installed_at_{};
     std::deque<PendingAccessUnit> pending_queue_{};
+    std::chrono::nanoseconds delay_{0};
+    std::deque<DelayedMessage> delayed_{};
+    std::size_t delayed_bytes_{0};
     std::size_t pending_bytes_{0};
     std::chrono::steady_clock::time_point hold_episode_started_at_{};
     std::size_t hold_peak_bytes_{0};

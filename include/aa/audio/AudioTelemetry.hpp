@@ -122,7 +122,23 @@ void log_sink_selected(const SinkReport& selected, std::string_view origin,
 
 [[nodiscard]] std::string audio_write_completed_json(const WriteCompletion& completion);
 [[nodiscard]] std::string audio_chunks_json(std::uint64_t count);
-[[nodiscard]] std::string media_timing_json(const RouterStats& stats);
+// Receiver-level context of a media_timing record (render worker).
+struct MediaTimingContext final {
+    // Sink routes replaced so far; the counters cover every route.
+    std::uint64_t sink_reopens{};
+    // Set when the playout clock is on (wireless): its target depth.
+    std::optional<core::Nanoseconds> playout_target{};
+    // Advertised max_unacked per audio channel and the most chunks one
+    // channel actually had unacknowledged.
+    std::uint32_t credit_window{1};
+    std::uint64_t max_unacked_seen{};
+};
+// Sum of a receiver's earlier routes (lifetime) and the current one: counters
+// add, maxima fold, the latest observations come from `route`.
+[[nodiscard]] RouterStats accumulate_router_stats(const RouterStats& lifetime,
+                                                  const RouterStats& route);
+[[nodiscard]] std::string media_timing_json(const RouterStats& stats,
+                                            const MediaTimingContext& context = {});
 // #155 catch-up record: one render step's LivePcmDriftPolicy::catch_up_watermark
 // trim (RouterStats::frames_caught_up delta and total) plus the worker's
 // lifetime event/frame totals across sink reopens.

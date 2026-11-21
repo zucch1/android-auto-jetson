@@ -6,6 +6,8 @@
 #include <aa/diagnostics/QueueRejection.hpp>
 #include <aa/channels/AvObservation.hpp>
 
+#include <algorithm>
+#include <deque>
 #include <functional>
 #include <utility>
 
@@ -22,6 +24,9 @@ struct DeferredAvDelivery final {
     std::function<std::optional<diagnostics::QueueRejection>()> rejection{};
     // Observational only: must not throw, reenter the sink, or perform transport I/O.
     std::function<void(const AvObservation&)> observe{};
+    // Credit window advertised as max_unacked: how many data messages may be
+    // submitted and not yet completed at once. 1 is stop-and-wait.
+    std::uint32_t window{1};
 };
 
 class AvSink final : public protocol::MessageSink {
@@ -62,6 +67,9 @@ public:
     }
 
 private:
+    [[nodiscard]] std::uint32_t window() const noexcept {
+        return deferred_ ? std::max<std::uint32_t>(1, deferred_->window) : 1;
+    }
     enum class AckFor : std::uint16_t { data = 0, codec_config = 1 };
     void observe(AvCreditEvent event, std::optional<ErrorCode> error = {}, std::uint32_t count = 0) const;
     [[nodiscard]] core::Result<void> send_ack(std::int32_t session, AckFor for_message);
@@ -80,9 +88,14 @@ private:
     std::uint64_t generation_{};
     std::uint64_t* generation_counter_{};
     std::uint64_t delivery_sequence_{};
-    std::optional<AvDeliveryId> pending_;
+    struct PendingDelivery final {
+        AvDeliveryId id;
+        AvObservation observation;
+    };
+    // Submitted, not yet completed deliveries, oldest first; at most the
+    // credit window (DeferredAvDelivery::window, 1 without deferral).
+    std::deque<PendingDelivery> pending_;
     AvObservation current_observation_{};
-    AvObservation pending_observation_{};
     std::optional<diagnostics::QueueRejection> last_queue_rejection_;
     std::vector<std::uint32_t> announced_;
     std::optional<protocol::VideoProfile> selected_profile_;

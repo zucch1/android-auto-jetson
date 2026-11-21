@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include <aa/audio/AudioTelemetry.hpp>
 
+#include <algorithm>
 #include <charconv>
 #include <cmath>
 #include <string>
@@ -75,9 +76,17 @@ std::string audio_write_completed_json(const WriteCompletion& completion) {
     // ALWAYS present on this playback-time contract: null when the sink
     // reported no slot, so the collector invalidates A/V instead of
     // mixing in a handoff endpoint.
+    // Playout (wireless): scheduled_ns/scheduled_end_ns are the content
+    // (arrival-clock) times, playout_offset_ns how much later the piece was
+    // scheduled. presented_ns - scheduled_ns therefore includes the playout
+    // buffer, so the A/V contract pairs a video frame with the audio that
+    // arrived with it. The field is absent on the arrival model (wired).
+    const auto offset = completion.playout_offset.count;
     return "{\"event\":\"audio_write_completed\",\"scheduled_ns\":" +
-        std::to_string(completion.scheduled.count) + ",\"scheduled_end_ns\":" +
-        std::to_string(completion.scheduled_end.count) + ",\"completed_ns\":" +
+        std::to_string(completion.scheduled.count - offset) + ",\"scheduled_end_ns\":" +
+        std::to_string(completion.scheduled_end.count - offset) +
+        (offset != 0 ? ",\"playout_offset_ns\":" + std::to_string(offset) : std::string{}) +
+        ",\"completed_ns\":" +
         std::to_string(completion.completed.count) + ",\"presented_ns\":" +
         (completion.presented ? std::to_string(completion.presented->count) : std::string{"null"}) +
         ",\"playback_slot_absence\":" +
@@ -91,18 +100,75 @@ std::string audio_chunks_json(std::uint64_t count) {
     return "{\"event\":\"audio_chunks\",\"count\":" + std::to_string(count) + "}";
 }
 
-std::string media_timing_json(const RouterStats& stats) {
-    return "{\"event\":\"media_timing\",\"audio_scheduling_skew_ms\":" +
+RouterStats accumulate_router_stats(const RouterStats& lifetime, const RouterStats& route) {
+    RouterStats out = route;
+    out.chunks_submitted += lifetime.chunks_submitted;
+    out.frames_mixed += lifetime.frames_mixed;
+    out.frames_written += lifetime.frames_written;
+    out.samples_written += lifetime.samples_written;
+    out.max_path_latency = std::max(out.max_path_latency, lifetime.max_path_latency);
+    out.max_completion_skew = std::max(out.max_completion_skew, lifetime.max_completion_skew);
+    out.frames_decoded += lifetime.frames_decoded;
+    out.frames_retained += lifetime.frames_retained;
+    out.frames_trimmed += lifetime.frames_trimmed;
+    out.frames_caught_up += lifetime.frames_caught_up;
+    out.frames_silence += lifetime.frames_silence;
+    out.frames_output += lifetime.frames_output;
+    out.frames_skipped += lifetime.frames_skipped;
+    out.frames_idle_skipped += lifetime.frames_idle_skipped;
+    out.playout_underruns += lifetime.playout_underruns;
+    out.playout_anchors += lifetime.playout_anchors;
+    out.frames_padded += lifetime.frames_padded;
+    const auto fold = [](std::optional<core::Nanoseconds> a, std::optional<core::Nanoseconds> b,
+                         bool lower) -> std::optional<core::Nanoseconds> {
+        if (!a) { return b; }
+        if (!b) { return a; }
+        return lower ? std::min(*a, *b) : std::max(*a, *b);
+    };
+    out.playout_depth_min = fold(route.playout_depth_min, lifetime.playout_depth_min, true);
+    out.playout_depth_max = fold(route.playout_depth_max, lifetime.playout_depth_max, false);
+    return out;
+}
+
+std::string media_timing_json(const RouterStats& stats, const MediaTimingContext& context) {
+    const auto optional_ms = [](std::optional<core::Nanoseconds> value) {
+        return value ? format_ms(*value) : std::string{"null"};
+    };
+    std::string json = "{\"event\":\"media_timing\",\"audio_scheduling_skew_ms\":" +
         format_ms(stats.max_completion_skew) + ",\"audio_latency_ms\":" +
         format_ms(stats.max_path_latency) +
-        // Cumulative router loss and synthesized silence: window 8 dropped
-        // 13.2% and filled 13.4% with gap silence while only the catch-up part
-        // (4.4%) was logged.
+        // Router loss and synthesized silence over the receiver's life (every
+        // sink route summed; sink_reopens counts the routes replaced): window 8
+        // dropped 13.2% and filled 13.4% with gap silence while only the
+        // catch-up part (4.4%) was logged. frames_skipped is elapsed time
+        // advanced without a write (withheld credit, playout underrun holes).
         ",\"frames_decoded\":" + std::to_string(stats.frames_decoded) +
         ",\"frames_trimmed\":" + std::to_string(stats.frames_trimmed) +
         ",\"frames_caught_up\":" + std::to_string(stats.frames_caught_up) +
         ",\"frames_silence\":" + std::to_string(stats.frames_silence) +
-        ",\"frames_idle_skipped\":" + std::to_string(stats.frames_idle_skipped) + "}";
+        ",\"frames_skipped\":" + std::to_string(stats.frames_skipped) +
+        ",\"frames_idle_skipped\":" + std::to_string(stats.frames_idle_skipped) +
+        ",\"sink_reopens\":" + std::to_string(context.sink_reopens);
+    if (context.playout_target) {
+        // Wireless playout buffer: depth is slot minus arrival of the latest
+        // chunk, min/max its range (anchors excluded), offset the depth of the
+        // least-delayed arrivals that audio_write_completed reports.
+        json += ",\"playout_target_ms\":" + format_ms(*context.playout_target) +
+            ",\"playout_depth_ms\":" + format_ms(stats.playout_depth) +
+            ",\"playout_depth_min_ms\":" + optional_ms(stats.playout_depth_min) +
+            ",\"playout_depth_max_ms\":" + optional_ms(stats.playout_depth_max) +
+            ",\"playout_offset_ms\":" + format_ms(stats.playout_offset) +
+            ",\"playout_underruns\":" + std::to_string(stats.playout_underruns) +
+            ",\"playout_anchors\":" + std::to_string(stats.playout_anchors) +
+            ",\"frames_padded\":" + std::to_string(stats.frames_padded);
+    }
+    if (context.playout_target || context.credit_window > 1) {
+        // Credit window advertised as max_unacked, and the most chunks the
+        // phone actually had unacknowledged on one channel.
+        json += ",\"credit_window\":" + std::to_string(context.credit_window) +
+            ",\"max_unacked_seen\":" + std::to_string(context.max_unacked_seen);
+    }
+    return json + "}";
 }
 
 std::string audio_catch_up_json(std::uint64_t frames, std::uint64_t total, std::uint32_t rate,

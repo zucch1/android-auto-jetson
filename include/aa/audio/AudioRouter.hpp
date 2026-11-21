@@ -113,6 +113,11 @@ struct WriteCompletion final {
     // reported no position.
     std::optional<core::Nanoseconds> presented{};
     PlaybackSlotAbsence playback_slot_absence{PlaybackSlotAbsence::unavailable};
+    // Wireless playout (PlayoutPolicy): how far after its content time this
+    // piece is scheduled - the playout buffer depth its parents were placed
+    // with (the largest among contributors). Zero on the arrival model
+    // (wired): scheduled is then the arrival-stamped content time itself.
+    core::Nanoseconds playout_offset{};
 };
 
 struct RenderStep final {
@@ -241,6 +246,52 @@ private:
     std::uint64_t rate_{};
 };
 
+// Wireless playout (owner decision 2026-11-20, "credit window + playout"). The
+// arrival model places each chunk at its receipt stamp, so on Wi-Fi every
+// round-trip spike becomes a gap (silence) and the burst after it is trimmed or
+// judged late. With playout enabled, render_step() schedules each role's
+// chunks back to back from its stream on the output clock, `depth` after the
+// arrival that anchored the stream:
+// - anchor: a role's first chunk (and the first after cancel_pending or a
+//   session reset) is placed at arrival + depth;
+// - steady: every later chunk follows the role's previous one exactly, so a
+//   burst or a short drought inside the buffer costs no trim and no silence;
+// - underrun: a chunk arriving after its back-to-back slot (by at most 1 s;
+//   later is a resume and counts as an anchor) re-anchors the role at
+//   arrival + depth. The elapsed part of the hole is skipped without a
+//   write (frames_skipped), the rest is `depth` of silence (frames_silence),
+//   and the session continues: playout never fails `late`;
+// - drift: the buffer depth of a chunk is its slot minus its arrival. The
+//   largest depth over the last `window` of arrivals is the depth of the
+//   least-delayed ones, i.e. the playout offset. When it is more than the
+//   LivePcmDriftPolicy high watermark above `depth` (phone clock faster, or a
+//   late anchor) the chunk loses the bounded drift trim from its head; when it
+//   is that far below (phone clock slower, or a slower path) up to max_trim of
+//   silence is inserted before it. Jitter alone only lowers single depths, so
+//   it never trims.
+// Wired keeps the arrival model (disabled).
+struct PlayoutPolicy final {
+    bool enabled{false};
+    core::Nanoseconds depth{core::Nanoseconds{120'000'000}};
+    core::Nanoseconds window{core::Nanoseconds{4'000'000'000LL}};
+
+    [[nodiscard]] friend constexpr bool operator==(const PlayoutPolicy&,
+                                                   const PlayoutPolicy&) noexcept = default;
+};
+
+// Wireless defaults, with the reasoning in docs/qualification/wireless-recovery-qa.md.
+// 120 ms of playout buffer rides out a one-way delay excursion of 120 ms (a
+// round trip spike to ~250 ms) and keeps the pulsesink ring (200 ms) able to
+// take a whole 42.67 ms chunk ahead of it without blocking the worker.
+inline constexpr core::Nanoseconds kWirelessPlayoutDepth{120'000'000};
+// Wireless audio credit window (AudioCreditPolicy, max_unacked): 4 x 42.67 ms
+// A26 media chunks = 170 ms of credit, more than the 150 ms round-trip spike
+// the replay tests cover and twice window 9's 83 ms spike second.
+inline constexpr std::uint32_t kWirelessCreditWindow = 4;
+// The largest depth the router accepts: the silence refilling the buffer after
+// an underrun must stay under the 200 ms synthesized-silence cap.
+inline constexpr core::Nanoseconds kMaxPlayoutDepth{180'000'000};
+
 struct RouterConfig final {
     AudioFormat output_format{48000, 2, 16};
     std::array<RoleStreamConfig, 4> roles{};
@@ -274,6 +325,8 @@ struct RouterConfig final {
     // Production uses pulsesink; native pipewiresink is refused on PipeWire
     // 1.0.5 / Ubuntu noble due to missing rate control and long-run degradation (#80).
     core::Nanoseconds render_quantum{core::Nanoseconds{50'000'000}};
+    // Wireless playout clock (default off: the wired arrival model).
+    PlayoutPolicy playout{};
 };
 
 enum class RouterState : std::uint8_t { active, degraded };
@@ -319,6 +372,23 @@ struct RouterStats final {
     // Elapsed all-role-idle prefix frames advanced without a write. Overlap
     // belongs to frames_skipped (backpressure), never to both counters.
     std::uint64_t frames_idle_skipped{};
+    // Playout (PlayoutPolicy) observations; all zero on the arrival model.
+    // playout_underruns counts re-anchors of a playing role whose chunk
+    // arrived after its slot (frames_skipped holds the elapsed hole,
+    // frames_silence the refill). playout_depth is the last chunk's buffer
+    // depth at arrival (slot minus arrival, before any drift trim or pad),
+    // playout_depth_min/max its range over the route excluding anchors, and
+    // playout_offset the current offset of the least-delayed arrivals (the
+    // value audio_write_completed reports as playout_offset_ns).
+    std::uint64_t playout_underruns{};
+    std::uint64_t playout_anchors{};
+    std::uint64_t frames_padded{};
+    core::Nanoseconds playout_depth{};
+    std::optional<core::Nanoseconds> playout_depth_min{};
+    std::optional<core::Nanoseconds> playout_depth_max{};
+    core::Nanoseconds playout_offset{};
+    // How long after its slot the chunk of the latest underrun arrived.
+    core::Nanoseconds playout_underrun_late{};
 };
 
 // ELEMENT-INGRESS observations (task-25 gate fix round 2): what entered the

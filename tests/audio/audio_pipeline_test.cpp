@@ -4650,6 +4650,301 @@ TEST_F(AudioPipelineRoute, CreditRoundTripsUnderTheChunkPeriodAreLossless) {
     }
 }
 
+namespace {
+
+// Window 9 (A26 over Wi-Fi, 2026-11-20, #180 deployed: TCP_NODELAY), the
+// phone's per-second media ack round trips in ms ("CAR.AUDIO.STATS: Acks from
+// MEDIA received ... with avg latency", acks:latency): 27 s before the
+// session ended `late` (~218 ms behind the cursor) right after the 12:83 ms
+// second. Mostly 9-42 ms at 22-25 acks/s, against 21-89 ms in window 8.
+constexpr std::array<std::int64_t, 27> kWindow9AckRoundTripMs{
+    16, 13, 37, 29, 38, 42, 39, 28, 9, 12,
+    9, 9, 13, 38, 36, 39, 32, 14, 9, 11,
+    11, 12, 26, 33, 57, 83, 35,
+};
+
+template <std::size_t N>
+[[nodiscard]] auto recorded_round_trips(const std::array<std::int64_t, N>& seconds) {
+    return [&seconds](std::int64_t second) {
+        return seconds.at(static_cast<std::size_t>(
+            std::clamp<std::int64_t>(second, 0, static_cast<std::int64_t>(N) - 1)));
+    };
+}
+
+struct PlayoutLoopResult final {
+    std::uint64_t chunks{};
+    aa::audio::RouterStats stats{};
+    std::optional<aa::audio::RenderFailureReason> failure{};
+    std::vector<aa::audio::WriteCompletion> completions{};
+    // Most chunks the phone had sent and not yet seen acknowledged.
+    std::uint64_t max_in_flight{};
+};
+
+// The credit loop of run_credit_loop() with a credit window: the phone may
+// keep `window` chunks unacknowledged, so it sends each 2048-frame chunk as
+// soon as it is captured unless `window` earlier chunks still await their
+// ack. TCP delivers in order, half a round trip after sending; the receiver
+// acks at arrival unless the 232 ms pulsesink ring is full, and the ack reaches
+// the phone half a round trip later. The receiver runs the real incremental
+// router with the wireless playout policy (PlayoutPolicy, production depth).
+template <typename RoundTrip>
+[[nodiscard]] PlayoutLoopResult run_playout_loop(std::int64_t seconds, RoundTrip round_trip_ms,
+                                                 std::uint32_t window,
+                                                 aa::core::Nanoseconds depth = aa::audio::kWirelessPlayoutDepth) {
+    constexpr std::int64_t kSinkAheadNs = 232'000'000;
+    constexpr std::uint64_t kChunkFrames = 2048;
+    constexpr std::int64_t kStart = 1'000'000'000;
+    PlayoutLoopResult result;
+    auto config = pcm_router_config();
+    config.live_pcm_drift.enabled = true;
+    config.playout.enabled = true;
+    config.playout.depth = depth;
+    auto completions = std::make_shared<std::vector<aa::audio::WriteCompletion>>();
+    config.on_write_completed = [completions](const aa::audio::WriteCompletion& completion) {
+        completions->push_back(completion);
+    };
+    auto sink = std::make_unique<RecordingAudioSink>();
+    const auto observed = sink->state;
+    auto opened = aa::audio::detail::open_router_with_sink_for_test(config, std::move(sink));
+    if (!opened) { result.failure = aa::audio::RenderFailureReason::missing_sink; return result; }
+    auto route = std::move(opened).value();
+    const auto written_end_ns = [&]() -> std::int64_t {
+        if (observed->write_ns.empty()) { return 0; }
+        const auto frames = static_cast<std::int64_t>(observed->writes.back().size() / 4);
+        return observed->write_ns.back() + frames * 1'000'000'000LL / 48000;
+    };
+    const auto chunk = constant_pcm({kMediaLevel, kChunkFrames});
+    std::deque<std::int64_t> acked_at; // phone time each in-flight chunk's ack arrives
+    std::int64_t last_arrival = 0;
+    for (std::uint64_t k = 0;; ++k) {
+        const auto captured = static_cast<std::int64_t>(k * kChunkFrames * 1'000'000'000ULL / 48000ULL);
+        std::int64_t sent = captured;
+        if (acked_at.size() >= window) {
+            sent = std::max(sent, acked_at.front());
+            acked_at.pop_front();
+        }
+        if (sent >= seconds * 1'000'000'000LL) { break; }
+        std::uint64_t in_flight = 1;
+        for (const auto at : acked_at) { if (at > sent) { ++in_flight; } }
+        result.max_in_flight = std::max(result.max_in_flight, in_flight);
+        const std::int64_t rtt = round_trip_ms(sent / 1'000'000'000LL) * 1'000'000LL;
+        const std::int64_t arrival = std::max(last_arrival, kStart + sent + rtt / 2);
+        last_arrival = arrival;
+        if (!route.submit(make_message(aa::protocol::ChannelRole::media_audio, k,
+                                       aa::core::Nanoseconds{arrival}, chunk))) {
+            result.failure = aa::audio::RenderFailureReason::closed;
+            break;
+        }
+        ++result.chunks;
+        bool drained = false;
+        for (int i = 0; i < 256; ++i) {
+            auto stepped = route.render_step();
+            if (!stepped) { break; }
+            if (!stepped.value().pending) { drained = true; break; }
+        }
+        if (!drained) {
+            const auto& failure = route.report().render_failure;
+            result.failure = failure ? failure->reason : aa::audio::RenderFailureReason::closed;
+            break;
+        }
+        const std::int64_t acked = std::max(arrival, written_end_ns() - kSinkAheadNs);
+        acked_at.push_back(acked - kStart + (rtt - rtt / 2));
+    }
+    result.stats = route.report().stats;
+    result.completions = *completions;
+    return result;
+}
+
+void expect_lossless_playout(const PlayoutLoopResult& run, const char* label) {
+    ASSERT_FALSE(run.failure) << label;
+    EXPECT_GT(run.chunks, 0U) << label;
+    EXPECT_EQ(run.stats.frames_trimmed, 0U) << label;
+    EXPECT_EQ(run.stats.frames_silence, 0U) << label;
+    EXPECT_EQ(run.stats.frames_skipped, 0U) << label;
+    EXPECT_EQ(run.stats.playout_underruns, 0U) << label;
+    EXPECT_EQ(run.stats.frames_retained, run.stats.frames_decoded) << label;
+    EXPECT_EQ(run.stats.playout_anchors, 1U) << label;
+}
+
+} // namespace
+
+// Window 9 ran #180 (TCP_NODELAY) with the arrival model and stop-and-wait:
+// the phone still lost credit round trips to every Wi-Fi spike, trimming 5.8%
+// and filling 8.4% with silence before ending `late`. Replaying its own round
+// trips through the arrival-stamped router with max_unacked 1 loses audio the
+// same way (this model has no Wi-Fi burst beyond the round trips, so it trims
+// less and does not reach the 200 ms cap); playout with the credit window
+// below loses none.
+TEST_F(AudioPipelineRoute, Window9RoundTripsCostTheStopAndWaitArrivalModelTrimsAndSilence) {
+    const auto run = run_credit_loop(0, 27, recorded_round_trips(kWindow9AckRoundTripMs));
+    ASSERT_FALSE(run.failure);
+    EXPECT_GT(run.stats.frames_trimmed, 0U);
+    EXPECT_GT(run.stats.frames_silence * 50, run.stats.frames_decoded); // > 2% gap silence
+}
+
+// Credit window + playout (owner decision 2026-11-20). With the wireless
+// credit window the phone never waits for a round trip under 4 x 42.67 ms, so
+// a spike delays arrivals by its one-way time instead of stalling the phone,
+// and the 120 ms playout buffer absorbs that. Windows 8 and 9's recorded round
+// trips then play every decoded frame: nothing trimmed, no gap silence, no
+// underrun, one anchor.
+TEST_F(AudioPipelineRoute, PlayoutWithCreditWindowPlaysWindow8And9Losslessly) {
+    const auto window8 = run_playout_loop(240, recorded_round_trips(kWindow8AckRoundTripMs),
+                                          aa::audio::kWirelessCreditWindow);
+    expect_lossless_playout(window8, "window 8");
+    EXPECT_GT(window8.chunks, 5600U);
+    const auto window9 = run_playout_loop(27, recorded_round_trips(kWindow9AckRoundTripMs),
+                                          aa::audio::kWirelessCreditWindow);
+    expect_lossless_playout(window9, "window 9");
+    EXPECT_GT(window9.chunks, 600U);
+    // The phone really used more than one credit at once.
+    EXPECT_GT(window8.max_in_flight, 1U);
+    EXPECT_LE(window8.max_in_flight, aa::audio::kWirelessCreditWindow);
+    // The buffer stayed inside its target band the whole time.
+    ASSERT_TRUE(window8.stats.playout_depth_min && window8.stats.playout_depth_max);
+    EXPECT_GT(window8.stats.playout_depth_min->count, 0);
+    EXPECT_LE(window8.stats.playout_depth_max->count,
+              aa::audio::kWirelessPlayoutDepth.count + 20'000'000);
+}
+
+// Synthetic Wi-Fi spikes inside the buffer: round trips of 83-150 ms for 1-2 s
+// on a 20 ms link (one-way excursion <= 65 ms < 120 ms) cost nothing.
+TEST_F(AudioPipelineRoute, PlayoutAbsorbsRoundTripSpikesInsideTheBuffer) {
+    for (const auto& [spike_ms, spike_s] : std::vector<std::pair<std::int64_t, std::int64_t>>{
+             {83, 1}, {83, 2}, {120, 1}, {150, 1}, {150, 2}}) {
+        const auto rtt = [spike_ms, spike_s](std::int64_t second) {
+            return second >= 10 && second < 10 + spike_s ? spike_ms : std::int64_t{20};
+        };
+        const auto run = run_playout_loop(30, rtt, aa::audio::kWirelessCreditWindow);
+        const auto label = std::to_string(spike_ms) + " ms x " + std::to_string(spike_s) + " s";
+        expect_lossless_playout(run, label.c_str());
+    }
+}
+
+// The rejected alternative: a jitter buffer with one chunk in flight. The
+// stop-and-wait phone cannot send faster than one chunk per round trip, so a
+// 150 ms spike starves the buffer however deep it is.
+TEST_F(AudioPipelineRoute, PlayoutWithOneChunkInFlightStillUnderrunsOnASpike) {
+    const auto rtt = [](std::int64_t second) {
+        return second >= 10 && second < 12 ? std::int64_t{150} : std::int64_t{20};
+    };
+    const auto run = run_playout_loop(30, rtt, 1);
+    ASSERT_FALSE(run.failure);
+    EXPECT_GT(run.stats.playout_underruns, 0U);
+}
+
+// A drought longer than the buffer (a 1 s spike to an 800 ms round trip: the
+// one-way delay jumps by 390 ms) underruns gracefully: the role re-anchors,
+// the elapsed hole is skipped without a write, the refill is bounded silence,
+// the phone's backlog that follows is bled back to the target with the bounded
+// drift trim, and the session never fails `late`.
+TEST_F(AudioPipelineRoute, PlayoutDroughtBeyondTheBufferUnderrunsBoundedNotLate) {
+    const auto rtt = [](std::int64_t second) {
+        return second == 10 ? std::int64_t{800} : std::int64_t{20};
+    };
+    const auto run = run_playout_loop(60, rtt, aa::audio::kWirelessCreditWindow);
+    ASSERT_FALSE(run.failure);
+    // An 800 ms round trip still lets the four credits through in bursts, so
+    // the drought is a few separate holes, each one bounded re-anchor.
+    EXPECT_GE(run.stats.playout_underruns, 1U);
+    EXPECT_LE(run.stats.playout_underruns, 4U);
+    // The hole was skipped, not synthesized.
+    EXPECT_GT(run.stats.frames_skipped, 0U);
+    // Refill silence: at most one buffer per underrun, plus bounded pads.
+    const auto depth_frames = static_cast<std::uint64_t>(aa::audio::kWirelessPlayoutDepth.count) * 48 / 1'000'000;
+    EXPECT_LE(run.stats.frames_silence - run.stats.frames_padded,
+              run.stats.playout_underruns * (depth_frames + 1));
+    // The phone's backlog then arrives on top of a refilled buffer. The drift
+    // trim (at most 5 ms per chunk, never a catch-up) removes exactly the
+    // latency the drought added - its skipped holes plus the refills - and no
+    // more: lossless playback of a longer drought would need unbounded latency.
+    EXPECT_EQ(run.stats.frames_caught_up, 0U);
+    EXPECT_GT(run.stats.frames_trimmed, 0U);
+    EXPECT_LE(run.stats.frames_trimmed, run.stats.frames_skipped + run.stats.frames_silence + 2048U);
+    EXPECT_LE(run.stats.frames_trimmed * 100, run.stats.frames_decoded * 3); // < 3% of the minute
+    // The buffer is back at its target by the end.
+    EXPECT_LE(std::abs(run.stats.playout_offset.count - aa::audio::kWirelessPlayoutDepth.count),
+              20'000'000);
+}
+
+// A/V alignment: each write reports the playout offset it was scheduled with,
+// and that offset equals the buffer depth, so scheduled - offset is the
+// content's arrival clock (the clock video frames are stamped on).
+TEST_F(AudioPipelineRoute, PlayoutWritesReportTheirOffsetFromTheArrivalClock) {
+    const auto run = run_playout_loop(5, [](std::int64_t) { return std::int64_t{20}; },
+                                      aa::audio::kWirelessCreditWindow);
+    expect_lossless_playout(run, "steady");
+    ASSERT_FALSE(run.completions.empty());
+    const auto& first = run.completions.front();
+    // The first chunk arrives half a 20 ms round trip after kStart.
+    EXPECT_EQ(first.scheduled.count - first.playout_offset.count, 1'000'000'000 + 10'000'000);
+    for (const auto& completion : run.completions) {
+        EXPECT_EQ(completion.playout_offset, aa::audio::kWirelessPlayoutDepth);
+    }
+}
+
+// The arrival model (wired) reports no offset: its schedule is the arrival.
+TEST_F(AudioPipelineRoute, ArrivalModelWritesReportNoPlayoutOffset) {
+    open_incremental();
+    enqueue(media, 1, {kMediaLevel, 960});
+    (void)step();
+    ASSERT_FALSE(completions.empty());
+    for (const auto& completion : completions) {
+        EXPECT_EQ(completion.playout_offset.count, 0);
+    }
+}
+
+// A stream that pauses without a stop message and resumes seconds later is a
+// fresh anchor, not an underrun: the elapsed pause is skipped (no 3 s of
+// synthesized silence, no gap-cap failure) and only the buffer refill plays.
+TEST_F(AudioPipelineRoute, PlayoutResumeAfterAPauseReanchorsWithoutUnderrun) {
+    auto config = pcm_router_config();
+    config.live_pcm_drift.enabled = true;
+    config.playout.enabled = true;
+    auto opened = aa::audio::detail::open_router_with_sink_for_test(
+        config, std::make_unique<RecordingAudioSink>());
+    ASSERT_TRUE(opened);
+    auto route = std::move(opened).value();
+    const auto chunk = constant_pcm({kMediaLevel, 2048});
+    const auto drain = [&] {
+        for (int i = 0; i < 512; ++i) {
+            auto stepped = route.render_step();
+            if (!stepped) { return false; }
+            if (!stepped.value().pending) { return true; }
+        }
+        return false;
+    };
+    constexpr std::int64_t kChunk = 2048LL * 1'000'000'000LL / 48000LL;
+    for (std::uint64_t k = 0; k < 10; ++k) {
+        ASSERT_TRUE(route.submit(make_message(media, k,
+            aa::core::Nanoseconds{base.count + static_cast<std::int64_t>(k) * kChunk}, chunk)));
+        ASSERT_TRUE(drain());
+    }
+    const aa::core::Nanoseconds resumed{base.count + 10 * kChunk + 3'000'000'000LL};
+    ASSERT_TRUE(route.submit(make_message(media, 10, resumed, chunk)));
+    ASSERT_TRUE(drain());
+    const auto& stats = route.report().stats;
+    EXPECT_EQ(stats.playout_underruns, 0U);
+    EXPECT_EQ(stats.playout_anchors, 2U);
+    // The hole is the pause less the buffer that was still queued: 3 s - 120 ms.
+    EXPECT_GT(stats.frames_skipped, 48000U * 28 / 10);
+    const auto depth_frames = static_cast<std::uint64_t>(aa::audio::kWirelessPlayoutDepth.count) * 48 / 1'000'000;
+    EXPECT_LE(stats.frames_silence, depth_frames + 1);
+    EXPECT_EQ(stats.frames_retained, 11U * 2048U);
+}
+
+// A playout depth must leave the refill under the 200 ms silence cap.
+TEST_F(AudioPipelineRoute, PlayoutRejectsADepthBeyondTheSilenceCap) {
+    auto config = pcm_router_config();
+    config.playout.enabled = true;
+    config.playout.depth = aa::core::Nanoseconds{aa::audio::kMaxPlayoutDepth.count + 1};
+    EXPECT_FALSE(aa::audio::detail::open_router_with_sink_for_test(
+        config, std::make_unique<RecordingAudioSink>()));
+    config.playout.depth = aa::audio::kMaxPlayoutDepth;
+    EXPECT_TRUE(aa::audio::detail::open_router_with_sink_for_test(
+        config, std::make_unique<RecordingAudioSink>()));
+}
+
 // #155 F1: a non-caught-up 200 ms guidance packet placed near the 90 ms
 // watermark advances cursor to timestamp + ~284 ms. A subsequent forward-
 // timestamped short chunk (< 83 ms, e.g. 42.67 ms media or 64 ms guidance

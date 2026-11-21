@@ -93,5 +93,10 @@ if(NOT CMAKE_CROSSCOMPILING)
                 "${CMAKE_SOURCE_DIR}/tests/wireless_e2e/test_audio_worker_telemetry.py"
                 "${CMAKE_SOURCE_DIR}" "$<TARGET_FILE:aa_wireless_audio_worker_test>")
     set_tests_properties(wireless_e2e_audio_worker_telemetry PROPERTIES TIMEOUT 90)
+    add_test(NAME wireless_e2e_playout_av_alignment
+        COMMAND "${Python3_EXECUTABLE}" -B
+                "${CMAKE_SOURCE_DIR}/tests/wireless_e2e/test_playout_av_alignment.py"
+                "${CMAKE_SOURCE_DIR}")
+    set_tests_properties(wireless_e2e_playout_av_alignment PROPERTIES TIMEOUT 60)
     include("${CMAKE_SOURCE_DIR}/cmake/WirelessMatrix.cmake")
 endif()

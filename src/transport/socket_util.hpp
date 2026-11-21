@@ -118,7 +118,19 @@ inline void close_fd(int& fd) noexcept {
 // caller (the TLS transport) refuses hostnames instead of blocking on DNS.
 enum class Resolve { any, numeric_only };
 
-// Resolve host:port and connect a TCP socket. Returns the connected fd or -1.
+// AAP is interactive: the receiver's media credit acks are small frames and the
+// phone sends its next audio chunk only against them. Nagle would
+// hold a small frame written while an earlier one is unacknowledged until the
+// phone's delayed ACK (~40 ms): enough to push wireless audio's credit round
+// trip past the 42.67 ms chunk period (window 8 measured 21-89 ms against a
+// few-ms link). Every AAP TCP socket sends at once: connect_socket() and
+// accept_socket() set it, so TCP and TLS links both have it.
+[[nodiscard]] inline bool set_no_delay(int fd) noexcept {
+    const int enabled = 1;
+    return ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &enabled, sizeof(enabled)) == 0;
+}
+
+// Resolve host:port and connect a TCP socket. Returns the connected fd (TCP_NODELAY set) or -1.
 [[nodiscard]] inline int connect_socket(const char* host, std::uint16_t port,
     const core::Deadline& deadline = {core::Deadline::Clock::now() + std::chrono::seconds{10}, {}},
     Resolve resolve = Resolve::any) {
@@ -151,18 +163,11 @@ enum class Resolve { any, numeric_only };
         fd = -1;
     }
     ::freeaddrinfo(result);
+    if (fd >= 0 && !set_no_delay(fd)) {
+        ::close(fd);
+        fd = -1;
+    }
     return fd;
-}
-
-// AAP is interactive: the phone sends media stop-and-wait (max_unacked 1), one
-// chunk per credit ack, and the receiver's acks are small frames. Nagle would
-// hold a small frame written while an earlier one is unacknowledged until the
-// phone's delayed ACK (~40 ms): enough to push wireless audio's credit round
-// trip past the 42.67 ms chunk period (window 8 measured 21-89 ms against a
-// few-ms link). Every AAP TCP socket sends at once.
-[[nodiscard]] inline bool set_no_delay(int fd) noexcept {
-    const int enabled = 1;
-    return ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &enabled, sizeof(enabled)) == 0;
 }
 
 // Bind + listen on host:port (port 0 for ephemeral). Returns the listening fd or -1.
@@ -216,6 +221,7 @@ enum class Resolve { any, numeric_only };
 }
 
 // Accept one connection on a listening fd. Returns the connected fd or -1.
+// Accepts one connection (TCP_NODELAY set). Returns the fd or -1.
 [[nodiscard]] inline int accept_socket(int listen_fd, sockaddr* peer = nullptr, socklen_t* length = nullptr,
     const core::Deadline& deadline = {core::Deadline::Clock::now() + std::chrono::seconds{10}, {}}) {
     if (listen_fd < 0) {
@@ -229,6 +235,10 @@ enum class Resolve { any, numeric_only };
             if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
                 continue;
             }
+            return -1;
+        }
+        if (!set_no_delay(fd)) {
+            ::close(fd);
             return -1;
         }
         return fd;

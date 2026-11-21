@@ -14,6 +14,8 @@
 #include <aa/diagnostics/StdoutLog.hpp>
 #include "../wired-receiver/VideoOutlet.hpp"
 #include <atomic>
+#include <chrono>
+#include <optional>
 #include <cstdio>
 #include <string>
 #include <string_view>
@@ -76,13 +78,32 @@ private:
 // 3 x 50 ms chunks within 5 ms) reaches >90 ms placement phase without a sink
 // stall and would be trimmed by the wired 90 ms phase watermark. Wired keeps
 // the 90 ms default in audio::pcm_router_config(); wireless stays off unless
-// explicitly configured (e.g. --audio-catch-up-watermark-ms).
+// explicitly configured (e.g. --audio-catch-up-watermark-ms), and only on the
+// legacy arrival model (--audio-playout-ms 0).
+//
+// Credit window + playout (owner decision 2026-11-20): wireless audio plays on
+// a steady playout clock `playout_depth` (default 120 ms) behind the arrival
+// that anchored each stream, with chunks back to back (audio::PlayoutPolicy),
+// and the phone may keep audio::kWirelessCreditWindow chunks unacknowledged.
+// Zero restores the arrival model.
 [[nodiscard]] inline audio::RouterConfig audio_config(
     audio::SinkBackend backend = audio::SinkBackend::pulse,
-    core::Nanoseconds catch_up_watermark = core::Nanoseconds{0}) {
+    core::Nanoseconds catch_up_watermark = core::Nanoseconds{0},
+    core::Nanoseconds playout_depth = audio::kWirelessPlayoutDepth) {
     auto config = audio::pcm_router_config(backend, audio_telemetry());
     config.live_pcm_drift.catch_up_watermark = catch_up_watermark;
+    config.playout.enabled = playout_depth.count > 0;
+    if (config.playout.enabled) { config.playout.depth = playout_depth; }
     return config;
+}
+
+// Video presentation delay (credit window + playout, 2026-11-20): by default (`video_delay_ms` absent, the
+// CLI's "match") video is held exactly the audio playout depth, so audio and
+// video leave the receiver the same time after their arrival and the A/V
+// contract (which pairs them on the arrival clock) still holds.
+[[nodiscard]] inline std::chrono::milliseconds video_delay(std::optional<std::int64_t> video_delay_ms,
+                                                           std::int64_t audio_playout_ms) {
+    return std::chrono::milliseconds{video_delay_ms.value_or(audio_playout_ms)};
 }
 
 // The media endpoints outlive every per-link session; callbacks resolve the

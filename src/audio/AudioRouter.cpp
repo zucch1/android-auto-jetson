@@ -31,6 +31,8 @@ constexpr std::size_t kMaxAudioPayloadBytes = std::size_t{64} * 1024;
 constexpr std::size_t kMaxPendingRunsPerRole = 512;
 constexpr std::size_t kMaxOutputPieceBytes = std::size_t{64} * 1024;
 constexpr std::size_t kMaxBackpressureIntervals = 64;
+// Playout: a role silent this long past its slot resumed rather than underran.
+constexpr std::int64_t kPlayoutResumeAfterNs = 1'000'000'000;
 
 [[nodiscard]] std::optional<Role> role_of(protocol::ChannelRole channel) {
     switch (channel) {
@@ -56,6 +58,24 @@ constexpr std::size_t kMaxBackpressureIntervals = 64;
     return core::Nanoseconds{std::max(slot->count, completed_ns)};
 }
 
+// How the playout policy places one run (see PlayoutPolicy).
+struct PlayoutPlan final {
+    enum class Mode : std::uint8_t { anchor, steady, underrun };
+    Mode mode{Mode::anchor};
+    // anchor/underrun: arrival + depth, where the run is placed.
+    std::int64_t target_ns{};
+    // Buffer depth at arrival: slot minus arrival (anchor/underrun: the depth
+    // it is re-anchored with).
+    std::int64_t depth_ns{};
+    // Largest depth over the window including this run, before adjustment.
+    std::int64_t window_max_ns{};
+    // underrun: how long after its slot the run arrived.
+    std::int64_t late_ns{};
+    // steady: bounded drift trim from the head, or silence inserted before it.
+    std::uint64_t trim_frames{};
+    std::uint64_t pad_frames{};
+};
+
 // One decoded run pending on the mix timeline. submitted_at_ns is stamped at
 // submit() BEFORE decode() so the whole decode + mix + write path is inside
 // the recorded latency (gate fix F4).
@@ -78,6 +98,12 @@ struct Run final {
     // carryover from earlier parents, at least this long, so its source
     // samples are at least carried_ns older than `timestamp`.
     std::int64_t carried_ns{};
+    // Playout decision (PlayoutPolicy), fixed once the run heads its role:
+    // every earlier run of the role is committed by then, so the decision no
+    // longer depends on a dry-run plan.
+    std::optional<PlayoutPlan> playout{};
+    // Playout offset this run was committed with (WriteCompletion).
+    std::int64_t playout_offset_ns{};
 };
 
 // One run placed on the sample timeline at an effective (non-overlapping)
@@ -98,6 +124,10 @@ struct ScheduledRun final {
     std::uint64_t caught_up_frames{0};
     // The run's phase takes the catch-up trim (#154).
     bool catching_up{false};
+    // Playout re-anchor: the already-elapsed frames [skip_first, skip_last)
+    // before the run are skipped without a write instead of synthesized.
+    std::uint64_t skip_first{0};
+    std::uint64_t skip_last{0};
 };
 
 // Drift trim of one unplaced run. The catch-up (#154) judges the run by the
@@ -316,6 +346,111 @@ struct AudioRouter::Impl final {
     };
     std::optional<IdleAuthorization> idle{};
 
+    // Playout state per role (PlayoutPolicy): anchored once the role's first
+    // run is committed; depths holds (arrival, buffer depth) of the committed
+    // runs inside the window, adjusted by every later trim or pad so it stays
+    // relative to the current schedule.
+    struct PlayoutRole final {
+        bool anchored{false};
+        std::deque<std::pair<std::int64_t, std::int64_t>> depths{};
+    };
+    std::array<PlayoutRole, kRoleCount> playout{};
+    LivePcmDriftCorrector playout_drift{};
+
+    [[nodiscard]] bool playout_enabled() const noexcept { return config.playout.enabled; }
+
+    void reset_playout(std::size_t role) noexcept {
+        playout[role].anchored = false;
+        playout[role].depths.clear();
+    }
+
+    // Largest committed depth whose arrival lies inside the window ending at
+    // `arrival`, folded with this run's own depth.
+    [[nodiscard]] std::int64_t window_max(std::size_t role, std::int64_t arrival,
+                                          std::int64_t depth) const noexcept {
+        std::int64_t best = depth;
+        const auto from = arrival - config.playout.window.count;
+        for (const auto& [at, value] : playout[role].depths) {
+            if (at >= from) { best = std::max(best, value); }
+        }
+        return best;
+    }
+
+    // Playout decision for an unplaced run whose back-to-back slot is
+    // `slot_frame`. False when a time cannot be represented (schedule
+    // rejection, like every other conversion failure).
+    [[nodiscard]] bool plan_playout(std::size_t role, const Run& run, std::uint64_t slot_frame,
+                                    std::int64_t base_ns, bool anchored, PlayoutPlan& plan) const {
+        const std::int64_t arrival = run.timestamp.count;
+        const std::int64_t depth = config.playout.depth.count;
+        std::int64_t slot_ns = 0;
+        if (!frame_time(slot_frame, base_ns, slot_ns)) { return false; }
+        plan = PlayoutPlan{};
+        if (!anchored || slot_ns < arrival) {
+            // A stream that resumes more than kPlayoutResumeAfter after its
+            // slot paused (no stop message) rather than starved: a fresh
+            // anchor, not an underrun.
+            const bool underrun = anchored && arrival - slot_ns <= kPlayoutResumeAfterNs;
+            plan.mode = underrun ? PlayoutPlan::Mode::underrun : PlayoutPlan::Mode::anchor;
+            plan.late_ns = underrun ? arrival - slot_ns : 0;
+            if (arrival > INT64_MAX - depth) { return false; }
+            plan.target_ns = arrival + depth;
+            plan.depth_ns = std::max(plan.target_ns, slot_ns) - arrival;
+            plan.window_max_ns = plan.depth_ns;
+            return true;
+        }
+        plan.mode = PlayoutPlan::Mode::steady;
+        plan.depth_ns = slot_ns - arrival;
+        plan.window_max_ns = window_max(role, arrival, plan.depth_ns);
+        const core::Nanoseconds excess{plan.window_max_ns - depth};
+        if (excess.count >= 0) {
+            plan.trim_frames = playout_drift.trim_frames(excess, run.frames);
+        } else {
+            plan.pad_frames = playout_drift.trim_frames(core::Nanoseconds{-excess.count}, UINT64_MAX);
+        }
+        return true;
+    }
+
+    // Commits a placed run's playout decision: role state, window and stats.
+    void commit_playout(std::size_t role, Run& run, const ScheduledRun& entry, std::int64_t base_ns) {
+        if (!playout_enabled() || !run.playout) { return; }
+        const auto& plan = *run.playout;
+        auto& state = playout[role];
+        auto& stats = report.stats;
+        std::int64_t start_ns = 0;
+        if (!frame_time(entry.start_frame, base_ns, start_ns)) { start_ns = run.timestamp.count; }
+        if (plan.mode == PlayoutPlan::Mode::steady) {
+            const auto adjust = frames_to_ns(plan.pad_frames).count - frames_to_ns(plan.trim_frames).count;
+            for (auto& [at, value] : state.depths) { value += adjust; }
+            state.depths.emplace_back(run.timestamp.count, plan.depth_ns + adjust);
+            run.playout_offset_ns = plan.window_max_ns + adjust;
+            stats.frames_padded += plan.pad_frames;
+            stats.playout_depth_min = stats.playout_depth_min
+                ? std::min(*stats.playout_depth_min, core::Nanoseconds{plan.depth_ns})
+                : core::Nanoseconds{plan.depth_ns};
+            stats.playout_depth_max = stats.playout_depth_max
+                ? std::max(*stats.playout_depth_max, core::Nanoseconds{plan.depth_ns})
+                : core::Nanoseconds{plan.depth_ns};
+        } else {
+            state.depths.clear();
+            const auto depth = start_ns - run.timestamp.count;
+            state.depths.emplace_back(run.timestamp.count, depth);
+            run.playout_offset_ns = depth;
+            if (plan.mode == PlayoutPlan::Mode::underrun) {
+                ++stats.playout_underruns;
+                stats.playout_underrun_late = core::Nanoseconds{plan.late_ns};
+            }
+            else { ++stats.playout_anchors; }
+        }
+        const auto from = run.timestamp.count - config.playout.window.count;
+        while (!state.depths.empty() && state.depths.front().first < from) { state.depths.pop_front(); }
+        constexpr std::size_t kMaxPlayoutDepths = 512;
+        while (state.depths.size() > kMaxPlayoutDepths) { state.depths.pop_front(); }
+        state.anchored = true;
+        stats.playout_depth = core::Nanoseconds{plan.depth_ns};
+        stats.playout_offset = core::Nanoseconds{run.playout_offset_ns};
+    }
+
     struct ElapsedRange final {
         std::uint64_t first;
         std::uint64_t last;
@@ -511,6 +646,17 @@ core::Result<AudioRouter> open_router_with(
     impl->config = config;
     impl->drift = LivePcmDriftCorrector{config.live_pcm_drift,
                                         config.output_format.sample_rate_hz};
+    if (config.playout.enabled) {
+        if (config.playout.depth.count <= 0 || config.playout.depth > kMaxPlayoutDepth
+            || config.playout.window.count <= 0) {
+            return core::Result<AudioRouter>{Error{ErrorCode::invalid_argument}};
+        }
+        // Playout keeps the drift trim bounded: never a catch-up.
+        auto bounded = config.live_pcm_drift;
+        bounded.enabled = true;
+        bounded.catch_up_watermark = core::Nanoseconds{0};
+        impl->playout_drift = LivePcmDriftCorrector{bounded, config.output_format.sample_rate_hz};
+    }
     impl->mixer = AudioMixer{config.mix};
     impl->report.sink.requested = config.backend;
     impl->test_decode = std::move(test_decode);
@@ -1062,6 +1208,7 @@ void AudioRouter::cancel_pending(protocol::ChannelRole role) {
     if (!index) { return; }
     std::lock_guard lock(impl_->pending_mutex);
     impl_->pending[role_index(*index)].clear();
+    impl_->reset_playout(role_index(*index));
     impl_->role_end_frames[role_index(*index)] = impl_->playback_cursor_frames;
     impl_->role_source_frontier_frames[role_index(*index)] = 0;
     ++impl_->generations[role_index(*index)];
@@ -1103,6 +1250,7 @@ void AudioRouter::reset_session_timeline() {
     if (impl_->closed) { return; }
     for (std::size_t i = 0; i < kRoleCount; ++i) {
         impl_->pending[i].clear();
+        impl_->reset_playout(i);
         ++impl_->generations[i];
     }
     impl_->timeline_base.reset();
@@ -1156,9 +1304,14 @@ core::Result<RenderStep> AudioRouter::render_step() {
     RenderStep result;
     auto base = impl_->timeline_base;
     if (!base) {
+        // A playout stream's timeline starts at its anchor (arrival + depth),
+        // so the buffer fills without synthesized silence.
+        const auto lead = impl_->playout_enabled() ? impl_->config.playout.depth.count : 0;
         for (const auto& queue : impl_->pending) {
             for (const auto& run : queue) {
-                if (!base || run.timestamp < *base) { base = run.timestamp; }
+                const core::Nanoseconds start{
+                    run.timestamp.count > INT64_MAX - lead ? INT64_MAX : run.timestamp.count + lead};
+                if (!base || start < *base) { base = start; }
             }
         }
     }
@@ -1187,7 +1340,8 @@ core::Result<RenderStep> AudioRouter::render_step() {
     for (std::size_t role = 0; role < kRoleCount && valid; ++role) {
         auto role_end = impl_->role_end_frames[role];
         auto role_source_frontier = impl_->role_source_frontier_frames[role];
-        for (const auto& run : impl_->pending[role]) {
+        bool anchored = impl_->playout[role].anchored;
+        for (auto& run : impl_->pending[role]) {
             diagnostic.offending = run.header;
             diagnostic.preflighted = run.preflighted;
             diagnostic.role_end = role_end;
@@ -1202,6 +1356,48 @@ core::Result<RenderStep> AudioRouter::render_step() {
             if (run.placed) {
                 entry.start_frame = *run.placed + run.consumed;
                 entry.head_trim_frames = run.trimmed + run.consumed;
+            } else if (impl_->playout_enabled()) {
+                // Playout: back to back from the role's stream, re-anchored
+                // at arrival + depth on a fresh stream or an underrun.
+                const auto slot_frame = std::max(cursor, role_end);
+                PlayoutPlan plan;
+                if (run.playout) {
+                    plan = *run.playout;
+                } else if (!impl_->plan_playout(role, run, slot_frame, base->count, anchored, plan)) {
+                    diagnostic.time_conversion_frame = slot_frame;
+                    fail(RenderFailureReason::placement_time_conversion);
+                    valid = false;
+                    break;
+                } else if (&run == &impl_->pending[role].front()) {
+                    run.playout = plan;
+                }
+                if (plan.mode == PlayoutPlan::Mode::steady) {
+                    entry.start_frame = slot_frame + plan.pad_frames;
+                    entry.head_trim_frames = std::min(plan.trim_frames, run.frames);
+                } else {
+                    std::int64_t target = 0;
+                    std::int64_t arrived = 0;
+                    if (!impl_->ns_to_frames_signed(core::Nanoseconds{plan.target_ns - base->count}, target)
+                        || !impl_->ns_to_frames_signed(
+                               core::Nanoseconds{run.timestamp.count - base->count}, arrived)) {
+                        fail(RenderFailureReason::intended_time_conversion);
+                        valid = false;
+                        break;
+                    }
+                    entry.start_frame = static_cast<std::uint64_t>(
+                        std::max<std::int64_t>(target, static_cast<std::int64_t>(slot_frame)));
+                    // The hole up to the arrival has already played out.
+                    if (arrived > static_cast<std::int64_t>(slot_frame)) {
+                        entry.skip_first = slot_frame;
+                        entry.skip_last = std::min(entry.start_frame, static_cast<std::uint64_t>(arrived));
+                    }
+                }
+                entry.intended = static_cast<std::int64_t>(entry.start_frame);
+                diagnostic.intended = entry.intended;
+                diagnostic.start = entry.start_frame;
+                anchored = true;
+                role_source_frontier =
+                    std::max(role_source_frontier, source_end_frame(*entry.intended, run.content_frames));
             } else {
                 std::int64_t intended = 0;
                 if (!impl_->ns_to_frames_signed(
@@ -1287,6 +1483,19 @@ core::Result<RenderStep> AudioRouter::render_step() {
                 const auto hi = std::min(entry.start_frame, range.last);
                 if (hi > lo) { gap -= hi - lo; }
             }
+            if (entry.skip_last > entry.skip_first) {
+                // Playout underrun hole: elapsed, disjoint from the ranges above
+                // only where they do not already cover it.
+                std::uint64_t covered = 0;
+                const auto lo = std::max(covered_end, entry.skip_first);
+                const auto hi = std::min(entry.start_frame, entry.skip_last);
+                for (const auto& range : elapsed) {
+                    const auto a = std::max(lo, range.first);
+                    const auto b = std::min(hi, range.last);
+                    if (b > a) { covered += b - a; }
+                }
+                if (hi > lo && hi - lo > covered) { gap -= std::min(gap, hi - lo - covered); }
+            }
             if (gap > cap || total_gap > cap - gap) {
                 diagnostic.offending = entry.run->header;
                 diagnostic.preflighted = entry.run->preflighted;
@@ -1338,6 +1547,7 @@ core::Result<RenderStep> AudioRouter::render_step() {
         if (head.start_frame == head.end_frame) {
             impl_->report.stats.frames_trimmed += head.head_trim_frames;
             impl_->report.stats.frames_caught_up += head.caught_up_frames;
+            impl_->commit_playout(role, queue.front(), head, base->count);
             impl_->role_end_frames[role] = head.end_frame;
             if (head.intended) {
                 const auto run_source_end = source_end_frame(*head.intended, head.run->content_frames);
@@ -1362,6 +1572,19 @@ core::Result<RenderStep> AudioRouter::render_step() {
         auto next_start = UINT64_MAX;
         for (const auto& head : heads) {
             if (head) { next_start = std::min(next_start, head->start_frame); }
+        }
+        // A playout re-anchor's elapsed hole is skipped like a recorded one.
+        for (const auto& head : heads) {
+            if (head && head->skip_first <= cursor && cursor < head->skip_last) {
+                const auto skipped = std::min(head->skip_last, next_start) - cursor;
+                impl_->timeline_base = base;
+                impl_->playback_cursor_frames = cursor + skipped;
+                impl_->source_frontier_frames =
+                    std::max(impl_->source_frontier_frames, impl_->playback_cursor_frames);
+                impl_->report.stats.frames_skipped += skipped;
+                result.pending = true;
+                return result;
+            }
         }
         for (const auto& range : elapsed) {
             if (range.first <= cursor && cursor < range.last) {
@@ -1403,6 +1626,7 @@ core::Result<RenderStep> AudioRouter::render_step() {
     std::array<PcmChunk, kRoleCount> materialized{};
     std::array<const PcmChunk*, kRoleCount> pieces{};
     std::optional<std::int64_t> oldest;
+    std::int64_t playout_offset_ns = 0;
     for (std::size_t role = 0; role < kRoleCount; ++role) {
         if (!heads[role] || heads[role]->start_frame > cursor) { continue; }
         const auto& head = *heads[role];
@@ -1412,6 +1636,7 @@ core::Result<RenderStep> AudioRouter::render_step() {
             run.trimmed = head.head_trim_frames;
             impl_->report.stats.frames_trimmed += run.trimmed;
             impl_->report.stats.frames_caught_up += head.caught_up_frames;
+            impl_->commit_playout(role, run, head, base->count);
             if (head.intended) {
                 const auto run_source_end = source_end_frame(*head.intended, run.content_frames);
                 impl_->source_frontier_frames = std::max(impl_->source_frontier_frames, run_source_end);
@@ -1425,6 +1650,7 @@ core::Result<RenderStep> AudioRouter::render_step() {
                 static_cast<std::size_t>(frames) * frame_bytes)};
         pieces[role] = &materialized[role];
         oldest = oldest ? std::min(*oldest, run.submitted_at_ns) : run.submitted_at_ns;
+        playout_offset_ns = std::max(playout_offset_ns, run.playout_offset_ns);
         result.contributors.push_back(run.header);
     }
     // Materialize before detaching: cancel_pending can now free EVERY parent
@@ -1480,7 +1706,8 @@ core::Result<RenderStep> AudioRouter::render_step() {
             impl_->config.on_write_completed(WriteCompletion{core::Nanoseconds{scheduled_ns},
                 core::Nanoseconds{end_ns}, core::Nanoseconds{done},
                 presented_at(impl_->sink->last_playback_slot(), done),
-                impl_->sink->last_playback_slot_absence()});
+                impl_->sink->last_playback_slot_absence(),
+                core::Nanoseconds{playout_offset_ns}});
         }
     } else { stats.frames_silence += frames; }
     lock.lock();

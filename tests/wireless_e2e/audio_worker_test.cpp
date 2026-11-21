@@ -16,6 +16,10 @@
 
 #include <gtest/gtest.h>
 
+#include <deque>
+#include <optional>
+#include <array>
+#include <algorithm>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
@@ -207,7 +211,11 @@ struct SessionHarness final {
     }
 
     std::size_t count_acks(std::size_t from_index, std::uint8_t channel, std::int32_t session_id) const {
-        const auto expected = proto::encode_av_sink_ack(session_id).value();
+        return count_payload(from_index, channel, proto::encode_av_sink_ack(session_id).value());
+    }
+
+    std::size_t count_payload(std::size_t from_index, std::uint8_t channel,
+                              const std::vector<std::byte>& expected) const {
         std::size_t count = 0;
         const auto& sent = transport.sent_frames();
         for (std::size_t i = from_index; i < sent.size(); ++i) {
@@ -466,9 +474,14 @@ TEST(WirelessAudioWorker, TelemetryEventParityWithCollectorAndSmokeContracts) {
     EXPECT_TRUE(cfg.live_pcm_drift.enabled);
     EXPECT_EQ(cfg.live_pcm_drift.catch_up_watermark, aa::core::Nanoseconds{0});
     EXPECT_TRUE(static_cast<bool>(cfg.on_write_completed));
-    const auto catch_up_cfg =
-        wr::audio_config(audio::SinkBackend::pulse, aa::core::Nanoseconds{90'000'000});
+    // Credit window + playout: the production default plays on the playout
+    // clock; catch-up is only reachable on the arrival model (playout 0).
+    EXPECT_TRUE(cfg.playout.enabled);
+    EXPECT_EQ(cfg.playout.depth, audio::kWirelessPlayoutDepth);
+    const auto catch_up_cfg = wr::audio_config(audio::SinkBackend::pulse,
+                                               aa::core::Nanoseconds{90'000'000}, aa::core::Nanoseconds{0});
     EXPECT_EQ(catch_up_cfg.live_pcm_drift.catch_up_watermark, aa::core::Nanoseconds{90'000'000});
+    EXPECT_FALSE(catch_up_cfg.playout.enabled);
 
     // 2. Verify DiagnosticOutput emits {"event":"diag",...} and worker emits exact audio JSON events.
     auto gate = std::make_shared<SinkGate>();
@@ -569,7 +582,55 @@ TEST(WirelessAudioWorker, TelemetryEventParityWithCollectorAndSmokeContracts) {
         audio::media_timing_json(timing),
         "{\"event\":\"media_timing\",\"audio_scheduling_skew_ms\":2,"
         "\"audio_latency_ms\":5.5,\"frames_decoded\":11534336,\"frames_trimmed\":1526736,"
-        "\"frames_caught_up\":509856,\"frames_silence\":1542356,\"frames_idle_skipped\":17675}");
+        "\"frames_caught_up\":509856,\"frames_silence\":1542356,\"frames_skipped\":0,"
+        "\"frames_idle_skipped\":17675,\"sink_reopens\":0}");
+    // Wireless playout: the buffer target, depth, underruns and the credit
+    // window the phone actually used, over every sink route.
+    timing.frames_skipped = 4800;
+    timing.playout_depth = aa::core::Nanoseconds{118'500'000};
+    timing.playout_depth_min = aa::core::Nanoseconds{61'000'000};
+    timing.playout_depth_max = aa::core::Nanoseconds{124'000'000};
+    timing.playout_offset = aa::core::Nanoseconds{121'000'000};
+    timing.playout_underruns = 1;
+    timing.playout_anchors = 2;
+    timing.frames_padded = 240;
+    audio::MediaTimingContext context;
+    context.sink_reopens = 1;
+    context.playout_target = aa::core::Nanoseconds{120'000'000};
+    context.credit_window = 4;
+    context.max_unacked_seen = 3;
+    EXPECT_EQ(
+        audio::media_timing_json(timing, context),
+        "{\"event\":\"media_timing\",\"audio_scheduling_skew_ms\":2,"
+        "\"audio_latency_ms\":5.5,\"frames_decoded\":11534336,\"frames_trimmed\":1526736,"
+        "\"frames_caught_up\":509856,\"frames_silence\":1542356,\"frames_skipped\":4800,"
+        "\"frames_idle_skipped\":17675,\"sink_reopens\":1,\"playout_target_ms\":120,"
+        "\"playout_depth_ms\":118.5,\"playout_depth_min_ms\":61,\"playout_depth_max_ms\":124,"
+        "\"playout_offset_ms\":121,\"playout_underruns\":1,\"playout_anchors\":2,"
+        "\"frames_padded\":240,\"credit_window\":4,\"max_unacked_seen\":3}");
+    // Lifetime: a reopened route's counters add to the earlier routes'.
+    audio::RouterStats earlier{};
+    earlier.frames_decoded = 100;
+    earlier.frames_trimmed = 7;
+    earlier.playout_underruns = 2;
+    earlier.max_path_latency = aa::core::Nanoseconds{9'000'000};
+    earlier.playout_depth_min = aa::core::Nanoseconds{40'000'000};
+    const auto total = audio::accumulate_router_stats(earlier, timing);
+    EXPECT_EQ(total.frames_decoded, 11'534'436U);
+    EXPECT_EQ(total.frames_trimmed, 1'526'743U);
+    EXPECT_EQ(total.playout_underruns, 3U);
+    EXPECT_EQ(total.max_path_latency, aa::core::Nanoseconds{9'000'000});
+    EXPECT_EQ(total.playout_depth_min, aa::core::Nanoseconds{40'000'000});
+    EXPECT_EQ(total.playout_depth, timing.playout_depth);
+    // A/V: a playout write reports its content (arrival-clock) times and the
+    // offset; the arrival model's record is unchanged.
+    audio::WriteCompletion played{aa::core::Nanoseconds{121'000}, aa::core::Nanoseconds{141'000},
+                                  aa::core::Nanoseconds{20'500}, aa::core::Nanoseconds{122'000},
+                                  audio::PlaybackSlotAbsence::none, aa::core::Nanoseconds{120'000}};
+    EXPECT_EQ(audio::audio_write_completed_json(played),
+              "{\"event\":\"audio_write_completed\",\"scheduled_ns\":1000,"
+              "\"scheduled_end_ns\":21000,\"playout_offset_ns\":120000,\"completed_ns\":20500,"
+              "\"presented_ns\":122000,\"playback_slot_absence\":null}");
     EXPECT_EQ(
         audio::audio_catch_up_json(960, 1920, 48000, 3, 4800),
         "{\"event\":\"audio_catch_up\",\"frames\":960,\"frames_total\":1920,\"rate\":48000,"
@@ -819,7 +880,8 @@ TEST(WirelessAudioWorker, NormalCoalescedBurstIsNotTrimmedAndPostStallBurstCatch
             StdoutCapture capture;
             diag::StdoutLogScope logging{wr::running};
             audio::AudioRenderWorker audio{
-                wr::audio_config(audio::SinkBackend::pulse, aa::core::Nanoseconds{90'000'000}),
+                wr::audio_config(audio::SinkBackend::pulse, aa::core::Nanoseconds{90'000'000},
+                                 aa::core::Nanoseconds{0}),
                 wr::audio_telemetry(), fake_router(gate)};
             ASSERT_TRUE(audio.ready());
             wr::Media media{audio};
@@ -885,7 +947,8 @@ TEST(WirelessAudioWorker, CatchUpLifetimeTotalsSurviveRealSinkReopen) {
         StdoutCapture capture;
         diag::StdoutLogScope logging{wr::running};
         audio::AudioRenderWorker audio{
-            wr::audio_config(audio::SinkBackend::pulse, aa::core::Nanoseconds{90'000'000}),
+            wr::audio_config(audio::SinkBackend::pulse, aa::core::Nanoseconds{90'000'000},
+                                 aa::core::Nanoseconds{0}),
             wr::audio_telemetry(), fake_router(gate)};
         ASSERT_TRUE(audio.ready());
         const auto role = proto::ChannelRole::media_audio;
@@ -966,6 +1029,246 @@ TEST(WirelessAudioWorker, CatchUpLifetimeTotalsSurviveRealSinkReopen) {
         EXPECT_EQ(records[i].events_lifetime, i + 1);
         EXPECT_EQ(records[i].frames_lifetime, (i + 1) * 1808U);
     }
+}
+
+
+// ---- Credit window + playout (owner decision 2026-11-20) --------------------
+
+// One 2048-frame A26 media chunk (42.67 ms of 48 kHz stereo PCM).
+std::vector<std::byte> pcm_chunk_2048() { return std::vector<std::byte>(8192, std::byte{0x20}); }
+
+constexpr std::int64_t kChunkNs = 2048LL * 1'000'000'000LL / 48000LL;
+
+struct CollectedTelemetry final {
+    std::mutex mutex;
+    std::vector<std::string> lines;
+    std::vector<std::string> kinds;
+
+    audio::AudioTelemetryCallbacks callbacks() {
+        const auto line = [this](const std::string& value) {
+            std::lock_guard lock(mutex);
+            lines.push_back(value);
+            kinds.emplace_back("line");
+        };
+        return {line,
+                [this](std::string_view kind, const std::string& value) {
+                    std::lock_guard lock(mutex);
+                    lines.push_back(value);
+                    kinds.emplace_back(kind);
+                },
+                line};
+    }
+
+    [[nodiscard]] std::vector<std::string> of(std::string_view kind) {
+        std::lock_guard lock(mutex);
+        std::vector<std::string> out;
+        for (std::size_t i = 0; i < kinds.size(); ++i) {
+            if (kinds[i] == kind) { out.push_back(lines[i]); }
+        }
+        return out;
+    }
+};
+
+// The production wireless policy (wr::audio_config(): playout, 120 ms) and
+// credit window, with write completions kept in the test instead of stdout.
+[[nodiscard]] audio::RouterConfig quiet_wireless_config() {
+    auto config = wr::audio_config(audio::SinkBackend::pulse);
+    config.on_write_completed = {};
+    return config;
+}
+
+TEST(WirelessAudioWorker, CreditWindowAdvertisesFourAndKeepsFourChunksInFlight) {
+    auto gate = std::make_shared<SinkGate>();
+    gate->block_first_write = true;
+    CollectedTelemetry telemetry;
+    audio::AudioRenderWorker audio{quiet_wireless_config(), telemetry.callbacks(), fake_router(gate),
+                                   audio::AudioRenderWorker::monotonic_now,
+                                   audio::AudioRenderWorker::kDefaultAckReleaseDrainTimeout,
+                                   audio::AudioCreditPolicy{audio::kWirelessCreditWindow}};
+    ASSERT_TRUE(audio.ready());
+    EXPECT_EQ(audio.credit_window(), 4U);
+    wr::Media media{audio};
+    SessionHarness h;
+    ASSERT_NO_FATAL_FAILURE(h.start(media));
+    // The media channel's ready advertised max_unacked 4 (the A26 logs it as
+    // "maxUnackedFramesAllowed").
+    const std::array<std::uint32_t, 1> indices{0};
+    EXPECT_EQ(h.count_payload(0, 100, proto::encode_av_sink_ready(indices, 4).value()), 1U);
+    EXPECT_EQ(h.count_payload(0, 100, proto::encode_av_sink_ready().value()), 0U);
+    const std::size_t ack_baseline = h.transport.sent_count();
+
+    // The phone sends four chunks without waiting; the first write blocks.
+    for (int i = 0; i < 4; ++i) {
+        h.clock.set(aa::core::Nanoseconds{1'000'000'000LL + i * kChunkNs});
+        ASSERT_TRUE(h.send_service(100, av_data_message(static_cast<std::uint64_t>(i), pcm_chunk_2048())));
+    }
+    ASSERT_TRUE(gate->wait_entered(1));
+    EXPECT_EQ(audio.max_unacked_seen(), 4U);
+    // All four fit the scaled reservation: each is acked while write 1 is held.
+    ASSERT_TRUE(app::service_audio_completions(h.session, audio));
+    EXPECT_EQ(h.count_acks(ack_baseline, 100, -7), 4U);
+    gate->release();
+    ASSERT_TRUE(audio.wait_idle(std::chrono::steady_clock::now() + std::chrono::seconds{2}));
+    audio.stop();
+    EXPECT_TRUE(audio.finish());
+    ASSERT_TRUE(audio.final_report());
+    EXPECT_EQ(audio.final_report()->stats.frames_retained, 4U * 2048U);
+    EXPECT_EQ(audio.final_report()->stats.frames_trimmed, 0U);
+}
+
+// The same worker with stop-and-wait keeps the old reservation exactly.
+TEST(WirelessAudioWorker, StopAndWaitCreditPolicyAdvertisesOne) {
+    auto gate = std::make_shared<SinkGate>();
+    audio::AudioRenderWorker audio{quiet_wireless_config(), {}, fake_router(gate)};
+    ASSERT_TRUE(audio.ready());
+    EXPECT_EQ(audio.credit_window(), 1U);
+    wr::Media media{audio};
+    SessionHarness h;
+    ASSERT_NO_FATAL_FAILURE(h.start(media));
+    EXPECT_EQ(h.count_payload(0, 100, proto::encode_av_sink_ready().value()), 1U);
+    audio.stop();
+    EXPECT_TRUE(audio.finish());
+}
+
+struct WorkerReplay final {
+    audio::RouterStats stats{};
+    std::optional<aa::ErrorCode> failure{};
+    std::uint64_t chunks{};
+    std::vector<std::string> media_timing{};
+    std::vector<std::string> underruns{};
+};
+
+// Window-9-style closed credit loop (see audio_pipeline_test run_playout_loop)
+// through the real session, AvSink, render worker and router with the
+// production wireless policy. Arrival stamps are the session clock.
+template <typename RoundTrip>
+[[nodiscard]] WorkerReplay replay_through_worker(std::int64_t seconds, RoundTrip round_trip_ms) {
+    constexpr std::int64_t kStart = 1'000'000'000;
+    WorkerReplay replay;
+    auto gate = std::make_shared<SinkGate>();
+    CollectedTelemetry telemetry;
+    audio::AudioRenderWorker audio{quiet_wireless_config(), telemetry.callbacks(), fake_router(gate),
+                                   audio::AudioRenderWorker::monotonic_now,
+                                   audio::AudioRenderWorker::kDefaultAckReleaseDrainTimeout,
+                                   audio::AudioCreditPolicy{audio::kWirelessCreditWindow}};
+    if (!audio.ready()) { replay.failure = aa::ErrorCode::audio_sink_unavailable; return replay; }
+    wr::Media media{audio};
+    SessionHarness h;
+    h.start(media);
+    const auto chunk = pcm_chunk_2048();
+    std::deque<std::int64_t> acked_at;
+    std::int64_t last_arrival = 0;
+    for (std::uint64_t k = 0;; ++k) {
+        const auto captured = static_cast<std::int64_t>(k) * kChunkNs;
+        std::int64_t sent = captured;
+        if (acked_at.size() >= audio::kWirelessCreditWindow) {
+            sent = std::max(sent, acked_at.front());
+            acked_at.pop_front();
+        }
+        if (sent >= seconds * 1'000'000'000LL) { break; }
+        const std::int64_t rtt = round_trip_ms(sent / 1'000'000'000LL) * 1'000'000LL;
+        const std::int64_t arrival = std::max(last_arrival, kStart + sent + rtt / 2);
+        last_arrival = arrival;
+        h.clock.set(aa::core::Nanoseconds{arrival});
+        const auto baseline = h.transport.sent_count();
+        if (auto sent_ok = h.send_service(100, av_data_message(k, chunk)); !sent_ok) {
+            replay.failure = sent_ok.error().code();
+            break;
+        }
+        ++replay.chunks;
+        if (!audio.wait_idle(std::chrono::steady_clock::now() + std::chrono::seconds{2})) {
+            replay.failure = aa::ErrorCode::timeout;
+            break;
+        }
+        if (auto serviced = app::service_audio_completions(h.session, audio); !serviced) {
+            replay.failure = serviced.error().code();
+            break;
+        }
+        // The worker acks at arrival: the credit reaches the phone half a
+        // round trip later.
+        if (h.count_acks(baseline, 100, -7) != 1U) { replay.failure = aa::ErrorCode::internal; break; }
+        acked_at.push_back(arrival - kStart + (rtt - rtt / 2));
+    }
+    audio.stop();
+    if (auto finished = audio.finish(); !finished && !replay.failure) {
+        replay.failure = finished.error().code();
+    }
+    if (audio.final_report()) { replay.stats = audio.final_report()->stats; }
+    replay.media_timing = telemetry.of("media_timing");
+    replay.underruns = telemetry.of("audio_playout_underrun");
+    return replay;
+}
+
+constexpr std::array<std::int64_t, 27> kWindow9RoundTripMs{
+    16, 13, 37, 29, 38, 42, 39, 28, 9, 12, 9, 9, 13, 38, 36, 39, 32, 14, 9, 11,
+    11, 12, 26, 33, 57, 83, 35,
+};
+
+// Window 9's recorded round trips (and the 12:83 ms second that ended the live
+// session `late`), then a synthetic 150 ms x 2 s spike: through the production
+// wireless policy nothing is trimmed, nothing is silence and nothing fails.
+TEST(WirelessAudioWorker, PlayoutReplaysWindow9AndASpikeLosslesslyThroughTheWorker) {
+    const auto window9 = replay_through_worker(27, [](std::int64_t second) {
+        return kWindow9RoundTripMs.at(static_cast<std::size_t>(std::clamp<std::int64_t>(second, 0, 26)));
+    });
+    ASSERT_FALSE(window9.failure) << aa::to_string(*window9.failure);
+    EXPECT_GT(window9.chunks, 600U);
+    EXPECT_EQ(window9.stats.frames_decoded, window9.chunks * 2048U);
+    EXPECT_EQ(window9.stats.frames_trimmed, 0U);
+    EXPECT_EQ(window9.stats.frames_silence, 0U);
+    EXPECT_EQ(window9.stats.playout_underruns, 0U);
+    EXPECT_EQ(window9.stats.frames_retained, window9.stats.frames_decoded);
+    EXPECT_TRUE(window9.underruns.empty());
+    // media_timing shows the buffer to the next live window.
+    ASSERT_FALSE(window9.media_timing.empty());
+    const auto& timing = window9.media_timing.back();
+    EXPECT_NE(timing.find("\"frames_trimmed\":0,"), std::string::npos) << timing;
+    EXPECT_NE(timing.find("\"frames_silence\":0,"), std::string::npos) << timing;
+    EXPECT_NE(timing.find("\"frames_skipped\":0,"), std::string::npos) << timing;
+    EXPECT_NE(timing.find("\"playout_target_ms\":120,"), std::string::npos) << timing;
+    EXPECT_NE(timing.find("\"playout_underruns\":0,"), std::string::npos) << timing;
+    EXPECT_NE(timing.find("\"credit_window\":4,"), std::string::npos) << timing;
+    EXPECT_NE(timing.find("\"playout_depth_ms\":"), std::string::npos) << timing;
+
+    const auto spike = replay_through_worker(20, [](std::int64_t second) {
+        return second >= 8 && second < 10 ? std::int64_t{150} : std::int64_t{20};
+    });
+    ASSERT_FALSE(spike.failure) << aa::to_string(*spike.failure);
+    EXPECT_EQ(spike.stats.frames_trimmed, 0U);
+    EXPECT_EQ(spike.stats.frames_silence, 0U);
+    EXPECT_EQ(spike.stats.playout_underruns, 0U);
+}
+
+// A drought longer than the buffer underruns once, is logged, and the session
+// keeps playing instead of failing `late`.
+TEST(WirelessAudioWorker, PlayoutDroughtBeyondTheBufferUnderrunsAndContinues) {
+    const auto replay = replay_through_worker(20, [](std::int64_t second) {
+        return second == 8 ? std::int64_t{800} : std::int64_t{20};
+    });
+    ASSERT_FALSE(replay.failure) << aa::to_string(*replay.failure);
+    EXPECT_GE(replay.stats.playout_underruns, 1U);
+    EXPECT_GT(replay.stats.frames_skipped, 0U);
+    ASSERT_FALSE(replay.underruns.empty());
+    EXPECT_NE(replay.underruns.front().find("{\"event\":\"audio_playout_underrun\",\"underruns_lifetime\":1,"),
+              std::string::npos) << replay.underruns.front();
+    // Chunks kept arriving and playing after the underrun.
+    EXPECT_GT(replay.stats.frames_retained, replay.stats.frames_decoded * 9 / 10);
+}
+
+// A/V alignment: the wireless receiver holds video for the audio playout depth
+// by default, so both streams leave the receiver the same time after arrival.
+TEST(WirelessAudioWorker, VideoDelayMatchesTheAudioPlayoutDepthByDefault) {
+    EXPECT_EQ(wr::video_delay(std::nullopt, 120), std::chrono::milliseconds{120});
+    EXPECT_EQ(wr::video_delay(std::int64_t{0}, 120), std::chrono::milliseconds{0});
+    EXPECT_EQ(wr::video_delay(std::nullopt, 0), std::chrono::milliseconds{0});
+    const auto config = wr::audio_config();
+    EXPECT_TRUE(config.playout.enabled);
+    EXPECT_EQ(config.playout.depth, audio::kWirelessPlayoutDepth);
+    EXPECT_EQ(wr::video_delay(std::nullopt, audio::kWirelessPlayoutDepth.count / 1'000'000),
+              std::chrono::milliseconds{120});
+    // Zero restores the arrival model.
+    EXPECT_FALSE(wr::audio_config(audio::SinkBackend::pulse, aa::core::Nanoseconds{0},
+                                  aa::core::Nanoseconds{0}).playout.enabled);
 }
 
 } // namespace

@@ -2189,3 +2189,76 @@ TEST(WiredReceiver, VideoOutletEpochChangeWhileHeldRestoresWaitingIdrAndDropsSta
         return s.find("\"event\":\"decode_stats\",\"frame_drops\":4") != std::string::npos;
     }), logs.end());
 }
+
+namespace {
+
+// Wireless playout (credit window + playout, 2026-11-20): video is held for the audio playout depth and then
+// forwarded with its arrival stamp, so the display's paint latency includes the
+// same offset as audio_write_completed's presented latency.
+TEST(WiredReceiver, PresentationDelayHoldsVideoForThePlayoutDepthWithItsArrivalStamp) {
+    using namespace std::chrono_literals;
+    std::vector<std::string> logs;
+    VideoOutlet outlet{[&](const std::string& line) { logs.push_back(line); }};
+    auto now = std::chrono::steady_clock::time_point{} + 10s;
+    VideoOutlet::IdrRecoveryHooks hooks;
+    hooks.clock = [&] { return now; };
+    outlet.set_idr_recovery(std::move(hooks));
+    auto pair = videotest::make_pair({});
+    ASSERT_TRUE(pair);
+    outlet.install(std::move(pair.value().producer));
+    outlet.set_presentation_delay(120ms);
+    const auto complete = [&](Milliseconds wait) {
+        const auto received = pair.value().consumer.receive(wait);
+        return received && received.value() == aa::ipc::ReceiveStatus::complete;
+    };
+    const p::MessageHeader header{p::ChannelRole::video, 1, aa::core::Nanoseconds{5'000'000'000}};
+    ASSERT_TRUE(outlet.on_message({header, wiredtest::kVideoIdr}));
+    EXPECT_TRUE(outlet.has_pending());
+    EXPECT_EQ(outlet.delayed_units(), 1U);
+    EXPECT_FALSE(complete(Milliseconds{20}));
+    now += 119ms;
+    ASSERT_TRUE(outlet.service_pending());
+    EXPECT_FALSE(complete(Milliseconds{20}));
+    now += 1ms;
+    ASSERT_TRUE(outlet.service_pending());
+    ASSERT_TRUE(complete(Milliseconds{500}));
+    EXPECT_EQ(pair.value().consumer.access_unit().timestamp_ns, 5'000'000'000ULL);
+    EXPECT_TRUE(pair.value().consumer.access_unit().idr);
+    EXPECT_FALSE(outlet.has_pending());
+
+    // Order is kept: a later frame never overtakes a held one.
+    const p::MessageHeader second{p::ChannelRole::video, 2, aa::core::Nanoseconds{5'100'000'000}};
+    const p::MessageHeader third{p::ChannelRole::video, 3, aa::core::Nanoseconds{5'110'000'000}};
+    ASSERT_TRUE(outlet.on_message({second, wiredtest::kVideoIdr}));
+    now += 10ms;
+    ASSERT_TRUE(outlet.on_message({third, wiredtest::kVideoIdr}));
+    EXPECT_EQ(outlet.delayed_units(), 2U);
+    now += 110ms; // only the second frame is due
+    ASSERT_TRUE(outlet.service_pending());
+    ASSERT_TRUE(complete(Milliseconds{500}));
+    EXPECT_EQ(pair.value().consumer.access_unit().timestamp_ns, 5'100'000'000ULL);
+    EXPECT_EQ(outlet.delayed_units(), 1U);
+    // A stream reset drops what is still held instead of sending it late.
+    outlet.reset();
+    EXPECT_FALSE(outlet.has_pending());
+    now += 1s;
+    ASSERT_TRUE(outlet.service_pending());
+    EXPECT_FALSE(complete(Milliseconds{20}));
+}
+
+// Without a delay (wired) a frame is forwarded during on_message as before.
+TEST(WiredReceiver, NoPresentationDelayForwardsAtOnce) {
+    VideoOutlet outlet{[](const std::string&) {}};
+    auto pair = videotest::make_pair({});
+    ASSERT_TRUE(pair);
+    outlet.install(std::move(pair.value().producer));
+    const p::MessageHeader header{p::ChannelRole::video, 1, aa::core::Nanoseconds{7}};
+    ASSERT_TRUE(outlet.on_message({header, wiredtest::kVideoIdr}));
+    EXPECT_FALSE(outlet.has_pending());
+    const auto received = pair.value().consumer.receive(Milliseconds{500});
+    ASSERT_TRUE(received);
+    EXPECT_EQ(received.value(), aa::ipc::ReceiveStatus::complete);
+    EXPECT_EQ(pair.value().consumer.access_unit().timestamp_ns, 7U);
+}
+
+} // namespace

@@ -232,7 +232,38 @@ routing element). Both are run-cumulative peaks (worst observed in events
 admitted through the measurement cutoff), not startup-exclusive active-window
 peaks. The receiver flushes a final cumulative event before router teardown,
 including orderly early exits; if first consumed after the cutoff it is raw-log
-diagnostic information only. `av_sync_ms` is computed only
+diagnostic information only.
+
+`media_timing` also carries the router's loss and silence accounting
+(informational, never gated), summed over every sink route of the receiver's
+life (`sink_reopens` counts the routes a reopen replaced): `frames_decoded`,
+`frames_trimmed` (drift trims, catch-up included), `frames_caught_up` (the
+catch-up part), `frames_silence` (synthesized gap frames), `frames_skipped`
+(elapsed time advanced without a write: withheld credit or a wireless playout
+underrun's hole) and `frames_idle_skipped` (settled all-role idle), all in
+48 kHz output frames. The wireless receiver adds its playout buffer and
+credit window (owner decision 2026-11-20): `playout_target_ms` (the configured depth),
+`playout_depth_ms` (the latest chunk's slot minus its arrival),
+`playout_depth_min_ms` / `playout_depth_max_ms` (that depth's range, anchors
+excluded; `null` before the first steady chunk), `playout_offset_ms` (the
+depth of the least-delayed recent arrivals, what `audio_write_completed`
+reports as `playout_offset_ns`), `playout_underruns` (a chunk up to 1 s
+after its slot), `playout_anchors` (stream starts, and resumes more than 1 s
+after the slot),
+`frames_padded` (drift pads, a subset of `frames_silence`), `credit_window`
+(the advertised `max_unacked`) and `max_unacked_seen` (the most chunks one
+audio channel had accepted and not yet released for ACK). Each underrun also
+logs `audio_playout_underrun` with `underruns_lifetime`, `late_ms` (how long
+after its slot the chunk arrived) and `depth_ms` (the depth it re-anchored
+with).
+
+On the wireless playout clock `audio_write_completed.scheduled_ns` and
+`scheduled_end_ns` are the content's arrival-clock times and the additive
+`playout_offset_ns` is how much later the piece was scheduled, so
+`presented_ns - scheduled_ns` includes the playout buffer and the A/V pairing
+matches a video frame with the audio that arrived with it. The wireless
+receiver holds video for the same depth (`--video-delay-ms match`), so the
+signed A/V contract is unchanged. Wired records never carry the field. `av_sync_ms` is computed only
 from the cross-stream consumer completion events: the video's retained common
 monotonic timestamp must lie in the audio write's half-open scheduled interval.
 For each pair, skew is `(video completed - video scheduled) - (audio write

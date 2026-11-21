@@ -60,7 +60,7 @@ if(NOT CMAKE_CROSSCOMPILING)
     add_test(NAME channel_services_sensors COMMAND aa_channel_services_test --gtest_filter=SensorWire.*)
     add_test(NAME channel_services_microphone COMMAND aa_channel_services_test --gtest_filter=MicrophoneWire.*)
     add_test(NAME channel_services_input COMMAND aa_channel_services_test --gtest_filter=InputWire.*)
-    add_test(NAME channel_services_av_sink COMMAND aa_channel_services_test --gtest_filter=AvSinkWire.*)
+    add_test(NAME channel_services_av_sink COMMAND aa_channel_services_test --gtest_filter=AvSinkWire.*:AvSinkCreditWindow.*)
     set_tests_properties(channel_services_routing channel_services_media_wire channel_services_wire_reject
         PROPERTIES TIMEOUT 60)
 endif()
