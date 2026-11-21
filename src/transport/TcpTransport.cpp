@@ -48,9 +48,13 @@ void TcpTransport::set_io_checkpoint_interval(std::chrono::milliseconds interval
 
 core::Result<std::unique_ptr<TcpTransport>>
 TcpTransport::connect(const char* host, std::uint16_t port) {
-    const int fd = su::connect_socket(host, port);
+    int fd = su::connect_socket(host, port);
     if (fd < 0) {
         return Error{ErrorCode::transport_unavailable};
+    }
+    if (!su::set_no_delay(fd)) {
+        su::close_fd(fd);
+        return Error{ErrorCode::transport_io};
     }
     return std::unique_ptr<TcpTransport>(new TcpTransport(std::make_unique<Impl>(fd)));
 }
@@ -131,8 +135,12 @@ TcpListener::accept(const core::Deadline& deadline, std::function<void()> checkp
     const TcpIo bounded{deadline.until, std::move(checkpoint)};
     for (;;) {
         if (auto ready = bounded.wait(impl_->fd, POLLIN, deadline.cancellation); !ready) return ready.error();
-        const int fd = ::accept4(impl_->fd, nullptr, nullptr, SOCK_CLOEXEC | SOCK_NONBLOCK);
+        int fd = ::accept4(impl_->fd, nullptr, nullptr, SOCK_CLOEXEC | SOCK_NONBLOCK);
         if (fd >= 0) {
+            if (!su::set_no_delay(fd)) {
+                su::close_fd(fd);
+                return Error{ErrorCode::transport_io};
+            }
             return std::unique_ptr<TcpTransport>(new TcpTransport(std::make_unique<TcpTransport::Impl>(fd)));
         }
         if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) return Error{ErrorCode::transport_io};

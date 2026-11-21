@@ -15,6 +15,7 @@
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <poll.h>
 #include <sys/socket.h>
 #include <sys/types.h>
@@ -151,6 +152,17 @@ enum class Resolve { any, numeric_only };
     }
     ::freeaddrinfo(result);
     return fd;
+}
+
+// AAP is interactive: the phone sends media stop-and-wait (max_unacked 1), one
+// chunk per credit ack, and the receiver's acks are small frames. Nagle would
+// hold a small frame written while an earlier one is unacknowledged until the
+// phone's delayed ACK (~40 ms): enough to push wireless audio's credit round
+// trip past the 42.67 ms chunk period (window 8 measured 21-89 ms against a
+// few-ms link). Every AAP TCP socket sends at once.
+[[nodiscard]] inline bool set_no_delay(int fd) noexcept {
+    const int enabled = 1;
+    return ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &enabled, sizeof(enabled)) == 0;
 }
 
 // Bind + listen on host:port (port 0 for ephemeral). Returns the listening fd or -1.
