@@ -1166,6 +1166,9 @@ struct WorkerReplay final {
     // Recorded pauses (over a second, resumed without a stop message): the
     // lookup 50 ms before the resume, and the offset before the pause.
     std::vector<std::pair<std::int64_t, std::int64_t>> pauses{};
+    // 100 ms of content past the newest write (a gap still open): the
+    // lookup, and the newest write's end offset.
+    std::pair<std::int64_t, std::int64_t> open_gap{};
     // After the run: the session reset and the hold fell back to the depth.
     std::chrono::nanoseconds hold_after_reset{};
     std::chrono::nanoseconds offset_after_reset{};
@@ -1297,6 +1300,12 @@ template <typename RoundTrip>
             + (b.playout_offset.count - a.playout_end_offset.count) * (t - a_end) / (b_start - a_end);
         replay.gaps.push_back({audio.playout_offset_at(aa::core::Nanoseconds{t}).count(), expected,
                                (b.playout_offset.count - a.playout_end_offset.count) * 1000 / (b_start - a_end)});
+    }
+    if (!completions->empty()) {
+        const auto& last = completions->back();
+        const auto end = last.scheduled_end.count - last.playout_end_offset.count;
+        replay.open_gap = {audio.playout_offset_at(aa::core::Nanoseconds{end + 100'000'000}).count(),
+                           last.playout_end_offset.count};
     }
     // P2-4: a new session drops the old session's offset; the hold falls back.
     audio.begin_session();
@@ -1531,6 +1540,17 @@ TEST(WirelessAudioWorker, PlayoutOffsetLookupFollowsTheRouterAcrossGaps) {
         fell = fell || gap.slope_milli < 0;
     }
     EXPECT_TRUE(fell) << "no gap lowered the offset";
+}
+
+// DeepSeek P3-1 (round 5): while a gap is still open the lookup predicts the
+// router's own clamp, a fall of half the content gap toward the depth (it
+// modelled a third, holding up to cg/6 too long).
+TEST(WirelessAudioWorker, PlayoutOffsetLookupInAnOpenGapFallsByHalfTheContentGap) {
+    const auto replay = replay_through_worker(8, [](std::int64_t) { return std::int64_t{20}; }, 4);
+    ASSERT_FALSE(replay.failure) << aa::to_string(*replay.failure);
+    const auto [lookup, end_offset] = replay.open_gap;
+    ASSERT_GT(end_offset, 170'000'000) << "grouped delivery should hold the offset above depth + 50 ms";
+    EXPECT_NEAR(static_cast<double>(lookup), static_cast<double>(end_offset - 50'000'000), 1e6);
 }
 
 // Neon P1-1 (round 5): a pause without a stop message leaves the history in

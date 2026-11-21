@@ -271,8 +271,11 @@ and each anchor logs `audio_playout_anchor` with `reason` (`start` or
 `depth_ms` and `anchors_lifetime`. The wireless VideoOutlet logs
 `video_hold_capped` (`requested_ms`, `cap_ms` 400, `capped_frames`, counted
 when a capped frame is released) when the offset it follows exceeds its hold
-cap, and `video_release_late` (`late_ms`, `late_releases`) when a held frame
-leaves more than 20 ms after its due. `playout_reported_offset_ms` keeps its
+cap, and `video_release_late` (`late_ms`, `late_releases`, `by`: the path that
+released it, `timer`, `checkpoint`, `arrival` or `service`, and
+`checkpoint_gap_ms`: how long the owner thread's checkpoint had not run) when
+a held frame leaves more than 20 ms after its due. Held frames are released
+by the outlet's own timer thread at their due, and also at checkpoints. `playout_reported_offset_ms` keeps its
 last value when the stream stops; only the history the video lookup uses is
 cleared.
 

@@ -113,10 +113,11 @@ Policy (wired is unchanged: stop-and-wait and the arrival model with the
     follows stays the delay audio plays with. It is audible: a 12.8 ms hole
     in every 42.67 ms chunk, a ~23 Hz gating, for the fraction of a second
     it runs right after an underrun. With the A26's 341 ms AudioRecord buffer
-    the post-drought offset peaks ~60-80 ms above the 400 ms cap for well
-    under a second (the replay tests bound the excess at 60 ms and the time
-    above the cap at 0.9 s, with the phone grouping 4 or 5 chunks); while it
-    is above, video plays early by that excess.
+    the post-drought offset peaks at most 60 ms above the 400 ms cap, for at
+    most 0.9 s (the replay tests' bound, with the phone grouping 4 or 5
+    chunks); while it is above, video plays early by that excess. The shed
+    target is absolute (350 ms), which is why `--audio-playout-ms` stops at
+    180: a deeper buffer would be drained to it.
 
   Window 10 (8fe9ea5, 244 s, passed) showed why: the first rule took the
   largest depth over 4 s as the reference, so every group read as excess
@@ -138,18 +139,24 @@ Policy (wired is unchanged: stop-and-wait and the arrival model with the
   frame's, so a frame is never pinned behind another. Across a gap in the
   audio (an underrun, a short pause) the lookup follows the router's own
   model: the line between the offsets either side, and, while the gap is
-  still open, a fall of a third of the content time past the last write
-  (the router may lower the offset by half the output gap at once, which is
-  exactly that). Until the first playout audio write, and after a second
-  without audio (a pause without a stop message: video latency then drops to
+  still open, a fall of half the content time past the last write, down to
+  the depth (the router's clamp: it may lower the offset by half the content
+  gap at once, toward the depth it re-anchors with). Until the first
+  playout audio write, and after a second without audio (a pause without a
+  stop message, including one already recorded: video latency then drops to
   the depth and climbs back on resume, with no audio to pair), it holds for
   the 120 ms depth. Above 400 ms it is capped, and every capped frame is counted
-  and logged (`video_hold_capped`). Held frames are released from the
-  runtime's checkpoint even while the session is mid-send (but not during
-  an IDR request's own send: the frames held then are older than the
-  keyframe asked for); an IDR request that release triggers waits for the
-  session and is dropped if the keyframe arrives first. A frame released
-  more than 20 ms after its due is counted and logged (`video_release_late`). `--video-delay-ms N` fixes
+  and logged (`video_hold_capped`). Held frames are released at their due
+  by a timer thread of the outlet's own (it sleeps until the front frame's
+  due, re-checking every 5 ms since a new audio write can move a due
+  earlier), and also from the runtime's checkpoint, even while the session
+  is mid-send (but not during an IDR request's own send: the frames held
+  then are older than the keyframe asked for); an IDR request either
+  release triggers waits for the session and is dropped if the keyframe
+  arrives first. A frame released more than 20 ms after its due is counted
+  and logged (`video_release_late`, with `by`: timer, checkpoint, arrival or
+  service, and `checkpoint_gap_ms`: how long the owner's checkpoint had not
+  run). `--video-delay-ms N` fixes
   the hold at N ms instead (it needs `--audio-playout-ms` > 0).
 
   Why the hold follows the offset (window 11, N1): with grouped delivery the
@@ -196,6 +203,35 @@ Policy (wired is unchanged: stop-and-wait and the arrival model with the
   whether any remain. Replaying window 13's records through this round's
   logic (releases at their due): max 44.6 ms, p99 35.5 ms, worst 5 s mean
   22.3 ms, no pair over 90 ms; `cap` and `soak_rate` pass.
+
+  Window 14 (795cf2d, 480 s): p50 +19.1 ms, p99 +43.9 ms, `window_mean`
+  and `p99` pass, but 4 pairs over 90 ms (102.7 and 103.8 ms at 132.33 s,
+  92.3 and 96.4 ms at 247.55-247.57 s) **failed** `max_abs`, and
+  `video_release_late` fired ~270 times (late_ms mostly 26-57). The lock
+  change did not remove the cause because the cause is not a lock: the
+  owner (session) thread itself stops running. Release lateness, from the
+  receiver's own records (each frame's `video_ipc_send` against arrival +
+  the hold of the audio it pairs with), is p50 1.9 ms and p90 5.1 ms (the
+  5 ms checkpoint cadence while TCP is idle works), but 297 frames left
+  more than 20 ms late, in 178 episodes spaced a median 2.0 s apart. In
+  those episodes the session thread stamped no arrival at all: 2 video
+  arrivals fell between the late frames' due and their release, against
+  197 in random windows of the same lengths, and 256 arrived in the 10 ms
+  after the release against 42 at random. The data was waiting in the
+  socket, and was read the moment the thread ran again. The render worker
+  kept writing audio during half of them. Which call blocks the owner
+  thread is not visible in the records. Both excursions are such episodes:
+  frames 3891-3894 left 79-91 ms late at 132.35 s, inside the Wi-Fi stall
+  that caused the second underrun (the offset was a steady 177.8 ms until
+  that underrun); frames 7319-7321 left 59-73 ms late at 247.56 s with the
+  offset a steady 181.7 ms and no underrun. Held frames are now released
+  by the outlet's own timer thread, which does not depend on the owner
+  thread (the outlet test releases 40 grouped frames with no checkpoint at
+  all: lateness p50 0.5 ms, p90 0.6 ms, max 0.6 ms), and `video_release_late` now
+  says which path released the frame and how long the checkpoint had not
+  run. Replaying window 14's records with releases at their due: max
+  50.3 ms, p99 35.8 ms, worst 5 s mean 23.2 ms, no pair over 90 ms; `cap`
+  and `soak_rate` pass.
 
   Replaying window 12's own records through the new outlet logic (hold for
   the frame's content time, decided at release, slewed, capped; display time
@@ -280,8 +316,9 @@ What a live window should check:
    ~33.5 s of window 9.
 5. The drive smoke's signed A/V criterion, judged on the run's own records
    with `aa_drive_smoke.av_pairs` and `aa_av_contract.evaluate`: it has not
-   yet passed live (windows 11, 12 and 13 failed it, see above). No
-   `video_release_late` should appear. Record its
+   yet passed live (windows 11-14 failed it, see above). No
+   `video_release_late` should appear; if one does, its `by` and
+   `checkpoint_gap_ms` say whether the timer itself was late. Record its
    result as measured, including the first seconds after audio starts and
    any pair over 90 ms with its cause. Every waiting_idr episode should
    stay under 1.0 s with the hold.
