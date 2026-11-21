@@ -66073,7 +66073,7 @@
      "evidence": [
       {
        "contains": "wire.set_status(shared::Config::STATUS_READY);",
-       "lines": "186",
+       "lines": "194",
        "path": "src/protocol/aasdk_adapter/AvSinkAdapter.cpp"
       }
      ],
@@ -66093,7 +66093,7 @@
     "citations": [
      {
       "contains": "wire.set_status(shared::Config::STATUS_READY);",
-      "lines": "186",
+      "lines": "194",
       "path": "src/protocol/aasdk_adapter/AvSinkAdapter.cpp"
      },
      {
