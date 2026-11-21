@@ -76,8 +76,9 @@ public:
     [[nodiscard]] core::Result<void> ready();
     // The max_unacked every audio channel advertises (AudioCreditPolicy).
     [[nodiscard]] std::uint32_t credit_window() const noexcept { return credit_window_; }
-    // Most chunks one channel has had accepted but not yet released for ACK.
-    [[nodiscard]] std::uint64_t max_unacked_seen() const;
+    // Most chunks one channel has had accepted but not yet released for ACK
+    // (our side; the phone's in-flight use shows as max_arrival_burst).
+    [[nodiscard]] std::uint64_t max_unacked_held() const;
     [[nodiscard]] SinkReport sink_report();
 
     [[nodiscard]] core::Result<void>
@@ -263,7 +264,7 @@ private:
     std::uint64_t catch_up_frames_lifetime_{};
     const std::uint32_t credit_window_;
     std::array<std::uint64_t, 4> unacked_{};
-    std::uint64_t max_unacked_seen_{};
+    std::uint64_t max_unacked_held_{};
     std::optional<core::Nanoseconds> step_started_;
     std::optional<core::Nanoseconds> bypass_since_;
     std::uint64_t bypass_epoch_{1};

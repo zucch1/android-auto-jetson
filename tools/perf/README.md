@@ -248,18 +248,26 @@ credit window (owner decision 2026-11-20): `playout_target_ms` (the configured d
 excluded; `null` before the first steady chunk), `playout_offset_ms` (the
 depth of the least-delayed recent arrivals, what `audio_write_completed`
 reports as `playout_offset_ns`), `playout_underruns` (a chunk up to 1 s
-after its slot), `playout_anchors` (stream starts, and resumes more than 1 s
-after the slot),
-`frames_padded` (drift pads, a subset of `frames_silence`), `credit_window`
-(the advertised `max_unacked`) and `max_unacked_seen` (the most chunks one
-audio channel had accepted and not yet released for ACK). Each underrun also
-logs `audio_playout_underrun` with `underruns_lifetime`, `late_ms` (how long
-after its slot the chunk arrived) and `depth_ms` (the depth it re-anchored
-with).
+after its slot), `playout_anchors` (stream starts and resumes) and
+`playout_resumes` (anchors more than 1 s after the slot), `frames_padded`
+(drift pads, a subset of `frames_silence`), `credit_window` (the advertised
+`max_unacked`), `max_unacked_held` (the most chunks one audio channel had
+accepted and not yet released for ACK: our side, normally 1 because acks go
+out on receipt) and `max_arrival_burst` (the most chunks of one channel that
+arrived within 10 ms of each other: the phone's side, above 1 when it uses
+more than one credit at once). Each underrun also logs
+`audio_playout_underrun` with `underruns_lifetime`, `late_ms` (how long after
+its slot the chunk arrived) and `depth_ms` (the depth it re-anchored with),
+and each anchor logs `audio_playout_anchor` with `reason` (`start` or
+`resume`), `skipped_ms` (elapsed time jumped over without a write),
+`depth_ms` and `anchors_lifetime`.
 
 On the wireless playout clock `audio_write_completed.scheduled_ns` and
 `scheduled_end_ns` are the content's arrival-clock times and the additive
-`playout_offset_ns` is how much later the piece was scheduled, so
+`playout_offset_ns` is how much later the piece was scheduled (the content
+interval never starts before the previous one ended, so after an offset
+increase the end offset briefly exceeds it while content advances at half
+rate), so
 `presented_ns - scheduled_ns` includes the playout buffer and the A/V pairing
 matches a video frame with the audio that arrived with it. The wireless
 receiver holds video for the same depth (`--video-delay-ms match`), so the

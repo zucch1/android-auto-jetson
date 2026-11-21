@@ -22,6 +22,7 @@ with that model:
 """
 from __future__ import annotations
 
+import json
 import random
 import sys
 from pathlib import Path
@@ -102,6 +103,35 @@ def main() -> int:
         result = judge(smoke, contract, audio, unheld, "cap")
         assert not result["passed"], result
         assert result["signed_p50_ms"] < -100, result
+
+    # Neon P2-4: the collector drops any write whose scheduled_ns does not
+    # advance. When the playout offset steps up (a re-anchor, a burst showing
+    # a later content clock), reporting scheduled - offset naively runs
+    # backwards and loses writes; the receiver instead lets the content
+    # interval advance at half rate until it has caught up (AudioRouter), so
+    # every write is kept.
+    import aa_projection_collect as collector  # noqa: PLC0415
+    piece = 50_000_000
+    targets = [DEPTH_NS] * 40 + [DEPTH_NS + 80_000_000] * 40 + [DEPTH_NS] * 40
+    naive, reported = [], []
+    last_end = None
+    for n, target in enumerate(targets):
+        slot = START_NS + n * piece
+        naive.append((slot - target, slot + piece - target, target))
+        start, end = slot - target, slot + piece - target
+        if last_end is not None and start < last_end:
+            start = last_end
+            end = max(end, start + piece // 2)
+        reported.append((start, end, slot - start))
+        last_end = end
+    for name, records, expected_all in (("naive", naive, False), ("reported", reported, True)):
+        parser = collector.EventParser()
+        for start, end, offset in records:
+            parser._consume(json.dumps({
+                "event": "audio_write_completed", "scheduled_ns": start, "scheduled_end_ns": end,
+                "playout_offset_ns": offset, "completed_ns": start + offset - 40_000_000,
+                "presented_ns": start + offset + SINK_NS, "playback_slot_absence": None}))
+        assert (parser.audio_writes == len(records)) == expected_all, (name, parser.audio_writes)
 
     # Wired records (no playout_offset_ns) keep their meaning.
     wired = [{"event": "audio_write_completed", "scheduled_ns": START_NS + k * CHUNK_NS,

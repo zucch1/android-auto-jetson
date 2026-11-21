@@ -37,6 +37,12 @@ struct AudioRenderWorker::SettlementDiagnostics {
         std::int64_t late_ns;
         std::int64_t depth_ns;
     };
+    struct Anchor {
+        bool resume;
+        std::int64_t skipped_ns;
+        std::int64_t depth_ns;
+        std::uint64_t anchors_lifetime;
+    };
     struct SinkStall {
         core::Nanoseconds start;
         core::Nanoseconds end;
@@ -56,6 +62,7 @@ struct AudioRenderWorker::SettlementDiagnostics {
     std::optional<IdleResume> resumed;
     std::optional<CatchUp> caught_up;
     std::optional<Underrun> underrun;
+    std::optional<Anchor> anchor;
 
     explicit SettlementDiagnostics(const AudioTelemetryCallbacks& callbacks) noexcept
         : telemetry(callbacks) {}
@@ -102,6 +109,18 @@ struct AudioRenderWorker::SettlementDiagnostics {
                 std::to_string(underrun->underruns_lifetime) + ",\"late_ms\":" +
                 format_ms(core::Nanoseconds{underrun->late_ns}) + ",\"depth_ms\":" +
                 format_ms(core::Nanoseconds{underrun->depth_ns}) + "}");
+        }
+        if (anchor) {
+            // A stream (re)start on the playout clock. skipped_ms is the
+            // elapsed time it jumped over without a write: 0 at a stream
+            // start, the pause on a resume. Every one is logged, so a large
+            // forward jump is never silent (DeepSeek F3).
+            telemetry.log_media("audio_playout_anchor",
+                std::string{"{\"event\":\"audio_playout_anchor\",\"reason\":\""} +
+                (anchor->resume ? "resume" : "start") + "\",\"skipped_ms\":" +
+                format_ms(core::Nanoseconds{anchor->skipped_ns}) + ",\"depth_ms\":" +
+                format_ms(core::Nanoseconds{anchor->depth_ns}) + ",\"anchors_lifetime\":" +
+                std::to_string(anchor->anchors_lifetime) + "}");
         }
         if (skipped) {
             telemetry.log_media("audio_idle_skipped",
@@ -152,16 +171,20 @@ AudioRenderWorker::AudioRenderWorker(RouterConfig config,
 
 void AudioRenderWorker::note_unacked_locked(std::size_t index) {
     ++unacked_[index];
-    max_unacked_seen_ = std::max(max_unacked_seen_, unacked_[index]);
+    max_unacked_held_ = std::max(max_unacked_held_, unacked_[index]);
 }
 
 void AudioRenderWorker::seed_credits_locked(std::size_t index) {
-    credits_[index].assign(credit_window_ - 1, envelope(index));
+    // Stop-and-wait keeps its historical accounting: the phone's single
+    // permit is checked against capacity when its chunk arrives. A window of
+    // N gives the phone N permits, and every one must be reserved, or a
+    // legally in-flight chunk is refused while the sink blocks (Neon P1-2).
+    credits_[index].assign(credit_window_ > 1 ? credit_window_ : 0, envelope(index));
 }
 
-std::uint64_t AudioRenderWorker::max_unacked_seen() const {
+std::uint64_t AudioRenderWorker::max_unacked_held() const {
     std::lock_guard lock(mutex_);
-    return max_unacked_seen_;
+    return max_unacked_held_;
 }
 
 AudioRenderWorker::~AudioRenderWorker() { (void)finish(); }
@@ -407,6 +430,8 @@ AudioRenderWorker::AckRelease AudioRenderWorker::try_begin_ack_release(
     }
     if (sink_state_ == SinkState::reopening) {
         completed_.push_front(completion);
+        // Taken again later: it is still unacknowledged.
+        if (idx) { ++unacked_[*idx]; }
         cv_.notify_all();
         return AckRelease::deferred;
     }
@@ -846,14 +871,14 @@ void AudioRenderWorker::run(RouterConfig config, const OpenRouter& open) {
         context.sink_reopens = sink_reopens;
         if (config.playout.enabled) { context.playout_target = config.playout.depth; }
         context.credit_window = credit_window_;
-        context.max_unacked_seen = max_unacked;
+        context.max_unacked_held = max_unacked;
         return context;
     };
     const auto emit_media_timing = [&](const RouterStats& route) {
         const auto stats = accumulate_router_stats(lifetime, route);
         if (stats.frames_written == 0 || !telemetry_.log_media) { return; }
         telemetry_.log_media("media_timing",
-                             media_timing_json(stats, timing_context(max_unacked_seen())));
+                             media_timing_json(stats, timing_context(max_unacked_held())));
     };
     std::uint64_t chunks = 0;
     for (;;) {
@@ -912,6 +937,8 @@ void AudioRenderWorker::run(RouterConfig config, const OpenRouter& open) {
         const auto idle_before = local_router.report().stats.frames_idle_skipped;
         const auto caught_up_before = local_router.report().stats.frames_caught_up;
         const auto underruns_before = local_router.report().stats.playout_underruns;
+        const auto anchors_before = local_router.report().stats.playout_anchors;
+        const auto resumes_before = local_router.report().stats.playout_resumes;
         lock.unlock();
         const auto step_started = monotonic_now();
         const auto result = local_router.render_step();
@@ -950,6 +977,11 @@ void AudioRenderWorker::run(RouterConfig config, const OpenRouter& open) {
             diagnostics.underrun = SettlementDiagnostics::Underrun{
                 lifetime.playout_underruns + stats.playout_underruns,
                 stats.playout_underrun_late.count, stats.playout_depth.count};
+        }
+        if (stats.playout_anchors > anchors_before) {
+            diagnostics.anchor = SettlementDiagnostics::Anchor{
+                stats.playout_resumes > resumes_before, stats.playout_anchor_skip.count,
+                stats.playout_depth.count, lifetime.playout_anchors + stats.playout_anchors};
         }
         // #155: the router trimmed this step's post-stall backlog (it happened
         // whatever the epoch, so it is always counted).

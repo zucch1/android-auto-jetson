@@ -81,11 +81,12 @@ std::string audio_write_completed_json(const WriteCompletion& completion) {
     // scheduled. presented_ns - scheduled_ns therefore includes the playout
     // buffer, so the A/V contract pairs a video frame with the audio that
     // arrived with it. The field is absent on the arrival model (wired).
-    const auto offset = completion.playout_offset.count;
+    const auto offset = std::max<std::int64_t>(0, completion.playout_offset.count);
+    const auto end_offset = std::max<std::int64_t>(0, completion.playout_end_offset.count);
     return "{\"event\":\"audio_write_completed\",\"scheduled_ns\":" +
         std::to_string(completion.scheduled.count - offset) + ",\"scheduled_end_ns\":" +
-        std::to_string(completion.scheduled_end.count - offset) +
-        (offset != 0 ? ",\"playout_offset_ns\":" + std::to_string(offset) : std::string{}) +
+        std::to_string(completion.scheduled_end.count - end_offset) +
+        (offset > 0 ? ",\"playout_offset_ns\":" + std::to_string(offset) : std::string{}) +
         ",\"completed_ns\":" +
         std::to_string(completion.completed.count) + ",\"presented_ns\":" +
         (completion.presented ? std::to_string(completion.presented->count) : std::string{"null"}) +
@@ -119,6 +120,8 @@ RouterStats accumulate_router_stats(const RouterStats& lifetime, const RouterSta
     out.playout_underruns += lifetime.playout_underruns;
     out.playout_anchors += lifetime.playout_anchors;
     out.frames_padded += lifetime.frames_padded;
+    out.playout_resumes += lifetime.playout_resumes;
+    out.max_arrival_burst = std::max(out.max_arrival_burst, lifetime.max_arrival_burst);
     const auto fold = [](std::optional<core::Nanoseconds> a, std::optional<core::Nanoseconds> b,
                          bool lower) -> std::optional<core::Nanoseconds> {
         if (!a) { return b; }
@@ -160,13 +163,18 @@ std::string media_timing_json(const RouterStats& stats, const MediaTimingContext
             ",\"playout_offset_ms\":" + format_ms(stats.playout_offset) +
             ",\"playout_underruns\":" + std::to_string(stats.playout_underruns) +
             ",\"playout_anchors\":" + std::to_string(stats.playout_anchors) +
+            ",\"playout_resumes\":" + std::to_string(stats.playout_resumes) +
             ",\"frames_padded\":" + std::to_string(stats.frames_padded);
     }
     if (context.playout_target || context.credit_window > 1) {
-        // Credit window advertised as max_unacked, and the most chunks the
-        // phone actually had unacknowledged on one channel.
+        // Credit window advertised as max_unacked; the most chunks one
+        // channel held accepted and not yet released for ACK (our side: acks
+        // go out on receipt, so normally 1); and the most chunks of one
+        // channel that arrived within 10 ms of each other (the phone's side:
+        // > 1 means it used more than one credit at once).
         json += ",\"credit_window\":" + std::to_string(context.credit_window) +
-            ",\"max_unacked_seen\":" + std::to_string(context.max_unacked_seen);
+            ",\"max_unacked_held\":" + std::to_string(context.max_unacked_held) +
+            ",\"max_arrival_burst\":" + std::to_string(stats.max_arrival_burst);
     }
     return json + "}";
 }

@@ -499,6 +499,8 @@ private:
         }
         const std::size_t lost_units = pending_queue_.size() + extra_drops;
         reset_pending_state_locked();
+        // Frames held for the playout delay go with the consumer.
+        clear_delayed_locked("consumer_disconnected");
         producer_->close();
         producer_.reset();
         idr_coordinator_.reset();
@@ -516,6 +518,9 @@ private:
         std::unique_lock<std::mutex>& lock, std::size_t extra_drops) {
         const std::size_t dropped_units = pending_queue_.size() + extra_drops;
         reset_pending_state_locked();
+        // Held frames are older than the recovery IDR this overflow requests:
+        // drop them too rather than drip them out after it.
+        clear_delayed_locked("backpressure");
         if (producer_.has_value()) {
             producer_->enter_waiting_idr_on_backpressure();
         }

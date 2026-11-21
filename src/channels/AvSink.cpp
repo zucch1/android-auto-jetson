@@ -184,7 +184,7 @@ core::Result<void> AvSink::codec_config(std::span<const std::byte> payload) {
     if (!pending_.empty()) {
         last_queue_rejection_ = diagnostics::QueueRejection{
             diagnostics::QueueSource::av_pending, diagnostics::QueueReason::codec_config,
-            service_.role, 1, 1, 0, 0, 0, 0, payload.size()};
+            service_.role, pending_.size(), window(), 0, 0, 0, 0, payload.size()};
         return Error{ErrorCode::ipc_queue_full};
     }
     const auto decoded = protocol::decode_av_sink_codec_config(payload);

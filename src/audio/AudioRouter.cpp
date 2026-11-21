@@ -33,6 +33,11 @@ constexpr std::size_t kMaxOutputPieceBytes = std::size_t{64} * 1024;
 constexpr std::size_t kMaxBackpressureIntervals = 64;
 // Playout: a role silent this long past its slot resumed rather than underran.
 constexpr std::int64_t kPlayoutResumeAfterNs = 1'000'000'000;
+// Playout drift: a depth error is sustained once the window holds this much
+// of arrivals (2 s, ~47 A26 chunks).
+constexpr std::int64_t kPlayoutSustainNs = 2'000'000'000;
+// Arrivals closer than this belong to one burst (max_arrival_burst).
+constexpr std::int64_t kArrivalBurstNs = 10'000'000;
 
 [[nodiscard]] std::optional<Role> role_of(protocol::ChannelRole channel) {
     switch (channel) {
@@ -67,13 +72,17 @@ struct PlayoutPlan final {
     // Buffer depth at arrival: slot minus arrival (anchor/underrun: the depth
     // it is re-anchored with).
     std::int64_t depth_ns{};
-    // Largest depth over the window including this run, before adjustment.
-    std::int64_t window_max_ns{};
-    // underrun: how long after its slot the run arrived.
+    // Re-anchor (underrun or resume): how long after its slot the run arrived.
     std::int64_t late_ns{};
+    // anchor: the role was anchored before (a resume, not a stream start).
+    bool resume{false};
     // steady: bounded drift trim from the head, or silence inserted before it.
     std::uint64_t trim_frames{};
     std::uint64_t pad_frames{};
+    // steady: absolute start frame (back-to-back slot plus pad), fixed when
+    // planned so a cached pad is applied once, never again to an advancing
+    // cursor (Neon P1-1).
+    std::uint64_t start_frame{};
 };
 
 // One decoded run pending on the mix timeline. submitted_at_ns is stamped at
@@ -128,6 +137,10 @@ struct ScheduledRun final {
     // before the run are skipped without a write instead of synthesized.
     std::uint64_t skip_first{0};
     std::uint64_t skip_last{0};
+    // Playout re-anchor: the refill silence before the run (at most the
+    // depth) is the buffer, not gap silence, and is exempt from the
+    // aggregate cap (Neon P2-3).
+    std::uint64_t refill_allowance{0};
 };
 
 // Drift trim of one unplaced run. The catch-up (#154) judges the run by the
@@ -355,25 +368,43 @@ struct AudioRouter::Impl final {
         std::deque<std::pair<std::int64_t, std::int64_t>> depths{};
     };
     std::array<PlayoutRole, kRoleCount> playout{};
+    struct ArrivalBurst final {
+        std::optional<std::int64_t> last{};
+        std::uint64_t length{};
+    };
+    std::array<ArrivalBurst, kRoleCount> arrival_bursts{};
     LivePcmDriftCorrector playout_drift{};
 
     [[nodiscard]] bool playout_enabled() const noexcept { return config.playout.enabled; }
+
+    // Content-clock end of the last reported write (WriteCompletion): the
+    // reported schedule never moves backwards (Neon P2-4).
+    std::optional<std::int64_t> last_content_end_ns{};
 
     void reset_playout(std::size_t role) noexcept {
         playout[role].anchored = false;
         playout[role].depths.clear();
     }
 
-    // Largest committed depth whose arrival lies inside the window ending at
-    // `arrival`, folded with this run's own depth.
-    [[nodiscard]] std::int64_t window_max(std::size_t role, std::int64_t arrival,
+    // Depth range over the committed runs inside the window ending at
+    // `arrival`, folded with this run's own depth. `sustained` is false until
+    // the window holds at least kPlayoutSustainNs of arrivals.
+    struct DepthRange final {
+        std::int64_t min;
+        std::int64_t max;
+        bool sustained;
+    };
+    [[nodiscard]] DepthRange window_range(std::size_t role, std::int64_t arrival,
                                           std::int64_t depth) const noexcept {
-        std::int64_t best = depth;
+        DepthRange range{depth, depth, false};
         const auto from = arrival - config.playout.window.count;
         for (const auto& [at, value] : playout[role].depths) {
-            if (at >= from) { best = std::max(best, value); }
+            if (at < from) { continue; }
+            range.min = std::min(range.min, value);
+            range.max = std::max(range.max, value);
+            if (arrival - at >= kPlayoutSustainNs) { range.sustained = true; }
         }
-        return best;
+        return range;
     }
 
     // Playout decision for an unplaced run whose back-to-back slot is
@@ -392,22 +423,28 @@ struct AudioRouter::Impl final {
             // anchor, not an underrun.
             const bool underrun = anchored && arrival - slot_ns <= kPlayoutResumeAfterNs;
             plan.mode = underrun ? PlayoutPlan::Mode::underrun : PlayoutPlan::Mode::anchor;
-            plan.late_ns = underrun ? arrival - slot_ns : 0;
+            plan.resume = anchored && !underrun;
+            plan.late_ns = std::max<std::int64_t>(0, arrival - slot_ns);
             if (arrival > INT64_MAX - depth) { return false; }
             plan.target_ns = arrival + depth;
             plan.depth_ns = std::max(plan.target_ns, slot_ns) - arrival;
-            plan.window_max_ns = plan.depth_ns;
             return true;
         }
         plan.mode = PlayoutPlan::Mode::steady;
         plan.depth_ns = slot_ns - arrival;
-        plan.window_max_ns = window_max(role, arrival, plan.depth_ns);
-        const core::Nanoseconds excess{plan.window_max_ns - depth};
-        if (excess.count >= 0) {
-            plan.trim_frames = playout_drift.trim_frames(excess, run.frames);
-        } else {
-            plan.pad_frames = playout_drift.trim_frames(core::Nanoseconds{-excess.count}, UINT64_MAX);
+        // Drift acts on sustained depth error only (DeepSeek F1, window 10).
+        // A burst of early chunks raises single depths and drains by itself,
+        // a late chunk lowers one: neither moves both ends of the range. Trim
+        // only when even the least-buffered arrival of a sustained window is
+        // too deep (phone clock faster, or a backlog), pad only when even the
+        // best-buffered one is too thin (phone clock slower, slower path).
+        const auto range = window_range(role, arrival, plan.depth_ns);
+        if (range.sustained && range.min > depth) {
+            plan.trim_frames = playout_drift.trim_frames(core::Nanoseconds{range.min - depth}, run.frames);
+        } else if (range.sustained && range.max < depth) {
+            plan.pad_frames = playout_drift.trim_frames(core::Nanoseconds{depth - range.max}, UINT64_MAX);
         }
+        plan.start_frame = slot_frame + plan.pad_frames;
         return true;
     }
 
@@ -423,7 +460,6 @@ struct AudioRouter::Impl final {
             const auto adjust = frames_to_ns(plan.pad_frames).count - frames_to_ns(plan.trim_frames).count;
             for (auto& [at, value] : state.depths) { value += adjust; }
             state.depths.emplace_back(run.timestamp.count, plan.depth_ns + adjust);
-            run.playout_offset_ns = plan.window_max_ns + adjust;
             stats.frames_padded += plan.pad_frames;
             stats.playout_depth_min = stats.playout_depth_min
                 ? std::min(*stats.playout_depth_min, core::Nanoseconds{plan.depth_ns})
@@ -435,12 +471,28 @@ struct AudioRouter::Impl final {
             state.depths.clear();
             const auto depth = start_ns - run.timestamp.count;
             state.depths.emplace_back(run.timestamp.count, depth);
-            run.playout_offset_ns = depth;
             if (plan.mode == PlayoutPlan::Mode::underrun) {
                 ++stats.playout_underruns;
                 stats.playout_underrun_late = core::Nanoseconds{plan.late_ns};
+            } else {
+                ++stats.playout_anchors;
+                if (plan.resume) { ++stats.playout_resumes; }
+                stats.playout_anchor_skip = core::Nanoseconds{plan.late_ns};
             }
-            else { ++stats.playout_anchors; }
+        }
+        // Playout offset: the depth of the least-delayed recent arrival, i.e.
+        // how long after the content (arrival) clock the role now plays. A
+        // phone releasing chunks in groups delivers the group's last chunk
+        // on time and the others late, so the earliest arrival is the
+        // content clock (A/V contract); after a re-anchor it is the anchor's
+        // depth until later arrivals show more.
+        {
+            std::int64_t best = 0;
+            const auto window_from = run.timestamp.count - config.playout.window.count;
+            for (const auto& [at, value] : state.depths) {
+                if (at >= window_from) { best = std::max(best, value); }
+            }
+            run.playout_offset_ns = best;
         }
         const auto from = run.timestamp.count - config.playout.window.count;
         while (!state.depths.empty() && state.depths.front().first < from) { state.depths.pop_front(); }
@@ -834,6 +886,15 @@ core::Result<void> AudioRouter::submit(const protocol::MessageView& message,
     }
 
     impl_->report.stats.frames_decoded += run.frames;
+    {
+        // Chunks arriving together on one channel: how many the phone had in
+        // flight at once (its credit use; our acks go out on receipt).
+        auto& burst = impl_->arrival_bursts[index];
+        burst.length = burst.last && run.timestamp.count - *burst.last < kArrivalBurstNs ? burst.length + 1 : 1;
+        burst.last = run.timestamp.count;
+        impl_->report.stats.max_arrival_burst =
+            std::max(impl_->report.stats.max_arrival_burst, burst.length);
+    }
     impl_->pending[index].push_back(std::move(run));
     impl_->report.stats.chunks_submitted += 1;
     return {};
@@ -1254,6 +1315,7 @@ void AudioRouter::reset_session_timeline() {
         ++impl_->generations[i];
     }
     impl_->timeline_base.reset();
+    impl_->last_content_end_ns.reset();
     impl_->playback_cursor_frames = 0;
     impl_->role_end_frames.fill(0);
     impl_->source_frontier_frames = 0;
@@ -1372,7 +1434,7 @@ core::Result<RenderStep> AudioRouter::render_step() {
                     run.playout = plan;
                 }
                 if (plan.mode == PlayoutPlan::Mode::steady) {
-                    entry.start_frame = slot_frame + plan.pad_frames;
+                    entry.start_frame = std::max(plan.start_frame, slot_frame);
                     entry.head_trim_frames = std::min(plan.trim_frames, run.frames);
                 } else {
                     std::int64_t target = 0;
@@ -1391,6 +1453,7 @@ core::Result<RenderStep> AudioRouter::render_step() {
                         entry.skip_first = slot_frame;
                         entry.skip_last = std::min(entry.start_frame, static_cast<std::uint64_t>(arrived));
                     }
+                    entry.refill_allowance = impl_->ns_to_frames(impl_->config.playout.depth) + 1;
                 }
                 entry.intended = static_cast<std::int64_t>(entry.start_frame);
                 diagnostic.intended = entry.intended;
@@ -1496,6 +1559,9 @@ core::Result<RenderStep> AudioRouter::render_step() {
                 }
                 if (hi > lo && hi - lo > covered) { gap -= std::min(gap, hi - lo - covered); }
             }
+            // A re-anchor's refill is the playout buffer (<= depth < cap),
+            // not gap silence: it never counts against the caps.
+            gap -= std::min(gap, entry.refill_allowance);
             if (gap > cap || total_gap > cap - gap) {
                 diagnostic.offending = entry.run->header;
                 diagnostic.preflighted = entry.run->preflighted;
@@ -1573,19 +1639,6 @@ core::Result<RenderStep> AudioRouter::render_step() {
         for (const auto& head : heads) {
             if (head) { next_start = std::min(next_start, head->start_frame); }
         }
-        // A playout re-anchor's elapsed hole is skipped like a recorded one.
-        for (const auto& head : heads) {
-            if (head && head->skip_first <= cursor && cursor < head->skip_last) {
-                const auto skipped = std::min(head->skip_last, next_start) - cursor;
-                impl_->timeline_base = base;
-                impl_->playback_cursor_frames = cursor + skipped;
-                impl_->source_frontier_frames =
-                    std::max(impl_->source_frontier_frames, impl_->playback_cursor_frames);
-                impl_->report.stats.frames_skipped += skipped;
-                result.pending = true;
-                return result;
-            }
-        }
         for (const auto& range : elapsed) {
             if (range.first <= cursor && cursor < range.last) {
                 const auto skipped = std::min(range.last, next_start) - cursor;
@@ -1599,6 +1652,24 @@ core::Result<RenderStep> AudioRouter::render_step() {
                 return result;
             }
             if (range.first > cursor) { end = std::min(end, range.first); }
+        }
+        // A playout re-anchor's elapsed hole is skipped like a recorded one;
+        // recorded idle/backpressure ranges (checked above) own their frames.
+        for (const auto& head : heads) {
+            if (head && head->skip_first <= cursor && cursor < head->skip_last) {
+                auto limit = std::min(head->skip_last, next_start);
+                for (const auto& range : elapsed) {
+                    if (range.first > cursor) { limit = std::min(limit, range.first); }
+                }
+                const auto skipped = limit - cursor;
+                impl_->timeline_base = base;
+                impl_->playback_cursor_frames = cursor + skipped;
+                impl_->source_frontier_frames =
+                    std::max(impl_->source_frontier_frames, impl_->playback_cursor_frames);
+                impl_->report.stats.frames_skipped += skipped;
+                result.pending = true;
+                return result;
+            }
         }
     }
     const auto frames = end - cursor;
@@ -1702,12 +1773,30 @@ core::Result<RenderStep> AudioRouter::render_step() {
         stats.max_path_latency = std::max(stats.max_path_latency, stats.last_path_latency);
         stats.last_completion_skew = core::Nanoseconds{done - scheduled_ns};
         stats.max_completion_skew = std::max(stats.max_completion_skew, stats.last_completion_skew);
+        std::int64_t playout_end_offset_ns = playout_offset_ns;
+        if (impl_->playout_enabled()) {
+            // The reported content interval never starts before the last one
+            // ended, so the collector never drops a write (Neon P2-4). A step
+            // up of the offset (a re-anchor, a burst showing a later content
+            // clock) is absorbed by content advancing at half the playout
+            // rate until it has caught up; a step down jumps forward.
+            const auto target = std::max<std::int64_t>(0, playout_offset_ns);
+            auto content_start = scheduled_ns - target;
+            auto content_end = end_ns - target;
+            if (impl_->last_content_end_ns && content_start < *impl_->last_content_end_ns) {
+                content_start = *impl_->last_content_end_ns;
+                content_end = std::max(content_end, content_start + std::max<std::int64_t>(1, (end_ns - scheduled_ns) / 2));
+            }
+            playout_offset_ns = std::max<std::int64_t>(0, scheduled_ns - content_start);
+            playout_end_offset_ns = std::max<std::int64_t>(0, end_ns - content_end);
+            impl_->last_content_end_ns = end_ns - playout_end_offset_ns;
+        }
         if (impl_->config.on_write_completed) {
             impl_->config.on_write_completed(WriteCompletion{core::Nanoseconds{scheduled_ns},
                 core::Nanoseconds{end_ns}, core::Nanoseconds{done},
                 presented_at(impl_->sink->last_playback_slot(), done),
                 impl_->sink->last_playback_slot_absence(),
-                core::Nanoseconds{playout_offset_ns}});
+                core::Nanoseconds{playout_offset_ns}, core::Nanoseconds{playout_end_offset_ns}});
         }
     } else { stats.frames_silence += frames; }
     lock.lock();

@@ -131,7 +131,7 @@ struct MediaTimingContext final {
     // Advertised max_unacked per audio channel and the most chunks one
     // channel actually had unacknowledged.
     std::uint32_t credit_window{1};
-    std::uint64_t max_unacked_seen{};
+    std::uint64_t max_unacked_held{};
 };
 // Sum of a receiver's earlier routes (lifetime) and the current one: counters
 // add, maxima fold, the latest observations come from `route`.

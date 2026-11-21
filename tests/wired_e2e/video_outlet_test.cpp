@@ -2262,3 +2262,89 @@ TEST(WiredReceiver, NoPresentationDelayForwardsAtOnce) {
 }
 
 } // namespace
+
+namespace {
+
+// Neon P3: frames still held for the playout delay are older than a
+// backpressure overflow's recovery IDR. They are dropped with the overflowed
+// queue instead of dripping out after it.
+TEST(WiredReceiver, PresentationDelayDropsHeldFramesOnBackpressureOverflow) {
+    using namespace std::chrono_literals;
+    auto now = std::chrono::steady_clock::time_point{} + 200s;
+    std::size_t idr_requests = 0;
+    std::vector<std::string> logs;
+    VideoOutlet outlet{[&](const std::string& line) { logs.push_back(line); }};
+    outlet.set_idr_recovery({
+        [] { return true; },
+        [&idr_requests]() -> aa::core::Result<void> { ++idr_requests; return {}; },
+        [&now] { return now; },
+    });
+    auto pair = videotest::make_pair({});
+    ASSERT_TRUE(pair);
+    bool force_would_block = false;
+    pair.value().producer.set_datagram_send_for_test(
+        [&force_would_block](int fd, const void* buf, std::size_t len, int flags,
+                             int& out_errno) -> std::ptrdiff_t {
+            if (force_would_block) { out_errno = EAGAIN; return -1; }
+            const auto sent = ::send(fd, buf, len, flags);
+            out_errno = (sent < 0) ? errno : 0;
+            return sent;
+        });
+    outlet.install(std::move(pair.value().producer));
+    outlet.set_presentation_delay(120ms);
+    const auto profile = p::VideoProfile{1920, 1080, 60, p::VideoCodec::h265};
+    p::MessageHeader hdr{p::ChannelRole::video, 1, {100}};
+    hdr.video_profile = profile;
+    hdr.video_session = 1;
+    hdr.video_generation = 1;
+    ASSERT_TRUE(outlet.on_message({hdr, make_h265_au(true, 16 * 1024, std::byte{0x10})}));
+    now += 120ms;
+    ASSERT_TRUE(outlet.service_pending());
+    ASSERT_TRUE(receive_complete_au(pair.value().consumer).has_value());
+
+    // The socket stalls. Five 100 KB P-frames arrive together, then three more
+    // 100 ms later; when the first five come due they overflow the byte budget.
+    force_would_block = true;
+    const auto chunk = make_h265_au(false, 100 * 1024, std::byte{0x22});
+    for (int i = 0; i < 5; ++i) {
+        ++hdr.sequence;
+        ASSERT_TRUE(outlet.on_message({hdr, chunk}));
+    }
+    now += 100ms;
+    for (int i = 0; i < 3; ++i) {
+        ++hdr.sequence;
+        ASSERT_TRUE(outlet.on_message({hdr, chunk}));
+    }
+    EXPECT_EQ(outlet.delayed_units(), 8U);
+    now += 20ms;
+    ASSERT_TRUE(outlet.service_pending());
+    EXPECT_EQ(idr_requests, 1U);
+    EXPECT_EQ(outlet.delayed_units(), 0U);
+    EXPECT_FALSE(outlet.has_pending());
+}
+
+// Neon P3: a consumer that disconnects takes the held frames with it.
+TEST(WiredReceiver, PresentationDelayDropsHeldFramesWhenTheConsumerDisconnects) {
+    using namespace std::chrono_literals;
+    auto now = std::chrono::steady_clock::time_point{} + 300s;
+    VideoOutlet outlet{[](const std::string&) {}};
+    VideoOutlet::IdrRecoveryHooks hooks;
+    hooks.clock = [&] { return now; };
+    outlet.set_idr_recovery(std::move(hooks));
+    auto pair = videotest::make_pair({});
+    ASSERT_TRUE(pair);
+    outlet.install(std::move(pair.value().producer));
+    outlet.set_presentation_delay(120ms);
+    const p::MessageHeader first{p::ChannelRole::video, 1, aa::core::Nanoseconds{1}};
+    const p::MessageHeader second{p::ChannelRole::video, 2, aa::core::Nanoseconds{2}};
+    ASSERT_TRUE(outlet.on_message({first, wiredtest::kVideoIdr}));
+    now += 50ms;
+    ASSERT_TRUE(outlet.on_message({second, wiredtest::kVideoIdr}));
+    pair.value().consumer.close();
+    now += 70ms; // only the first frame is due: its send finds the peer gone
+    ASSERT_TRUE(outlet.service_pending());
+    EXPECT_EQ(outlet.delayed_units(), 0U);
+    EXPECT_FALSE(outlet.has_pending());
+}
+
+} // namespace

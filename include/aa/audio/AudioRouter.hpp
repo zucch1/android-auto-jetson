@@ -118,6 +118,10 @@ struct WriteCompletion final {
     // with (the largest among contributors). Zero on the arrival model
     // (wired): scheduled is then the arrival-stamped content time itself.
     core::Nanoseconds playout_offset{};
+    // The same at scheduled_end. It differs from playout_offset only while
+    // an offset increase is absorbed (the reported content clock never runs
+    // backwards, so it advances at half rate for a while).
+    core::Nanoseconds playout_end_offset{};
 };
 
 struct RenderStep final {
@@ -261,14 +265,20 @@ private:
 //   arrival + depth. The elapsed part of the hole is skipped without a
 //   write (frames_skipped), the rest is `depth` of silence (frames_silence),
 //   and the session continues: playout never fails `late`;
-// - drift: the buffer depth of a chunk is its slot minus its arrival. The
-//   largest depth over the last `window` of arrivals is the depth of the
-//   least-delayed ones, i.e. the playout offset. When it is more than the
-//   LivePcmDriftPolicy high watermark above `depth` (phone clock faster, or a
-//   late anchor) the chunk loses the bounded drift trim from its head; when it
-//   is that far below (phone clock slower, or a slower path) up to max_trim of
-//   silence is inserted before it. Jitter alone only lowers single depths, so
-//   it never trims.
+// - drift: the buffer depth of a chunk is its slot minus its arrival. A phone
+//   using its credit window releases chunks in groups (window 10: depths up
+//   to 274 ms), which raises single depths, and a late chunk lowers one; both
+//   drain by themselves. Correction acts only on sustained error: once the
+//   window holds 2 s of arrivals, a chunk loses the bounded LivePcmDriftPolicy
+//   trim (at most max_trim) only when even the least-buffered arrival in the
+//   window is more than the high watermark above `depth` (phone clock faster,
+//   a backlog after an underrun), and up to max_trim of silence is inserted
+//   before it only when even the best-buffered one is that far below (phone
+//   clock slower, a slower path). Bursts and jitter never trim or pad.
+// - offset: WriteCompletion reports the depth of the least-delayed recent
+//   arrival as the playout offset (the content clock), never letting the
+//   reported content interval start before the previous one ended: an
+//   increase is absorbed at half rate.
 // Wired keeps the arrival model (disabled).
 struct PlayoutPolicy final {
     bool enabled{false};
@@ -379,7 +389,8 @@ struct RouterStats final {
     // depth at arrival (slot minus arrival, before any drift trim or pad),
     // playout_depth_min/max its range over the route excluding anchors, and
     // playout_offset the current offset of the least-delayed arrivals (the
-    // value audio_write_completed reports as playout_offset_ns).
+    // target audio_write_completed reports as playout_offset_ns; an increase
+    // reaches the record at half rate so the content clock never runs back).
     std::uint64_t playout_underruns{};
     std::uint64_t playout_anchors{};
     std::uint64_t frames_padded{};
@@ -389,6 +400,14 @@ struct RouterStats final {
     core::Nanoseconds playout_offset{};
     // How long after its slot the chunk of the latest underrun arrived.
     core::Nanoseconds playout_underrun_late{};
+    // Anchors that resumed a paused stream (subset of playout_anchors), and
+    // the elapsed time the latest anchor skipped (DeepSeek F3: logged as
+    // audio_playout_anchor so a large forward jump is visible).
+    std::uint64_t playout_resumes{};
+    core::Nanoseconds playout_anchor_skip{};
+    // Most chunks of one channel that arrived within 10 ms of each other: the
+    // phone's credit use (our acks go out on receipt).
+    std::uint64_t max_arrival_burst{};
 };
 
 // ELEMENT-INGRESS observations (task-25 gate fix round 2): what entered the
