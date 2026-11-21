@@ -130,7 +130,11 @@ _PROJECTION_STARTUP_TIMEOUT_SECONDS = 60
 # - Ready poll (5 s) + display probe fallback (5 s) + safety margin (12 s) = 120 s
 WIRELESS_STARTUP_BUDGET_S = transport.WIRELESS_STARTUP_BUDGET_S
 _MEDIA_STALL_SECONDS = 10
-_STARTUP_OBSERVATION_MAX_AGE_NS = 10_000_000_000
+# Startup eligibility is decided by the receiver's own ACTIVE mono_ns against the
+# deadline, and binding also requires the session to still be active. There is
+# deliberately no age limit on a timely observation: collector work between the
+# observation and the bind (process scans, a display probe of up to ~5 s) is not
+# bounded, and an age limit dropped healthy, still-active sessions (PR #184 review).
 # A normal sample interval is at most 5 s (see the sleeps in collect) plus a short
 # parse. Anything beyond this is the collector itself having been frozen, so it is
 # recorded as host interference; the margin below _MEDIA_STALL_SECONDS means gaps
@@ -1234,8 +1238,6 @@ def collect(args: argparse.Namespace, build: dict | None = None) -> dict:
             and parser.first_active_mono_ns is not None
             and parser.first_active_mono_ns <= startup_deadline_ns
             and startup_active_at_ns is not None
-            and now_ns - startup_active_at_ns <= _STARTUP_OBSERVATION_MAX_AGE_NS
-            and now_ns - startup_deadline_ns <= _STARTUP_OBSERVATION_MAX_AGE_NS
         )
 
     def read_sample() -> Sample:

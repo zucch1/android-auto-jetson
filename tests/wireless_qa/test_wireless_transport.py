@@ -1382,7 +1382,7 @@ class Issue171StartupBudgetAndApTests(unittest.TestCase):
         self.assertEqual(cap_at_deadline["active_projection_seconds"], 3.0)
         self.assertEqual(cap_at_deadline["events"]["startup_ms"], 96000)
 
-    def test_virtual_clock_in_budget_active_mono_ns_and_age_limit(self) -> None:
+    def test_virtual_clock_in_budget_active_mono_ns_binds_despite_collector_delay(self) -> None:
         second = 1_000_000_000
         run_scenario = self._run_virtual_clock_scenario
         active_at_events = self._sol_active_at_events
@@ -1415,14 +1415,18 @@ class Issue171StartupBudgetAndApTests(unittest.TestCase):
         self.assertGreaterEqual(cap_oversleep["active_projection_seconds"], 3.0)
         self.assertEqual(cap_oversleep["events"]["startup_ms"], 119900)
 
-        # P2-B: age limit rejects a stale observation after a 30 s pause (observed at 118.9 s -> 153.8 s).
-        cap_stale = run_scenario(
-            active_at_events(118 * second),
-            startup_timeout_s=None, display_probe_s=4.9, duration_seconds=10,
-            pause_after_active_s=30.0)
-        self.assertFalse(cap_stale["link"]["adb_bound"])
-        self.assertIsNone(cap_stale["startup_wait_seconds"])
-        self.assertEqual(cap_stale["active_projection_seconds"], 0.0)
+        # A timely ACTIVE on a still-active session binds however long the collector's own
+        # work takes before the bind decision: 5.101 s of collector delay plus the 4.9 s
+        # probe (the review reproduction), and a 30 s collector pause.
+        for pause_s in (5.101, 30.0):
+            cap_delayed = run_scenario(
+                active_at_events(118 * second),
+                startup_timeout_s=None, display_probe_s=4.9, duration_seconds=10,
+                pause_after_active_s=pause_s)
+            self.assertTrue(cap_delayed["link"]["adb_bound"], pause_s)
+            self.assertIsNotNone(cap_delayed["startup_wait_seconds"], pause_s)
+            self.assertGreaterEqual(cap_delayed["active_projection_seconds"], 10.0, pause_s)
+            self.assertEqual(cap_delayed["events"]["startup_ms"], 118000, pause_s)
 
     def test_v3_schema_requires_valid_ap_on_wireless_qualifying_and_offline_not_live(self) -> None:
         import aa_perf_schema as schema
