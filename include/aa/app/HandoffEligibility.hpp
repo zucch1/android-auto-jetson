@@ -63,13 +63,13 @@ public:
     HandoffEligibilityCoordinator& operator=(const HandoffEligibilityCoordinator&) = delete;
     // Starts an attempt. A retry with the same source while this coordinator's bootstrap is
     // still in progress keeps it (no retirement, no denial, no re-observation, #161). A fresh
-    // attempt's caller first retires the previous one with retire(), which settles its denial
-    // with the helper; begin()'s own retirement only queues it (#169 review).
+    // attempt's caller first retires the previous one with retire(), which sends any due denial.
+    // Retirement in begin() queues the denial for tick() (#169 review).
     void begin(helper::Source source);
     void consumer(std::optional<core::ConsumerId> live);
     void tick(bool active = false);
-    // Retires the attempt and, before returning, sends its denial to the helper (after any
-    // operation still in flight), so a fresh attempt never starts against the retired one.
+    // Retires the attempt, collects any in-flight operation and sends its denial if due.
+    // Failed denials share the retry schedule used by tick().
     void retire();
     // Retires a still-pending bootstrap; ACTIVE and consumer grace require success.
     void confirm_completion();
