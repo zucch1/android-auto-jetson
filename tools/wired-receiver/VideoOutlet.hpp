@@ -142,6 +142,12 @@ public:
     void set_presentation_delay_source(std::function<std::chrono::nanoseconds(core::Nanoseconds)> source) {
         std::lock_guard lock(mutex_);
         delay_source_ = std::move(source);
+        last_released_.reset();
+    }
+
+    [[nodiscard]] std::uint64_t late_releases() const {
+        std::lock_guard lock(mutex_);
+        return late_releases_;
     }
 
     // The hold a frame with this timestamp would get now, before slewing.
@@ -196,13 +202,20 @@ public:
     // deferred to the next service_pending(). Window 12 (349.5 s): during a
     // Wi-Fi stall the session's outbound send blocked ~90 ms, the guarded
     // service_pending() was skipped, and the held frames left 90 ms late.
+    // It stands down while an IDR request is being sent (idr_dispatching):
+    // the frames held then are older than the keyframe just requested, and
+    // the consumer drops them anyway (DeepSeek P3-2).
     [[nodiscard]] core::Result<void> release_held() {
         std::unique_lock lock(mutex_);
         if (idr_dispatching_.load(std::memory_order_acquire) || delayed_.empty()) { return {}; }
-        defer_idr_ = true;
-        auto released = release_due_locked(lock, now_locked());
-        defer_idr_ = false;
-        return released;
+        struct DeferIdr final {
+            bool& flag;
+            explicit DeferIdr(bool& value) : flag(value) { flag = true; }
+            ~DeferIdr() { flag = false; }
+            DeferIdr(const DeferIdr&) = delete;
+            DeferIdr& operator=(const DeferIdr&) = delete;
+        } defer{defer_idr_};
+        return release_due_locked(lock, now_locked());
     }
 
     [[nodiscard]] core::Result<void> service_pending() {
@@ -210,8 +223,11 @@ public:
         if (idr_dispatching_.load(std::memory_order_acquire)) { return {}; }
         if (deferred_idr_reason_) {
             const auto reason = std::exchange(deferred_idr_reason_, std::nullopt);
-            if (auto idr = maybe_request_idr_locked(lock, *reason); !idr) { return idr.error(); }
-            if (idr_dispatching_.load(std::memory_order_acquire)) { return {}; }
+            // Only while the episode it was deferred for is still open.
+            if (idr_coordinator_.waiting() && producer_.has_value()) {
+                if (auto idr = maybe_request_idr_locked(lock, *reason); !idr) { return idr.error(); }
+                if (idr_dispatching_.load(std::memory_order_acquire)) { return {}; }
+            }
         }
         if (auto released = release_due_locked(lock, now_locked()); !released) {
             return released.error();
@@ -232,6 +248,8 @@ public:
         clear_delayed_locked("reset");
         clear_pending_locked(/*abandon_partial=*/true, "reset");
         idr_coordinator_.reset();
+        deferred_idr_reason_.reset();
+        last_released_.reset();
         had_backpressure_ = false;
         replaced_consumer_ = false;
         armed_late_consumer_ = false;
@@ -259,7 +277,6 @@ public:
             return deliver_locked(lock, message);
         }
         delayed_bytes_ += message.payload.size();
-        note_capped_locked(message.header.timestamp);
         delayed_.push_back(DelayedMessage{message.header,
             {message.payload.begin(), message.payload.end()}, now});
         // A zero hold releases it at once, still in order.
@@ -371,8 +388,10 @@ private:
 public:
     void install(ipc::VideoProducer producer) {
         std::lock_guard lock(mutex_);
-        // Frames held for the playout delay belonged to the old consumer (F12).
+        // Frames held for the playout delay belonged to the old consumer (F12),
+        // and so does any IDR request deferred for it.
         if (producer_.has_value()) { clear_delayed_locked("consumer_replaced"); }
+        deferred_idr_reason_.reset();
         clear_pending_locked(/*abandon_partial=*/false, "consumer_replaced");
         // Endpoint events fire once per access unit (audit L13), so they are media
         // telemetry: rate-limited and never waiting for the sink. The producer only
@@ -407,6 +426,8 @@ public:
         std::lock_guard lock(mutex_);
         clear_delayed_locked("closed");
         clear_pending_locked(/*abandon_partial=*/false, "closed");
+        deferred_idr_reason_.reset();
+        last_released_.reset();
         emit_drops(true);
         idr_coordinator_.reset();
         had_backpressure_ = false;
@@ -473,11 +494,15 @@ private:
     static constexpr std::size_t kMaxDelayedUnits = 64;
     static constexpr std::size_t kMaxDelayedBytes = std::size_t{32} * 1024 * 1024;
 
-    [[nodiscard]] core::Result<void> release_front_locked(std::unique_lock<std::mutex>& lock) {
+    // Releases the front frame with its hold (computed once, by the caller
+    // or here); a capped frame is counted when its capped hold is applied.
+    [[nodiscard]] core::Result<void> release_front_locked(std::unique_lock<std::mutex>& lock,
+                                                          std::optional<std::chrono::nanoseconds> hold = {}) {
         auto item = std::move(delayed_.front());
         delayed_.pop_front();
         delayed_bytes_ -= item.payload.size();
-        note_released_locked(item, front_hold_locked(item));
+        note_capped_locked(item.header.timestamp);
+        note_released_locked(item, hold ? *hold : front_hold_locked(item));
         return deliver_locked(lock, protocol::MessageView{item.header, item.payload});
     }
 
@@ -485,10 +510,21 @@ private:
                                                         std::chrono::steady_clock::time_point now) {
         while (!delayed_.empty() && !idr_dispatching_.load(std::memory_order_acquire)) {
             const auto hold = front_hold_locked(delayed_.front());
-            if (delayed_.front().arrived + std::chrono::duration_cast<std::chrono::steady_clock::duration>(hold) > now) {
-                break;
+            const auto due = delayed_.front().arrived
+                + std::chrono::duration_cast<std::chrono::steady_clock::duration>(hold);
+            if (due > now) { break; }
+            // Window 13: three frames left 80-85 ms after their due while the
+            // display was idle. Count and log any release that late, so the
+            // next window can see it (and how often).
+            if (now - due > kLateRelease) {
+                ++late_releases_;
+                if (late_releases_ == 1 || late_releases_ % 30 == 0) {
+                    media("video_release_late", "{\"event\":\"video_release_late\",\"late_ms\":" +
+                          std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(now - due).count()) +
+                          ",\"late_releases\":" + std::to_string(late_releases_) + "}");
+                }
             }
-            if (auto released = release_front_locked(lock); !released) { return released.error(); }
+            if (auto released = release_front_locked(lock, hold); !released) { return released.error(); }
         }
         return {};
     }
@@ -564,6 +600,9 @@ private:
         had_backpressure_ = false;
         replaced_consumer_ = false;
         armed_late_consumer_ = false;
+        // A keyframe reached the consumer: a request deferred by release_held()
+        // is obsolete (it would reopen a phantom waiting_idr episode).
+        if (is_idr) { deferred_idr_reason_.reset(); }
         if (is_idr && idr_coordinator_.waiting()) {
             const auto recovered = idr_coordinator_.on_idr_delivered(now);
             if (recovered.recovered) {
@@ -596,8 +635,10 @@ private:
         }
         const std::size_t lost_units = pending_queue_.size() + extra_drops;
         reset_pending_state_locked();
-        // Frames held for the playout delay go with the consumer.
+        // Frames held for the playout delay go with the consumer, and so does
+        // any IDR request deferred for it.
         clear_delayed_locked("consumer_disconnected");
+        deferred_idr_reason_.reset();
         producer_->close();
         producer_.reset();
         idr_coordinator_.reset();
@@ -860,6 +901,8 @@ private:
     };
     std::optional<ReleasedHold> last_released_{};
     std::uint64_t capped_holds_{0};
+    static constexpr std::chrono::milliseconds kLateRelease{20};
+    std::uint64_t late_releases_{0};
     bool defer_idr_{false};
     std::optional<std::string> deferred_idr_reason_{};
     std::deque<DelayedMessage> delayed_{};

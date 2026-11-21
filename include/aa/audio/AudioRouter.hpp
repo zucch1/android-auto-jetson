@@ -270,16 +270,18 @@ private:
 //   time, so a group's chunks are late and its last on time) spreads single
 //   depths by the group, and a late chunk lowers one; both drain by
 //   themselves. Correction judges the window's smallest depth (the group's
-//   first, latest-delivered chunk) once the window holds 2 s of arrivals:
+//   first, longest-in-transit chunk) once the window holds 2 s of arrivals:
 //   the bounded LivePcmDriftPolicy trim (at most max_trim) only when it is
 //   more than the high watermark above `depth` (phone clock faster, a
 //   backlog), and up to max_trim of silence (refilling toward half the
 //   depth) only when it is below a quarter of `depth` (phone clock slower, a
 //   slower path), so a jitter spike inside the buffer costs nothing. Within
-//   4 s of an underrun the window is the last 1 s (older entries are dropped,
-//   the re-anchor chunk itself ignored) and 0.5 s sustains, so the backlog
-//   that follows starts draining at once; a backlog more than 230 ms above
-//   the depth (350 ms) is shed at 30% of each chunk, keeping the offset under
+//   4 s of an underrun the window is the last 0.5 s (older entries are dropped,
+//   the re-anchor group itself ignored) and 0.25 s sustains, so the backlog
+//   that follows starts draining at once; while that floor is over-full and
+//   the offset (the window's largest depth) is above min(depth + 230 ms,
+//   350 ms), the backlog is shed at 30% of each chunk - audible as a ~23 Hz
+//   gating for the fraction of a second it runs - keeping the offset under
 //   the wireless video hold cap (400 ms).
 // - offset: the depth of the least-delayed recent arrival, i.e. how long
 //   after on-time content audio plays (depth + (group - 1) chunk periods with
@@ -595,6 +597,8 @@ public:
     // Owner-thread: the playout re-anchors committed since the last call, in
     // order (at most 64 between calls).
     [[nodiscard]] std::vector<PlayoutEvent> take_playout_events();
+    // True while any role plays on the playout clock (any thread).
+    [[nodiscard]] bool playout_anchored() const;
     // Worker-only observation of settled all-role idle lasting >200 ms.
     // Authorizes only whole, already-elapsed frames within [start, end) in
     // the NEXT resumed schedule's leading uncovered prefix. All pending

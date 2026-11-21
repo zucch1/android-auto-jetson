@@ -4762,7 +4762,9 @@ template <typename RoundTrip>
         for (const auto at : acked_at) { if (at > sent) { ++in_flight; } }
         result.max_in_flight = std::max(result.max_in_flight, in_flight);
         const std::int64_t rtt = round_trip_ms(sent / 1'000'000'000LL) * 1'000'000LL;
-        const std::int64_t arrival = std::max(last_arrival, kStart + sent + rtt / 2);
+        // TCP delivers in order; co-arriving chunks still get distinct
+        // receiver stamps, ~100 us apart as on the live link (Neon P2-3).
+        const std::int64_t arrival = std::max(last_arrival + (last_arrival != 0 ? 100'000 : 0), kStart + sent + rtt / 2);
         last_arrival = arrival;
         if (!route.submit(make_message(aa::protocol::ChannelRole::media_audio, k,
                                        aa::core::Nanoseconds{arrival}, chunk))) {
@@ -5208,6 +5210,82 @@ TEST_F(AudioPipelineRoute, PlayoutDeepBacklogIsShedUnderTheVideoHoldCap) {
                   5'000'000) << label;
         expect_monotonic_content_schedule(run, label.c_str());
     }
+}
+
+// DeepSeek N1 (round 4): the shed protects the 400 ms video hold cap, which
+// bounds the offset - the window's largest depth. With grouped delivery that
+// is a group span above the floor, so a shed gated on the floor stopped while
+// the offset was still up to a span above its threshold (~520 ms at groups of
+// 5 against the 400 ms hold). Gated on the offset, the excess over the cap
+// stays small whatever the grouping, with the A26's 341 ms AudioRecord buffer.
+TEST_F(AudioPipelineRoute, PlayoutShedKeepsTheOffsetUnderTheCapWhileThePhoneBursts) {
+    for (const std::uint64_t burst : {4U, 5U}) {
+        const auto run = run_playout_loop(30, [](std::int64_t second) {
+            return second == 10 ? std::int64_t{800} : std::int64_t{20};
+        }, aa::audio::kWirelessCreditWindow + 1, aa::audio::kWirelessPlayoutDepth, burst, 0, 0, 341'000'000);
+        const auto label = "burst " + std::to_string(burst);
+        ASSERT_FALSE(run.failure) << label;
+        ASSERT_GE(run.stats.playout_underruns, 1U) << label;
+        std::int64_t excess = 0;
+        std::int64_t above = 0;
+        for (const auto& completion : run.completions) {
+            excess = std::max(excess, completion.playout_end_offset.count - 400'000'000);
+            if (completion.playout_end_offset.count > 400'000'000) {
+                above += completion.scheduled_end.count - completion.scheduled.count;
+            }
+        }
+        EXPECT_LE(excess, 60'000'000) << label;
+        EXPECT_LE(above, 900'000'000) << label;
+        expect_monotonic_content_schedule(run, label.c_str());
+    }
+}
+
+// Neon P2-3 (round 4): the re-anchor's co-arriving chunks carry live stamps
+// microseconds apart; skipping only the exact re-anchor stamp let the next
+// chunk (depth + one period) hold the recovery floor down for the whole 1 s
+// window. After an underrun the shed now starts on the first deep chunk of
+// the backlog (it arrives as a ramp: groups of 4 every ~20 ms here).
+TEST_F(AudioPipelineRoute, PlayoutShedStartsPromptlyWithLiveArrivalStamps) {
+    const auto run = run_playout_loop(30, [](std::int64_t second) {
+        return second == 10 ? std::int64_t{800} : std::int64_t{20};
+    }, aa::audio::kWirelessCreditWindow, aa::audio::kWirelessPlayoutDepth, 1, 0, 0, 682'000'000);
+    ASSERT_FALSE(run.failure);
+    std::optional<std::int64_t> last_underrun;
+    std::optional<std::int64_t> first_trim;
+    for (std::size_t i = 1; i < run.offsets.size(); ++i) {
+        const auto& sample = run.offsets[i];
+        if (sample.underruns > run.offsets[i - 1].underruns) { last_underrun = sample.arrival; first_trim.reset(); }
+        if (last_underrun && !first_trim && sample.trimmed > run.offsets[i - 1].trimmed) { first_trim = sample.arrival; }
+    }
+    ASSERT_TRUE(last_underrun);
+    ASSERT_TRUE(first_trim);
+    EXPECT_LE(*first_trim - *last_underrun, 600'000'000LL);
+}
+
+// Window 13: with playout, media PCM already in the output format skips the
+// GStreamer round trip (an identity conversion) so the render worker's lock
+// stays short under a post-stall burst; the bytes played are the bytes sent.
+TEST_F(AudioPipelineRoute, PlayoutIdentityPcmIsPlayedAsSent) {
+    auto config = pcm_router_config();
+    config.live_pcm_drift.enabled = true;
+    config.playout.enabled = true;
+    auto sink = std::make_unique<RecordingAudioSink>();
+    const auto observed = sink->state;
+    auto opened = aa::audio::detail::open_router_with_sink_for_test(config, std::move(sink));
+    ASSERT_TRUE(opened);
+    auto route = std::move(opened).value();
+    std::vector<std::byte> pcm(2048 * 4);
+    for (std::size_t i = 0; i < pcm.size(); ++i) { pcm[i] = static_cast<std::byte>((i * 37U + 11U) & 0xffU); }
+    ASSERT_TRUE(route.submit(make_message(media, 1, base, pcm)));
+    for (int i = 0; i < 16; ++i) {
+        auto stepped = route.render_step();
+        ASSERT_TRUE(stepped);
+        if (!stepped.value().pending) { break; }
+    }
+    std::vector<std::byte> played;
+    for (const auto& write : observed->writes) { played.insert(played.end(), write.begin(), write.end()); }
+    ASSERT_GE(played.size(), pcm.size());
+    EXPECT_TRUE(std::equal(pcm.begin(), pcm.end(), played.end() - static_cast<std::ptrdiff_t>(pcm.size())));
 }
 
 // Neon P2-3: a backlog that builds over a second after an underrun (the round

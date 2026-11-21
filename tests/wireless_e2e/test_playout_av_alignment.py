@@ -154,6 +154,59 @@ def outlet_video(seconds: int, audio: list[dict], new_outlet: bool) -> list[dict
     return events
 
 
+def gap_audio_events(seconds: int, high: int, gap_at: int, content_gap: int) -> list[dict]:
+    """Writes at offset `high`, an underrun's content gap, then the router's resume.
+
+    Across an output gap og the router may lower the offset by og/2 at once;
+    with content gap cg = og + (high - start) that is start = high - cg/3. It
+    then slews to the 120 ms depth by at most half a chunk per write.
+    """
+    events, offset, content = [], high, START_NS
+    resumed = False
+    while content < START_NS + seconds * 1_000_000_000:
+        if not resumed and content >= gap_at:
+            content += content_gap
+            offset = max(DEPTH_NS, high - content_gap // 3)
+            resumed = True
+        target = high if not resumed else DEPTH_NS
+        start_offset = offset
+        end_offset = start_offset + max(-CHUNK_NS // 2, min(CHUNK_NS // 2, target - start_offset))
+        offset = end_offset
+        events.append({"event": "audio_write_completed", "scheduled_ns": content,
+                       "scheduled_end_ns": content + CHUNK_NS, "playout_offset_ns": start_offset,
+                       "completed_ns": content, "presented_ns": content + start_offset + SINK_NS,
+                       "playback_slot_absence": None, "_end_offset": end_offset})
+        content += CHUNK_NS
+    return events
+
+
+def gap_lookup(audio: list[dict], t: int, follow_router: bool) -> int:
+    """AudioRenderWorker::playout_offset_at: inside a write, or across a gap."""
+    for a, b in zip(audio, audio[1:]):
+        if a["scheduled_ns"] <= t < a["scheduled_end_ns"]:
+            return offset_at([a], t)
+        if a["scheduled_end_ns"] <= t < b["scheduled_ns"]:
+            if not follow_router:
+                return a["_end_offset"]          # old: flat across the gap
+            span = b["scheduled_ns"] - a["scheduled_end_ns"]
+            return a["_end_offset"] + (b["playout_offset_ns"] - a["_end_offset"]) * (t - a["scheduled_end_ns"]) // span
+    return offset_at(audio, t)
+
+
+def outlet_video_lookup(seconds: int, audio: list[dict], follow_router: bool) -> list[dict]:
+    """The new outlet (hold at release, half-rate down-slew) over either lookup."""
+    events, previous = [], None
+    for n in range(seconds * 1_000_000_000 // FRAME_NS):
+        arrival = START_NS + n * FRAME_NS + 10_000_000
+        hold = gap_lookup(audio, arrival, follow_router)
+        if previous is not None:
+            hold = max(hold, previous[1] - (arrival - previous[0]) // 2)
+        previous = (arrival, hold)
+        events.append({"event": "video_presented", "scheduled_ns": arrival,
+                       "completed_ns": arrival + hold + PAINT_NS})
+    return events
+
+
 def judge(smoke, contract, audio: list[dict], video: list[dict], clause: str) -> dict:
     valid, invalid = smoke._valid_audio(audio)
     assert invalid == 0
@@ -213,6 +266,19 @@ def main() -> int:
             new_result = judge(smoke, contract, new_audio, outlet_video(66, new_audio, new_outlet=True), clause)
             assert new_result["passed"], (high, low, clause, new_result)
             assert new_result["signed_max_ms"] < 20, (high, low, new_result)
+
+    # Neon P1 #1 (round 4): an underrun's gap at a 295 ms offset (window 11's
+    # p99) with video arriving all through it. Held for the old offset across
+    # the gap, the frames after the resume sit above the audio's lower offset
+    # and fail the cap; following the router's line across the gap they pass.
+    for content_gap in (350_000_000, 500_000_000):
+        audio = gap_audio_events(70, 295_000_000, START_NS + 30 * 1_000_000_000, content_gap)
+        flat = judge(smoke, contract, audio, outlet_video_lookup(66, audio, follow_router=False), "cap")
+        assert not flat["passed"] and flat["signed_max_ms"] > 90, (content_gap, flat)
+        for clause in ("cap", "soak_rate"):
+            followed = judge(smoke, contract, audio, outlet_video_lookup(66, audio, follow_router=True), clause)
+            assert followed["passed"], (content_gap, clause, followed)
+            assert followed["signed_max_ms"] < 30, (content_gap, followed)
 
     # Neon P2-4: the collector drops any write whose scheduled_ns does not
     # advance. When the playout offset steps up (a re-anchor, a burst showing

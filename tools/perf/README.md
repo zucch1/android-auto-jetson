@@ -256,7 +256,8 @@ after its slot), `playout_anchors` (stream starts and resumes) and
 the value the wireless video hold follows; it moves toward
 `playout_offset_ms` by at most half the output time that passes),
 `frames_padded` (drift pads, a subset of `frames_silence`), `frames_shed`
-(a post-drought backlog above 350 ms shed at 30% of each chunk, a subset of
+(a backlog whose offset is above min(depth + 230 ms, 350 ms) shed at 30% of
+each chunk, a subset of
 `frames_trimmed`), `credit_window` (the advertised
 `max_unacked`), `max_unacked_held` (the most chunks one audio channel had
 accepted and not yet released for ACK: our side, normally 1 because acks go
@@ -268,8 +269,12 @@ its slot the chunk arrived) and `depth_ms` (the depth it re-anchored with),
 and each anchor logs `audio_playout_anchor` with `reason` (`start` or
 `resume`), `skipped_ms` (elapsed time jumped over without a write),
 `depth_ms` and `anchors_lifetime`. The wireless VideoOutlet logs
-`video_hold_capped` (`requested_ms`, `cap_ms` 400, `capped_frames`) when the
-offset it follows exceeds its hold cap.
+`video_hold_capped` (`requested_ms`, `cap_ms` 400, `capped_frames`, counted
+when a capped frame is released) when the offset it follows exceeds its hold
+cap, and `video_release_late` (`late_ms`, `late_releases`) when a held frame
+leaves more than 20 ms after its due. `playout_reported_offset_ms` keeps its
+last value when the stream stops; only the history the video lookup uses is
+cleared.
 
 On the wireless playout clock `audio_write_completed.scheduled_ns` and
 `scheduled_end_ns` are the content's arrival-clock times and the additive

@@ -39,12 +39,17 @@ constexpr std::int64_t kPlayoutSustainNs = 2'000'000'000;
 // After an underrun the phone's backlog arrives on top of the refill: judge it
 // after 0.5 s of arrivals (within 4 s of the re-anchor) so it drains well
 // inside the A/V contract's 5 s mean window (Neon P2-3).
-constexpr std::int64_t kPlayoutRecoverySustainNs = 500'000'000;
+constexpr std::int64_t kPlayoutRecoverySustainNs = 250'000'000;
 constexpr std::int64_t kPlayoutRecoveryNs = 4'000'000'000;
-constexpr std::int64_t kPlayoutRecoveryWindowNs = 1'000'000'000;
+constexpr std::int64_t kPlayoutRecoveryWindowNs = 500'000'000;
 // Shed a backlog whose shallowest chunk is this far above the depth (350 ms
 // at the 120 ms default), so the offset stays under the 400 ms video hold cap.
 constexpr std::int64_t kPlayoutShedAboveNs = 230'000'000;
+// ... but never above 350 ms (a 180 ms depth would put 410 ms above the cap).
+constexpr std::int64_t kPlayoutShedCeilingNs = 350'000'000;
+// Re-anchor chunks arriving within this of the re-anchor are one co-arriving
+// group (live stamps differ by microseconds; Neon P2-3 round 4).
+constexpr std::int64_t kPlayoutReanchorGroupNs = 10'000'000;
 // Playout fails closed, like the arrival model's late cap, when a role's
 // arrival clock runs backwards by more than this (N6).
 constexpr std::int64_t kPlayoutBackwardCapNs = 200'000'000;
@@ -421,7 +426,7 @@ struct AudioRouter::Impl final {
     // so the group's spread never reads as drift (DeepSeek F1, N2).
     // `sustained` is false until the window holds kPlayoutSustainNs of
     // arrivals. While the role recovers from an underrun the window is only
-    // the last 1 s and 0.5 s of it sustains, so the one late re-anchor chunk cannot
+    // the last 0.5 s and 0.25 s of it sustains, so the one late re-anchor chunk cannot
     // hold the backlog's drain back for the whole 4 s window (Neon P2-3).
     struct DepthFloor final {
         std::int64_t low;
@@ -440,11 +445,25 @@ struct AudioRouter::Impl final {
             // While recovering, the re-anchor chunk itself says nothing: it
             // sits at the depth by construction (P1-2: it held the floor down
             // for a second before a deep backlog could be shed).
-            if (recovering && at == *state.recovering_since) { continue; }
+            if (recovering && at - *state.recovering_since < kPlayoutReanchorGroupNs) { continue; }
             low = std::min(low, value);
             oldest = std::min(oldest, at);
         }
         return {low, arrival - oldest >= needed};
+    }
+
+    // Largest committed depth inside the window ending at `arrival` (folded
+    // with this run's): the offset estimate (commit_playout).
+    [[nodiscard]] std::int64_t window_max(std::size_t role, std::int64_t arrival,
+                                          std::int64_t depth) const noexcept {
+        const auto& state = playout[role];
+        const bool recovering = state.recovering_since && arrival - *state.recovering_since <= kPlayoutRecoveryNs;
+        const auto span = recovering ? kPlayoutRecoveryWindowNs : config.playout.window.count;
+        std::int64_t high = depth;
+        for (const auto& [at, value] : state.depths) {
+            if (at >= arrival - span) { high = std::max(high, value); }
+        }
+        return high;
     }
 
     // Playout decision for an unplaced run whose back-to-back slot is
@@ -488,7 +507,23 @@ struct AudioRouter::Impl final {
         // buffer is spent down to that floor before it is refilled.
         const auto floor = window_floor(role, arrival, plan.depth_ns);
         const auto pad_floor = depth / 4;
-        if (floor.sustained && floor.low > depth + kPlayoutShedAboveNs) {
+        // The shed protects the video hold cap, which bounds the offset - the
+        // window's largest depth, a group span above the floor with grouped
+        // delivery (DeepSeek N1) - so it is gated on that, and only while the
+        // floor itself is over-full (shedding never thins the latest chunk's
+        // buffer below the trim threshold).
+        const auto shed_above = std::min(depth + kPlayoutShedAboveNs, kPlayoutShedCeilingNs);
+        const auto over_full = depth + config.live_pcm_drift.high_watermark.count;
+        const auto& role_state = playout[role];
+        const bool recovering = role_state.recovering_since
+            && arrival - *role_state.recovering_since <= kPlayoutRecoveryNs;
+        // After an underrun the backlog that follows is expected: the chunks
+        // arriving deep are the ones to shed, and the shallow ones of the
+        // backlog's ramp have already played, so the current chunk's own
+        // buffer is the margin to keep. Otherwise the window's floor is.
+        const bool shed_margin = recovering ? plan.depth_ns > over_full
+                                            : floor.sustained && floor.low > over_full;
+        if (shed_margin && window_max(role, arrival, plan.depth_ns) > shed_above) {
             // A backlog this deep (after a drought) is shed fast, 30% of each
             // chunk, so audio comes back under the 400 ms video hold cap
             // within about a second instead of dwelling above it at 5 ms per
@@ -799,7 +834,7 @@ core::Result<AudioRouter> open_router_with(
             return core::Result<AudioRouter>{Error{ErrorCode::invalid_argument}};
         }
         // Playout keeps the drift trim bounded: never a catch-up.
-        // F13: a disabled live_pcm_drift disables the playout trim and pad too.
+        // Playout keeps its trims bounded: never a catch-up.
         auto bounded = config.live_pcm_drift;
         bounded.catch_up_watermark = core::Nanoseconds{0};
         impl->playout_drift = LivePcmDriftCorrector{bounded, config.output_format.sample_rate_hz};
@@ -945,6 +980,13 @@ core::Result<void> AudioRouter::submit(const protocol::MessageView& message,
             return scripted.error();
         }
         run.pcm = std::move(scripted).value();
+    } else if (impl_->playout_enabled() && chunk.codec == Codec::pcm
+               && chunk.input_format == impl_->config.output_format) {
+        // Playout (wireless): PCM already in the output format is an
+        // identity conversion; skipping the GStreamer push/pull round trip
+        // keeps the render worker's lock short while a post-stall burst is
+        // queued (window 13: video releases waited ~85-200 ms behind it).
+        run.pcm.assign(message.payload.begin(), message.payload.end());
     } else {
         auto decoded = impl_->decoders[index]->decode(chunk);
         if (!decoded.has_value()) {
@@ -1368,12 +1410,20 @@ void AudioRouter::cancel_pending(protocol::ChannelRole role) {
     impl_->reset_playout(role_index(*index));
     if (std::none_of(impl_->playout.begin(), impl_->playout.end(),
                      [](const auto& state) { return state.anchored; })) {
+        // The next stream re-anchors; the stat keeps the last reported value
+        // (a stop no longer reads as a 0 ms offset in the final media_timing).
         impl_->last_reported.reset();
-        impl_->report.stats.playout_reported_offset = {};
     }
     impl_->role_end_frames[role_index(*index)] = impl_->playback_cursor_frames;
     impl_->role_source_frontier_frames[role_index(*index)] = 0;
     ++impl_->generations[role_index(*index)];
+}
+
+bool AudioRouter::playout_anchored() const {
+    if (!impl_) { return false; }
+    std::lock_guard lock(impl_->pending_mutex);
+    return std::any_of(impl_->playout.begin(), impl_->playout.end(),
+                       [](const auto& state) { return state.anchored; });
 }
 
 std::vector<PlayoutEvent> AudioRouter::take_playout_events() {

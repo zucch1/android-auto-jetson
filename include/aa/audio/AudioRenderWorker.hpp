@@ -289,7 +289,11 @@ private:
         std::int64_t end_offset;
     };
     static constexpr std::size_t kPlayoutHistory = 256; // ~11 s of A26 chunks
+    // Guards playout_writes_ only (never held with mutex_ the other way round).
+    mutable std::mutex playout_mutex_;
     std::deque<PlayoutWrite> playout_writes_{};
+    const std::int64_t playout_depth_ns_;
+    void clear_playout_writes();
     std::optional<core::Nanoseconds> step_started_;
     std::optional<core::Nanoseconds> bypass_since_;
     std::uint64_t bypass_epoch_{1};

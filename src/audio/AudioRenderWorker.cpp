@@ -155,7 +155,8 @@ AudioRenderWorker::AudioRenderWorker(RouterConfig config,
     : telemetry_(std::move(telemetry)),
       idle_clock_(std::move(idle_clock)),
       ack_release_timeout_(std::max(std::chrono::milliseconds{1}, ack_release_timeout)),
-      credit_window_(std::clamp<std::uint32_t>(credit.window, 1, AudioCreditPolicy::kMaxWindow)) {
+      credit_window_(std::clamp<std::uint32_t>(credit.window, 1, AudioCreditPolicy::kMaxWindow)),
+      playout_depth_ns_(config.playout.enabled ? config.playout.depth.count : 0) {
     for (std::size_t index = 0; index < credits_.size(); ++index) { seed_credits_locked(index); }
     // Started last: every member above is initialized before run() reads it.
     thread_ = std::thread([this, config = std::move(config), open = std::move(open)] {
@@ -177,19 +178,42 @@ void AudioRenderWorker::seed_credits_locked(std::size_t index) {
 }
 
 std::chrono::nanoseconds AudioRenderWorker::playout_offset_at(core::Nanoseconds content) const {
-    std::lock_guard lock(mutex_);
+    // Its own lock: the render worker holds mutex_ while it submits a
+    // post-stall burst, and the video hold must never wait for that.
+    std::lock_guard lock(playout_mutex_);
     if (playout_writes_.empty()) { return std::chrono::nanoseconds{0}; }
     const auto t = content.count;
-    if (t >= playout_writes_.back().content_end) {
+    // Across output gaps the router may lower the offset by half the gap
+    // (an underrun's skip and refill, a short pause): that is exactly a fall
+    // of one third of the content time the gap spans. The lookup follows the
+    // same model, so video arriving in a gap is never held for the old offset
+    // while the audio it pairs with on resume plays earlier (Neon P1 #1).
+    const auto decayed = [&](const PlayoutWrite& last) {
+        const auto fallen = last.end_offset - (t - last.content_end) / 3;
+        return std::max(fallen, std::min(last.end_offset, playout_depth_ns_));
+    };
+    const auto& newest = playout_writes_.back();
+    if (t >= newest.content_end) {
         // No audio for over a second (stopped without a stop message): no
         // offset to follow; the caller falls back to the depth.
         constexpr std::int64_t kStaleAfterNs = 1'000'000'000;
-        if (t - playout_writes_.back().content_end > kStaleAfterNs) { return std::chrono::nanoseconds{0}; }
-        return std::chrono::nanoseconds{playout_writes_.back().end_offset};
+        if (t - newest.content_end > kStaleAfterNs) { return std::chrono::nanoseconds{0}; }
+        return std::chrono::nanoseconds{decayed(newest)};
     }
     for (auto it = playout_writes_.rbegin(); it != playout_writes_.rend(); ++it) {
         if (t < it->content_start) { continue; }
-        if (t >= it->content_end) { return std::chrono::nanoseconds{it->end_offset}; } // a gap
+        if (t >= it->content_end) {
+            // A recorded gap between this write and the next one: the line
+            // between their offsets (slope >= -1/3, the router's gap credit).
+            const auto next = it.base(); // the write after *it
+            if (next == playout_writes_.end()) { return std::chrono::nanoseconds{decayed(*it)}; }
+            const auto span = std::max<std::int64_t>(1, next->content_start - it->content_end);
+            return std::chrono::nanoseconds{it->end_offset
+                + (next->start_offset - it->end_offset) * (t - it->content_end) / span};
+        }
+        // Inside a write: interpolated across its slew. The A/V contract
+        // compares the chunk's start offset; the two differ by at most half
+        // a chunk of slew (DeepSeek P3-1), and by nothing in steady state.
         const auto span = it->content_end - it->content_start;
         const auto into = t - it->content_start;
         const auto delta = it->end_offset - it->start_offset;
@@ -200,8 +224,13 @@ std::chrono::nanoseconds AudioRenderWorker::playout_offset_at(core::Nanoseconds 
 }
 
 std::chrono::nanoseconds AudioRenderWorker::current_playout_offset() const {
-    std::lock_guard lock(mutex_);
+    std::lock_guard lock(playout_mutex_);
     return std::chrono::nanoseconds{playout_writes_.empty() ? 0 : playout_writes_.back().end_offset};
+}
+
+void AudioRenderWorker::clear_playout_writes() {
+    std::lock_guard lock(playout_mutex_);
+    playout_writes_.clear();
 }
 
 std::uint64_t AudioRenderWorker::max_unacked_held() const {
@@ -355,10 +384,11 @@ void AudioRenderWorker::invalidate(protocol::ChannelRole role, std::uint64_t gen
     if (router_) { router_->cancel_pending(role); }
     seed_credits_locked(*index);
     unacked_[*index] = 0;
-    // The media stream restarts: until it writes again the hold falls back to
-    // the depth rather than a stale offset (P2-4). A guidance overlay ending
-    // keeps media's history, so its offset never steps.
-    if (role == protocol::ChannelRole::media_audio) { playout_writes_.clear(); }
+    // When no stream plays on the playout clock any more the hold falls back
+    // to the depth rather than a stale offset (P2-4), exactly when the router
+    // drops its own slew state; an overlay ending while another stream plays
+    // keeps the history, so the offset never steps.
+    if (!router_ || !router_->playout_anchored()) { clear_playout_writes(); }
     generations_[*index] = generation;
     const auto stale = [&](const auto& entry) {
         return entry.id.role == role && entry.id.generation != generation;
@@ -390,7 +420,7 @@ void AudioRenderWorker::begin_session() {
     unacked_ = {};
     deferred_ = {};
     generations_ = {};
-    playout_writes_.clear();
+    clear_playout_writes();
     last_queue_rejection_.reset();
     frozen_rejection_.reset();
     credit_ledger_.reset();
@@ -763,6 +793,7 @@ void AudioRenderWorker::enter_bypass_locked(const char* trigger) {
     }
     ++bypass_total_;
     cancel_all();
+    clear_playout_writes(); // the router dropped every stream (P2 #4)
     discard_if(queued_, [](const auto&) { return true; });
     credits_ = {};
     std::size_t granted = 0;
@@ -870,6 +901,7 @@ void AudioRenderWorker::run(RouterConfig config, const OpenRouter& open) {
             step_completion_ = value;
             if (playout) {
                 // Only this session's writes feed the video hold (P2-4).
+                std::lock_guard history(playout_mutex_);
                 playout_writes_.push_back({value.scheduled.count - value.playout_offset.count,
                                            value.scheduled_end.count - value.playout_end_offset.count,
                                            value.playout_offset.count, value.playout_end_offset.count});

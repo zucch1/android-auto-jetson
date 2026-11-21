@@ -1155,6 +1155,14 @@ struct WorkerReplay final {
     // for a frame arriving with each chunk.
     std::vector<audio::WriteCompletion> completions{};
     std::vector<std::pair<std::int64_t, std::chrono::nanoseconds>> holds{};
+    // Inside recorded gaps of the last 8 s: (lookup, the line between the
+    // neighbouring writes' offsets, that line's slope x 1000).
+    struct GapSample final {
+        std::int64_t lookup;
+        std::int64_t expected;
+        std::int64_t slope_milli;
+    };
+    std::vector<GapSample> gaps{};
     // After the run: the session reset and the hold fell back to the depth.
     std::chrono::nanoseconds hold_after_reset{};
     std::chrono::nanoseconds offset_after_reset{};
@@ -1269,6 +1277,18 @@ template <typename RoundTrip>
     if (!replay.failure) { (void)service(); }
     replay.max_unacked_held = audio.max_unacked_held();
     replay.playout_offset = audio.current_playout_offset().count();
+    for (std::size_t i = 1; i < completions->size(); ++i) {
+        const auto& a = (*completions)[i - 1];
+        const auto& b = (*completions)[i];
+        const auto a_end = a.scheduled_end.count - a.playout_end_offset.count;
+        const auto b_start = b.scheduled.count - b.playout_offset.count;
+        if (b_start - a_end < 5'000'000 || b_start < last_arrival - 8'000'000'000LL) { continue; }
+        const auto t = a_end + (b_start - a_end) / 2;
+        const auto expected = a.playout_end_offset.count
+            + (b.playout_offset.count - a.playout_end_offset.count) * (t - a_end) / (b_start - a_end);
+        replay.gaps.push_back({audio.playout_offset_at(aa::core::Nanoseconds{t}).count(), expected,
+                               (b.playout_offset.count - a.playout_end_offset.count) * 1000 / (b_start - a_end)});
+    }
     // P2-4: a new session drops the old session's offset; the hold falls back.
     audio.begin_session();
     replay.offset_after_reset = audio.playout_offset_at(aa::core::Nanoseconds{last_arrival});
@@ -1479,6 +1499,59 @@ TEST(WirelessAudioWorker, VideoHoldIsTheOffsetOfTheAudioItPairsWithWhileTheOffse
     EXPECT_LE(worst, 2'000'000) << "hold differs from the paired audio's reported offset";
     // The offset really moved (by three chunk periods).
     EXPECT_GT(highest - lowest, 100'000'000);
+}
+
+
+// Neon P1 #1 (round 4): across an output gap (an underrun's skip and refill)
+// the router may lower the offset by half the gap at once. The video lookup
+// returned the old offset flat across the gap, so frames arriving in it were
+// held for it and the down-slew floor kept the first frames after the resume
+// up to ~160 ms too long. It now draws the router's own line across the gap
+// (slope >= -1/3 of content time, which is what half the output gap is).
+TEST(WirelessAudioWorker, PlayoutOffsetLookupFollowsTheRouterAcrossGaps) {
+    const auto replay = replay_through_worker(16, [](std::int64_t second) {
+        return second == 10 ? std::int64_t{800} : std::int64_t{20};
+    }, 3);
+    ASSERT_FALSE(replay.failure) << aa::to_string(*replay.failure);
+    ASSERT_GE(replay.stats.playout_underruns, 1U);
+    ASSERT_FALSE(replay.gaps.empty());
+    bool fell = false;
+    for (const auto& gap : replay.gaps) {
+        EXPECT_NEAR(static_cast<double>(gap.lookup), static_cast<double>(gap.expected), 1e6);
+        EXPECT_GE(gap.slope_milli, -334);
+        fell = fell || gap.slope_milli < 0;
+    }
+    EXPECT_TRUE(fell) << "no gap lowered the offset";
+}
+
+// Neon P2 #4 (round 4): the history the video hold reads is dropped exactly
+// when no stream plays on the playout clock any more (as the router drops its
+// own slew state), not by channel: a guidance stream playing alone and
+// stopping leaves no stale offset, and media stopping while guidance plays
+// keeps guidance's.
+TEST(WirelessAudioWorker, PlayoutHistoryClearsWhenNoStreamIsAnchored) {
+    auto gate = std::make_shared<SinkGate>();
+    audio::AudioRenderWorker audio{quiet_wireless_config(), {}, fake_router(gate)};
+    ASSERT_TRUE(audio.ready());
+    const auto guidance = proto::ChannelRole::guidance_audio;
+    const auto media = proto::ChannelRole::media_audio;
+    const std::vector<std::byte> voice(6400, std::byte{0x10});
+    const aa::core::Nanoseconds t0{1'000'000'000};
+    ASSERT_TRUE(audio.submit({{guidance, 1, t0}, voice}, {guidance, 0, 1, 1}));
+    ASSERT_TRUE(audio.wait_idle(std::chrono::steady_clock::now() + std::chrono::seconds{2}));
+    EXPECT_GT(audio.playout_offset_at(t0).count(), 0);
+    audio.invalidate(guidance, 1); // guidance alone stops
+    EXPECT_EQ(audio.playout_offset_at(t0).count(), 0);
+
+    const aa::core::Nanoseconds t1{3'000'000'000};
+    ASSERT_TRUE(audio.submit({{guidance, 2, t1}, voice}, {guidance, 1, 2, 1}));
+    ASSERT_TRUE(audio.submit({{media, 3, t1}, pcm_chunk_2048()}, {media, 0, 3, 1}));
+    ASSERT_TRUE(audio.wait_idle(std::chrono::steady_clock::now() + std::chrono::seconds{2}));
+    ASSERT_GT(audio.playout_offset_at(t1).count(), 0);
+    audio.invalidate(media, 1); // media stops; guidance still plays
+    EXPECT_GT(audio.playout_offset_at(t1).count(), 0);
+    audio.stop();
+    EXPECT_TRUE(audio.finish());
 }
 
 } // namespace

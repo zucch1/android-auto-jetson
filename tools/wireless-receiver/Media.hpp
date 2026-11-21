@@ -136,7 +136,8 @@ struct Media final {
     // plays with (audio_write_completed's playout_offset_ns), not the
     // configured buffer: a phone delivering in groups makes audio play later
     // than the buffer, and the hold follows. `fallback` (the configured
-    // depth) holds video until the first playout audio write.
+    // depth) holds video until the first playout audio write and after a
+    // second without one (a pause without a stop message).
     void match_video_to_audio(std::chrono::nanoseconds fallback) {
         video.set_presentation_delay_source([this, fallback](core::Nanoseconds content) {
             const auto offset = audio.playout_offset_at(content);

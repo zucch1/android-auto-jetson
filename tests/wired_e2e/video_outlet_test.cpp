@@ -2453,23 +2453,34 @@ TEST(WiredReceiver, PresentationDelayDownwardStepNeverPinsFrames) {
 }
 
 // Neon P1-2 / DeepSeek R1: a hold above the cap is clamped, never silently:
-// every capped frame is counted and logged.
+// every frame released with a capped hold is counted and logged (at release,
+// from the audio known then; Neon P3 round 4).
 TEST(WiredReceiver, PresentationDelayCapIsCountedAndLogged) {
     using namespace std::chrono_literals;
+    auto now = std::chrono::steady_clock::time_point{} + 800s;
     std::vector<std::string> media;
     VideoOutlet outlet{[](const std::string&) {}, [&](std::string_view, const std::string& line) {
         media.push_back(line);
     }};
+    VideoOutlet::IdrRecoveryHooks hooks;
+    hooks.clock = [&] { return now; };
+    outlet.set_idr_recovery(std::move(hooks));
     auto pair = videotest::make_pair({});
     ASSERT_TRUE(pair);
     outlet.install(std::move(pair.value().producer));
     outlet.set_presentation_delay_source([](aa::core::Nanoseconds) { return std::chrono::nanoseconds{600ms}; });
     ASSERT_TRUE(outlet.on_message({p::MessageHeader{p::ChannelRole::video, 1, aa::core::Nanoseconds{1}},
                                    wiredtest::kVideoIdr}));
+    EXPECT_EQ(outlet.capped_holds(), 0U);
+    now += 399ms;
+    ASSERT_TRUE(outlet.release_held());
+    EXPECT_EQ(outlet.capped_holds(), 0U);
+    now += 1ms;
+    ASSERT_TRUE(outlet.release_held());
     EXPECT_EQ(outlet.capped_holds(), 1U);
-    ASSERT_FALSE(media.empty());
-    EXPECT_NE(media.back().find("{\"event\":\"video_hold_capped\",\"requested_ms\":600,\"cap_ms\":400,"),
-              std::string::npos) << media.back();
+    EXPECT_NE(std::find_if(media.begin(), media.end(), [](const std::string& line) {
+        return line.find("{\"event\":\"video_hold_capped\",\"requested_ms\":600,\"cap_ms\":400,") != std::string::npos;
+    }), media.end());
 }
 
 // F12 / N4: a replacement consumer does not receive frames held for the old one.
@@ -2546,6 +2557,83 @@ TEST(WiredReceiver, ReleaseHeldNeedsNoSessionAndDefersItsIdrRequest) {
     EXPECT_FALSE(outlet.has_pending());
     ASSERT_TRUE(outlet.service_pending());
     EXPECT_EQ(idr_requests, 1U);
+}
+
+} // namespace
+
+namespace {
+
+// Neon P1 #2 (round 4): release_held() defers the IDR request a waiting_idr
+// drop makes. When the batch it releases also carries the keyframe, the
+// episode closes there, and the deferred request is obsolete: dispatching it
+// later reopened a phantom waiting_idr episode and sent a spurious request.
+TEST(WiredReceiver, ReleaseHeldKeyframeInTheBatchCancelsTheDeferredIdrRequest) {
+    using namespace std::chrono_literals;
+    auto now = std::chrono::steady_clock::time_point{} + 900s;
+    std::size_t idr_requests = 0;
+    std::vector<std::string> logs;
+    VideoOutlet outlet{[&](const std::string& line) { logs.push_back(line); }};
+    outlet.set_idr_recovery({
+        [] { return true; },
+        [&idr_requests]() -> aa::core::Result<void> { ++idr_requests; return {}; },
+        [&now] { return now; },
+    });
+    auto pair = videotest::make_pair({});
+    ASSERT_TRUE(pair);
+    outlet.install(std::move(pair.value().producer));
+    outlet.set_presentation_delay(120ms);
+    now += 2s; // past the IDR startup grace: a dropped non-IDR asks for one
+    const auto profile = p::VideoProfile{1920, 1080, 60, p::VideoCodec::h265};
+    p::MessageHeader hdr{p::ChannelRole::video, 1, {100}};
+    hdr.video_profile = profile;
+    hdr.video_session = 1;
+    hdr.video_generation = 1;
+    ASSERT_TRUE(outlet.on_message({hdr, make_h265_au(false, 1024, std::byte{0x22})})); // non-IDR
+    ++hdr.sequence;
+    ASSERT_TRUE(outlet.on_message({hdr, make_h265_au(true, 1024, std::byte{0x10})}));  // IDR
+    now += 120ms;
+    ASSERT_TRUE(outlet.release_held());
+    ASSERT_TRUE(receive_complete_au(pair.value().consumer).has_value());
+    const auto waits_before = std::count_if(logs.begin(), logs.end(), [](const std::string& line) {
+        return line.find("\"event\":\"idr_wait_started\"") != std::string::npos;
+    });
+    ASSERT_TRUE(outlet.service_pending());
+    EXPECT_EQ(idr_requests, 0U);
+    const auto waits_after = std::count_if(logs.begin(), logs.end(), [](const std::string& line) {
+        return line.find("\"event\":\"idr_wait_started\"") != std::string::npos;
+    });
+    EXPECT_EQ(waits_after, waits_before);
+}
+
+// Window 13: a frame that leaves more than 20 ms after its due is counted and
+// logged (video_release_late), so the next window shows any release stall.
+TEST(WiredReceiver, LateReleaseIsCountedAndLogged) {
+    using namespace std::chrono_literals;
+    auto now = std::chrono::steady_clock::time_point{} + 1000s;
+    std::vector<std::string> media;
+    VideoOutlet outlet{[](const std::string&) {}, [&](std::string_view, const std::string& line) {
+        media.push_back(line);
+    }};
+    VideoOutlet::IdrRecoveryHooks hooks;
+    hooks.clock = [&] { return now; };
+    outlet.set_idr_recovery(std::move(hooks));
+    auto pair = videotest::make_pair({});
+    ASSERT_TRUE(pair);
+    outlet.install(std::move(pair.value().producer));
+    outlet.set_presentation_delay(120ms);
+    ASSERT_TRUE(outlet.on_message({p::MessageHeader{p::ChannelRole::video, 1, aa::core::Nanoseconds{1}},
+                                   wiredtest::kVideoIdr}));
+    now += 125ms; // 5 ms late: fine
+    ASSERT_TRUE(outlet.release_held());
+    EXPECT_EQ(outlet.late_releases(), 0U);
+    ASSERT_TRUE(outlet.on_message({p::MessageHeader{p::ChannelRole::video, 2, aa::core::Nanoseconds{2}},
+                                   wiredtest::kVideoIdr}));
+    now += 205ms; // 85 ms late, as in window 13
+    ASSERT_TRUE(outlet.release_held());
+    EXPECT_EQ(outlet.late_releases(), 1U);
+    EXPECT_NE(std::find_if(media.begin(), media.end(), [](const std::string& line) {
+        return line.find("{\"event\":\"video_release_late\",\"late_ms\":85,") != std::string::npos;
+    }), media.end());
 }
 
 } // namespace
