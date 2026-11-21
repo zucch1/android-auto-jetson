@@ -37,7 +37,9 @@ struct HandoffEligibilityCoordinator::Impl {
     std::optional<helper::ApSnapshot> snapshot;
     std::uint64_t handle{}, retired_handle{};
     bool active{}, completed{}, confirming{};
-    // 950ms evidence + <=25ms owner scheduling + <=25ms synchronous stop <=1s.
+    bool reactivated_parked_denial{};
+    // Evidence expires after 950 ms. Retirement closes admission before waiting
+    // for helper work, whose reconnect budget is documented on retire().
     Clock::time_point expires{Clock::time_point::max()}, establishment{}, grace{Clock::time_point::max()};
     // From the first observation of `handle`: the bootstrap's own budget (#161).
     Clock::time_point bootstrap_until{};
@@ -103,9 +105,12 @@ struct HandoffEligibilityCoordinator::Impl {
     }
     void deny_observed_binding(helper::Source bound_source, std::uint64_t bound) {
         retired_handle = bound;
-        // Successful observation proves a live binding even after auth failures parked the deny.
-        if (!denial || denial->job.source != bound_source || denial->job.handle != bound || denial->parked())
-            denial = Denial{{Operation::deny, epoch.load(), bound_source, bound}};
+        if (denial && denial->job.source == bound_source && denial->job.handle == bound) {
+            // Successful observation can recover a parked denial once per attempt.
+            if (!denial->parked() || reactivated_parked_denial) return;
+            reactivated_parked_denial = true;
+        }
+        denial = Denial{{Operation::deny, epoch.load(), bound_source, bound}};
     }
     // A stale observation may still name a handle: PollBootstrapV1 bound the phone's live
     // bootstrap to this attempt's source before the attempt was retired. It is denied like any
@@ -140,6 +145,7 @@ struct HandoffEligibilityCoordinator::Impl {
             const auto& observed = reply.result.value();
             if (observed.peer.handle == retired_handle && denial && denial->job.handle == retired_handle) {
                 deny_observed_binding(reply.job.source, observed.peer.handle);
+                if (denial->parked()) { retire(); return; }
                 // Keep the establishment deadline while waiting for the old binding to clear.
                 stage = Stage::clearing_retired;
                 return;
@@ -233,6 +239,7 @@ void HandoffEligibilityCoordinator::begin(helper::Source source) {
     impl_->retire();
     if (!source.generation || !impl_->consumer || impl_->consumer->value != source.generation) return;
     ++impl_->epoch;
+    impl_->reactivated_parked_denial = false;
     impl_->source = source;
     impl_->stage = Impl::Stage::observing;
     impl_->establishment = Clock::now() + impl_->timing.establishment;

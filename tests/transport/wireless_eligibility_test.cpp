@@ -513,6 +513,38 @@ TEST(WirelessEligibility, SustainedRejectionParksTheDenial) {
     EXPECT_EQ(f.denial_attempts.load(), 3U);
     EXPECT_EQ(f.denied_handle.load(), f.peer.handle);
 }
+TEST(WirelessEligibility, ParkedDenialReactivatesAtMostOncePerAttempt) {
+    VirtualClock clock;
+    EligibilityFixture f;
+    f.start();
+    ASSERT_TRUE(f.eventually([&] { return f.coordinator.admitting(); }));
+    f.reject_denials = true;
+    f.coordinator.retire();
+    f.coordinator.retire();
+    ASSERT_EQ(f.denial_attempts.load(), 2U);
+    ASSERT_EQ(f.denial_workers.load(), 0U);
+
+    for (unsigned attempt = 1; attempt <= 2; ++attempt) {
+        SCOPED_TRACE(attempt);
+        const auto prior_observations = f.initial_observations.load();
+        const auto prior_denials = f.denial_attempts.load();
+        const auto prior_workers = f.denial_workers.load();
+        f.start();
+        const auto attempt_epoch = f.coordinator.epoch();
+        ASSERT_TRUE(f.eventually([&] {
+            if (f.coordinator.epoch() != attempt_epoch || f.denial_attempts.load() > prior_denials + 2)
+                return true;
+            clock.advance(25ms);
+            return false;
+        }));
+        ASSERT_NE(f.coordinator.epoch(), attempt_epoch) << "the stale handle kept the attempt polling";
+        EXPECT_EQ(f.initial_observations.load(), prior_observations + 2);
+        EXPECT_EQ(f.denial_attempts.load(), prior_denials + 2);
+        EXPECT_EQ(f.denial_workers.load(), prior_workers + 2);
+        EXPECT_EQ(f.denials_in_flight.load(), 0U);
+        EXPECT_FALSE(f.coordinator.admitting());
+    }
+}
 TEST(WirelessEligibility, NewObservationSupersedesAnOutstandingDenial) {
     VirtualClock clock;
     EligibilityFixture f;
