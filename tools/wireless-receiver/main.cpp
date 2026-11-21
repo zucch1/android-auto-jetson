@@ -266,7 +266,16 @@ int receiver_main(int argc, char** argv) {
     }
     // Held frames leave at their due on the outlet's own timer, not only
     // when the owner thread next reaches a checkpoint (window 14).
-    if (follow || video_hold.count() > 0) { media.video.start_release_timer(); }
+    if (follow || video_hold.count() > 0) {
+        try {
+            media.video.start_release_timer();
+        } catch (const std::system_error&) {
+            // Thread creation failed (EAGAIN under thread or memory limits).
+            report("video release timer", ErrorCode::internal);
+            log_line("{\"event\":\"video_release_timer_error\",\"reason\":\"start_failed\"}");
+            return 3;
+        }
+    }
     // video_delay_ms is always a number: the fixed hold, or the hold used
     // until the first playout write when video_hold is "match".
     log_line("{\"event\":\"wireless_media_policy\",\"audio_playout_ms\":" +

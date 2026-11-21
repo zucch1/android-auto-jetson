@@ -275,7 +275,10 @@ cap, and `video_release_late` (`late_ms`, `late_releases`, `by`: the path that
 released it, `timer`, `checkpoint`, `arrival` or `service`, and
 `checkpoint_gap_ms`: how long the owner thread's checkpoint had not run) when
 a held frame leaves more than 20 ms after its due. Held frames are released
-by the outlet's own timer thread at their due, and also at checkpoints. `playout_reported_offset_ms` keeps its
+by the outlet's own timer thread at their due, and also at checkpoints; a
+delivery error on the timer is returned by the session's next outlet call, and
+`video_release_timer_error` (`reason`: `exception` or `start_failed`) records
+a timer that threw or could not start. `playout_reported_offset_ms` keeps its
 last value when the stream stops; only the history the video lookup uses is
 cleared.
 

@@ -139,9 +139,12 @@ Policy (wired is unchanged: stop-and-wait and the arrival model with the
   frame's, so a frame is never pinned behind another. Across a gap in the
   audio (an underrun, a short pause) the lookup follows the router's own
   model: the line between the offsets either side, and, while the gap is
-  still open, a fall of half the content time past the last write, down to
-  the depth (the router's clamp: it may lower the offset by half the content
-  gap at once, toward the depth it re-anchors with). Until the first
+  still open, a fall of a third of the content time past the last write,
+  down to the depth. That is the router's clamp: it may lower the offset by
+  half the output gap at once (its times are output-clock times), and with
+  the drop d and content gap cg = og + d, d <= og/2 is d <= cg/3. (Round 5
+  briefly used half the content time, a misreading that released frames in
+  an open gap up to ~90 ms early; round 6 reverted it.) Until the first
   playout audio write, and after a second without audio (a pause without a
   stop message, including one already recorded: video latency then drops to
   the depth and climbs back on resume, with no audio to pair), it holds for

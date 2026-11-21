@@ -211,7 +211,8 @@ public:
         const DeferredMedia logs{*this};
         std::unique_lock lock(mutex_);
         last_checkpoint_ = now_locked();
-        // A release the timer thread could not complete fails the session here.
+        // A release the timer thread could not complete fails the session
+        // here (or in on_message() / service_pending(), whichever runs first).
         if (release_error_) { return std::exchange(release_error_, std::nullopt).value(); }
         if (idr_dispatching_.load(std::memory_order_acquire) || delayed_.empty()) { return {}; }
         const DeferIdr defer{defer_idr_};
@@ -248,6 +249,9 @@ public:
     [[nodiscard]] core::Result<void> service_pending() {
         const DeferredMedia logs{*this};
         std::unique_lock lock(mutex_);
+        // A timer release that failed is surfaced by whichever entry point
+        // runs first, before anything after the failed frame is released.
+        if (release_error_) { return std::exchange(release_error_, std::nullopt).value(); }
         if (idr_dispatching_.load(std::memory_order_acquire)) { return {}; }
         if (deferred_idr_reason_) {
             const auto reason = std::exchange(deferred_idr_reason_, std::nullopt);
@@ -275,6 +279,7 @@ public:
         std::lock_guard lock(mutex_);
         clear_delayed_locked("reset");
         clear_pending_locked(/*abandon_partial=*/true, "reset");
+        release_error_.reset();
         idr_coordinator_.reset();
         deferred_idr_reason_.reset();
         last_released_.reset();
@@ -290,6 +295,7 @@ public:
     [[nodiscard]] core::Result<void> on_message(const protocol::MessageView& message) override {
         const DeferredMedia logs{*this};
         std::unique_lock lock(mutex_);
+        if (release_error_) { return std::exchange(release_error_, std::nullopt).value(); }
         const auto now = now_locked();
         const bool holding = delay_source_ || delay_.count() > 0;
         if (!holding && delayed_.empty()) { return deliver_locked(lock, message); }
@@ -423,6 +429,7 @@ public:
         if (producer_.has_value()) { clear_delayed_locked("consumer_replaced"); }
         deferred_idr_reason_.reset();
         last_released_.reset();
+        release_error_.reset(); // the timer's error belonged to the old consumer
         clear_pending_locked(/*abandon_partial=*/false, "consumer_replaced");
         // Endpoint events fire once per access unit (audit L13), so they are media
         // telemetry: rate-limited and never waiting for the sink. The producer only
@@ -458,6 +465,7 @@ public:
         std::lock_guard lock(mutex_);
         clear_delayed_locked("closed");
         clear_pending_locked(/*abandon_partial=*/false, "closed");
+        release_error_.reset();
         deferred_idr_reason_.reset();
         last_released_.reset();
         emit_drops(true);
@@ -565,7 +573,9 @@ private:
                     defer_media("video_release_late", "{\"event\":\"video_release_late\",\"late_ms\":" +
                           ms(now - due) + ",\"late_releases\":" + std::to_string(late_releases_) +
                           ",\"by\":\"" + by + "\",\"checkpoint_gap_ms\":" +
-                          (last_checkpoint_ ? ms(now - *last_checkpoint_) : std::string{"null"}) + "}");
+                          (last_checkpoint_ ? ms(std::max(now - *last_checkpoint_,
+                                                           std::chrono::steady_clock::duration::zero()))
+                                            : std::string{"null"}) + "}");
                 }
             }
             if (auto released = release_front_locked(lock, hold); !released) { return released.error(); }
@@ -610,7 +620,12 @@ private:
         std::unique_lock lock(mutex_);
         while (!release_stop_) {
             const auto now = now_locked();
-            if (release_error_ || delayed_.empty() || idr_dispatching_.load(std::memory_order_acquire)) {
+            if (delayed_.empty()) {
+                // Idle until a frame is held (on_message notifies) or stop.
+                release_cv_.wait(lock, [&] { return release_stop_ || !delayed_.empty(); });
+                continue;
+            }
+            if (release_error_ || idr_dispatching_.load(std::memory_order_acquire)) {
                 release_cv_.wait_for(lock, kReleaseTimerSlice);
                 continue;
             }
@@ -622,11 +637,21 @@ private:
                                                due - now, kReleaseTimerSlice));
                 continue;
             }
-            {
+            // A throw (an allocation in the delivery path) must not reach
+            // std::terminate from this thread: it is latched as a typed error
+            // for the session, like a delivery error, and logged.
+            try {
                 const DeferIdr defer{defer_idr_};
                 if (auto released = release_due_locked(lock, now, "timer"); !released) {
                     release_error_ = released.error();
                 }
+            } catch (...) {
+                if (!lock.owns_lock()) { lock.lock(); }
+                release_error_ = Error{ErrorCode::internal};
+                try {
+                    defer_media("video_release_timer_error",
+                                "{\"event\":\"video_release_timer_error\",\"reason\":\"exception\"}");
+                } catch (...) {}
             }
             if (!deferred_media_.empty()) {
                 lock.unlock();

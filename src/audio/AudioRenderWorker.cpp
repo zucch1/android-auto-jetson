@@ -183,15 +183,18 @@ std::chrono::nanoseconds AudioRenderWorker::playout_offset_at(core::Nanoseconds 
     std::lock_guard lock(playout_mutex_);
     if (playout_writes_.empty()) { return std::chrono::nanoseconds{0}; }
     const auto t = content.count;
-    // Across a gap the router may lower the offset by half the content gap
-    // at once (its clamp is previous_offset - (scheduled - previous_end) / 2,
-    // both content times: an underrun's skip and refill, a short pause),
-    // toward the depth it re-anchors with. The lookup predicts exactly that,
-    // so video arriving in a gap is never held for the old offset while the
-    // audio it pairs with on resume plays earlier (Neon P1 #1, DeepSeek
-    // P3-1).
+    // Across a gap the router may lower the offset by half the OUTPUT gap at
+    // once: its clamp is previous_offset - (scheduled - previous_end) / 2,
+    // and scheduled/previous_end are output-clock times (an underrun's skip
+    // and refill, a short pause). In content time, with the drop d and
+    // content gap cg = og + d, d <= og / 2 is d <= cg / 3: a fall of a third
+    // of the content time past the last write, toward the depth it
+    // re-anchors with. The lookup predicts exactly that, so video arriving in
+    // a gap is never held for the old offset while the audio it pairs with
+    // on resume plays earlier (Neon P1 #1; round 6 Neon P2-1 reverted a
+    // misread 1/2).
     const auto decayed = [&](const PlayoutWrite& last) {
-        const auto fallen = last.end_offset - (t - last.content_end) / 2;
+        const auto fallen = last.end_offset - (t - last.content_end) / 3;
         return std::max(fallen, std::min(last.end_offset, playout_depth_ns_));
     };
     // Past this, a gap is a pause, not an underrun: no offset to follow, and
@@ -914,9 +917,11 @@ void AudioRenderWorker::run(RouterConfig config, const OpenRouter& open) {
             last_completion_ = value;
             step_completion_ = value;
             // Only this session's writes feed the video hold (P2-4), and
-            // not one that completes after bypass or after every stream was
-            // cancelled (invalidate() already cleared the history: Neon
-            // P1-2). The router released its lock before this callback.
+            // not one that completes after bypass or after the last stream
+            // was cancelled (invalidate() already cleared the history: Neon
+            // P1-2). The gate is router-wide: a cancelled role's in-flight
+            // write still lands while another stream plays (DeepSeek T8).
+            // The router released its lock before this callback.
             if (playout && !bypass_since_ && router_ && router_->playout_anchored()) {
                 std::lock_guard history(playout_mutex_);
                 playout_writes_.push_back({value.scheduled.count - value.playout_offset.count,

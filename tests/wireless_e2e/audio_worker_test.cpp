@@ -1521,11 +1521,12 @@ TEST(WirelessAudioWorker, VideoHoldIsTheOffsetOfTheAudioItPairsWithWhileTheOffse
 
 
 // Neon P1 #1 (round 4): across an output gap (an underrun's skip and refill)
-// the router may lower the offset by half the content gap at once. The video
+// the router may lower the offset by half the output gap at once. The video
 // lookup returned the old offset flat across the gap, so frames arriving in it
 // were held for it and the down-slew floor kept the first frames after the
 // resume up to ~160 ms too long. It now draws the router's own line across the
-// gap (slope >= -1/2 of content time: the router's clamp, DeepSeek P3-1).
+// gap (slope >= -1/3 of content time, which is what half the output gap is:
+// d <= og/2 with cg = og + d).
 TEST(WirelessAudioWorker, PlayoutOffsetLookupFollowsTheRouterAcrossGaps) {
     const auto replay = replay_through_worker(16, [](std::int64_t second) {
         return second == 10 ? std::int64_t{800} : std::int64_t{20};
@@ -1536,21 +1537,22 @@ TEST(WirelessAudioWorker, PlayoutOffsetLookupFollowsTheRouterAcrossGaps) {
     bool fell = false;
     for (const auto& gap : replay.gaps) {
         EXPECT_NEAR(static_cast<double>(gap.lookup), static_cast<double>(gap.expected), 1e6);
-        EXPECT_GE(gap.slope_milli, -500);
+        EXPECT_GE(gap.slope_milli, -334);
         fell = fell || gap.slope_milli < 0;
     }
     EXPECT_TRUE(fell) << "no gap lowered the offset";
 }
 
-// DeepSeek P3-1 (round 5): while a gap is still open the lookup predicts the
-// router's own clamp, a fall of half the content gap toward the depth (it
-// modelled a third, holding up to cg/6 too long).
-TEST(WirelessAudioWorker, PlayoutOffsetLookupInAnOpenGapFallsByHalfTheContentGap) {
+// While a gap is still open the lookup predicts the router's own clamp: half
+// the output gap, a third of the content gap, toward the depth (round 6, Neon
+// P2-1: the round-5 1/2 misread the clamp's output-clock times as content
+// times and released frames in an open gap up to ~90 ms early).
+TEST(WirelessAudioWorker, PlayoutOffsetLookupInAnOpenGapFallsByAThirdOfTheContentGap) {
     const auto replay = replay_through_worker(8, [](std::int64_t) { return std::int64_t{20}; }, 4);
     ASSERT_FALSE(replay.failure) << aa::to_string(*replay.failure);
     const auto [lookup, end_offset] = replay.open_gap;
     ASSERT_GT(end_offset, 170'000'000) << "grouped delivery should hold the offset above depth + 50 ms";
-    EXPECT_NEAR(static_cast<double>(lookup), static_cast<double>(end_offset - 50'000'000), 1e6);
+    EXPECT_NEAR(static_cast<double>(lookup), static_cast<double>(end_offset - 100'000'000 / 3), 1e6);
 }
 
 // Neon P1-1 (round 5): a pause without a stop message leaves the history in

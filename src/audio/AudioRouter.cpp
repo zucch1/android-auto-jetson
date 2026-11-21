@@ -1955,8 +1955,10 @@ core::Result<RenderStep> AudioRouter::render_step() {
             //
             // last_reported is shared with cancel_pending() on the session
             // thread, so it is read and written under pending_mutex (Neon
-            // P1-2), and a write that completes after every stream was
-            // cancelled no longer seeds the next stream's slew. The lock is
+            // P1-2), and a write that completes after the last stream was
+            // cancelled (no role anchored; the gate is router-wide, as
+            // cancel_pending's reset is) no longer seeds the next stream's
+            // slew. The lock is
             // released again before on_write_completed: that callback takes
             // the render worker's mutex, which is ordered before this one.
             const auto target = std::max<std::int64_t>(0, playout_offset_ns);
