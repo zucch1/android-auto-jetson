@@ -23,6 +23,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 import unittest.mock
 from datetime import datetime, timezone
@@ -412,10 +413,14 @@ class GateTransportTests(unittest.TestCase):
         record.update(fields)
         return record
 
-    def check(self, record: dict, name: str, phone_id: int | None = None) -> str | None:
+    def check(self, record: dict, name: str, phone_id: int | None = None,
+              ap_interface: str | None = None) -> str | None:
+        if name == "wireless" and ap_interface is None:
+            ap_interface = "wlan0"
         return smoke.check_record(record, receiver_sha256="a" * 64, display_sha256="b" * 64,
                                   phone_serial="SER", now=datetime.now(timezone.utc),
-                                  transport_name=name, phone_id=phone_id)[0]
+                                  transport_name=name, phone_id=phone_id,
+                                  ap_interface=ap_interface)[0]
 
     CLEAN = {"readable": True, "phone_attached": False, "aoa_attached": False}
 
@@ -426,7 +431,8 @@ class GateTransportTests(unittest.TestCase):
         return link
 
     def wireless(self, **fields) -> dict:
-        return self.record(**{"transport": "wireless", "phone_id": 1, "link": self.link(), **fields})
+        return self.record(**{"transport": "wireless", "phone_id": 1, "ap_interface": "wlan0",
+                              "ap_channel": 36, "link": self.link(), **fields})
 
     def test_matching_transport_admits(self) -> None:
         self.assertIsNone(self.check(self.wireless(), "wireless", 1))
@@ -438,7 +444,8 @@ class GateTransportTests(unittest.TestCase):
         aoa = dict(self.CLEAN, aoa_attached=True)
         unreadable = {"readable": False, "phone_attached": None, "aoa_attached": None}
         cases = {
-            "no link": self.record(transport="wireless", phone_id=1),
+            "no link": self.record(transport="wireless", phone_id=1, ap_interface="wlan0",
+                                   ap_channel=36),
             "link not an object": self.wireless(link=[]),
             "adb unbound": self.wireless(link=self.link(adb_bound=False)),
             "adb_bound not a bool": self.wireless(link=self.link(adb_bound="yes")),
@@ -1041,6 +1048,871 @@ class SoakChainTransportTests(unittest.TestCase):
                                          "--drive-smoke", "d", "--media-uri", "u",
                                          "--media-component", "p/.a", "--transport", "wireless",
                                          "--phone-id", "7", "--store", "/s/approved-phones.json"]), 2)
+
+
+class Issue171StartupBudgetAndApTests(unittest.TestCase):
+    """Issue #171 and PR #184 Sol review fixes (P2 startup budget, v3 schema, P3 AP & CLI bounds)."""
+
+    @staticmethod
+    def _wireless_record(**fields) -> dict:
+        gate = GateTransportTests()
+        return gate.wireless(**fields)
+
+    @staticmethod
+    def _live_wireless_capture(ap_interface: str | None = "wlan0",
+                               ap_channel: int | None = 44,
+                               *, origin: str = "live") -> dict:
+        perf_tests = str(ROOT / "tests" / "perf")
+        if perf_tests not in sys.path:
+            sys.path.insert(0, perf_tests)
+        import test_v3_av_contract as v3_contract  # noqa: E402
+        capture = v3_contract.v3(seconds=30)
+        capture["mode"] = "wireless"
+        capture["measurement_origin"] = origin
+        capture["startup_wait_seconds"] = 1.2
+        capture["active_projection_seconds"] = 30.0
+        capture["link"] = {
+            "phone_id": 7,
+            "adb_bound": True,
+            "before": None,
+            "after": None,
+            "host_usb": {
+                "before": GateTransportTests.CLEAN,
+                "during": [GateTransportTests.CLEAN],
+                "after": GateTransportTests.CLEAN,
+            },
+        }
+        if ap_interface is not None:
+            capture["ap_interface"] = ap_interface
+        if ap_channel is not None:
+            capture["ap_channel"] = ap_channel
+        return capture
+
+    def test_derived_wireless_startup_budget_includes_post_tcp_negotiation_and_wired_unchanged(self) -> None:
+        # Wired budgets stay strictly unchanged at 25 s (smoke) and 60 s (collector).
+        self.assertEqual(smoke.READY_TIMEOUT_S, 25.0)
+        self.assertEqual(collect._PROJECTION_STARTUP_TIMEOUT_SECONDS, 60)
+        self.assertEqual(smoke.startup_budget("wired", None), 25.0)
+        self.assertEqual(collect.startup_timeout_seconds("wired", None), 60)
+
+        # Derived wireless floor must include: attempt1 (15) + backoff cap (5) + attempt2 (15)
+        # + bootstrap (40) + connect (5) + post-TCP negotiation (10, WirelessLink.cpp:58)
+        # + 2x helper RPC bounds (4 * 1 s per admission, BusClient.cpp)
+        # + ready poll (5) + display probe fallback (5) + safety margin -> 120 s floor.
+        self.assertEqual(transport.WIRELESS_ADMISSION_ATTEMPT_S, 15)
+        self.assertEqual(transport.WIRELESS_BACKOFF_CAP_S, 5)
+        self.assertEqual(transport.WIRELESS_BOOTSTRAP_S, 40)
+        self.assertEqual(transport.WIRELESS_CONNECT_S, 5)
+        self.assertEqual(transport.WIRELESS_NEGOTIATION_S, 10)
+        self.assertEqual(transport.WIRELESS_HELPER_RPC_S, 1)
+        self.assertEqual(transport.WIRELESS_ADMISSION_HELPER_S, 4)
+        self.assertEqual(transport.WIRELESS_READY_POLL_S, 5)
+        self.assertEqual(transport.WIRELESS_DISPLAY_PROBE_S, 5)
+        self.assertGreater(transport.WIRELESS_STARTUP_MARGIN_S, 0)
+        expected_floor = (
+            transport.WIRELESS_ADMISSION_ATTEMPT_S
+            + transport.WIRELESS_BACKOFF_CAP_S
+            + transport.WIRELESS_ADMISSION_ATTEMPT_S
+            + transport.WIRELESS_BOOTSTRAP_S
+            + transport.WIRELESS_CONNECT_S
+            + transport.WIRELESS_NEGOTIATION_S
+            + 2 * transport.WIRELESS_ADMISSION_HELPER_S
+            + transport.WIRELESS_READY_POLL_S
+            + transport.WIRELESS_DISPLAY_PROBE_S
+            + transport.WIRELESS_STARTUP_MARGIN_S
+        )
+        self.assertEqual(transport.WIRELESS_STARTUP_BUDGET_S, expected_floor)
+        self.assertEqual(transport.WIRELESS_STARTUP_BUDGET_S, 120)
+        self.assertEqual(smoke.WIRELESS_STARTUP_BUDGET_S, float(transport.WIRELESS_STARTUP_BUDGET_S))
+        self.assertEqual(collect.WIRELESS_STARTUP_BUDGET_S, transport.WIRELESS_STARTUP_BUDGET_S)
+        self.assertEqual(smoke.startup_budget("wireless", None),
+                         float(transport.WIRELESS_STARTUP_BUDGET_S))
+        self.assertEqual(collect.startup_timeout_seconds("wireless", None),
+                         transport.WIRELESS_STARTUP_BUDGET_S)
+
+    def test_virtual_clock_late_tcp_attach_and_late_active_fails_at_85_passes_at_floor(self) -> None:
+        # Attempt 1 expires at 17 s -> 5 s backoff -> attempt 2 at 22 s -> late TCP attach
+        # at 80 s ("negotiating") -> 10 s negotiation -> ACTIVE at 90 s (plus polling near floor).
+        second = 1_000_000_000
+        events = {
+            1 * second: '{"event":"ready","state":"waiting_for_consumer"}',
+            2 * second: '{"event":"wireless_admission"}',
+            17 * second: '{"event":"wireless_admission_expired"}',
+            22 * second: '{"event":"wireless_admission"}',
+            80 * second: '{"kind":"session_state_changed","session":1,"mono_ns":80000000000,'
+                         '"to_state":"negotiating","transport":"usb"}',
+            90 * second: (
+                '{"kind":"session_state_changed","session":1,"mono_ns":90000000000,'
+                '"to_state":"active","transport":"usb"}\n'
+                '{"event":"video_sent","units":10}\n'
+                '{"event":"audio_chunks","count":10}\n'
+                '{"event":"audio_write_completed","scheduled_ns":90000000000,'
+                '"scheduled_end_ns":90040000000,"completed_ns":90000000000,"presented_ns":90010000000}\n'
+                '{"event":"video_presented","frame":1,"scheduled_ns":90000000000,'
+                '"completed_ns":90012000000,"count":1}'
+            ),
+            92 * second: (
+                '{"event":"video_sent","units":20}\n'
+                '{"event":"audio_chunks","count":20}\n'
+                '{"event":"audio_write_completed","scheduled_ns":92000000000,'
+                '"scheduled_end_ns":92040000000,"completed_ns":92000000000,"presented_ns":92010000000}\n'
+                '{"event":"video_presented","frame":2,"scheduled_ns":92000000000,'
+                '"completed_ns":92012000000,"count":1}'
+            ),
+            94 * second: (
+                '{"event":"video_sent","units":30}\n'
+                '{"event":"audio_chunks","count":30}\n'
+                '{"event":"audio_write_completed","scheduled_ns":94000000000,'
+                '"scheduled_end_ns":94040000000,"completed_ns":94000000000,"presented_ns":94010000000}\n'
+                '{"event":"video_presented","frame":3,"scheduled_ns":94000000000,'
+                '"completed_ns":94012000000,"count":1}'
+            ),
+        }
+
+        def run_with_startup(startup_timeout_s: int | None) -> dict:
+            clock_ns = [0]
+            spawned: list = []
+            written = {t: False for t in events}
+
+            class FakeProc:
+                pid = os.getpid()
+
+                def __init__(self, command=(), *, stdout=None, **kwargs) -> None:
+                    self.stdout = stdout
+                    self.returncode = None
+                    spawned.append(self)
+
+                def poll(self):
+                    return self.returncode
+
+                def terminate(self):
+                    self.returncode = 0
+
+                def kill(self):
+                    self.returncode = -9
+
+                def wait(self, timeout=None):
+                    return 0
+
+            def fake_sleep(seconds: float) -> None:
+                clock_ns[0] += int(seconds * second)
+                for stamp, block in sorted(events.items()):
+                    if clock_ns[0] >= stamp and not written[stamp]:
+                        written[stamp] = True
+                        spawned[0].stdout.write(block + "\n")
+                        spawned[0].stdout.flush()
+
+            clean_usb = {"readable": True, "phone_attached": False, "aoa_attached": False}
+            with tempfile.TemporaryDirectory(prefix="wireless-post-tcp-") as directory:
+                root = Path(directory)
+                args = argparse.Namespace(
+                    receiver="rx", display="disp", no_display=False, port="1-2.1",
+                    duration_seconds=3, interval=1, store=str(root / "approved-phones.json"),
+                    video_socket=None, input_socket=None, state_dir=str(root / "state"),
+                    phone_serial=PHONE, workload="none", thermal_policy="strict-all-zones",
+                    transport="wireless", phone_id=7, ap_interface="wlan0", ap_channel=44,
+                    startup_timeout_seconds=startup_timeout_s)
+                with (unittest.mock.patch.object(collect.time, "monotonic_ns", side_effect=lambda: clock_ns[0]),
+                      unittest.mock.patch.object(collect.time, "monotonic", side_effect=lambda: clock_ns[0] / second),
+                      unittest.mock.patch.object(collect.time, "sleep", side_effect=fake_sleep),
+                      unittest.mock.patch.object(collect.subprocess, "Popen", FakeProc),
+                      unittest.mock.patch.object(collect, "_display_connected", return_value=True),
+                      unittest.mock.patch.object(collect, "_thermal_inventory", return_value=()),
+                      unittest.mock.patch.object(collect, "_thermal_zones", return_value=()),
+                      unittest.mock.patch.object(collect, "_target_hardware_state", return_value={}),
+                      unittest.mock.patch.object(collect, "build_processes", return_value=[]),
+                      unittest.mock.patch.object(transport, "host_usb_evidence", return_value=clean_usb),
+                      unittest.mock.patch.object(transport, "receiver_session_peers", return_value=[STATION]),
+                      unittest.mock.patch.object(transport, "read_ap_stations", return_value=[STATION]),
+                      unittest.mock.patch.object(transport, "bind_adb", return_value=(f"{STATION}:5555", None)),
+                      unittest.mock.patch.object(transport, "link_snapshot", return_value={"wifi": {"channel": 44}}),
+                      unittest.mock.patch.object(collect, "_host_adb")):
+                    return collect.collect(args)
+
+        old_floor_capture = run_with_startup(85)
+        self.assertIsNone(old_floor_capture["startup_wait_seconds"])
+        self.assertEqual(old_floor_capture["active_projection_seconds"], 0.0)
+        self.assertIsNone(old_floor_capture["events"]["startup_ms"])
+
+        derived_floor_capture = run_with_startup(None)
+        self.assertIsNotNone(derived_floor_capture["startup_wait_seconds"])
+        self.assertGreaterEqual(derived_floor_capture["startup_wait_seconds"], 90.0)
+        self.assertEqual(derived_floor_capture["active_projection_seconds"], 3.0)
+        self.assertEqual(derived_floor_capture["events"]["startup_ms"], 90000)
+
+    @staticmethod
+    def _run_virtual_clock_scenario(scenario_events: dict, *, startup_timeout_s: int | None,
+                                    display_probe_s: float, duration_seconds: int = 3,
+                                    oversleep_deadline_ms: int = 0,
+                                    pause_after_active_s: float = 0.0) -> dict:
+        second = 1_000_000_000
+        clock_ns = [0]
+        spawned: list = []
+        written = {t: False for t in scenario_events}
+        target_deadline_s = (
+            startup_timeout_s if startup_timeout_s is not None else transport.WIRELESS_STARTUP_BUDGET_S
+        )
+        paused = [False]
+
+        def flush_due() -> None:
+            if not spawned:
+                return
+            for stamp, block in sorted(scenario_events.items()):
+                if clock_ns[0] >= stamp and not written[stamp]:
+                    written[stamp] = True
+                    spawned[0].stdout.write(block + "\n")
+                    spawned[0].stdout.flush()
+
+        class FakeProc:
+            pid = os.getpid()
+
+            def __init__(self, command=(), *, stdout=None, **kwargs) -> None:
+                self.stdout = stdout
+                self.returncode = None
+                spawned.append(self)
+
+            def poll(self):
+                return self.returncode
+
+            def terminate(self):
+                self.returncode = 0
+
+            def kill(self):
+                self.returncode = -9
+
+            def wait(self, timeout=None):
+                return 0
+
+        def fake_sleep(seconds: float) -> None:
+            nxt = clock_ns[0] + int(round(seconds * second))
+            if (oversleep_deadline_ms and clock_ns[0] < target_deadline_s * second
+                    and nxt == target_deadline_s * second):
+                nxt += oversleep_deadline_ms * 1_000_000
+            clock_ns[0] = nxt
+            flush_due()
+
+        def fake_display_probe() -> bool:
+            if (pause_after_active_s and not paused[0]
+                    and any(w for t, w in written.items() if '"to_state":"active"' in scenario_events[t])):
+                paused[0] = True
+                clock_ns[0] += int(round(pause_after_active_s * second))
+            clock_ns[0] += int(round(display_probe_s * second))
+            flush_due()
+            return True
+
+        clean_usb = {"readable": True, "phone_attached": False, "aoa_attached": False}
+        with tempfile.TemporaryDirectory(prefix="wireless-sol-recheck-") as directory:
+            root = Path(directory)
+            args = argparse.Namespace(
+                receiver="rx", display="disp", no_display=False, port="1-2.1",
+                duration_seconds=duration_seconds, interval=5,
+                store=str(root / "approved-phones.json"),
+                video_socket=None, input_socket=None, state_dir=str(root / "state"),
+                phone_serial=PHONE, workload="none", thermal_policy="strict-all-zones",
+                transport="wireless", phone_id=7, ap_interface="wlan0", ap_channel=44,
+                startup_timeout_seconds=startup_timeout_s)
+            with (unittest.mock.patch.object(collect.time, "monotonic_ns", side_effect=lambda: clock_ns[0]),
+                  unittest.mock.patch.object(collect.time, "monotonic", side_effect=lambda: clock_ns[0] / second),
+                  unittest.mock.patch.object(collect.time, "sleep", side_effect=fake_sleep),
+                  unittest.mock.patch.object(collect.subprocess, "Popen", FakeProc),
+                  unittest.mock.patch.object(collect, "_display_connected", side_effect=fake_display_probe),
+                  unittest.mock.patch.object(collect, "_thermal_inventory", return_value=()),
+                  unittest.mock.patch.object(collect, "_thermal_zones", return_value=()),
+                  unittest.mock.patch.object(collect, "_target_hardware_state", return_value={}),
+                  unittest.mock.patch.object(collect, "build_processes", return_value=[]),
+                  unittest.mock.patch.object(transport, "host_usb_evidence", return_value=clean_usb),
+                  unittest.mock.patch.object(transport, "receiver_session_peers", return_value=[STATION]),
+                  unittest.mock.patch.object(transport, "read_ap_stations", return_value=[STATION]),
+                  unittest.mock.patch.object(transport, "bind_adb", return_value=(f"{STATION}:5555", None)),
+                  unittest.mock.patch.object(transport, "link_snapshot", return_value={"wifi": {"channel": 44}}),
+                  unittest.mock.patch.object(collect, "_host_adb")):
+                return collect.collect(args)
+
+    @staticmethod
+    def _sol_active_at_events(active_ns: int, *, steps: int = 8) -> dict:
+        second = 1_000_000_000
+        base_ev = {
+            8 * second: '{"event":"ready","state":"waiting_for_consumer"}',
+            12 * second: '{"event":"wireless_admission"}',
+            27 * second: '{"event":"wireless_admission_expired"}',
+            29 * second: '{"event":"wireless_admission"}',
+            86 * second: '{"kind":"session_state_changed","session":1,"mono_ns":86000000000,'
+                         '"to_state":"negotiating","transport":"usb"}',
+            active_ns: (
+                f'{{"kind":"session_state_changed","session":1,"mono_ns":{active_ns},'
+                f'"to_state":"active","transport":"usb"}}\n'
+                '{"event":"video_sent","units":10}\n'
+                '{"event":"audio_chunks","count":10}\n'
+                f'{{"event":"audio_write_completed","scheduled_ns":{active_ns},'
+                f'"scheduled_end_ns":{active_ns + 40_000_000},"completed_ns":{active_ns},'
+                f'"presented_ns":{active_ns + 10_000_000}}}\n'
+                f'{{"event":"video_presented","frame":1,"scheduled_ns":{active_ns},'
+                f'"completed_ns":{active_ns + 12_000_000},"count":1}}'
+            ),
+        }
+        for step in range(1, steps + 1):
+            t_ns = active_ns + step * 5 * second
+            base_ev[t_ns] = (
+                f'{{"event":"video_sent","units":{10 + step * 10}}}\n'
+                f'{{"event":"audio_chunks","count":{10 + step * 10}}}\n'
+                f'{{"event":"audio_write_completed","scheduled_ns":{t_ns},'
+                f'"scheduled_end_ns":{t_ns + 40_000_000},"completed_ns":{t_ns},'
+                f'"presented_ns":{t_ns + 10_000_000}}}\n'
+                f'{{"event":"video_presented","frame":{1 + step},"scheduled_ns":{t_ns},'
+                f'"completed_ns":{t_ns + 12_000_000},"count":1}}'
+            )
+        return base_ev
+
+    def test_virtual_clock_sol_scenario_and_active_at_deadline_always_binds(self) -> None:
+        # Sol re-check scenario: ready 8 s, admissions 12/29 s, expiry 27 s, TCP 86 s, ACTIVE 96 s,
+        # 5 s interval, and 4.9 s display probe per loop.
+        events = self._sol_active_at_events(96 * 1_000_000_000)
+
+        # P2-A: 10 s request with 4.9 s probe crossing the measurement deadline MUST record >= 10.0 s.
+        cap_default = self._run_virtual_clock_scenario(
+            events, startup_timeout_s=None, display_probe_s=4.9, duration_seconds=10)
+        self.assertIsNotNone(cap_default["startup_wait_seconds"])
+        self.assertGreaterEqual(cap_default["active_projection_seconds"], 10.0)
+        self.assertEqual(cap_default["events"]["startup_ms"], 96000)
+
+        # Loop ordering with 100 s deadline and immediate probe: ACTIVE at 96 s parsed at t=100 s binds.
+        cap_at_deadline = self._run_virtual_clock_scenario(
+            events, startup_timeout_s=100, display_probe_s=0.0, duration_seconds=3)
+        self.assertIsNotNone(cap_at_deadline["startup_wait_seconds"])
+        self.assertEqual(cap_at_deadline["active_projection_seconds"], 3.0)
+        self.assertEqual(cap_at_deadline["events"]["startup_ms"], 96000)
+
+    def test_virtual_clock_in_budget_active_mono_ns_binds_despite_collector_delay(self) -> None:
+        second = 1_000_000_000
+        run_scenario = self._run_virtual_clock_scenario
+        active_at_events = self._sol_active_at_events
+
+        # P2-B: 4.9 s probe with ACTIVE at 119 s and 120 s must bind & record full requested duration.
+        for active_s in (119, 120):
+            cap_in = run_scenario(
+                active_at_events(active_s * second),
+                startup_timeout_s=None, display_probe_s=4.9, duration_seconds=10)
+            self.assertTrue(cap_in["link"]["adb_bound"], active_s)
+            self.assertIsNotNone(cap_in["startup_wait_seconds"], active_s)
+            self.assertGreaterEqual(cap_in["active_projection_seconds"], 10.0, active_s)
+            self.assertEqual(cap_in["events"]["startup_ms"], active_s * 1000, active_s)
+
+        # P2-B: ACTIVE at 120.001 s (past deadline on receiver clock) must NOT bind.
+        cap_late = run_scenario(
+            active_at_events(120 * second + 1_000_000),
+            startup_timeout_s=None, display_probe_s=4.9, duration_seconds=10)
+        self.assertFalse(cap_late["link"]["adb_bound"])
+        self.assertIsNone(cap_late["startup_wait_seconds"])
+        self.assertEqual(cap_late["active_projection_seconds"], 0.0)
+
+        # P2-B: immediate probe, ACTIVE at 119.9 s, 1 ms oversleep must bind via mono_ns & final read.
+        cap_oversleep = run_scenario(
+            active_at_events(119 * second + 900_000_000),
+            startup_timeout_s=None, display_probe_s=0.0, duration_seconds=3,
+            oversleep_deadline_ms=1)
+        self.assertTrue(cap_oversleep["link"]["adb_bound"])
+        self.assertIsNotNone(cap_oversleep["startup_wait_seconds"])
+        self.assertGreaterEqual(cap_oversleep["active_projection_seconds"], 3.0)
+        self.assertEqual(cap_oversleep["events"]["startup_ms"], 119900)
+
+        # A timely ACTIVE on a still-active session binds however long the collector's own
+        # work takes before the bind decision: 5.101 s of collector delay plus the 4.9 s
+        # probe (the review reproduction), and a 30 s collector pause.
+        for pause_s in (5.101, 30.0):
+            cap_delayed = run_scenario(
+                active_at_events(118 * second),
+                startup_timeout_s=None, display_probe_s=4.9, duration_seconds=10,
+                pause_after_active_s=pause_s)
+            self.assertTrue(cap_delayed["link"]["adb_bound"], pause_s)
+            self.assertIsNotNone(cap_delayed["startup_wait_seconds"], pause_s)
+            self.assertGreaterEqual(cap_delayed["active_projection_seconds"], 10.0, pause_s)
+            self.assertEqual(cap_delayed["events"]["startup_ms"], 118000, pause_s)
+
+    def test_v3_schema_requires_valid_ap_on_wireless_qualifying_and_offline_not_live(self) -> None:
+        import aa_perf_schema as schema
+        s = schema.load_schema(schema.SCHEMA_V3)
+
+        # Offline replay of a legacy wireless capture (null AP fields): stays OFFLINE_ONLY, never COMPLETE_LIVE.
+        offline_legacy = self._live_wireless_capture(
+            ap_interface=None, ap_channel=None, origin="offline")
+        offline_res = report.build_result(
+            offline_legacy, duration_requested="3s", now="2026-11-20T00:00:00Z",
+            capture_path=None, capture_sha256=None)
+        self.assertEqual(offline_res["verdict"], "PASS")
+        self.assertEqual(offline_res["measurement_origin"], "offline")
+        self.assertEqual(offline_res["qualification_status"], "OFFLINE_ONLY")
+        self.assertIsNone(offline_res["ap_interface"])
+        self.assertIsNone(offline_res["ap_channel"])
+        self.assertEqual(schema.validate(offline_res, s), [])
+
+        # Live replay of the same missing-AP capture is BLOCKED by the reporter.
+        live_legacy = self._live_wireless_capture(
+            ap_interface=None, ap_channel=None, origin="live")
+        live_missing_res = report.build_result(
+            live_legacy, duration_requested="3s", now="2026-11-20T00:00:00Z",
+            capture_path=None, capture_sha256=None)
+        self.assertEqual(live_missing_res["verdict"], "BLOCKED")
+        self.assertEqual(live_missing_res["qualification_status"], "INCOMPLETE")
+        self.assertIn("run_evidence:ap_interface", live_missing_res["blocked_on"])
+        self.assertIn("run_evidence:ap_channel", live_missing_res["blocked_on"])
+        self.assertEqual(schema.validate(live_missing_res, s), [])
+
+        # Live wireless PASS/COMPLETE_LIVE requires valid non-null ap_interface and ap_channel.
+        qualifying_res = report.build_result(
+            self._live_wireless_capture(ap_interface="wlan0", ap_channel=44, origin="live"),
+            duration_requested="3s", now="2026-11-20T00:00:00Z",
+            capture_path=None, capture_sha256=None)
+        self.assertEqual((qualifying_res["verdict"], qualifying_res["qualification_status"]),
+                         ("PASS", "COMPLETE_LIVE"))
+        self.assertEqual(schema.validate(qualifying_res, s), [])
+
+        for mutator in (
+            lambda d: d.pop("ap_interface", None),
+            lambda d: d.pop("ap_channel", None),
+            lambda d: (d.pop("ap_interface", None), d.pop("ap_channel", None)),
+            lambda d: d.update(ap_interface=None),
+            lambda d: d.update(ap_channel=None),
+            lambda d: d.update(ap_interface=None, ap_channel=None),
+            lambda d: d.update(ap_interface="bad interface"),
+            lambda d: d.update(ap_interface="-wlan0"),
+            lambda d: d.update(ap_interface=".wlan0"),
+            lambda d: d.update(ap_interface="a" * 16),
+            lambda d: d.update(ap_interface=""),
+            lambda d: d.update(ap_channel=52),
+            lambda d: d.update(ap_channel=True),
+        ):
+            bad = json.loads(json.dumps(qualifying_res))
+            mutator(bad)
+            self.assertTrue(schema.validate(bad, s), f"expected schema failure for {bad!r}")
+
+        # Offline capture cannot masquerade as COMPLETE_LIVE in the schema.
+        forged_offline = json.loads(json.dumps(offline_res))
+        forged_offline["qualification_status"] = "COMPLETE_LIVE"
+        self.assertTrue(schema.validate(forged_offline, s))
+
+        # Wired PASS results remain valid with no AP fields.
+        wired_res = json.loads(json.dumps(qualifying_res))
+        wired_res["mode"] = "wired"
+        wired_res.pop("ap_interface", None)
+        wired_res.pop("ap_channel", None)
+        wired_res.pop("link", None)
+        wired_res.pop("startup_basis", None)
+        self.assertEqual(schema.validate(wired_res, s), [])
+
+    def test_schema_pattern_ecma_trailing_newline_and_legacy_ap_compat(self) -> None:
+        import aa_perf_schema as schema
+        s = schema.load_schema(schema.SCHEMA_V3)
+
+        qualifying_res = report.build_result(
+            self._live_wireless_capture(ap_interface="wlan0", ap_channel=44, origin="live"),
+            duration_requested="3s", now="2026-11-20T00:00:00Z",
+            capture_path=None, capture_sha256=None)
+
+        # P2-2: trailing newline bypass ("wlan0\n") must fail ECMA-262 pattern matching.
+        nl_iface = json.loads(json.dumps(qualifying_res))
+        nl_iface["ap_interface"] = "wlan0\n"
+        self.assertTrue(schema.validate(nl_iface, s))
+
+        # Generic ECMA-262 pattern semantics across arbitrary patterns (no $ match before final LF).
+        for pattern, good_vals, bad_vals in (
+            ("^[A-Za-z0-9_][A-Za-z0-9_.-]{0,14}$", ("wlan0",), ("wlan0\n", "bad interface", "")),
+            ("^abc$", ("abc",), ("abc\n", "xabc", "abcd")),
+            ("tag$", ("tag", "mytag"), ("tag\n", "tagx")),
+            (r"^\$1$", ("$1",), ("$1\n", "1")),
+            ("^[a$]+$", ("a$",), ("a$\n",)),
+            ("[]$|x$", ("x", "ax"), ("x\n", "", "y")),
+            ("[^]$", ("x", "\n", "ax", "x\n"), ("",)),
+            ("^[^]$", ("a", "\n"), ("ab", "a\n", "x\n", "")),
+        ):
+            pat_schema = {"type": "string", "pattern": pattern}
+            for good in good_vals:
+                self.assertEqual(schema.validate(good, pat_schema), [], (pattern, good))
+            for bad in bad_vals:
+                self.assertTrue(schema.validate(bad, pat_schema), (pattern, bad))
+        with self.assertRaises(schema.SchemaError):
+            schema.validate("a", {"type": "string", "pattern": "[abc"})
+
+        # P3: Legacy free-form ap_interface on wired, offline, and incomplete records must still validate.
+        wired_legacy = json.loads(json.dumps(qualifying_res))
+        wired_legacy["mode"] = "wired"
+        wired_legacy.pop("link", None)
+        wired_legacy.pop("startup_basis", None)
+        wired_legacy["ap_interface"] = "bad interface"
+        self.assertEqual(schema.validate(wired_legacy, s), [])
+
+        offline_legacy = report.build_result(
+            self._live_wireless_capture(ap_interface=None, ap_channel=None, origin="offline"),
+            duration_requested="3s", now="2026-11-20T00:00:00Z",
+            capture_path=None, capture_sha256=None)
+        offline_legacy["ap_interface"] = "bad interface"
+        self.assertEqual(schema.validate(offline_legacy, s), [])
+
+        incomplete_legacy = report.build_result(
+            self._live_wireless_capture(ap_interface=None, ap_channel=None, origin="live"),
+            duration_requested="3s", now="2026-11-20T00:00:00Z",
+            capture_path=None, capture_sha256=None)
+        self.assertEqual(incomplete_legacy["qualification_status"], "INCOMPLETE")
+        incomplete_legacy["ap_interface"] = "bad interface"
+        self.assertEqual(schema.validate(incomplete_legacy, s), [])
+
+    def test_wireless_check_record_requires_expected_ap_interface(self) -> None:
+        now = datetime.now(timezone.utc)
+        ch36 = self._wireless_record(ap_interface="wlan0", ap_channel=36)
+        self.assertEqual(
+            smoke.check_record(ch36, receiver_sha256="a" * 64, display_sha256="b" * 64,
+                               phone_serial="SER", now=now, transport_name="wireless",
+                               phone_id=1, ap_channel=36, ap_interface="wlan0")[0],
+            None)
+        for missing_or_bad in (None, "", "-wlan0", ".wlan0", "bad iface", "wlan1"):
+            self.assertEqual(
+                smoke.check_record(ch36, receiver_sha256="a" * 64, display_sha256="b" * 64,
+                                   phone_serial="SER", now=now, transport_name="wireless",
+                                   phone_id=1, ap_channel=36, ap_interface=missing_or_bad)[0],
+                "drive_smoke_ap_interface_mismatch", missing_or_bad)
+
+        # CLI `check --transport wireless` requires matching --ap-interface (fails closed with exit 3).
+        with tempfile.TemporaryDirectory(prefix="smoke-check-no-iface-") as directory:
+            rec_path = Path(directory) / "result.json"
+            rec_path.write_text(json.dumps(ch36))
+            for extra in ([], ["--ap-interface", "wlan1"]):
+                rc = smoke.main(["check", "--record", str(rec_path),
+                                 "--receiver-sha256", "a" * 64, "--display-sha256", "b" * 64,
+                                 "--phone-serial", "SER", "--transport", "wireless",
+                                 "--phone-id", "1", "--ap-channel", "36", *extra,
+                                 "--now", now.isoformat()])
+                self.assertEqual(rc, 3, extra)
+            rc_ok = smoke.main(["check", "--record", str(rec_path),
+                                "--receiver-sha256", "a" * 64, "--display-sha256", "b" * 64,
+                                "--phone-serial", "SER", "--transport", "wireless",
+                                "--phone-id", "1", "--ap-channel", "36",
+                                "--ap-interface", "wlan0", "--now", now.isoformat()])
+            self.assertEqual(rc_ok, 0)
+
+        # Wired check behavior remains unchanged without ap_interface.
+        wired = GateTransportTests().record(transport="wired")
+        self.assertIsNone(
+            smoke.check_record(wired, receiver_sha256="a" * 64, display_sha256="b" * 64,
+                               phone_serial="SER", now=now, transport_name="wired")[0])
+
+    def test_wireless_channel_mismatch_and_missing_fail_closed(self) -> None:
+        now = datetime.now(timezone.utc)
+        base_wireless = self._wireless_record(ap_interface="wlan0", ap_channel=44)
+        for stage_ch in (36, None):
+            self.assertEqual(
+                smoke.check_record(base_wireless, receiver_sha256="a" * 64,
+                                   display_sha256="b" * 64, phone_serial="SER", now=now,
+                                   transport_name="wireless", phone_id=1,
+                                   ap_channel=stage_ch, ap_interface="wlan0")[0],
+                "drive_smoke_ap_channel_mismatch")
+        self.assertIsNone(
+            smoke.check_record(base_wireless, receiver_sha256="a" * 64,
+                               display_sha256="b" * 64, phone_serial="SER", now=now,
+                               transport_name="wireless", phone_id=1,
+                               ap_channel=44, ap_interface="wlan0")[0])
+        ch36 = self._wireless_record(ap_interface="wlan0", ap_channel=36)
+        self.assertIsNone(
+            smoke.check_record(ch36, receiver_sha256="a" * 64,
+                               display_sha256="b" * 64, phone_serial="SER", now=now,
+                               transport_name="wireless", phone_id=1,
+                               ap_channel=None, ap_interface="wlan0")[0])
+        self.assertEqual(
+            smoke.check_record(ch36, receiver_sha256="a" * 64,
+                               display_sha256="b" * 64, phone_serial="SER", now=now,
+                               transport_name="wireless", phone_id=1,
+                               ap_channel=44, ap_interface="wlan0")[0],
+            "drive_smoke_ap_channel_mismatch")
+        for bad in ({}, {"ap_channel": None}, {"ap_channel": True}, {"ap_channel": 52},
+                    {"ap_interface": None}, {"ap_interface": ""}):
+            doc = dict(base_wireless)
+            if not bad:
+                doc.pop("ap_channel")
+            else:
+                doc.update(bad)
+            self.assertEqual(
+                smoke.check_record(doc, receiver_sha256="a" * 64,
+                                   display_sha256="b" * 64, phone_serial="SER", now=now,
+                                   transport_name="wireless", phone_id=1,
+                                   ap_channel=44, ap_interface="wlan0")[0],
+                "drive_smoke_malformed", bad)
+
+    def test_launcher_channel_mismatch_refused_before_collector(self) -> None:
+        now = datetime.now(timezone.utc)
+        with tempfile.TemporaryDirectory(prefix="launcher-ch-mismatch-") as directory:
+            root = Path(directory)
+            ch44_path = root / "ch44-smoke.json"
+            ch44_path.write_text(json.dumps(self._wireless_record(
+                phone_id=7, phone_serial=base.PHONE, ap_interface="wlan0", ap_channel=44,
+                finished_utc=now.isoformat())))
+            for extra in ((), ("--ap-channel", "36")):
+                proc, ssh = base.LauncherGateTests.launch(
+                    self, root, "--mode", "wireless", "--phone-id", "7",
+                    "--receiver", "/opt/aa/aa-wired-receiver",
+                    "--ap-interface", "wlan0", "--store", "/s/approved-phones.json",
+                    "--drive-smoke", str(ch44_path), *extra)
+                self.assertEqual(proc.returncode, 3, proc.stderr)
+                out_doc = json.loads((root / "out.json").read_text())
+                self.assertEqual(out_doc["blocked_on"], "drive_smoke_ap_channel_mismatch", extra)
+                self.assertEqual((out_doc["ap_interface"], out_doc["ap_channel"]), ("wlan0", 36))
+                self.assertNotIn("aa_projection_collect.py", ssh)
+                self.assertNotIn("python3 -", ssh)
+
+    def test_smoke_ap_fields_recorded_deterministically_including_early_blocked(self) -> None:
+        # 1. Early-blocked wireless smokes (missing CMakeCache.txt -> unoptimized_build)
+        #    must record ap_interface and ap_channel (explicit 44 and default 36).
+        for ch_args, expected_ch in ((["--ap-channel", "44"], 44), ([], 36)):
+            with tempfile.TemporaryDirectory(prefix="smoke-early-block-") as directory:
+                root = Path(directory)
+                build, state, out = root / "build", root / "state", root / "out"
+                build.mkdir()
+                state.mkdir()
+                (build / "aa-wireless-receiver").write_text("#!/bin/sh\n")
+                (build / "aa-dummy-display").write_text("#!/bin/sh\n")
+                (state / "approved-phones.json").write_text("{}")
+                rc = smoke.main(["run", "--transport", "wireless", "--phone-id", "7",
+                                 "--ap-interface", "wlan0", *ch_args, "--serial", PHONE,
+                                 "--build-dir", str(build),
+                                 "--store", str(state / "approved-phones.json"),
+                                 "--media-uri", "file:///sdcard/Music/fake.opus",
+                                 "--media-component", "org.example.player/.Play",
+                                 "--duration", "1", "--out", str(out)])
+                result = json.loads((out / "result.json").read_text())
+                self.assertEqual((rc, result["verdict"], result["blocked_on"]),
+                                 (3, "BLOCKED", "unoptimized_build"))
+                self.assertEqual((result["ap_interface"], result["ap_channel"]),
+                                 ("wlan0", expected_ch))
+
+        # 2. One deterministic wireless smoke integration run: receiver emits ACTIVE and blocks
+        #    on signal.pause() until the runner stops it (zero child-exit vs log-thread race), with
+        #    process-group cleanup in finally so an outer timeout can never orphan fixtures.
+        def run_smoke_with_cleanup(cmd: list[str], *, env: dict, pid_files: tuple[Path, ...],
+                                   timeout: float) -> tuple[int, str]:
+            proc = subprocess.Popen(
+                cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, start_new_session=True)
+            try:
+                out_text, _ = proc.communicate(timeout=timeout)
+                return proc.returncode, out_text
+            finally:
+                if proc.stdout is not None:
+                    proc.stdout.close()
+                for sig, wait_s in ((signal.SIGTERM, 2.0), (signal.SIGKILL, 2.0)):
+                    try:
+                        os.killpg(proc.pid, sig)
+                    except (ProcessLookupError, PermissionError):
+                        pass
+                    try:
+                        proc.wait(timeout=wait_s)
+                        break
+                    except subprocess.TimeoutExpired:
+                        continue
+                for pid_file in pid_files:
+                    if not pid_file.exists():
+                        continue
+                    for token in pid_file.read_text().split():
+                        try:
+                            pid = int(token)
+                        except ValueError:
+                            continue
+                        for kill_fn in (os.killpg, os.kill):
+                            try:
+                                kill_fn(pid, signal.SIGKILL)
+                            except (ProcessLookupError, PermissionError):
+                                pass
+
+        with tempfile.TemporaryDirectory(prefix="smoke-controlled-") as directory:
+            root = Path(directory)
+            build, bin_dir, usb = root / "build", root / "bin", root / "usb"
+            build.mkdir()
+            bin_dir.mkdir()
+            usb.mkdir()
+            (build / "CMakeCache.txt").write_text("CMAKE_BUILD_TYPE:STRING=Release\n")
+            rx_deterministic = (
+                "#!/usr/bin/env python3\nimport os, signal, sys, time\n"
+                + FAKE_SESSION
+                + 'directory = os.environ["FAKE_DIR"]\n'
+                + 'open(os.path.join(directory, "receiver.argv"), "w").write("\\n".join(sys.argv[1:]))\n'
+                + 'open(os.path.join(directory, "receiver.pids"), "w").write(str(os.getpid()))\n'
+                + 'print(\'{"event":"ready","state":"waiting_for_consumer"}\', flush=True)\n'
+                + 'print(\'{"event":"wireless_admission"}\', flush=True)\n'
+                + 'fake_session()\n'
+                + 'print(\'{"kind":"session_state_changed","session":1,"mono_ns":%d,'
+                + '"to_state":"active","transport":"usb"}\' % time.monotonic_ns(), flush=True)\n'
+                + 'print(\'{"event":"video_profile","width":1280,"height":720,"fps":30,"codec":"h264"}\', flush=True)\n'
+                + 'while True:\n    signal.pause()\n'
+            )
+            for path, body in ((build / "aa-wireless-receiver", rx_deterministic),
+                               (build / "aa-dummy-display", FAKE_WIRELESS_DISPLAY),
+                               (bin_dir / "adb", base.FAKE_ADB), (bin_dir / "ip", FAKE_IP)):
+                path.write_text(body)
+                path.chmod(0o755)
+            state = root / "state"
+            state.mkdir()
+            (state / "approved-phones.json").write_text("{}")
+            env = dict(os.environ, FAKE_DIR=str(root), DRIVE_HOOK="", PATH=f"{bin_dir}:/usr/bin:/bin",
+                       FAKE_ADB_LOG=str(root / "adb.log"), FAKE_ADB_WIFI_STATUS=WIFI,
+                       FAKE_USB=str(usb), FAKE_LEASES=str(root / "absent-{interface}.leases"),
+                       FAKE_PROC=str(root / "proc"))
+            pid_files = (root / "receiver.pids", root / "display.pids")
+            rc, combined = run_smoke_with_cleanup(
+                [sys.executable, "-B", "-c", DRIVER, str(base.SMOKE.parent), "run",
+                 "--transport", "wireless", "--phone-id", "7", "--ap-interface", "wlan0",
+                 "--ap-channel", "44", "--serial", PHONE, "--build-dir", str(build),
+                 "--store", str(state / "approved-phones.json"), "--display-env", ":99",
+                 "--media-uri", "file:///sdcard/Music/fake.opus",
+                 "--media-component", "org.example.player/.Play", "--duration", "2",
+                 "--out", str(root / "out")],
+                env=env, pid_files=pid_files,
+                timeout=int(smoke.READY_TIMEOUT_S + transport.WIRELESS_STARTUP_BUDGET_S + 30))
+            result = json.loads((root / "out" / "result.json").read_text())
+            run_doc = json.loads((root / "out" / "run.json").read_text())
+            failed = sorted(c["name"] for c in result["criteria"] if not c["passed"])
+            self.assertEqual((rc, result["verdict"], failed),
+                             (1, "FAIL", ["av_signed_contract", "painted_fps_per_window"]),
+                             combined)
+            self.assertEqual((result["ap_interface"], result["ap_channel"]), ("wlan0", 44))
+            self.assertEqual(run_doc["startup_budget_s"], float(transport.WIRELESS_STARTUP_BUDGET_S))
+
+            # Forced-timeout regression: an outer timeout must kill the fake receiver and display
+            # sessions too (zero orphaned processes).
+            for pf in pid_files:
+                pf.unlink(missing_ok=True)
+            with self.assertRaises(subprocess.TimeoutExpired):
+                run_smoke_with_cleanup(
+                    [sys.executable, "-B", "-c", DRIVER, str(base.SMOKE.parent), "run",
+                     "--transport", "wireless", "--phone-id", "7", "--ap-interface", "wlan0",
+                     "--ap-channel", "44", "--serial", PHONE, "--build-dir", str(build),
+                     "--store", str(state / "approved-phones.json"), "--display-env", ":99",
+                     "--media-uri", "file:///sdcard/Music/fake.opus",
+                     "--media-component", "org.example.player/.Play", "--duration", "30",
+                     "--out", str(root / "out-timeout")],
+                    env=env, pid_files=pid_files, timeout=2.0)
+            recorded_pids = []
+            for pf in pid_files:
+                self.assertTrue(pf.exists(), f"missing pid file {pf}")
+                recorded_pids.extend(int(t) for t in pf.read_text().split())
+            self.assertEqual(len(recorded_pids), 2)
+            for pid in recorded_pids:
+                reap_until = time.monotonic() + 2.0
+                while time.monotonic() < reap_until:
+                    try:
+                        os.kill(pid, 0)
+                    except ProcessLookupError:
+                        break
+                    time_sleep(0.05)
+                with self.assertRaises(ProcessLookupError, msg=f"orphaned fixture PID {pid}"):
+                    os.kill(pid, 0)
+
+        # 3. Deterministic v3 live capture -> result preserves AP settings and passes schema.
+        import aa_perf_schema as schema
+        live_cap = self._live_wireless_capture(ap_interface="wlan1", ap_channel=48, origin="live")
+        res = report.build_result(live_cap, duration_requested="3s", now="2026-11-20T00:00:00Z",
+                                  capture_path=None, capture_sha256=None)
+        self.assertEqual((res["verdict"], res["qualification_status"]), ("PASS", "COMPLETE_LIVE"))
+        self.assertEqual((res["ap_interface"], res["ap_channel"]), ("wlan1", 48))
+        self.assertEqual(schema.validate(res, schema.load_schema(schema.schema_for(res["schema"]))), [])
+
+    def test_startup_timeout_validation_and_derived_ceilings_across_entry_points(self) -> None:
+        floor = transport.WIRELESS_STARTUP_BUDGET_S
+
+        # 1. Soak chain: explicit --startup-timeout-seconds 0 is forwarded when calling stage_command,
+        #    and invalid / overflowing / out-of-range values are rejected up front by main().
+        args = SoakChainTransportTests().args(
+            transport="wireless", phone_id=7, ap_interface="wlan0",
+            store="/s/approved-phones.json", startup_timeout_seconds=0)
+        cmd = chain.stage_command(args, 1800)
+        idx = cmd.index("--startup-timeout-seconds")
+        self.assertEqual(cmd[idx + 1], "0")
+
+        max_chain_startup = collect.max_wireless_startup_timeout_seconds(max(chain.STAGES))
+        with tempfile.TemporaryDirectory(prefix="chain-startup-val-") as directory:
+            root = Path(directory)
+            for idx_case, (tp, val) in enumerate((
+                ("wireless", "0"),
+                ("wireless", str(floor - 1)),
+                ("wireless", str(max_chain_startup + 1)),
+                ("wireless", "86400"),
+                ("wired", "0"),
+                ("wired", "61"),
+            )):
+                extra = (["--phone-id", "7", "--ap-interface", "wlan0", "--store", "/s/approved-phones.json"]
+                         if tp == "wireless" else [])
+                out_dir = root / f"chain-{idx_case}"
+                rc = chain.main(["--out", str(out_dir), "--phone-serial", "S", "--drive-smoke", "d",
+                                 "--media-uri", "u", "--media-component", "p/.a",
+                                 "--transport", tp, *extra, "--startup-timeout-seconds", val])
+                self.assertEqual(rc, 2, (tp, val))
+                self.assertFalse(out_dir.exists(), (tp, val))
+
+        # 2. Collector: ceiling derived from 86400 - duration - 150; wired stays in [1, 60].
+        max_col = collect.max_wireless_startup_timeout_seconds(100)
+        self.assertEqual(max_col, 86400 - 100 - 150)
+        self.assertEqual(collect.startup_timeout_seconds("wireless", max_col, duration_seconds=100), max_col)
+        for bad in (max_col + 1, 86400, floor - 1, 0, -5, 18446744073709551617):
+            with self.assertRaises(ValueError):
+                collect.startup_timeout_seconds("wireless", bad, duration_seconds=100)
+        self.assertEqual(collect.startup_timeout_seconds("wired", 60, duration_seconds=100), 60)
+        for bad in (0, -1, 61, 18446744073709551617):
+            with self.assertRaises(ValueError):
+                collect.startup_timeout_seconds("wired", bad, duration_seconds=100)
+
+        # 3. Drive smoke: ceiling derived from 86400 - (2*duration + 25 + 15 + 30); rejects 1e308 cleanly.
+        for bad in ("0", "-5", str(floor - 1), "86400", "1e308", "inf", "nan"):
+            with self.assertRaises(SystemExit) as raised:
+                smoke.main(["run", "--transport", "wireless", "--phone-id", "7",
+                            "--ap-interface", "wlan0", "--serial", "S", "--build-dir", "/b",
+                            "--store", "/s/approved-phones.json", "--media-uri", "u",
+                            "--media-component", "p/.a", "--duration", "120", "--out", "/tmp/x",
+                            "--startup-timeout-seconds", bad])
+            self.assertEqual(raised.exception.code, 2, bad)
+        with self.assertRaises(SystemExit) as raised:
+            smoke.main(["run", "--transport", "wired", "--serial", "S", "--build-dir", "/b",
+                        "--store", "/s/approved-phones.json", "--media-uri", "u",
+                        "--media-component", "p/.a", "--out", "/tmp/x",
+                        "--startup-timeout-seconds", "60"])
+        self.assertEqual(raised.exception.code, 2)
+
+        # 4. Perf launcher shell: rejects empty string, non-live modes, 64-bit overflow,
+        #    values below derived floor or above duration-derived ceiling.
+        with tempfile.TemporaryDirectory(prefix="launcher-startup-") as directory:
+            root = Path(directory)
+            dummy_cap = root / "cap.json"
+            dummy_cap.write_text("{}")
+            invalid_invocations = [
+                ("--mode", "wireless", "--phone-id", "7", "--ap-interface", "wlan0",
+                 "--store", "/s/approved-phones.json", "--duration", "30s",
+                 "--startup-timeout-seconds", ""),
+                ("--mode", "wireless", "--phone-id", "7", "--ap-interface", "wlan0",
+                 "--store", "/s/approved-phones.json", "--duration", "30s",
+                 "--startup-timeout-seconds", str(floor - 1)),
+                ("--mode", "wireless", "--phone-id", "7", "--ap-interface", "wlan0",
+                 "--store", "/s/approved-phones.json", "--duration", "7200s",
+                 "--startup-timeout-seconds", "80000"),
+                ("--mode", "wireless", "--phone-id", "7", "--ap-interface", "wlan0",
+                 "--store", "/s/approved-phones.json", "--duration", "30s",
+                 "--startup-timeout-seconds", "18446744073709551617"),
+                ("--mode", "wired", "--duration", "30s", "--startup-timeout-seconds", "18446744073709551617"),
+                ("--mode", "wired", "--duration", "30s", "--startup-timeout-seconds", "61"),
+                ("--mode", "wired", "--duration", "30s", "--startup-timeout-seconds", "1e308"),
+                ("--mode", "wired", "--readiness-only", "--startup-timeout-seconds", "30"),
+                ("--mode", "wired", "--capture", str(dummy_cap), "--startup-timeout-seconds", "30"),
+            ]
+            for argv in invalid_invocations:
+                proc = subprocess.run(
+                    ["bash", str(base.LAUNCHER), "--out", str(root / "bad.json"), *argv],
+                    capture_output=True, text=True, timeout=30)
+                self.assertEqual(proc.returncode, 2, (argv, proc.stderr))
+
+            good = self._wireless_record(
+                phone_id=7, phone_serial=base.PHONE, ap_interface="wlan0", ap_channel=36,
+                finished_utc=datetime.now(timezone.utc).isoformat())
+            good_path = root / "good-smoke.json"
+            good_path.write_text(json.dumps(good))
+            proc, ssh = base.LauncherGateTests.launch(
+                self, root, "--mode", "wireless", "--phone-id", "7", "--ap-interface", "wlan0",
+                "--receiver", "/opt/aa/aa-wired-receiver",
+                "--store", "/s/approved-phones.json", "--drive-smoke", str(good_path),
+                "--startup-timeout-seconds", str(floor))
+            self.assertIn(f"--startup-timeout-seconds '{floor}'", ssh, proc.stderr)
 
 
 if __name__ == "__main__":

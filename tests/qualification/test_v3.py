@@ -46,6 +46,7 @@ class V3PackageTests(PackageTest):
             with self.subTest(field=field):
                 self.restore()
                 self.tamper(field, lambda d: d.update(mode='wireless', link=link,
+                                                      ap_interface='wlan0', ap_channel=36,
                                                       startup_basis='harness_launch_to_active'))
                 with self.assertRaises(EvidenceError) as raised:
                     check(self.manifest)

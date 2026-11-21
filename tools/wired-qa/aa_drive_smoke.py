@@ -139,6 +139,17 @@ CONTROL_WRITE_TIMEOUT_S = moving_map.CONTROL_WRITE_TIMEOUT_S
 # measured.startup_to_first_paint_s.
 FIRST_PAINT_WAIT_S = 15.0
 READY_TIMEOUT_S = 25.0
+# Wireless startup budget derived in aa_transport.WIRELESS_STARTUP_BUDGET_S from:
+# - tools/wireless-receiver/Runtime.hpp:228 (15 s per admission attempt)
+# - tools/wireless-receiver/Runtime.hpp:35,207,242 (250 ms initial backoff, 5 s cap)
+# - tools/wireless-receiver/Runtime.hpp:251 (attempt held while bootstrapping)
+# - include/aa/app/HandoffEligibility.hpp:45,47 (40 s bootstrap #170 + 5 s connect)
+# - src/app/WirelessLink.cpp:58,84,143-146 (10 s post-TCP negotiation before ACTIVE)
+# - src/helper/BusClient.cpp:21,104,176,184 (2 x 4 helper RPCs @ 1 s)
+# - Ready poll (5 s) + display probe fallback (5 s) + safety margin (12 s) = 120 s
+WIRELESS_STARTUP_BUDGET_S = float(transport.WIRELESS_STARTUP_BUDGET_S)
+# tools/wireless-receiver/main.cpp:146 caps --duration-ms at 86,400,000 ms (86,400 s).
+_RECEIVER_MAX_LIFETIME_S = 86_400
 # The soak gate. Same bytes are checked by hash. The age bound keeps the phone,
 # its Android Auto / Maps versions and the target's state close to what the
 # smoke saw: the 1800+7200 s chain takes about 2.5 h, so one day is a
@@ -589,10 +600,45 @@ def load_record(text: str) -> dict | None:
     return value if isinstance(value, dict) else None
 
 
+def max_wireless_startup_budget(duration_s: float = DEFAULT_DURATION_S) -> float:
+    """Largest wireless startup wait that fits inside the receiver's --duration-ms cap."""
+    return _RECEIVER_MAX_LIFETIME_S - (
+        2.0 * duration_s + READY_TIMEOUT_S + FIRST_PAINT_WAIT_S + 30.0
+    )
+
+
+def startup_budget(transport_name: str, override_s: float | None = None, *,
+                   duration_s: float = DEFAULT_DURATION_S) -> float:
+    """Active-marker wait budget: wired stays 25 s; wireless uses its derived floor or extension."""
+    if transport_name == "wireless":
+        if not _finite_number(duration_s) or duration_s <= 0:
+            raise ValueError("--duration must be finite and positive")
+        max_budget = max_wireless_startup_budget(duration_s)
+        if max_budget < WIRELESS_STARTUP_BUDGET_S:
+            raise ValueError(
+                f"--duration {duration_s:g} s leaves only {max_budget:g} s under the "
+                f"{_RECEIVER_MAX_LIFETIME_S} s receiver lifetime (< {WIRELESS_STARTUP_BUDGET_S:g} s floor)"
+            )
+        if override_s is None:
+            return WIRELESS_STARTUP_BUDGET_S
+        if (not _finite_number(override_s) or override_s < WIRELESS_STARTUP_BUDGET_S
+                or override_s > max_budget):
+            raise ValueError(
+                f"--startup-timeout-seconds for wireless must be in "
+                f"[{WIRELESS_STARTUP_BUDGET_S:g}, {max_budget:g}] s for --duration {duration_s:g} s"
+            )
+        return float(override_s)
+    if override_s is not None:
+        raise ValueError("--startup-timeout-seconds is only supported for --transport wireless")
+    return READY_TIMEOUT_S
+
+
 def check_record(record: dict | None, *, receiver_sha256: str, display_sha256: str,
                  phone_serial: str, now: datetime,
                  transport_name: str = transport.DEFAULT_TRANSPORT,
-                 phone_id: int | None = None) -> tuple[str | None, str]:
+                 phone_id: int | None = None,
+                 ap_channel: int | None = None,
+                 ap_interface: str | None = None) -> tuple[str | None, str]:
     """Return (blocked reason, detail); reason None means the soak may start.
 
     Both launched binaries must have been hashed (64 lowercase hex digits) and
@@ -636,6 +682,22 @@ def check_record(record: dict | None, *, receiver_sha256: str, display_sha256: s
             return "drive_smoke_malformed", "a wireless smoke must record its phone_id"
         if type(phone_id) is not int or recorded != phone_id:
             return "drive_smoke_phone_mismatch", "the smoke projected a different approved phone id"
+        recorded_iface = record.get("ap_interface")
+        if not transport.valid_interface(recorded_iface):
+            return "drive_smoke_malformed", "a wireless smoke must record its ap_interface"
+        if not transport.valid_interface(ap_interface) or recorded_iface != ap_interface:
+            return "drive_smoke_ap_interface_mismatch", (
+                f"the smoke ran on AP interface {recorded_iface!r}, stage uses {ap_interface!r}"
+            )
+        recorded_channel = record.get("ap_channel")
+        if type(recorded_channel) is not int or recorded_channel not in transport.AP_CHANNELS:
+            return "drive_smoke_malformed", "a wireless smoke must record its ap_channel"
+        expected_channel = transport.DEFAULT_AP_CHANNEL if ap_channel is None else ap_channel
+        if (type(expected_channel) is not int or expected_channel not in transport.AP_CHANNELS
+                or recorded_channel != expected_channel):
+            return "drive_smoke_ap_channel_mismatch", (
+                f"the smoke ran on AP channel {recorded_channel}, stage uses {expected_channel}"
+            )
         # A wireless PASS counts only with its link evidence: adb bound to the
         # admitted phone, and this host's USB bus readable and clean (no phone,
         # no AOA device) before, at every sample during, and after the drive.
@@ -686,7 +748,8 @@ def _check_cli(args) -> int:
     reason, detail = check_record(record, receiver_sha256=args.receiver_sha256,
                                   display_sha256=args.display_sha256,
                                   phone_serial=args.phone_serial, now=now,
-                                  transport_name=args.transport, phone_id=args.phone_id)
+                                  transport_name=args.transport, phone_id=args.phone_id,
+                                  ap_channel=args.ap_channel, ap_interface=args.ap_interface)
     if malformed:
         reason, detail = "drive_smoke_malformed", "the result is not strict JSON"
     if reason:
@@ -886,6 +949,12 @@ def _run_cli(args) -> int:
                       "av_p99_abs_max_ms": AV_P99_ABS_MAX_MS, "av_max_abs_ms": AV_MAX_ABS_MS,
                       "av_coverage_min": AV_COVERAGE_MIN},
                   "qualified_profile": QUALIFIED_PROFILE if args.video_profiles is None else None}
+    if wireless:
+        base["phone_id"] = args.phone_id
+        base["ap_interface"] = args.ap_interface
+        base["ap_channel"] = (
+            args.ap_channel if args.ap_channel is not None else transport.DEFAULT_AP_CHANNEL
+        )
     try:
         build_type = require_optimized_build(args.build_dir)
         verify_launched_binaries(args.build_dir, {"receiver": str(receiver_bin),
@@ -906,7 +975,6 @@ def _run_cli(args) -> int:
     if wireless:
         # Android Auto suppresses wireless while the phone is on USB: the cable
         # must be out, shown from this host's own USB bus, not over adb.
-        base["phone_id"] = args.phone_id
         base["link"] = {"adb_bound": False, "before": None, "after": None,
                         "host_usb": {"before": transport.host_usb_evidence(args.serial),
                                      "during": [], "after": None}}
@@ -938,7 +1006,11 @@ def _run_cli(args) -> int:
             env["XAUTHORITY"] = xauth
     socket = f"{env['XDG_RUNTIME_DIR']}/aa-drive-smoke-{os.getpid()}"
     profiles = ["--video-profiles", args.video_profiles] if args.video_profiles else []
-    lifetime_ms = str(int((2 * args.duration + READY_TIMEOUT_S * 2 + FIRST_PAINT_WAIT_S + 30) * 1000))
+    active_timeout = startup_budget(
+        args.transport, getattr(args, "startup_timeout_seconds", None), duration_s=args.duration
+    )
+    lifetime_ms = str(int((2 * args.duration + READY_TIMEOUT_S + active_timeout
+                           + FIRST_PAINT_WAIT_S + 30) * 1000))
     if wireless:
         # The receiver acquires the helper's AP and bootstraps the phone over
         # Bluetooth when the display asks to project; it releases both on stop.
@@ -955,6 +1027,7 @@ def _run_cli(args) -> int:
                    "--video-socket", socket + ".video", "--input-socket", socket + ".input", *profiles]
     base["configuration"] = configuration(receiver_cmd, display_cmd)
     run = {"duration_s": args.duration, "transport": args.transport,
+           "startup_budget_s": active_timeout,
            "receiver_command": receiver_cmd, "display_command": display_cmd,
            "started_utc": datetime.now(timezone.utc).isoformat(), "media_relaunches": 0}
     lock = threading.Lock()
@@ -1026,8 +1099,8 @@ def _run_cli(args) -> int:
         loggers[-1].start()
         dx = loggers[1].seen
         marker = "diag_active" if wireless else "active"
-        # Wireless startup includes the AP and the Bluetooth bootstrap, inside the same budget.
-        if not _wait(lambda: marker in rx, READY_TIMEOUT_S, stop, receiver, display):
+        # Wired keeps READY_TIMEOUT_S (25 s); wireless uses its derived admission/bootstrap budget.
+        if not _wait(lambda: marker in rx, active_timeout, stop, receiver, display):
             run["failure"] = "no active session within the startup budget"
             return
         run["active_ns"] = rx[marker]
@@ -1189,6 +1262,10 @@ def main(argv: list[str]) -> int:
                           "required, since ap.conf is root-only and never read")
     run.add_argument("--ap-channel", type=int, choices=transport.AP_CHANNELS,
                      help="wireless: the AP channel ap.conf names (the receiver's default is 36)")
+    run.add_argument("--startup-timeout-seconds", type=float, default=None,
+                     help=f"wireless: extend the startup budget past its derived "
+                          f"{int(WIRELESS_STARTUP_BUDGET_S)} s floor (never shorten; wired stays "
+                          f"{int(READY_TIMEOUT_S)} s)")
     run.add_argument("--port", default=os.environ.get("AA_PERF_PORT", "1-2.1"),
                      help="USB port context the phone is on (default 1-2.1)")
     run.add_argument("--build-dir", default=os.environ.get("AA_BUILD_DIR"),
@@ -1221,6 +1298,9 @@ def main(argv: list[str]) -> int:
     check.add_argument("--transport", choices=transport.TRANSPORTS, default=transport.DEFAULT_TRANSPORT,
                        help="the soak's transport; a smoke of another transport is refused")
     check.add_argument("--phone-id", type=int, help="wireless: the soak's approved phone id")
+    check.add_argument("--ap-interface", help="wireless: the stage's AP interface")
+    check.add_argument("--ap-channel", type=int, choices=transport.AP_CHANNELS,
+                       help="wireless: the stage's AP channel (default 36)")
     args = parser.parse_args(argv)
     if args.command == "check":
         return _check_cli(args)
@@ -1232,6 +1312,10 @@ def main(argv: list[str]) -> int:
         parser.error("--duration must be positive")
     if not args.build_dir:
         parser.error("--build-dir (or AA_BUILD_DIR) is required: the smoke qualifies a Release build")
+    try:
+        startup_budget(args.transport, args.startup_timeout_seconds, duration_s=args.duration)
+    except ValueError as error:
+        parser.error(str(error))
     if args.transport == "wireless":
         if not args.phone_id or args.phone_id <= 0:
             parser.error("--transport wireless needs --phone-id (the approved wireless phone)")

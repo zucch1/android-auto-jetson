@@ -75,7 +75,7 @@ import time
 from pathlib import Path
 
 import aa_host_preflight
-from aa_projection_collect import ancestors, build_processes
+from aa_projection_collect import ancestors, build_processes, startup_timeout_seconds
 
 STAGES = (1800, 7200)  # the 60 s stage is retired (#137)
 WATCH_PERIOD_S = 5
@@ -298,8 +298,9 @@ def stage_command(args: argparse.Namespace, seconds: int) -> list[str]:
                         ("--build-dir", args.build_dir), ("--thermal-policy", args.thermal_policy),
                         ("--provenance", args.provenance), ("--display-env", args.display_env),
                         ("--phone-id", args.phone_id), ("--ap-interface", args.ap_interface),
-                        ("--ap-channel", args.ap_channel)):
-        if value:
+                        ("--ap-channel", args.ap_channel),
+                        ("--startup-timeout-seconds", getattr(args, "startup_timeout_seconds", None))):
+        if value is not None and value != "":
             command += [flag, str(value)]
     return command
 
@@ -455,6 +456,8 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--ap-interface", help="wireless: the helper's AP interface (required)")
     parser.add_argument("--ap-channel", type=int, choices=(36, 40, 44, 48),
                         help="wireless: the AP channel the helper's ap.conf names")
+    parser.add_argument("--startup-timeout-seconds", type=int, default=None,
+                        help="wireless: extend startup budget (must be >= derived wireless floor)")
     parser.add_argument("--host", default="localhost")
     parser.add_argument("--receiver")
     parser.add_argument("--display")
@@ -478,6 +481,14 @@ def main(argv: list[str]) -> int:
         print("usage error: --transport wireless needs --phone-id, --store and --ap-interface",
               file=sys.stderr)
         return 2
+    if args.startup_timeout_seconds is not None:
+        try:
+            startup_timeout_seconds(
+                args.transport, args.startup_timeout_seconds, duration_seconds=max(STAGES)
+            )
+        except ValueError as error:
+            print(f"usage error: {error}", file=sys.stderr)
+            return 2
     try:
         args.out.mkdir(mode=0o700, parents=True, exist_ok=False)
     except FileExistsError:

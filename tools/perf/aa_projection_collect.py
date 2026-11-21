@@ -120,7 +120,21 @@ CAPTURE_SCHEMA = "aa-projection-perf-capture/3"
 _AV_SERIES_LIMIT = 1_000_000
 _TERMINATE_GRACE_SECONDS = 5.0
 _PROJECTION_STARTUP_TIMEOUT_SECONDS = 60
+# Derived wireless startup floor from aa_transport.WIRELESS_STARTUP_BUDGET_S:
+# - tools/wireless-receiver/Runtime.hpp:228 (15 s per admission attempt)
+# - tools/wireless-receiver/Runtime.hpp:35,207,242 (250 ms initial backoff, 5 s cap)
+# - tools/wireless-receiver/Runtime.hpp:251 (attempt held while bootstrapping)
+# - include/aa/app/HandoffEligibility.hpp:45,47 (40 s bootstrap #170 + 5 s connect)
+# - src/app/WirelessLink.cpp:58,84,143-146 (10 s post-TCP negotiation before ACTIVE)
+# - src/helper/BusClient.cpp:21,104,176,184 (2 x 4 helper RPCs @ 1 s)
+# - Ready poll (5 s) + display probe fallback (5 s) + safety margin (12 s) = 120 s
+WIRELESS_STARTUP_BUDGET_S = transport.WIRELESS_STARTUP_BUDGET_S
 _MEDIA_STALL_SECONDS = 10
+# Startup eligibility is decided by the receiver's own ACTIVE mono_ns against the
+# deadline, and binding also requires the session to still be active. There is
+# deliberately no age limit on a timely observation: collector work between the
+# observation and the bind (process scans, a display probe of up to ~5 s) is not
+# bounded, and an age limit dropped healthy, still-active sessions (PR #184 review).
 # A normal sample interval is at most 5 s (see the sleeps in collect) plus a short
 # parse. Anything beyond this is the collector itself having been frozen, so it is
 # recorded as host interference; the margin below _MEDIA_STALL_SECONDS means gaps
@@ -579,6 +593,7 @@ class EventParser:
         self.video_presentations = 0
         self.receiver_ready = False
         self.projection_active = False
+        self.first_active_mono_ns: int | None = None
         self.last_audio_scheduled = -1
         self.last_video_scheduled = -1
         self.video_measurements = VideoMeasurements()
@@ -941,6 +956,8 @@ class EventParser:
             self.session_id = session
             if type(mono) is int and self.receiver_started_ns is not None and self.startup_ms is None:
                 self.startup_ms = max(0, (mono - self.receiver_started_ns) // 10**6)
+            if type(mono) is int and mono >= 0:
+                self.first_active_mono_ns = mono
             if not self.readmitted:
                 self.projection_active = True
         elif state in ("disconnected", "reconnecting", "failed", "stopping"):
@@ -1077,6 +1094,40 @@ def build_record(args: argparse.Namespace, build_type: str | None = None,
     return record
 
 
+def max_wireless_startup_timeout_seconds(duration_seconds: int = 0) -> int:
+    """Largest wireless startup deadline whose full receiver lifetime fits in _RECEIVER_MAX_LIFETIME_MS."""
+    overhead = 10 + int(_ADB_BIND_TIMEOUT_SECONDS) + _WIRELESS_PREPARE_HEADROOM_SECONDS
+    return (_RECEIVER_MAX_LIFETIME_MS // 1000) - duration_seconds - overhead
+
+
+def startup_timeout_seconds(transport_name: str, override_s: int | None = None, *,
+                            duration_seconds: int = 0) -> int:
+    """Resolve and validate the startup deadline: wired stays <= 60 s; wireless >= derived floor."""
+    if transport_name == "wireless":
+        max_s = max_wireless_startup_timeout_seconds(duration_seconds)
+        if max_s < WIRELESS_STARTUP_BUDGET_S:
+            raise ValueError(
+                f"--duration-seconds {duration_seconds} leaves only {max_s} s under the "
+                f"{_RECEIVER_MAX_LIFETIME_MS // 1000} s receiver lifetime "
+                f"(< {WIRELESS_STARTUP_BUDGET_S} s floor)"
+            )
+        if override_s is None:
+            return WIRELESS_STARTUP_BUDGET_S
+        if type(override_s) is not int or override_s < WIRELESS_STARTUP_BUDGET_S or override_s > max_s:
+            raise ValueError(
+                f"--startup-timeout-seconds for wireless must be in "
+                f"[{WIRELESS_STARTUP_BUDGET_S}, {max_s}]"
+            )
+        return override_s
+    if override_s is None:
+        return _PROJECTION_STARTUP_TIMEOUT_SECONDS
+    if type(override_s) is not int or not 0 < override_s <= _PROJECTION_STARTUP_TIMEOUT_SECONDS:
+        raise ValueError(
+            f"--startup-timeout-seconds must be in [1, {_PROJECTION_STARTUP_TIMEOUT_SECONDS}]"
+        )
+    return override_s
+
+
 def collect(args: argparse.Namespace, build: dict | None = None) -> dict:
     selected_policy = getattr(args, "thermal_policy", "strict-all-zones")
     hardware = _target_hardware_state() if selected_policy != "strict-all-zones" else None
@@ -1086,11 +1137,15 @@ def collect(args: argparse.Namespace, build: dict | None = None) -> dict:
     receiver_log = state_dir / "receiver.log"
     display_log = state_dir / "display.log"
 
-    startup_timeout = getattr(args, "startup_timeout_seconds", _PROJECTION_STARTUP_TIMEOUT_SECONDS)
+    wireless = getattr(args, "transport", transport.DEFAULT_TRANSPORT) == "wireless"
+    raw_startup = getattr(args, "startup_timeout_seconds", None)
+    startup_timeout = (
+        raw_startup if raw_startup is not None
+        else (WIRELESS_STARTUP_BUDGET_S if wireless else _PROJECTION_STARTUP_TIMEOUT_SECONDS)
+    )
     managed_display = bool(args.display and not args.no_display)
     video_socket = getattr(args, "video_socket", None)
     input_socket = getattr(args, "input_socket", None)
-    wireless = getattr(args, "transport", transport.DEFAULT_TRANSPORT) == "wireless"
     lifetime_s = args.duration_seconds + startup_timeout + 10
     if wireless:
         # Wireless binds adb and prepares the phone after the receiver is up
@@ -1164,12 +1219,30 @@ def collect(args: argparse.Namespace, build: dict | None = None) -> dict:
     observed_duration = 0.0
     catch_up_doubts_at_cutoff: int | None = None
     deadline = start + startup_timeout
+    startup_deadline_ns = origin_ns + startup_timeout * 1_000_000_000
+    startup_active_at_ns: int | None = None
+
+    def poll_startup_logs() -> None:
+        nonlocal startup_active_at_ns
+        parser.poll(str(receiver_log))
+        if wireless and startup_active_at_ns is None and parser.projection_active:
+            startup_active_at_ns = time.monotonic_ns()
+        if display is not None:
+            parser.poll(str(display_log))
+
+    def startup_active_eligible(now_ns: int) -> bool:
+        return (
+            wireless
+            and not prepared
+            and parser.projection_active
+            and parser.first_active_mono_ns is not None
+            and parser.first_active_mono_ns <= startup_deadline_ns
+            and startup_active_at_ns is not None
+        )
 
     def read_sample() -> Sample:
         nonlocal inventory
-        parser.poll(str(receiver_log))
-        if display is not None:
-            parser.poll(str(display_log))
+        poll_startup_logs()
         observed = _thermal_inventory() if thermal_policy is not None else None
         if observed is not None and inventory and set(observed) != {zone.zone for zone in inventory}:
             parser.invalid_telemetry.append("thermal_inventory_changed")
@@ -1249,6 +1322,7 @@ def collect(args: argparse.Namespace, build: dict | None = None) -> dict:
             origin_ns = time.monotonic_ns()
             start = origin_ns / 1e9
             deadline = start + startup_timeout
+            startup_deadline_ns = origin_ns + startup_timeout * 1_000_000_000
         rec_file = open(receiver_log, "w", encoding="utf-8")
         receiver = subprocess.Popen(receiver_cmd, stdout=rec_file, stderr=subprocess.STDOUT,
                                     start_new_session=True)
@@ -1260,7 +1334,7 @@ def collect(args: argparse.Namespace, build: dict | None = None) -> dict:
             # bounded by the one absolute startup deadline above, measured from
             # the pre-launch origin and never refreshed by readiness.
             while True:
-                parser.poll(str(receiver_log))
+                poll_startup_logs()
                 now = time.monotonic_ns() / 1e9
                 if receiver.poll() is not None:
                     early_exit = True
@@ -1289,39 +1363,8 @@ def collect(args: argparse.Namespace, build: dict | None = None) -> dict:
                     if workload is not None and display.stdin is not None:
                         os.set_blocking(display.stdin.fileno(), False)
 
-        while True:
-            now = time.monotonic_ns() / 1e9
-            if display is not None:
-                display_connected = _display_connected()
-                if not display_connected:
-                    break
-            if now >= deadline:
-                break
-            if receiver.poll() is not None:
-                early_exit = True
-                break
-            if display is not None and display.poll() is not None:
-                display_survived = False
-                break
-            if parser.terminal_errors:
-                break
-            if wireless and not prepared and parser.projection_active:
-                if not bind_and_prepare():
-                    early_exit = True
-                    break
-                prepared = True
-                continue  # the next sample is the first that may start the window
-            if prepared:
-                sample_host_usb()
-            if (workload is not None and stimulus is None and display is not None
-                    and display.stdin is not None and parser.projection_active and prepared):
-                stimulus = moving_map.SoakStimulus(workload, display.stdin.fileno(), receiver_log,
-                                                   since_ns=time.monotonic_ns())
-                stimulus.start()
-            if stimulus is not None and stimulus.failure:
-                parser.terminal_errors.append({"event": "err", "code": stimulus.failure})
-                break
-            time.sleep(min(args.interval, 5.0, max(0.0, deadline - now)))
+        def take_sample() -> bool:
+            nonlocal inventory, deadline
             sample = read_sample()
             logged_progress = None
             if progress.event_anchored and progress.started_ns is not None:
@@ -1353,7 +1396,84 @@ def collect(args: argparse.Namespace, build: dict | None = None) -> dict:
                 deadline = start + progress.started_ns / 1e9 + args.duration_seconds
             elif was_started and progress.last_ns == sample.t_ns:
                 parser.video_measurements.advance(sample.t_ns)
-            if progress.failure:
+            return not progress.failure
+
+        # Wireless startup loop: judge ACTIVE eligibility by the receiver's own
+        # monotonic timestamp (mono_ns <= startup_deadline_ns), refresh now after
+        # any display probe, run one final log read on timeout, and bound bind age.
+        post_prepare_pending = False
+        while wireless and not prepared:
+            if display is not None:
+                display_connected = _display_connected()
+                if not display_connected:
+                    break
+            now_ns = time.monotonic_ns()
+            if receiver.poll() is not None:
+                early_exit = True
+                break
+            if display is not None and display.poll() is not None:
+                display_survived = False
+                break
+            if parser.terminal_errors:
+                break
+            if now_ns >= startup_deadline_ns:
+                if not parser.projection_active:
+                    poll_startup_logs()
+                    now_ns = time.monotonic_ns()
+                    if parser.terminal_errors:
+                        break
+                if startup_active_eligible(now_ns):
+                    if not bind_and_prepare():
+                        early_exit = True
+                        break
+                    prepared = True
+                    post_prepare_pending = True
+                break
+            if parser.projection_active:
+                if startup_active_eligible(now_ns):
+                    if not bind_and_prepare():
+                        early_exit = True
+                        break
+                    prepared = True
+                    post_prepare_pending = True
+                break
+            time.sleep(min(args.interval, 5.0, max(0.0, (startup_deadline_ns - now_ns) / 1e9)))
+            if not take_sample():
+                break
+
+        # Measurement loop (restored d1200dc behaviour): read now before
+        # _display_connected() so a final probe crossing the deadline still
+        # records the final sample and advances progress through the cutoff.
+        while (prepared and not early_exit and display_survived is not False
+               and display_connected is not False and not parser.terminal_errors
+               and not progress.failure):
+            now = time.monotonic_ns() / 1e9
+            if display is not None:
+                display_connected = _display_connected()
+                if not display_connected:
+                    break
+            if now >= deadline and not post_prepare_pending:
+                break
+            post_prepare_pending = False
+            if receiver.poll() is not None:
+                early_exit = True
+                break
+            if display is not None and display.poll() is not None:
+                display_survived = False
+                break
+            if parser.terminal_errors:
+                break
+            sample_host_usb()
+            if (workload is not None and stimulus is None and display is not None
+                    and display.stdin is not None and parser.projection_active):
+                stimulus = moving_map.SoakStimulus(workload, display.stdin.fileno(), receiver_log,
+                                                   since_ns=time.monotonic_ns())
+                stimulus.start()
+            if stimulus is not None and stimulus.failure:
+                parser.terminal_errors.append({"event": "err", "code": stimulus.failure})
+                break
+            time.sleep(min(args.interval, 5.0, max(0.0, deadline - now)))
+            if not take_sample():
                 break
 
         video_evidence = parser.video_measurements.finish(progress.last_ns)
@@ -1518,7 +1638,12 @@ def collect(args: argparse.Namespace, build: dict | None = None) -> dict:
                            if workload is not None else {"kind": "none"})
     capture["concurrent_builds"] = concurrent_builds
     if wireless:
+        ap_channel = getattr(args, "ap_channel", None)
         capture["link"] = link
+        capture["ap_interface"] = getattr(args, "ap_interface", None)
+        capture["ap_channel"] = (
+            ap_channel if ap_channel is not None else transport.DEFAULT_AP_CHANNEL
+        )
         capture["startup_basis"] = "harness_launch_to_active"
         capture["media_telemetry_dropped"] = parser.media_telemetry_dropped
     if thermal_policy is not None:
@@ -1560,8 +1685,10 @@ def _cli(argv: list[str]) -> int:
     parser.add_argument("--thermal-policy", choices=("strict-all-zones", NANO_PROFILE),
                         default="strict-all-zones", help="explicit approved Nano CV availability exception")
     parser.add_argument("--startup-timeout-seconds", type=int,
-                        default=_PROJECTION_STARTUP_TIMEOUT_SECONDS,
-                        help="startup timeout, may only shorten the default 60-second grace")
+                        default=None,
+                        help=f"startup timeout (wired: [1, {_PROJECTION_STARTUP_TIMEOUT_SECONDS}], "
+                             f"default {_PROJECTION_STARTUP_TIMEOUT_SECONDS}; wireless: >= "
+                             f"{WIRELESS_STARTUP_BUDGET_S}, default {WIRELESS_STARTUP_BUDGET_S})")
     parser.add_argument("--build-dir", default=os.environ.get("AA_BUILD_DIR"),
                         help="build directory (CMakeCache.txt) that produced the launched binaries; "
                              "required for a live qualification stage")
@@ -1629,8 +1756,12 @@ def _run(args: argparse.Namespace) -> int:
         print("error: --workload moving-map needs --media-component PKG/ACTIVITY, so the media "
               "player can be stopped and verified after the stage", file=sys.stderr)
         return 2
-    if not 0 < args.startup_timeout_seconds <= _PROJECTION_STARTUP_TIMEOUT_SECONDS:
-        print("error: --startup-timeout-seconds must be in [1, 60]", file=sys.stderr)
+    try:
+        args.startup_timeout_seconds = startup_timeout_seconds(
+            args.transport, args.startup_timeout_seconds, duration_seconds=args.duration_seconds
+        )
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
         return 2
     if not math.isfinite(args.interval) or args.interval <= 0:
         print("error: --interval must be positive", file=sys.stderr)

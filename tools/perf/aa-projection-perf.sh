@@ -81,6 +81,8 @@ RECEIVER=""
 PHONE_ID=""
 AP_INTERFACE=""
 AP_CHANNEL=""
+STARTUP_TIMEOUT_SECONDS=""
+STARTUP_TIMEOUT_SET=0
 DISPLAY_BIN="/opt/aa/aa-dummy-display"
 STORE=""
 OUT=""
@@ -152,6 +154,7 @@ while (($# > 0)); do
         --phone-id) require_value "$@"; PHONE_ID="$2"; shift 2 ;;
         --ap-interface) require_value "$@"; AP_INTERFACE="$2"; shift 2 ;;
         --ap-channel) require_value "$@"; AP_CHANNEL="$2"; shift 2 ;;
+        --startup-timeout-seconds) require_value "$@"; STARTUP_TIMEOUT_SECONDS="$2"; STARTUP_TIMEOUT_SET=1; shift 2 ;;
         --media-uri) require_value "$@"; MEDIA_URI="$2"; shift 2 ;;
         --media-type) require_value "$@"; MEDIA_TYPE="$2"; shift 2 ;;
         --media-component) require_value "$@"; MEDIA_COMPONENT="$2"; shift 2 ;;
@@ -247,6 +250,28 @@ if [[ "$MODE" == "wireless" ]]; then
     RECEIVER="${RECEIVER:-/opt/aa/aa-wireless-receiver}"
 fi
 RECEIVER="${RECEIVER:-/opt/aa/aa-wired-receiver}"
+WIRELESS_STARTUP_FLOOR_S=""
+if [[ "$MODE" == "wireless" ]] && ((!READINESS_ONLY)) && [[ -z "$CAPTURE" ]]; then
+    WIRELESS_STARTUP_FLOOR_S="$("$PY" -B -c "import sys; sys.path.insert(0, sys.argv[1]); import aa_transport; print(aa_transport.WIRELESS_STARTUP_BUDGET_S)" "$TOOL_DIR")"
+fi
+if ((STARTUP_TIMEOUT_SET)); then
+    if ((READINESS_ONLY)) || [[ -n "$CAPTURE" ]]; then
+        echo "usage error: --startup-timeout-seconds is only valid in live measurement modes" >&2
+        exit 2
+    fi
+    if [[ ! "$STARTUP_TIMEOUT_SECONDS" =~ ^[1-9][0-9]*$ ]] || ((${#STARTUP_TIMEOUT_SECONDS} > 6)); then
+        echo "usage error: --startup-timeout-seconds must be a positive integer within receiver lifetime" >&2
+        exit 2
+    fi
+    if [[ "$MODE" == "wireless" ]] && ((STARTUP_TIMEOUT_SECONDS < WIRELESS_STARTUP_FLOOR_S)); then
+        echo "usage error: --startup-timeout-seconds for --mode wireless must be >= ${WIRELESS_STARTUP_FLOOR_S} (derived floor)" >&2
+        exit 2
+    fi
+    if [[ "$MODE" != "wireless" ]] && ((STARTUP_TIMEOUT_SECONDS > 60)); then
+        echo "usage error: --startup-timeout-seconds for --mode wired must be in [1, 60]" >&2
+        exit 2
+    fi
+fi
 if [[ ! "$INTERVAL" =~ ^[0-9]+([.][0-9]+)?$ ]] || [[ "$INTERVAL" == "0" || "$INTERVAL" == "0.0" ]]; then
     echo "usage error: --interval must be a positive number" >&2
     exit 2
@@ -328,10 +353,12 @@ blocked_result() {
     local reason="$1"
     local capture="$BUFFER/blocked-capture.json"
     AA_BLOCK_MODE="$MODE" AA_BLOCK_BUILD_TYPE="${2:-}" AA_BLOCK_BUILD_DIR="${3:-}" \
-        AA_BLOCK_ALLOW_UNOPTIMIZED="${4:-0}" "$PY" -B - "$capture" <<'PY'
+        AA_BLOCK_ALLOW_UNOPTIMIZED="${4:-0}" AA_BLOCK_AP_INTERFACE="$AP_INTERFACE" \
+        AA_BLOCK_AP_CHANNEL="${AP_CHANNEL:-36}" "$PY" -B - "$capture" <<'PY'
 import json, os, sys
 build_type = os.environ.get("AA_BLOCK_BUILD_TYPE") or None
 build_dir = os.environ.get("AA_BLOCK_BUILD_DIR") or None
+mode = os.environ.get("AA_BLOCK_MODE") or "wired"
 doc = {
     "schema": "aa-projection-perf-capture/3",
     "av_series": {"pair_t_ns": [], "pair_skew_ns": [], "audio_intervals_ns": []},
@@ -339,7 +366,7 @@ doc = {
     "monotonic_origin_ns": 0,
     "cpu_ticks_per_second": 1,
     "video_evidence": {"blocks": [], "ipc_latency_ns": [], "decode_latency_ns": []},
-    "mode": os.environ.get("AA_BLOCK_MODE") or "wired",
+    "mode": mode,
     "duration_seconds": 0,
     "crashes": 0,
     "samples": [],
@@ -351,6 +378,10 @@ doc = {
         "verified_on": "none",
     },
 }
+if mode == "wireless":
+    doc["ap_interface"] = os.environ.get("AA_BLOCK_AP_INTERFACE") or None
+    ch = os.environ.get("AA_BLOCK_AP_CHANNEL") or "36"
+    doc["ap_channel"] = int(ch) if ch.isdigit() else None
 with open(sys.argv[1], "w", encoding="utf-8") as handle:
     json.dump(doc, handle)
 PY
@@ -424,6 +455,18 @@ fi
 if [[ -z "$duration_secs" ]]; then
     echo "usage error: --duration is required for a live run" >&2
     exit 2
+fi
+if [[ "$MODE" == "wireless" ]]; then
+    if ! wireless_bound_msg="$("$PY" -B -c "
+import sys
+sys.path.insert(0, sys.argv[1])
+import aa_projection_collect as collect
+override = int(sys.argv[2]) if sys.argv[2] else None
+collect.startup_timeout_seconds('wireless', override, duration_seconds=int(sys.argv[3]))
+" "$TOOL_DIR" "$STARTUP_TIMEOUT_SECONDS" "$duration_secs" 2>&1)"; then
+        echo "usage error: ${wireless_bound_msg##*ValueError: }" >&2
+        exit 2
+    fi
 fi
 # The soak workload (#137): every live stage drags a moving map with media
 # playing for the whole stage. The values reach the remote collector inside
@@ -531,10 +574,15 @@ if [[ "$PHONE_SERIAL" =~ ^[A-Za-z0-9._:-]+$ ]]; then
         fi
     fi
 fi
+smoke_ap_args=()
+if [[ "$MODE" == "wireless" ]]; then
+    smoke_ap_args=(--ap-interface "$AP_INTERFACE" --ap-channel "${AP_CHANNEL:-36}")
+fi
 if ! smoke_reason="$("$PY" -B "$TOOL_DIR/../wired-qa/aa_drive_smoke.py" check \
         --record "${DRIVE_SMOKE:-/nonexistent}" \
         --receiver-sha256 "$receiver_sha" --display-sha256 "$display_sha" \
-        --phone-serial "$verified_serial" --transport "$MODE" ${PHONE_ID:+--phone-id "$PHONE_ID"})"; then
+        --phone-serial "$verified_serial" --transport "$MODE" ${PHONE_ID:+--phone-id "$PHONE_ID"} \
+        "${smoke_ap_args[@]}")"; then
     smoke_reason="${smoke_reason:-drive_smoke_missing}"
     blocked_result "$smoke_reason" "$build_type_known" "$BUILD_DIR" "$ALLOW_UNOPTIMIZED"
     exit 3
@@ -580,6 +628,10 @@ COLLECTOR_MEASUREMENT_SLACK_S=30
 COLLECTOR_CLEANUP_BUDGET_S=240
 collector_timeout=$((COLLECTOR_STARTUP_BUDGET_S + duration_secs + COLLECTOR_MEASUREMENT_SLACK_S
                      + COLLECTOR_CLEANUP_BUDGET_S))
+if [[ "$MODE" == "wireless" ]]; then
+    effective_startup="${STARTUP_TIMEOUT_SECONDS:-$WIRELESS_STARTUP_FLOOR_S}"
+    ((effective_startup > 60)) && collector_timeout=$((collector_timeout + effective_startup - 60 + 20))
+fi
 blocked_type=""
 # A stop (TERM/INT, e.g. from tools/perf/aa_soak_chain.py) must reach the
 # collector on the target: ending this side's ssh client does not signal a
@@ -628,6 +680,7 @@ timeout -k "$SSH_KILL_GRACE_S" "$collector_timeout" ssh "${SSH_OPTS[@]}" "$HOST"
         ${MEDIA_COMPONENT:+--media-component '${MEDIA_COMPONENT}'} ${GEO_URI:+--geo-uri '${GEO_URI}'} \
         --transport '${MODE}' ${PHONE_ID:+--phone-id '${PHONE_ID}'} \
         ${AP_INTERFACE:+--ap-interface '${AP_INTERFACE}'} ${AP_CHANNEL:+--ap-channel '${AP_CHANNEL}'} \
+        ${STARTUP_TIMEOUT_SECONDS:+--startup-timeout-seconds '${STARTUP_TIMEOUT_SECONDS}'} \
         --run-file '${RUN_FILE}'" \
         <"$BUFFER/collector.py" >"$capture_file" 2>"$BUFFER/collector.err" &
 collector_job=$!

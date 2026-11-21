@@ -139,6 +139,48 @@ def _check_keywords(schema: dict, path: str) -> None:
         raise SchemaError(f"{path}: unsupported schema keyword(s): {', '.join(unknown)}")
 
 
+def _ecma_to_python_regex(pattern: str) -> str:
+    """Translate ECMA-262 anchors (^, $) and empty classes ([], [^]) to Python re."""
+    out: list[str] = []
+    i = 0
+    in_class = False
+    n = len(pattern)
+    while i < n:
+        ch = pattern[i]
+        if ch == "\\" and i + 1 < n:
+            out.append(pattern[i : i + 2])
+            i += 2
+            continue
+        if ch == "[" and not in_class:
+            # In ECMA-262, [] never matches and [^] matches any code unit (incl. \n).
+            if i + 1 < n and pattern[i + 1] == "]":
+                out.append(r"[^\s\S]")
+                i += 2
+                continue
+            if i + 2 < n and pattern[i + 1 : i + 3] == "^]":
+                out.append(r"[\s\S]")
+                i += 3
+                continue
+            in_class = True
+            out.append(ch)
+            i += 1
+            if i < n and pattern[i] == "^":
+                out.append(pattern[i])
+                i += 1
+            continue
+        if ch == "]" and in_class:
+            in_class = False
+            out.append(ch)
+        elif ch == "^" and not in_class:
+            out.append(r"\A")
+        elif ch == "$" and not in_class:
+            out.append(r"\Z")
+        else:
+            out.append(ch)
+        i += 1
+    return "".join(out)
+
+
 def _check_format(instance: str, fmt: str) -> list[str]:
     if fmt != "date-time":
         return []  # other formats are annotations; nothing to assert
@@ -205,7 +247,11 @@ def _validate(instance: object, schema: object, root: dict, path: str, depth: in
     if "maxLength" in schema and isinstance(instance, str) and len(instance) > schema["maxLength"]:
         errors.append(f"{path}: string longer than maxLength {schema['maxLength']}")
     if "pattern" in schema and isinstance(instance, str):
-        if re.search(schema["pattern"], instance) is None:
+        try:
+            matched = re.search(_ecma_to_python_regex(schema["pattern"]), instance)
+        except re.error as exc:
+            raise SchemaError(f"{path}: invalid pattern {schema['pattern']!r}: {exc}") from exc
+        if matched is None:
             errors.append(f"{path}: string does not match pattern {schema['pattern']!r}")
     if "format" in schema and isinstance(instance, str):
         errors.extend(f"{path}: {e}" for e in _check_format(instance, schema["format"]))

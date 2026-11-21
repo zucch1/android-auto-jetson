@@ -217,6 +217,53 @@ ADB_TCP_PORT = 5555
 _INTERFACE = re.compile(r"[A-Za-z0-9_.-]{1,15}")
 # Non-DFS UNII-1 channels aa-wireless-receiver and the helper accept (--ap-channel).
 AP_CHANNELS = (36, 40, 44, 48)
+DEFAULT_AP_CHANNEL = 36
+
+# Wireless startup budget derived from the receiver's admission, bootstrap,
+# post-TCP negotiation, helper RPC bounds, and collector polling/probe allowances:
+# - tools/wireless-receiver/Runtime.hpp:228: per-attempt admission deadline = 15 s
+#   (`attempt_until = Clock::now() + std::chrono::seconds{15}`).
+# - tools/wireless-receiver/Runtime.hpp:35,207,242: retry backoff starts at
+#   250 ms and doubles up to a 5 s cap (`std::chrono::milliseconds{5000}`).
+# - tools/wireless-receiver/Runtime.hpp:251: an observed bootstrap is held to its
+#   own deadline instead of expiring with `attempt_until`.
+# - include/aa/app/HandoffEligibility.hpp:45,47: bootstrap allowance = 40 s
+#   (`bootstrap{40'000}` since #170) + 5 s TCP connect (`connect{5'000}`).
+# - src/app/WirelessLink.cpp:58,84,143-146: post-TCP negotiation phase = 10 s
+#   (`phases.negotiate = core::Milliseconds{10'000}`) before ACTIVE.
+# - src/helper/BusClient.cpp:21,104,176,184 & tools/wireless-receiver/Runtime.hpp:213-258:
+#   helper RPCs per admission (`reconnect`, `ap_status`, `acquire_ap`, expiry
+#   `bootstrap_wait`) are each 1 s bounded (4 s per admission * 2 = 8 s).
+# - tools/perf/aa_projection_collect.py:1318: ready poll interval = 5 s.
+# - tools/perf/aa_projection_collect.py:359,1341: one display probe / xrandr
+#   fallback = 5 s.
+# - Documented safety margin = 12 s covering active-loop polling up to 5 s
+#   (aa_projection_collect.py:1370), synchronous retirement settlement
+#   (src/app/HandoffEligibility.cpp:212), and scheduling jitter.
+# Total derived lower bound = 15 + 5 + 15 + 40 + 5 + 10 + 8 + 5 + 5 + 12 = 120 s
+# (extendable via --startup-timeout-seconds, not an exact worst case).
+WIRELESS_ADMISSION_ATTEMPT_S = 15
+WIRELESS_BACKOFF_CAP_S = 5
+WIRELESS_BOOTSTRAP_S = 40
+WIRELESS_CONNECT_S = 5
+WIRELESS_NEGOTIATION_S = 10
+WIRELESS_HELPER_RPC_S = 1
+WIRELESS_ADMISSION_HELPER_S = 4 * WIRELESS_HELPER_RPC_S
+WIRELESS_READY_POLL_S = 5
+WIRELESS_DISPLAY_PROBE_S = 5
+WIRELESS_STARTUP_MARGIN_S = 12
+WIRELESS_STARTUP_BUDGET_S = (
+    WIRELESS_ADMISSION_ATTEMPT_S
+    + WIRELESS_BACKOFF_CAP_S
+    + WIRELESS_ADMISSION_ATTEMPT_S
+    + WIRELESS_BOOTSTRAP_S
+    + WIRELESS_CONNECT_S
+    + WIRELESS_NEGOTIATION_S
+    + 2 * WIRELESS_ADMISSION_HELPER_S
+    + WIRELESS_READY_POLL_S
+    + WIRELESS_DISPLAY_PROBE_S
+    + WIRELESS_STARTUP_MARGIN_S
+)
 
 
 def valid_interface(name: object) -> bool:
