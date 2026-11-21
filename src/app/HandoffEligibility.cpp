@@ -77,15 +77,22 @@ struct HandoffEligibilityCoordinator::Impl {
     // bootstrap to this attempt's source before the attempt was retired. It is denied like any
     // retired handle and never adopted again; otherwise the helper keeps the bootstrap, its
     // binding and its lease into the next attempt (#169 review).
-    void orphaned(const Reply& reply) {
+    void settle_reply(const Reply& reply) {
+        if (reply.job.operation == Operation::deny) {
+            if (reply.result) denial.reset();
+            return;
+        }
         if (reply.job.operation != Operation::observe || !reply.result || !reply.result.value().peer.handle) return;
         const auto bound = reply.result.value().peer.handle;
         retired_handle = bound;
-        if (!denial) denial = Job{Operation::deny, epoch.load(), reply.job.source, bound};
+        // The successful poll now owns the helper's single binding.
+        denial = Job{Operation::deny, epoch.load(), reply.job.source, bound};
     }
     void accept(Reply reply) {
-        if (reply.job.operation == Operation::deny) return;
-        if (reply.job.epoch != epoch.load()) { orphaned(reply); return; }
+        if (reply.job.operation == Operation::deny || reply.job.epoch != epoch.load()) {
+            settle_reply(reply);
+            return;
+        }
         if (!reply.result) {
             // A server-side RFCOMM peer may not have connected yet. Keep only
             // initial observation bounded by establishment; all later errors retire.
@@ -135,15 +142,15 @@ struct HandoffEligibilityCoordinator::Impl {
         }
     }
     // Sends this coordinator's outstanding denial now, after any operation still in flight (whose
-    // reply is stale once retired, but may name a handle to deny: orphaned()). The helper then has
-    // retired the old hand-off before the caller starts a fresh attempt (#169 review).
+    // reply is stale once retired, but may name a handle to deny). Keep a failed denial for tick().
     void settle() {
-        if (pending) { auto reply = pending->get(); pending.reset(); orphaned(reply); }
-        if (denial) {
-            const auto job = *denial;
-            denial.reset();
-            (void)operations.authorize(job.source, job.handle, false);
+        if (pending) {
+            auto reply = pending->get();
+            pending.reset();
+            settle_reply(reply);
+            if (reply.job.operation == Operation::deny) return;
         }
+        if (denial && operations.authorize(denial->source, denial->handle, false)) denial.reset();
     }
     void tick() {
         // Establishment bounds only the wait for a bootstrap. An observed one runs to its own
@@ -152,11 +159,20 @@ struct HandoffEligibilityCoordinator::Impl {
             (stage == Stage::observing && Clock::now() >= establishment) ||
             ((stage == Stage::preparing || stage == Stage::authorizing) && Clock::now() >= bootstrap_until) ||
             (phone && !trusted()) || (!live_consumer() && !active))) retire();
+        bool finished_denial = false;
         if (pending && pending->wait_for(0ms) == std::future_status::ready) {
-            auto reply = pending->get(); pending.reset(); accept(std::move(reply));
+            auto reply = pending->get();
+            pending.reset();
+            finished_denial = reply.job.operation == Operation::deny;
+            accept(std::move(reply));
         }
         if (pending) return;
-        if (denial) { auto job = *denial; denial.reset(); launch(job); return; }
+        // A gone handle can be rejected on every retry. Give a replacement attempt an
+        // observation between retries, then let it proceed once it has its own handle.
+        if (denial && (stage == Stage::retired || (stage == Stage::observing && !finished_denial))) {
+            launch(*denial);
+            return;
+        }
         if (withdrawal) { auto job = *withdrawal; withdrawal.reset(); launch(job); return; }
         if (stage == Stage::observing) launch({Operation::observe, epoch.load(), source, 0});
         if (stage == Stage::preparing) launch({Operation::refresh, epoch.load(), source, handle});

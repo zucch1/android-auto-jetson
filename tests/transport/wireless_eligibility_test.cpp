@@ -23,6 +23,9 @@ struct EligibilityFixture {
     std::atomic<bool> sampled{false};
     std::atomic<bool> authorize_wait{false}, authorizing{false};
     std::atomic<unsigned> denied{};
+    std::atomic<bool> fail_next_denial{false};
+    std::atomic<bool> reject_denials{false};
+    std::atomic<unsigned> denial_attempts{};
     std::atomic<std::uint64_t> denied_handle{};
     std::atomic<std::uint64_t> observed_handle{41};
     std::atomic<unsigned> allowed{};
@@ -54,7 +57,13 @@ struct EligibilityFixture {
                 while (authorize_wait.load()) std::this_thread::yield();
                 if (moderate_ops.load()) std::this_thread::sleep_for(350ms);
                 ++allowed;
-            } else { denied_handle = handle; ++denied; }
+            } else {
+                ++denial_attempts;
+                if (fail_next_denial.exchange(false)) return aa::Error{aa::ErrorCode::timeout};
+                if (reject_denials) return aa::Error{aa::ErrorCode::helper_rejected};
+                denied_handle = handle;
+                ++denied;
+            }
             return {};
         }, [this](aa::helper::Source, std::uint64_t) -> aa::core::Result<void> {
             ++withdrawn;
@@ -377,6 +386,47 @@ TEST(WirelessEligibility, RetireWithAnObservationInFlightDeniesTheHandleItBound)
     f.coordinator.retire();
     EXPECT_EQ(f.denied.load(), 1U) << "retire() returned without denying the observed handle";
     EXPECT_EQ(f.denied_handle.load(), f.peer.handle);
+}
+TEST(WirelessEligibility, TickRetriesADenialThatTimedOutDuringRetire) {
+    EligibilityFixture f;
+    f.start();
+    ASSERT_TRUE(f.eventually([&] { return f.coordinator.admitting(); }));
+    f.fail_next_denial = true;
+    f.coordinator.retire();
+    ASSERT_EQ(f.denial_attempts.load(), 1U);
+    ASSERT_EQ(f.denied.load(), 0U);
+    EXPECT_TRUE(f.eventually([&] { return f.denied.load() == 1U; }))
+        << "tick did not retry the retired handoff's denial";
+    EXPECT_EQ(f.denial_attempts.load(), 2U);
+    EXPECT_EQ(f.denied_handle.load(), f.peer.handle);
+    f.coordinator.retire();
+    EXPECT_EQ(f.denial_attempts.load(), 2U) << "a successful denial must not be retried";
+}
+TEST(WirelessEligibility, TickRetriesADenialThatTimedOutDuringTick) {
+    EligibilityFixture f;
+    f.start();
+    ASSERT_TRUE(f.eventually([&] { return f.coordinator.admitting(); }));
+    f.fail_next_denial = true;
+    f.coordinator.consumer(std::nullopt);
+    EXPECT_TRUE(f.eventually([&] { return f.denied.load() == 1U; }))
+        << "tick dropped the failed asynchronous denial";
+    EXPECT_EQ(f.denial_attempts.load(), 2U);
+    EXPECT_EQ(f.denied_handle.load(), f.peer.handle);
+    f.coordinator.retire();
+    EXPECT_EQ(f.denial_attempts.load(), 2U);
+}
+TEST(WirelessEligibility, RetryingADenialForAGoneHandleLetsTheNextAttemptProceed) {
+    EligibilityFixture f;
+    f.start();
+    ASSERT_TRUE(f.eventually([&] { return f.coordinator.admitting(); }));
+    // The helper can apply the deny while its reply times out, then reject every retry.
+    f.fail_next_denial = true;
+    f.reject_denials = true;
+    f.coordinator.retire();
+    f.observed_handle = 42;
+    f.start();
+    EXPECT_TRUE(f.eventually([&] { return f.coordinator.admitting(); }));
+    EXPECT_GE(f.denial_attempts.load(), 2U);
 }
 TEST(WirelessEligibility, EstablishmentExpiryWithAnObservationInFlightDeniesTheHandleItBound) {
     EligibilityFixture f{{std::chrono::milliseconds{100}, std::chrono::milliseconds{10'000}, std::chrono::milliseconds{5'000}}};

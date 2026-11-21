@@ -52,6 +52,7 @@ public:
     core::Result<void> reconnect(ipc::ControlService& control, const trust::TransportIdentity& identity) {
         const auto state = control.state();
         if (!state.consumer.value) return Error{ErrorCode::ipc_consumer_rejected};
+        stop();
         const auto result = helper_.reconnect(identity);
         if (!result) return result.error();
         return begin(control, {state.consumer.value, 0});

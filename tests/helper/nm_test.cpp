@@ -988,6 +988,20 @@ TEST_F(NmDaemon, RetryInsideTheWindowClearsABackstoppedCompletion) {
     EXPECT_FALSE(phone.bluetooth.handoff()) << "the backstopped completion survived the retry";
     EXPECT_EQ(phone.connect(bluez), "allowed") << "the window stays open for the phone's fresh bootstrap";
 }
+TEST_F(NmDaemon, RetryExpiresAnUnconfirmedCompletionBeforeTheNextTick) {
+    seed_managed_phone(directory);
+    ClockedReconnect phone{address, directory}; ASSERT_NO_FATAL_FAILURE(phone.open(bluez));
+    phone.elapsed = 1000; ASSERT_EQ(phone.connect(bluez), "allowed");
+    const auto live = phone.bluetooth.handoff(); ASSERT_TRUE(live);
+    ASSERT_NO_FATAL_FAILURE(phone.complete(bluez, live.value().handle));
+    ASSERT_EQ(bluez.command("wire-read"), "open");
+    // Reconnect arrives after the 30 s backstop and before the platform pump runs again.
+    phone.elapsed = 32000;
+    ASSERT_TRUE(phone.retry());
+    EXPECT_EQ(bluez.command("wire-read"), "closed");
+    EXPECT_FALSE(phone.bluetooth.handoff()) << "reconnect retained the expired handoff";
+    EXPECT_EQ(phone.connect(bluez), "allowed");
+}
 TEST_F(NmDaemon, RetryInsideTheWindowAbortsAConfirmedHandoffWithDisc) {
     seed_managed_phone(directory);
     ClockedReconnect phone{address, directory}; phone.open(bluez);
