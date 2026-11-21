@@ -100,3 +100,53 @@ TEST(WirelessTcp, PartialAapHeaderStillServicesControlAndCancels) {
     client.value()->close();
     aa::transport::socket_util::close_fd(peer); aa::transport::socket_util::close_fd(listener);
 }
+
+// Wireless audio (window 8): the A26 sends media audio stop-and-wait
+// (max_unacked 1), so its throughput is one 42.67 ms chunk per credit round
+// trip, and the receiver's credit acks are small frames. With Nagle on, a small
+// frame written while an earlier small frame is still unacknowledged is held
+// until the peer's delayed ACK (~40 ms), and video and audio acks interleave
+// exactly like that. The phone measured 55-89 ms ack round trips, which is
+// slower than real time. Two back-to-back small frames from either end of a
+// wireless TCP link must reach a silent peer without waiting for its ACK.
+TEST(WirelessTcp, SmallFramesAreNotHeldBehindAnUnacknowledgedFrame) {
+    auto pair = aa::transport::make_tcp_loopback();
+    ASSERT_TRUE(pair);
+    aa::core::CancellationSource cancel;
+    auto& accepted = *pair.value().server;
+    auto& connected = *pair.value().client;
+    ASSERT_TRUE(accepted.open(cancel.get_token()));
+    ASSERT_TRUE(connected.open(cancel.get_token()));
+    auto ack = aa::transport::encode_message({3, aa::transport::MessageKind::specific,
+        std::vector<std::byte>(6, std::byte{1})}, aa::transport::Encryption::plain, nullptr);
+    ASSERT_TRUE(ack);
+    ASSERT_EQ(ack.value().size(), 1U);
+    const auto& frame = ack.value().front();
+    constexpr int kRounds = 8;
+    const auto held_rounds = [&](aa::transport::TcpTransport& sender,
+                                 aa::transport::TcpTransport& receiver) {
+        int held = 0;
+        for (int round = 0; round < kRounds; ++round) {
+            const auto began = std::chrono::steady_clock::now();
+            EXPECT_TRUE(sender.send(frame));
+            EXPECT_TRUE(sender.send(frame));
+            EXPECT_TRUE(receiver.receive());
+            EXPECT_TRUE(receiver.receive());
+            if (std::chrono::steady_clock::now() - began > 20ms) { ++held; }
+            // The peer answers each pair, as the phone answers each ack with
+            // its next chunk: an interactive peer delays its own TCP ACKs.
+            EXPECT_TRUE(receiver.send(frame));
+            EXPECT_TRUE(sender.receive());
+        }
+        return held;
+    };
+    // The receiver of the HU's acks is the phone: here the connected end
+    // reads what the accepted (HU) end sends, then the reverse.
+    const int held_from_accepted = held_rounds(accepted, connected);
+    const int held_from_connected = held_rounds(connected, accepted);
+    // Nagle holds the second frame of every round after the first for the
+    // peer's delayed ACK (~44 ms on loopback); without it a round takes
+    // microseconds, so a stray scheduler delay stays rare.
+    EXPECT_LT(held_from_accepted, kRounds / 2) << "accepted socket holds small frames (Nagle)";
+    EXPECT_LT(held_from_connected, kRounds / 2) << "connected socket holds small frames (Nagle)";
+}

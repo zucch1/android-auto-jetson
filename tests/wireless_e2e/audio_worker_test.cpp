@@ -554,6 +554,22 @@ TEST(WirelessAudioWorker, TelemetryEventParityWithCollectorAndSmokeContracts) {
         "{\"event\":\"audio_write_completed\",\"scheduled_ns\":1000,"
         "\"scheduled_end_ns\":21000,\"completed_ns\":20500,"
         "\"presented_ns\":22000,\"playback_slot_absence\":null}");
+    // Window 8 lost 31.8 s to trims and played 32.1 s of gap silence, but only
+    // the 10.6 s caught up was ever logged: media_timing carries the router's
+    // cumulative loss and silence so a live window shows them directly.
+    audio::RouterStats timing{};
+    timing.max_completion_skew = aa::core::Nanoseconds{2'000'000};
+    timing.max_path_latency = aa::core::Nanoseconds{5'500'000};
+    timing.frames_decoded = 11'534'336;
+    timing.frames_trimmed = 1'526'736;
+    timing.frames_caught_up = 509'856;
+    timing.frames_silence = 1'542'356;
+    timing.frames_idle_skipped = 17'675;
+    EXPECT_EQ(
+        audio::media_timing_json(timing),
+        "{\"event\":\"media_timing\",\"audio_scheduling_skew_ms\":2,"
+        "\"audio_latency_ms\":5.5,\"frames_decoded\":11534336,\"frames_trimmed\":1526736,"
+        "\"frames_caught_up\":509856,\"frames_silence\":1542356,\"frames_idle_skipped\":17675}");
     EXPECT_EQ(
         audio::audio_catch_up_json(960, 1920, 48000, 3, 4800),
         "{\"event\":\"audio_catch_up\",\"frames\":960,\"frames_total\":1920,\"rate\":48000,"

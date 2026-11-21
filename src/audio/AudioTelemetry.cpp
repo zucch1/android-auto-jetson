@@ -94,7 +94,15 @@ std::string audio_chunks_json(std::uint64_t count) {
 std::string media_timing_json(const RouterStats& stats) {
     return "{\"event\":\"media_timing\",\"audio_scheduling_skew_ms\":" +
         format_ms(stats.max_completion_skew) + ",\"audio_latency_ms\":" +
-        format_ms(stats.max_path_latency) + "}";
+        format_ms(stats.max_path_latency) +
+        // Cumulative router loss and synthesized silence: window 8 dropped
+        // 13.2% and filled 13.4% with gap silence while only the catch-up part
+        // (4.4%) was logged.
+        ",\"frames_decoded\":" + std::to_string(stats.frames_decoded) +
+        ",\"frames_trimmed\":" + std::to_string(stats.frames_trimmed) +
+        ",\"frames_caught_up\":" + std::to_string(stats.frames_caught_up) +
+        ",\"frames_silence\":" + std::to_string(stats.frames_silence) +
+        ",\"frames_idle_skipped\":" + std::to_string(stats.frames_idle_skipped) + "}";
 }
 
 std::string audio_catch_up_json(std::uint64_t frames, std::uint64_t total, std::uint32_t rate,

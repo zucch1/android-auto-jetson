@@ -4524,6 +4524,132 @@ TEST_F(AudioPipelineRoute, IncrementalOrdinaryJitterNeverTriggersTheCatchUp) {
     EXPECT_GT(route.report().stats.frames_trimmed, 0U);
 }
 
+namespace {
+
+// Window 8 (A26 over Wi-Fi, 2026-11-20): the phone's own per-second average
+// media ack round trip in ms ("CAR.AUDIO.STATS: Acks from MEDIA received ...
+// with avg latency"), 241 s. In every second count x latency is ~1000 ms: the
+// phone always had a chunk queued and sent stop-and-wait (max_unacked 1), so
+// it delivered one 2048-frame (42.67 ms) chunk per round trip. 5632 acks in
+// 241 s match the 5632 chunks the receiver decoded.
+constexpr std::array<std::int64_t, 241> kWindow8AckRoundTripMs{
+    29, 24, 21, 26, 46, 46, 89, 88, 72, 44, 34, 34, 33, 32, 36, 46, 50, 58, 52, 50,
+    33, 32, 32, 32, 29, 53, 44, 58, 57, 51, 35, 33, 33, 32, 23, 42, 48, 50, 63, 49,
+    35, 33, 34, 31, 28, 29, 43, 52, 68, 70, 54, 34, 32, 32, 32, 24, 41, 42, 76, 63,
+    56, 41, 33, 34, 34, 34, 38, 46, 49, 54, 59, 47, 33, 32, 33, 27, 26, 44, 48, 59,
+    52, 57, 38, 34, 34, 34, 29, 37, 41, 52, 56, 55, 48, 33, 31, 32, 24, 25, 50, 46,
+    54, 63, 55, 35, 32, 32, 32, 25, 33, 51, 48, 63, 68, 48, 33, 33, 34, 32, 27, 53,
+    44, 55, 65, 55, 35, 32, 32, 31, 24, 38, 40, 58, 61, 66, 39, 33, 33, 32, 21, 27,
+    47, 47, 63, 61, 56, 33, 32, 34, 32, 27, 41, 45, 65, 65, 54, 43, 37, 38, 33, 34,
+    38, 57, 56, 55, 54, 51, 31, 32, 31, 34, 29, 46, 51, 57, 51, 54, 38, 32, 34, 33,
+    33, 31, 45, 58, 51, 59, 43, 32, 31, 33, 25, 28, 43, 47, 61, 54, 56, 36, 34, 34,
+    32, 24, 44, 45, 57, 67, 70, 35, 32, 32, 32, 24, 33, 51, 48, 52, 56, 41, 34, 33,
+    32, 22, 29, 51, 55, 52, 55, 51, 36, 30, 32, 29, 26, 45, 43, 63, 63, 49, 39, 32,
+    31,
+};
+
+struct CreditLoopResult final {
+    std::uint64_t chunks{};
+    aa::audio::RouterStats stats{};
+    std::optional<aa::audio::RenderFailureReason> failure{};
+    std::uint64_t stored_backpressure{};
+};
+
+// Closed credit loop of a stop-and-wait phone and the receiver, in virtual
+// time, through the real incremental router. The phone captures a 2048-frame
+// chunk every 42.67 ms and sends the oldest one when it holds the credit; it
+// arrives half a round trip later and is stamped at arrival (as the session
+// does). The receiver acks when the write completes: at once, unless the
+// pulsesink ring buffer (200 ms buffer-time + 21.3 ms latency-time + slack;
+// window 7's last write completed 232 ms before its end) is full. The ack
+// reaches the phone half a round trip later. The round trip of a chunk sent
+// in second s is round_trip_ms(s).
+template <typename RoundTrip>
+[[nodiscard]] CreditLoopResult run_credit_loop(std::int64_t catch_up_ns, std::int64_t seconds,
+                                               RoundTrip round_trip_ms) {
+    constexpr std::int64_t kSinkAheadNs = 232'000'000;
+    constexpr std::uint64_t kChunkFrames = 2048;
+    constexpr std::int64_t kStart = 1'000'000'000;
+    BurstRoute burst{catch_up_ns, std::nullopt,
+        [](const aa::audio::EncodedChunk& chunk) -> aa::core::Result<std::vector<std::byte>> {
+            return std::vector<std::byte>(chunk.payload.begin(), chunk.payload.end());
+        }};
+    CreditLoopResult result;
+    if (!burst.route) { result.failure = aa::audio::RenderFailureReason::missing_sink; return result; }
+    const auto chunk = constant_pcm({kMediaLevel, kChunkFrames});
+    std::int64_t credit_at = 0;
+    for (std::uint64_t k = 0;; ++k) {
+        const auto captured = static_cast<std::int64_t>(k * kChunkFrames * 1'000'000'000ULL / 48000ULL);
+        const std::int64_t sent = std::max(captured, credit_at);
+        if (sent >= seconds * 1'000'000'000LL) { break; }
+        const std::int64_t rtt = round_trip_ms(sent / 1'000'000'000LL) * 1'000'000LL;
+        const std::int64_t arrival = kStart + sent + rtt / 2;
+        if (!burst.route->submit(make_message(aa::protocol::ChannelRole::media_audio, k,
+                                              aa::core::Nanoseconds{arrival}, chunk))) {
+            result.failure = aa::audio::RenderFailureReason::closed;
+            break;
+        }
+        ++result.chunks;
+        if (auto drained = burst.drain(); !drained) {
+            const auto& failure = burst.route->report().render_failure;
+            result.failure = failure ? failure->reason : aa::audio::RenderFailureReason::closed;
+            if (failure) { result.stored_backpressure = failure->stored_backpressure.count; }
+            break;
+        }
+        const std::int64_t completed = std::max(arrival, burst.written_end_ns() - kSinkAheadNs);
+        credit_at = completed - kStart + (rtt - rtt / 2);
+    }
+    result.stats = burst.route->report().stats;
+    return result;
+}
+
+} // namespace
+
+// Root cause of the wireless audio failures (windows 7 and 8): the recorded
+// credit round trips, not the router. Replaying window 8's own ack round trips
+// (21-89 ms against a 42.67 ms chunk) makes the stop-and-wait phone alternate
+// between bursts faster than real time (trimmed) and droughts (gap silence).
+// With the 90 ms catch-up it survives but loses audio and plays silence, as
+// window 8 did (13.2% trimmed, 13.4% silence); with the wireless default (off)
+// a burst refills the sink and the next chunk is judged >200 ms late with no
+// recorded backpressure, the session-ending failure of window 7.
+TEST_F(AudioPipelineRoute, Window8CreditRoundTripsTrimAndSilenceAndEndInLateWithoutCatchUp) {
+    const auto recorded = [](std::int64_t second) {
+        return kWindow8AckRoundTripMs.at(static_cast<std::size_t>(
+            std::min(second, static_cast<std::int64_t>(kWindow8AckRoundTripMs.size()) - 1)));
+    };
+    const auto caught_up = run_credit_loop(90'000'000, 240, recorded);
+    ASSERT_FALSE(caught_up.failure);
+    const auto decoded = caught_up.stats.frames_decoded;
+    EXPECT_GT(caught_up.chunks, 5600U);
+    EXPECT_GT(caught_up.stats.frames_trimmed * 20, decoded);   // > 5% dropped
+    EXPECT_GT(caught_up.stats.frames_caught_up * 50, decoded); // > 2% whole chunks
+    EXPECT_GT(caught_up.stats.frames_silence * 20, decoded);   // > 5% gap silence
+
+    const auto off = run_credit_loop(0, 240, recorded);
+    ASSERT_TRUE(off.failure);
+    EXPECT_EQ(*off.failure, aa::audio::RenderFailureReason::late);
+    EXPECT_EQ(off.stored_backpressure, 0U);
+    EXPECT_LT(off.chunks, 1000U);
+}
+
+// The same router and policy are lossless whenever the credit round trip stays
+// under the chunk period: the phone is then paced by capture, not by acks, and
+// arrival stamps track real time. That is what removing the Nagle hold on the
+// receiver's small ack frames (TCP_NODELAY) restores on Wi-Fi; no router
+// policy change is needed for it.
+TEST_F(AudioPipelineRoute, CreditRoundTripsUnderTheChunkPeriodAreLossless) {
+    for (const std::int64_t rtt_ms : {5, 16, 30, 40}) {
+        for (const std::int64_t catch_up_ns : {std::int64_t{0}, std::int64_t{90'000'000}}) {
+            const auto run = run_credit_loop(catch_up_ns, 120, [rtt_ms](std::int64_t) { return rtt_ms; });
+            ASSERT_FALSE(run.failure) << rtt_ms;
+            EXPECT_EQ(run.stats.frames_trimmed, 0U) << rtt_ms;
+            EXPECT_EQ(run.stats.frames_silence, 0U) << rtt_ms;
+            EXPECT_EQ(run.stats.frames_retained, run.stats.frames_decoded) << rtt_ms;
+        }
+    }
+}
+
 // #155 F1: a non-caught-up 200 ms guidance packet placed near the 90 ms
 // watermark advances cursor to timestamp + ~284 ms. A subsequent forward-
 // timestamped short chunk (< 83 ms, e.g. 42.67 ms media or 64 ms guidance
