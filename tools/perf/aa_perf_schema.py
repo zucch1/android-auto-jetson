@@ -140,7 +140,7 @@ def _check_keywords(schema: dict, path: str) -> None:
 
 
 def _ecma_to_python_regex(pattern: str) -> str:
-    """Translate ECMA-262 start/end anchors (^, $) outside char classes to \\A / \\Z."""
+    """Translate ECMA-262 anchors (^, $) and empty classes ([], [^]) to Python re."""
     out: list[str] = []
     i = 0
     in_class = False
@@ -152,13 +152,19 @@ def _ecma_to_python_regex(pattern: str) -> str:
             i += 2
             continue
         if ch == "[" and not in_class:
+            # In ECMA-262, [] never matches and [^] matches any code unit (incl. \n).
+            if i + 1 < n and pattern[i + 1] == "]":
+                out.append(r"[^\s\S]")
+                i += 2
+                continue
+            if i + 2 < n and pattern[i + 1 : i + 3] == "^]":
+                out.append(r"[\s\S]")
+                i += 3
+                continue
             in_class = True
             out.append(ch)
             i += 1
             if i < n and pattern[i] == "^":
-                out.append(pattern[i])
-                i += 1
-            if i < n and pattern[i] == "]":
                 out.append(pattern[i])
                 i += 1
             continue

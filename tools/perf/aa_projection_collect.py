@@ -130,6 +130,7 @@ _PROJECTION_STARTUP_TIMEOUT_SECONDS = 60
 # - Ready poll (5 s) + display probe fallback (5 s) + safety margin (12 s) = 120 s
 WIRELESS_STARTUP_BUDGET_S = transport.WIRELESS_STARTUP_BUDGET_S
 _MEDIA_STALL_SECONDS = 10
+_STARTUP_OBSERVATION_MAX_AGE_NS = 10_000_000_000
 # A normal sample interval is at most 5 s (see the sleeps in collect) plus a short
 # parse. Anything beyond this is the collector itself having been frozen, so it is
 # recorded as host interference; the margin below _MEDIA_STALL_SECONDS means gaps
@@ -588,6 +589,7 @@ class EventParser:
         self.video_presentations = 0
         self.receiver_ready = False
         self.projection_active = False
+        self.first_active_mono_ns: int | None = None
         self.last_audio_scheduled = -1
         self.last_video_scheduled = -1
         self.video_measurements = VideoMeasurements()
@@ -950,6 +952,8 @@ class EventParser:
             self.session_id = session
             if type(mono) is int and self.receiver_started_ns is not None and self.startup_ms is None:
                 self.startup_ms = max(0, (mono - self.receiver_started_ns) // 10**6)
+            if type(mono) is int and mono >= 0:
+                self.first_active_mono_ns = mono
             if not self.readmitted:
                 self.projection_active = True
         elif state in ("disconnected", "reconnecting", "failed", "stopping"):
@@ -1211,15 +1215,32 @@ def collect(args: argparse.Namespace, build: dict | None = None) -> dict:
     observed_duration = 0.0
     catch_up_doubts_at_cutoff: int | None = None
     deadline = start + startup_timeout
-    startup_active_at_s: float | None = None
+    startup_deadline_ns = origin_ns + startup_timeout * 1_000_000_000
+    startup_active_at_ns: int | None = None
 
-    def read_sample() -> Sample:
-        nonlocal inventory, startup_active_at_s
+    def poll_startup_logs() -> None:
+        nonlocal startup_active_at_ns
         parser.poll(str(receiver_log))
-        if wireless and startup_active_at_s is None and parser.projection_active:
-            startup_active_at_s = time.monotonic_ns() / 1e9
+        if wireless and startup_active_at_ns is None and parser.projection_active:
+            startup_active_at_ns = time.monotonic_ns()
         if display is not None:
             parser.poll(str(display_log))
+
+    def startup_active_eligible(now_ns: int) -> bool:
+        return (
+            wireless
+            and not prepared
+            and parser.projection_active
+            and parser.first_active_mono_ns is not None
+            and parser.first_active_mono_ns <= startup_deadline_ns
+            and startup_active_at_ns is not None
+            and now_ns - startup_active_at_ns <= _STARTUP_OBSERVATION_MAX_AGE_NS
+            and now_ns - startup_deadline_ns <= _STARTUP_OBSERVATION_MAX_AGE_NS
+        )
+
+    def read_sample() -> Sample:
+        nonlocal inventory
+        poll_startup_logs()
         observed = _thermal_inventory() if thermal_policy is not None else None
         if observed is not None and inventory and set(observed) != {zone.zone for zone in inventory}:
             parser.invalid_telemetry.append("thermal_inventory_changed")
@@ -1299,6 +1320,7 @@ def collect(args: argparse.Namespace, build: dict | None = None) -> dict:
             origin_ns = time.monotonic_ns()
             start = origin_ns / 1e9
             deadline = start + startup_timeout
+            startup_deadline_ns = origin_ns + startup_timeout * 1_000_000_000
         rec_file = open(receiver_log, "w", encoding="utf-8")
         receiver = subprocess.Popen(receiver_cmd, stdout=rec_file, stderr=subprocess.STDOUT,
                                     start_new_session=True)
@@ -1310,10 +1332,8 @@ def collect(args: argparse.Namespace, build: dict | None = None) -> dict:
             # bounded by the one absolute startup deadline above, measured from
             # the pre-launch origin and never refreshed by readiness.
             while True:
-                parser.poll(str(receiver_log))
+                poll_startup_logs()
                 now = time.monotonic_ns() / 1e9
-                if wireless and startup_active_at_s is None and parser.projection_active:
-                    startup_active_at_s = now
                 if receiver.poll() is not None:
                     early_exit = True
                     break
@@ -1341,43 +1361,8 @@ def collect(args: argparse.Namespace, build: dict | None = None) -> dict:
                     if workload is not None and display.stdin is not None:
                         os.set_blocking(display.stdin.fileno(), False)
 
-        post_prepare_pending = False
-        while True:
-            if display is not None:
-                display_connected = _display_connected()
-                if not display_connected:
-                    break
-            now = time.monotonic_ns() / 1e9
-            if receiver.poll() is not None:
-                early_exit = True
-                break
-            if display is not None and display.poll() is not None:
-                display_survived = False
-                break
-            if parser.terminal_errors:
-                break
-            if (wireless and not prepared and parser.projection_active
-                    and startup_active_at_s is not None and startup_active_at_s <= deadline):
-                if not bind_and_prepare():
-                    early_exit = True
-                    break
-                prepared = True
-                post_prepare_pending = True
-                continue  # the next sample is the first that may start the window
-            if now >= deadline and not post_prepare_pending:
-                break
-            post_prepare_pending = False
-            if prepared:
-                sample_host_usb()
-            if (workload is not None and stimulus is None and display is not None
-                    and display.stdin is not None and parser.projection_active and prepared):
-                stimulus = moving_map.SoakStimulus(workload, display.stdin.fileno(), receiver_log,
-                                                   since_ns=time.monotonic_ns())
-                stimulus.start()
-            if stimulus is not None and stimulus.failure:
-                parser.terminal_errors.append({"event": "err", "code": stimulus.failure})
-                break
-            time.sleep(min(args.interval, 5.0, max(0.0, deadline - now)))
+        def take_sample() -> bool:
+            nonlocal inventory, deadline
             sample = read_sample()
             logged_progress = None
             if progress.event_anchored and progress.started_ns is not None:
@@ -1409,7 +1394,84 @@ def collect(args: argparse.Namespace, build: dict | None = None) -> dict:
                 deadline = start + progress.started_ns / 1e9 + args.duration_seconds
             elif was_started and progress.last_ns == sample.t_ns:
                 parser.video_measurements.advance(sample.t_ns)
-            if progress.failure:
+            return not progress.failure
+
+        # Wireless startup loop: judge ACTIVE eligibility by the receiver's own
+        # monotonic timestamp (mono_ns <= startup_deadline_ns), refresh now after
+        # any display probe, run one final log read on timeout, and bound bind age.
+        post_prepare_pending = False
+        while wireless and not prepared:
+            if display is not None:
+                display_connected = _display_connected()
+                if not display_connected:
+                    break
+            now_ns = time.monotonic_ns()
+            if receiver.poll() is not None:
+                early_exit = True
+                break
+            if display is not None and display.poll() is not None:
+                display_survived = False
+                break
+            if parser.terminal_errors:
+                break
+            if now_ns >= startup_deadline_ns:
+                if not parser.projection_active:
+                    poll_startup_logs()
+                    now_ns = time.monotonic_ns()
+                    if parser.terminal_errors:
+                        break
+                if startup_active_eligible(now_ns):
+                    if not bind_and_prepare():
+                        early_exit = True
+                        break
+                    prepared = True
+                    post_prepare_pending = True
+                break
+            if parser.projection_active:
+                if startup_active_eligible(now_ns):
+                    if not bind_and_prepare():
+                        early_exit = True
+                        break
+                    prepared = True
+                    post_prepare_pending = True
+                break
+            time.sleep(min(args.interval, 5.0, max(0.0, (startup_deadline_ns - now_ns) / 1e9)))
+            if not take_sample():
+                break
+
+        # Measurement loop (restored d1200dc behaviour): read now before
+        # _display_connected() so a final probe crossing the deadline still
+        # records the final sample and advances progress through the cutoff.
+        while (prepared and not early_exit and display_survived is not False
+               and display_connected is not False and not parser.terminal_errors
+               and not progress.failure):
+            now = time.monotonic_ns() / 1e9
+            if display is not None:
+                display_connected = _display_connected()
+                if not display_connected:
+                    break
+            if now >= deadline and not post_prepare_pending:
+                break
+            post_prepare_pending = False
+            if receiver.poll() is not None:
+                early_exit = True
+                break
+            if display is not None and display.poll() is not None:
+                display_survived = False
+                break
+            if parser.terminal_errors:
+                break
+            sample_host_usb()
+            if (workload is not None and stimulus is None and display is not None
+                    and display.stdin is not None and parser.projection_active):
+                stimulus = moving_map.SoakStimulus(workload, display.stdin.fileno(), receiver_log,
+                                                   since_ns=time.monotonic_ns())
+                stimulus.start()
+            if stimulus is not None and stimulus.failure:
+                parser.terminal_errors.append({"event": "err", "code": stimulus.failure})
+                break
+            time.sleep(min(args.interval, 5.0, max(0.0, deadline - now)))
+            if not take_sample():
                 break
 
         video_evidence = parser.video_measurements.finish(progress.last_ns)
