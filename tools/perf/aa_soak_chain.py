@@ -75,7 +75,7 @@ import time
 from pathlib import Path
 
 import aa_host_preflight
-from aa_projection_collect import ancestors, build_processes
+from aa_projection_collect import ancestors, build_processes, startup_timeout_seconds
 
 STAGES = (1800, 7200)  # the 60 s stage is retired (#137)
 WATCH_PERIOD_S = 5
@@ -300,7 +300,7 @@ def stage_command(args: argparse.Namespace, seconds: int) -> list[str]:
                         ("--phone-id", args.phone_id), ("--ap-interface", args.ap_interface),
                         ("--ap-channel", args.ap_channel),
                         ("--startup-timeout-seconds", getattr(args, "startup_timeout_seconds", None))):
-        if value:
+        if value is not None and value != "":
             command += [flag, str(value)]
     return command
 
@@ -481,6 +481,14 @@ def main(argv: list[str]) -> int:
         print("usage error: --transport wireless needs --phone-id, --store and --ap-interface",
               file=sys.stderr)
         return 2
+    if args.startup_timeout_seconds is not None:
+        try:
+            startup_timeout_seconds(
+                args.transport, args.startup_timeout_seconds, duration_seconds=max(STAGES)
+            )
+        except ValueError as error:
+            print(f"usage error: {error}", file=sys.stderr)
+            return 2
     try:
         args.out.mkdir(mode=0o700, parents=True, exist_ok=False)
     except FileExistsError:

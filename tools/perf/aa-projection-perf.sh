@@ -82,6 +82,7 @@ PHONE_ID=""
 AP_INTERFACE=""
 AP_CHANNEL=""
 STARTUP_TIMEOUT_SECONDS=""
+STARTUP_TIMEOUT_SET=0
 DISPLAY_BIN="/opt/aa/aa-dummy-display"
 STORE=""
 OUT=""
@@ -153,7 +154,7 @@ while (($# > 0)); do
         --phone-id) require_value "$@"; PHONE_ID="$2"; shift 2 ;;
         --ap-interface) require_value "$@"; AP_INTERFACE="$2"; shift 2 ;;
         --ap-channel) require_value "$@"; AP_CHANNEL="$2"; shift 2 ;;
-        --startup-timeout-seconds) require_value "$@"; STARTUP_TIMEOUT_SECONDS="$2"; shift 2 ;;
+        --startup-timeout-seconds) require_value "$@"; STARTUP_TIMEOUT_SECONDS="$2"; STARTUP_TIMEOUT_SET=1; shift 2 ;;
         --media-uri) require_value "$@"; MEDIA_URI="$2"; shift 2 ;;
         --media-type) require_value "$@"; MEDIA_TYPE="$2"; shift 2 ;;
         --media-component) require_value "$@"; MEDIA_COMPONENT="$2"; shift 2 ;;
@@ -249,13 +250,21 @@ if [[ "$MODE" == "wireless" ]]; then
     RECEIVER="${RECEIVER:-/opt/aa/aa-wireless-receiver}"
 fi
 RECEIVER="${RECEIVER:-/opt/aa/aa-wired-receiver}"
-if [[ -n "$STARTUP_TIMEOUT_SECONDS" ]]; then
-    if [[ ! "$STARTUP_TIMEOUT_SECONDS" =~ ^[1-9][0-9]*$ ]]; then
-        echo "usage error: --startup-timeout-seconds must be a positive integer" >&2
+WIRELESS_STARTUP_FLOOR_S=""
+if [[ "$MODE" == "wireless" ]] && ((!READINESS_ONLY)) && [[ -z "$CAPTURE" ]]; then
+    WIRELESS_STARTUP_FLOOR_S="$("$PY" -B -c "import sys; sys.path.insert(0, sys.argv[1]); import aa_transport; print(aa_transport.WIRELESS_STARTUP_BUDGET_S)" "$TOOL_DIR")"
+fi
+if ((STARTUP_TIMEOUT_SET)); then
+    if ((READINESS_ONLY)) || [[ -n "$CAPTURE" ]]; then
+        echo "usage error: --startup-timeout-seconds is only valid in live measurement modes" >&2
         exit 2
     fi
-    if [[ "$MODE" == "wireless" ]] && ((STARTUP_TIMEOUT_SECONDS < 85)); then
-        echo "usage error: --startup-timeout-seconds for --mode wireless must be >= 85 (derived floor)" >&2
+    if [[ ! "$STARTUP_TIMEOUT_SECONDS" =~ ^[1-9][0-9]*$ ]] || ((${#STARTUP_TIMEOUT_SECONDS} > 6)); then
+        echo "usage error: --startup-timeout-seconds must be a positive integer within receiver lifetime" >&2
+        exit 2
+    fi
+    if [[ "$MODE" == "wireless" ]] && ((STARTUP_TIMEOUT_SECONDS < WIRELESS_STARTUP_FLOOR_S)); then
+        echo "usage error: --startup-timeout-seconds for --mode wireless must be >= ${WIRELESS_STARTUP_FLOOR_S} (derived floor)" >&2
         exit 2
     fi
     if [[ "$MODE" != "wireless" ]] && ((STARTUP_TIMEOUT_SECONDS > 60)); then
@@ -447,6 +456,18 @@ if [[ -z "$duration_secs" ]]; then
     echo "usage error: --duration is required for a live run" >&2
     exit 2
 fi
+if [[ "$MODE" == "wireless" ]]; then
+    if ! wireless_bound_msg="$("$PY" -B -c "
+import sys
+sys.path.insert(0, sys.argv[1])
+import aa_projection_collect as collect
+override = int(sys.argv[2]) if sys.argv[2] else None
+collect.startup_timeout_seconds('wireless', override, duration_seconds=int(sys.argv[3]))
+" "$TOOL_DIR" "$STARTUP_TIMEOUT_SECONDS" "$duration_secs" 2>&1)"; then
+        echo "usage error: ${wireless_bound_msg##*ValueError: }" >&2
+        exit 2
+    fi
+fi
 # The soak workload (#137): every live stage drags a moving map with media
 # playing for the whole stage. The values reach the remote collector inside
 # single quotes, so they may not contain one.
@@ -608,7 +629,7 @@ COLLECTOR_CLEANUP_BUDGET_S=240
 collector_timeout=$((COLLECTOR_STARTUP_BUDGET_S + duration_secs + COLLECTOR_MEASUREMENT_SLACK_S
                      + COLLECTOR_CLEANUP_BUDGET_S))
 if [[ "$MODE" == "wireless" ]]; then
-    effective_startup="${STARTUP_TIMEOUT_SECONDS:-85}"
+    effective_startup="${STARTUP_TIMEOUT_SECONDS:-$WIRELESS_STARTUP_FLOOR_S}"
     ((effective_startup > 60)) && collector_timeout=$((collector_timeout + effective_startup - 60 + 20))
 fi
 blocked_type=""

@@ -219,7 +219,8 @@ _INTERFACE = re.compile(r"[A-Za-z0-9_.-]{1,15}")
 AP_CHANNELS = (36, 40, 44, 48)
 DEFAULT_AP_CHANNEL = 36
 
-# Wireless startup budget derived from the receiver's real admission/bootstrap timings:
+# Wireless startup budget derived from the receiver's real admission, bootstrap,
+# post-TCP negotiation, and harness polling timings:
 # - tools/wireless-receiver/Runtime.hpp:228: per-attempt admission deadline = 15 s
 #   (`attempt_until = Clock::now() + std::chrono::seconds{15}`).
 # - tools/wireless-receiver/Runtime.hpp:35,207,242: retry backoff starts at
@@ -228,21 +229,31 @@ DEFAULT_AP_CHANNEL = 36
 #   own deadline instead of expiring with `attempt_until`.
 # - include/aa/app/HandoffEligibility.hpp:45,47: bootstrap allowance = 40 s
 #   (`bootstrap{40'000}` since #170) + 5 s TCP connect (`connect{5'000}`).
-# Covers at least one full failed admission attempt (15 s), max backoff (5 s),
-# and a second attempt's pre-bootstrap wait (up to 15 s) + bootstrap (40 s) +
-# TCP connect (5 s) + 5 s harness ready/polling slack = 85 s derived floor.
+# - src/app/WirelessLink.cpp:58,84,143-146: post-TCP negotiation phase = 10 s
+#   (`phases.negotiate = core::Milliseconds{10'000}`) before ACTIVE.
+# - tools/wireless-receiver/Runtime.hpp:209-231,254-258 &
+#   src/app/HandoffEligibility.cpp:207-212: bounded synchronous D-Bus helper calls
+#   outside the 15 s attempt clock (`retire`, `reconnect`, `ap_status`, `acquire_ap`,
+#   `link_wait`) = 5 s.
+# - tools/perf/aa_projection_collect.py:1293-1398: collector receiver-ready wait,
+#   display launch, and <= 5 s poll interval = 5 s.
+# Total derived floor = 15 + 5 + 15 + 40 + 5 + 10 + 5 + 5 = 100 s.
 WIRELESS_ADMISSION_ATTEMPT_S = 15
 WIRELESS_BACKOFF_CAP_S = 5
 WIRELESS_BOOTSTRAP_S = 40
 WIRELESS_CONNECT_S = 5
-WIRELESS_STARTUP_SLACK_S = 5
+WIRELESS_NEGOTIATION_S = 10
+WIRELESS_HELPER_OVERHEAD_S = 5
+WIRELESS_COLLECTOR_SLACK_S = 5
 WIRELESS_STARTUP_BUDGET_S = (
     WIRELESS_ADMISSION_ATTEMPT_S
     + WIRELESS_BACKOFF_CAP_S
     + WIRELESS_ADMISSION_ATTEMPT_S
     + WIRELESS_BOOTSTRAP_S
     + WIRELESS_CONNECT_S
-    + WIRELESS_STARTUP_SLACK_S
+    + WIRELESS_NEGOTIATION_S
+    + WIRELESS_HELPER_OVERHEAD_S
+    + WIRELESS_COLLECTOR_SLACK_S
 )
 
 

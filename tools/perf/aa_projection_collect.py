@@ -125,6 +125,8 @@ _PROJECTION_STARTUP_TIMEOUT_SECONDS = 60
 # - tools/wireless-receiver/Runtime.hpp:35,207,242 (250 ms initial backoff, 5 s cap)
 # - tools/wireless-receiver/Runtime.hpp:251 (attempt held while bootstrapping)
 # - include/aa/app/HandoffEligibility.hpp:45,47 (40 s bootstrap #170 + 5 s connect)
+# - src/app/WirelessLink.cpp:58,84,143-146 (10 s post-TCP negotiation before ACTIVE)
+# - Bounded D-Bus helper overhead (5 s) + collector readiness/polling slack (5 s)
 WIRELESS_STARTUP_BUDGET_S = transport.WIRELESS_STARTUP_BUDGET_S
 _MEDIA_STALL_SECONDS = 10
 # A normal sample interval is at most 5 s (see the sleeps in collect) plus a short
@@ -1083,16 +1085,29 @@ def build_record(args: argparse.Namespace, build_type: str | None = None,
     return record
 
 
-def startup_timeout_seconds(transport_name: str, override_s: int | None = None) -> int:
+def max_wireless_startup_timeout_seconds(duration_seconds: int = 0) -> int:
+    """Largest wireless startup deadline whose full receiver lifetime fits in _RECEIVER_MAX_LIFETIME_MS."""
+    overhead = 10 + int(_ADB_BIND_TIMEOUT_SECONDS) + _WIRELESS_PREPARE_HEADROOM_SECONDS
+    return (_RECEIVER_MAX_LIFETIME_MS // 1000) - duration_seconds - overhead
+
+
+def startup_timeout_seconds(transport_name: str, override_s: int | None = None, *,
+                            duration_seconds: int = 0) -> int:
     """Resolve and validate the startup deadline: wired stays <= 60 s; wireless >= derived floor."""
     if transport_name == "wireless":
+        max_s = max_wireless_startup_timeout_seconds(duration_seconds)
+        if max_s < WIRELESS_STARTUP_BUDGET_S:
+            raise ValueError(
+                f"--duration-seconds {duration_seconds} leaves only {max_s} s under the "
+                f"{_RECEIVER_MAX_LIFETIME_MS // 1000} s receiver lifetime "
+                f"(< {WIRELESS_STARTUP_BUDGET_S} s floor)"
+            )
         if override_s is None:
             return WIRELESS_STARTUP_BUDGET_S
-        if (type(override_s) is not int or override_s < WIRELESS_STARTUP_BUDGET_S
-                or override_s > _RECEIVER_MAX_LIFETIME_MS // 1000):
+        if type(override_s) is not int or override_s < WIRELESS_STARTUP_BUDGET_S or override_s > max_s:
             raise ValueError(
                 f"--startup-timeout-seconds for wireless must be in "
-                f"[{WIRELESS_STARTUP_BUDGET_S}, {_RECEIVER_MAX_LIFETIME_MS // 1000}]"
+                f"[{WIRELESS_STARTUP_BUDGET_S}, {max_s}]"
             )
         return override_s
     if override_s is None:
@@ -1669,7 +1684,7 @@ def _run(args: argparse.Namespace) -> int:
         return 2
     try:
         args.startup_timeout_seconds = startup_timeout_seconds(
-            args.transport, args.startup_timeout_seconds
+            args.transport, args.startup_timeout_seconds, duration_seconds=args.duration_seconds
         )
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
