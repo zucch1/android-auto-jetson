@@ -32,16 +32,11 @@ struct AudioRenderWorker::SettlementDiagnostics {
         std::uint64_t events_lifetime;
         std::uint64_t frames_lifetime;
     };
-    struct Underrun {
-        std::uint64_t underruns_lifetime;
-        std::int64_t late_ns;
-        std::int64_t depth_ns;
-    };
-    struct Anchor {
-        bool resume;
-        std::int64_t skipped_ns;
-        std::int64_t depth_ns;
-        std::uint64_t anchors_lifetime;
+    struct Playout {
+        PlayoutEvent event;
+        // Underruns or anchors (start + resume) over the worker's life,
+        // including this one.
+        std::uint64_t lifetime;
     };
     struct SinkStall {
         core::Nanoseconds start;
@@ -61,8 +56,7 @@ struct AudioRenderWorker::SettlementDiagnostics {
     std::optional<IdleSkip> skipped;
     std::optional<IdleResume> resumed;
     std::optional<CatchUp> caught_up;
-    std::optional<Underrun> underrun;
-    std::optional<Anchor> anchor;
+    std::vector<Playout> playout;
 
     explicit SettlementDiagnostics(const AudioTelemetryCallbacks& callbacks) noexcept
         : telemetry(callbacks) {}
@@ -99,28 +93,28 @@ struct AudioRenderWorker::SettlementDiagnostics {
                 audio_catch_up_json(caught_up->frames, caught_up->total, caught_up->rate,
                                     caught_up->events_lifetime, caught_up->frames_lifetime));
         }
-        if (underrun) {
-            // Playout underrun: a chunk arrived late_ms after its slot, so the
-            // role was re-anchored depth_ms after that arrival. The elapsed
-            // hole is skipped (media_timing frames_skipped), the refill is
-            // silence (frames_silence).
-            telemetry.log_media("audio_playout_underrun",
-                "{\"event\":\"audio_playout_underrun\",\"underruns_lifetime\":" +
-                std::to_string(underrun->underruns_lifetime) + ",\"late_ms\":" +
-                format_ms(core::Nanoseconds{underrun->late_ns}) + ",\"depth_ms\":" +
-                format_ms(core::Nanoseconds{underrun->depth_ns}) + "}");
-        }
-        if (anchor) {
+        for (const auto& entry : playout) {
+            const auto& event = entry.event;
+            if (event.kind == PlayoutEvent::Kind::underrun) {
+                // Playout underrun: a chunk arrived late_ms after its slot, so
+                // the role was re-anchored depth_ms after that arrival. The
+                // elapsed hole is skipped (media_timing frames_skipped), the
+                // refill is silence (frames_silence).
+                telemetry.log_media("audio_playout_underrun",
+                    "{\"event\":\"audio_playout_underrun\",\"underruns_lifetime\":" +
+                    std::to_string(entry.lifetime) + ",\"late_ms\":" +
+                    format_ms(event.late) + ",\"depth_ms\":" + format_ms(event.depth) + "}");
+                continue;
+            }
             // A stream (re)start on the playout clock. skipped_ms is the
             // elapsed time it jumped over without a write: 0 at a stream
             // start, the pause on a resume. Every one is logged, so a large
-            // forward jump is never silent (DeepSeek F3).
+            // forward jump is never silent (DeepSeek F3, N3).
             telemetry.log_media("audio_playout_anchor",
                 std::string{"{\"event\":\"audio_playout_anchor\",\"reason\":\""} +
-                (anchor->resume ? "resume" : "start") + "\",\"skipped_ms\":" +
-                format_ms(core::Nanoseconds{anchor->skipped_ns}) + ",\"depth_ms\":" +
-                format_ms(core::Nanoseconds{anchor->depth_ns}) + ",\"anchors_lifetime\":" +
-                std::to_string(anchor->anchors_lifetime) + "}");
+                (event.kind == PlayoutEvent::Kind::resume ? "resume" : "start") +
+                "\",\"skipped_ms\":" + format_ms(event.late) + ",\"depth_ms\":" +
+                format_ms(event.depth) + ",\"anchors_lifetime\":" + std::to_string(entry.lifetime) + "}");
         }
         if (skipped) {
             telemetry.log_media("audio_idle_skipped",
@@ -936,9 +930,6 @@ void AudioRenderWorker::run(RouterConfig config, const OpenRouter& open) {
         const auto before = local_router.report().stats.frames_written;
         const auto idle_before = local_router.report().stats.frames_idle_skipped;
         const auto caught_up_before = local_router.report().stats.frames_caught_up;
-        const auto underruns_before = local_router.report().stats.playout_underruns;
-        const auto anchors_before = local_router.report().stats.playout_anchors;
-        const auto resumes_before = local_router.report().stats.playout_resumes;
         lock.unlock();
         const auto step_started = monotonic_now();
         const auto result = local_router.render_step();
@@ -973,16 +964,13 @@ void AudioRenderWorker::run(RouterConfig config, const OpenRouter& open) {
         }
         in_flight_ = false;
         const auto stats = local_router.report().stats;
-        if (stats.playout_underruns > underruns_before) {
-            diagnostics.underrun = SettlementDiagnostics::Underrun{
-                lifetime.playout_underruns + stats.playout_underruns,
-                stats.playout_underrun_late.count, stats.playout_depth.count};
+        for (const auto& event : local_router.take_playout_events()) {
+            auto& count = event.kind == PlayoutEvent::Kind::underrun ? playout_underruns_logged_
+                                                                     : playout_anchors_logged_;
+            diagnostics.playout.push_back({event, ++count});
         }
-        if (stats.playout_anchors > anchors_before) {
-            diagnostics.anchor = SettlementDiagnostics::Anchor{
-                stats.playout_resumes > resumes_before, stats.playout_anchor_skip.count,
-                stats.playout_depth.count, lifetime.playout_anchors + stats.playout_anchors};
-        }
+        // The wireless video hold follows the offset audio really plays with.
+        playout_offset_ns_.store(stats.playout_reported_offset.count, std::memory_order_relaxed);
         // #155: the router trimmed this step's post-stall backlog (it happened
         // whatever the epoch, so it is always counted).
         if (stats.frames_caught_up > caught_up_before) {

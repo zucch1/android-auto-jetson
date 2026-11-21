@@ -246,8 +246,10 @@ credit window (owner decision 2026-11-20): `playout_target_ms` (the configured d
 `playout_depth_ms` (the latest chunk's slot minus its arrival),
 `playout_depth_min_ms` / `playout_depth_max_ms` (that depth's range, anchors
 excluded; `null` before the first steady chunk), `playout_offset_ms` (the
-depth of the least-delayed recent arrivals, what `audio_write_completed`
-reports as `playout_offset_ns`), `playout_underruns` (a chunk up to 1 s
+depth of the least-delayed recent arrivals: how long after on-time content
+audio plays, the target of `audio_write_completed`'s `playout_offset_ns` and
+what the wireless video hold follows; above the depth by the phone's group
+span), `playout_underruns` (a chunk up to 1 s
 after its slot), `playout_anchors` (stream starts and resumes) and
 `playout_resumes` (anchors more than 1 s after the slot), `frames_padded`
 (drift pads, a subset of `frames_silence`), `credit_window` (the advertised
@@ -270,7 +272,7 @@ increase the end offset briefly exceeds it while content advances at half
 rate), so
 `presented_ns - scheduled_ns` includes the playout buffer and the A/V pairing
 matches a video frame with the audio that arrived with it. The wireless
-receiver holds video for the same depth (`--video-delay-ms match`), so the
+receiver holds video for the reported offset (`--video-delay-ms match`), so the
 signed A/V contract is unchanged. Wired records never carry the field. `av_sync_ms` is computed only
 from the cross-stream consumer completion events: the video's retained common
 monotonic timestamp must lie in the audio write's half-open scheduled interval.

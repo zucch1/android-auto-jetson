@@ -127,6 +127,21 @@ public:
     void set_presentation_delay(std::chrono::nanoseconds delay) {
         std::lock_guard lock(mutex_);
         delay_ = std::max(std::chrono::nanoseconds{0}, delay);
+        delay_source_ = {};
+    }
+
+    // N1: the hold is read per frame from `source` (the wireless receiver
+    // passes the audio playout offset, the delay audio really plays with), so
+    // the two stay the same quantity. Bounded to kMaxPresentationDelay; a
+    // shorter hold never lets a frame overtake a held one.
+    void set_presentation_delay_source(std::function<std::chrono::nanoseconds()> source) {
+        std::lock_guard lock(mutex_);
+        delay_source_ = std::move(source);
+    }
+
+    [[nodiscard]] std::chrono::nanoseconds current_presentation_delay() const {
+        std::lock_guard lock(mutex_);
+        return presentation_delay_locked();
     }
 
     [[nodiscard]] std::size_t delayed_units() const {
@@ -198,7 +213,8 @@ public:
 
     [[nodiscard]] core::Result<void> on_message(const protocol::MessageView& message) override {
         std::unique_lock lock(mutex_);
-        if (delay_.count() == 0 && delayed_.empty()) { return deliver_locked(lock, message); }
+        const auto hold = presentation_delay_locked();
+        if (hold.count() == 0 && delayed_.empty()) { return deliver_locked(lock, message); }
         const auto now = now_locked();
         if (auto released = release_due_locked(lock, now); !released) { return released.error(); }
         // Bounded hold: past it the oldest unit leaves early rather than grow.
@@ -206,15 +222,17 @@ public:
                                      delayed_bytes_ + message.payload.size() > kMaxDelayedBytes)) {
             if (auto released = release_front_locked(lock); !released) { return released.error(); }
         }
-        if (delay_.count() == 0) {
+        if (hold.count() == 0) {
             while (!delayed_.empty()) {
                 if (auto released = release_front_locked(lock); !released) { return released.error(); }
             }
             return deliver_locked(lock, message);
         }
         delayed_bytes_ += message.payload.size();
+        auto due = now + std::chrono::duration_cast<std::chrono::steady_clock::duration>(hold);
+        if (!delayed_.empty()) { due = std::max(due, delayed_.back().due); }
         delayed_.push_back(DelayedMessage{message.header,
-            {message.payload.begin(), message.payload.end()}, now + delay_});
+            {message.payload.begin(), message.payload.end()}, due});
         return {};
     }
 
@@ -323,6 +341,8 @@ private:
 public:
     void install(ipc::VideoProducer producer) {
         std::lock_guard lock(mutex_);
+        // Frames held for the playout delay belonged to the old consumer (F12).
+        if (producer_.has_value()) { clear_delayed_locked("consumer_replaced"); }
         clear_pending_locked(/*abandon_partial=*/false, "consumer_replaced");
         // Endpoint events fire once per access unit (audit L13), so they are media
         // telemetry: rate-limited and never waiting for the sink. The producer only
@@ -376,6 +396,14 @@ private:
         std::vector<std::byte> payload{};
         std::chrono::steady_clock::time_point due{};
     };
+    static constexpr std::chrono::milliseconds kMaxPresentationDelay{400};
+
+    [[nodiscard]] std::chrono::nanoseconds presentation_delay_locked() const {
+        const auto hold = delay_source_ ? delay_source_() : delay_;
+        return std::clamp<std::chrono::nanoseconds>(hold, std::chrono::nanoseconds{0},
+                                                    kMaxPresentationDelay);
+    }
+
     // 180 ms at 60 fps is 11 units; the byte bound covers IDR-heavy bursts.
     static constexpr std::size_t kMaxDelayedUnits = 64;
     static constexpr std::size_t kMaxDelayedBytes = std::size_t{32} * 1024 * 1024;
@@ -750,6 +778,7 @@ private:
     std::optional<std::chrono::steady_clock::time_point> producer_installed_at_{};
     std::deque<PendingAccessUnit> pending_queue_{};
     std::chrono::nanoseconds delay_{0};
+    std::function<std::chrono::nanoseconds()> delay_source_{};
     std::deque<DelayedMessage> delayed_{};
     std::size_t delayed_bytes_{0};
     std::size_t pending_bytes_{0};

@@ -132,6 +132,17 @@ struct Media final {
             {ChannelRole::microphone, &microphone}};
         return config;
     }
+    // --video-delay-ms match (N1): hold video for the offset audio really
+    // plays with (audio_write_completed's playout_offset_ns), not the
+    // configured buffer: a phone delivering in groups makes audio play later
+    // than the buffer, and the hold follows. `fallback` (the configured
+    // depth) holds video until the first playout audio write.
+    void match_video_to_audio(std::chrono::nanoseconds fallback) {
+        video.set_presentation_delay_source([this, fallback] {
+            const auto offset = audio.current_playout_offset();
+            return offset.count() > 0 ? offset : fallback;
+        });
+    }
     core::Result<void> bind(app::WiredSession& session) {
         audio.begin_session();
         return app::register_av_sinks(session, video, audio);

@@ -1147,6 +1147,8 @@ struct WorkerReplay final {
     std::vector<std::string> underruns{};
     std::vector<std::string> anchors{};
     std::uint64_t max_unacked_held{};
+    std::int64_t playout_offset{};
+    std::chrono::nanoseconds video_hold{};
 };
 
 // Window-9-style closed credit loop (see audio_pipeline_test run_playout_loop)
@@ -1168,6 +1170,7 @@ template <typename RoundTrip>
                                    audio::AudioCreditPolicy{audio::kWirelessCreditWindow}};
     if (!audio.ready()) { replay.failure = aa::ErrorCode::audio_sink_unavailable; return replay; }
     wr::Media media{audio};
+    media.match_video_to_audio(std::chrono::milliseconds{120});
     SessionHarness h;
     h.start(media);
     const auto chunk = pcm_chunk_2048();
@@ -1220,6 +1223,8 @@ template <typename RoundTrip>
     }
     if (!replay.failure) { (void)service(); }
     replay.max_unacked_held = audio.max_unacked_held();
+    replay.playout_offset = audio.current_playout_offset().count();
+    replay.video_hold = media.video.current_presentation_delay();
     audio.stop();
     if (auto finished = audio.finish(); !finished && !replay.failure) {
         replay.failure = finished.error().code();
@@ -1291,6 +1296,8 @@ TEST(WirelessAudioWorker, PlayoutDroughtBeyondTheBufferUnderrunsAndContinues) {
 // A/V alignment: the wireless receiver holds video for the audio playout depth
 // by default, so both streams leave the receiver the same time after arrival.
 TEST(WirelessAudioWorker, VideoDelayMatchesTheAudioPlayoutDepthByDefault) {
+    // Before audio anchors, "match" holds video for the configured depth; the
+    // runtime then follows the audio's playout offset (see the burst test).
     EXPECT_EQ(wr::video_delay(std::nullopt, 120), std::chrono::milliseconds{120});
     EXPECT_EQ(wr::video_delay(std::int64_t{0}, 120), std::chrono::milliseconds{0});
     EXPECT_EQ(wr::video_delay(std::nullopt, 0), std::chrono::milliseconds{0});
@@ -1313,6 +1320,11 @@ TEST(WirelessAudioWorker, PlayoutCoalescedBurstsThroughTheWorkerAreNotTrimmed) {
         return second >= 8 && second < 10 ? std::int64_t{120} : std::int64_t{20};
     }, 3);
     ASSERT_FALSE(replay.failure) << aa::to_string(*replay.failure);
+    // N1: the audio really plays two chunk periods later than the 120 ms
+    // buffer (the anchor was a group's late first chunk), and the wireless
+    // video hold follows that delay instead of staying at 120 ms.
+    EXPECT_NEAR(static_cast<double>(replay.playout_offset), 120e6 + 2 * static_cast<double>(kChunkNs), 2e6);
+    EXPECT_EQ(replay.video_hold, std::chrono::nanoseconds{replay.playout_offset});
     EXPECT_GE(replay.max_unacked_held, 3U);
     EXPECT_GE(replay.stats.max_arrival_burst, 3U);
     EXPECT_EQ(replay.stats.frames_trimmed, 0U);
@@ -1336,7 +1348,13 @@ TEST(WirelessAudioWorker, PlayoutResumeSkipsAreLoggedWithTheirSize) {
               std::string::npos) << replay.anchors.front();
     bool resumed = false;
     for (const auto& line : replay.anchors) {
-        if (line.find("\"reason\":\"resume\"") != std::string::npos) { resumed = true; }
+        if (line.find("\"reason\":\"resume\"") == std::string::npos) { continue; }
+        resumed = true;
+        // N3: the record carries the skip's real size (a ~2 s hole here).
+        const std::regex skipped{R"("skipped_ms":([0-9.]+))"};
+        std::smatch match;
+        ASSERT_TRUE(std::regex_search(line, match, skipped)) << line;
+        EXPECT_GT(std::stod(match[1].str()), 1000.0) << line;
     }
     EXPECT_TRUE(resumed);
 }

@@ -266,19 +266,26 @@ private:
 //   write (frames_skipped), the rest is `depth` of silence (frames_silence),
 //   and the session continues: playout never fails `late`;
 // - drift: the buffer depth of a chunk is its slot minus its arrival. A phone
-//   using its credit window releases chunks in groups (window 10: depths up
-//   to 274 ms), which raises single depths, and a late chunk lowers one; both
-//   drain by themselves. Correction acts only on sustained error: once the
-//   window holds 2 s of arrivals, a chunk loses the bounded LivePcmDriftPolicy
-//   trim (at most max_trim) only when even the least-buffered arrival in the
-//   window is more than the high watermark above `depth` (phone clock faster,
-//   a backlog after an underrun), and up to max_trim of silence is inserted
-//   before it only when even the best-buffered one is that far below (phone
-//   clock slower, a slower path). Bursts and jitter never trim or pad.
-// - offset: WriteCompletion reports the depth of the least-delayed recent
-//   arrival as the playout offset (the content clock), never letting the
-//   reported content interval start before the previous one ended: an
-//   increase is absorbed at half rate.
+//   delivering in groups (windows 10/11: up to 5 chunks; it captures in real
+//   time, so a group's chunks are late and its last on time) spreads single
+//   depths by the group, and a late chunk lowers one; both drain by
+//   themselves. Correction judges the window's smallest depth (the latest
+//   arrival, a group's first chunk) once the window holds 2 s of arrivals:
+//   the bounded LivePcmDriftPolicy trim (at most max_trim) only when it is
+//   more than the high watermark above `depth` (phone clock faster, a
+//   backlog), and up to max_trim of silence only when it is below a quarter
+//   of `depth` (phone clock slower, a slower path), so a jitter spike inside
+//   the buffer costs nothing. Within 4 s of an underrun the window is the last
+//   1 s and 0.5 s sustains, so the backlog that follows starts draining at
+//   once.
+// - offset: the depth of the least-delayed recent arrival, i.e. how long
+//   after on-time content audio plays. With grouped delivery that is depth +
+//   (group - 1) chunk periods, not `depth`. WriteCompletion reports it (never
+//   letting the reported content interval start before the previous one
+//   ended: an increase is absorbed at half rate), and the wireless receiver
+//   holds video for exactly the reported value (--video-delay-ms match).
+// - a role's arrival clock running backwards by more than 200 ms fails
+//   closed `late`, as the arrival model does.
 // Wired keeps the arrival model (disabled).
 struct PlayoutPolicy final {
     bool enabled{false};
@@ -408,6 +415,21 @@ struct RouterStats final {
     // Most chunks of one channel that arrived within 10 ms of each other: the
     // phone's credit use (our acks go out on receipt).
     std::uint64_t max_arrival_burst{};
+    // Offset the latest audio_write_completed reported (what the wireless
+    // video hold follows; below playout_offset while an increase is absorbed).
+    core::Nanoseconds playout_reported_offset{};
+};
+
+// One playout re-anchor (stream start, resume, or underrun) of one role,
+// collected for the render worker's log (AudioRouter::take_playout_events).
+struct PlayoutEvent final {
+    enum class Kind : std::uint8_t { start, resume, underrun };
+    Kind kind{Kind::start};
+    // How long after its slot the run arrived: the elapsed time skipped.
+    core::Nanoseconds late{};
+    // Depth the role was re-anchored with.
+    core::Nanoseconds depth{};
+    Role role{Role::media};
 };
 
 // ELEMENT-INGRESS observations (task-25 gate fix round 2): what entered the
@@ -561,6 +583,9 @@ public:
     // gaps and late arrivals keep the strict policy. Non-incremental pump()
     // ignores these observations.
     void note_backpressure(core::Nanoseconds start, core::Nanoseconds end);
+    // Owner-thread: the playout re-anchors committed since the last call, in
+    // order (at most 64 between calls).
+    [[nodiscard]] std::vector<PlayoutEvent> take_playout_events();
     // Worker-only observation of settled all-role idle lasting >200 ms.
     // Authorizes only whole, already-elapsed frames within [start, end) in
     // the NEXT resumed schedule's leading uncovered prefix. All pending

@@ -13,9 +13,16 @@ paint latency includes the video hold. This drives the real A/V pairing
 (tools/wired-qa/aa_drive_smoke.av_pairs) and contract (tools/perf/aa_av_contract)
 with that model:
 
-- video held for the playout depth: the smoke cap (max <= 90 ms) and the soak
-  rate (no pair > 150 ms, at most 1 > 90 ms per 30 min) hold, through a Wi-Fi
-  spike inside the buffer;
+- video held for the playout offset: the smoke cap (max <= 90 ms) and the soak
+  rate (no pair > 150 ms, at most 1 > 90 ms per 30 min) hold. A Wi-Fi spike
+  inside the buffer delays video arrivals (and its pairing) but not the audio
+  schedule, which is the point of the buffer, so the audio model is unchanged
+  by it (F9);
+- a phone delivering audio in groups of B (window 11: max_arrival_burst 5;
+  it captures in real time, so a group's chunks are late, its last on time)
+  makes audio play (B - 1) chunk periods after the 120 ms buffer. The
+  receiver reports that as the offset and holds video for it (N1): the gates
+  hold for B = 2..5, while a fixed 120 ms hold fails them from B = 3;
 - video not held: the contract sees the 120 ms audio lag and fails, so the
   offset is never hidden;
 - the record without playout_offset_ns (wired) is judged exactly as before.
@@ -72,6 +79,26 @@ def video_events(seconds: int, spike: bool, hold_ns: int, rng: random.Random) ->
     return events
 
 
+def burst_audio_events(seconds: int, burst: int) -> list[dict]:
+    """The router's records for a phone releasing groups of `burst` chunks.
+
+    Chunk k is captured at k periods; its group is released when the group's
+    last chunk is captured and arrives 10 ms later. The anchor is group 0's
+    first (late) chunk, so the offset from on-time content is depth +
+    (burst - 1) periods (AudioRouter test PlayoutOffsetIsTheDelayFromOnTime...).
+    """
+    offset = DEPTH_NS + (burst - 1) * CHUNK_NS
+    events = []
+    for k in range(seconds * 1_000_000_000 // CHUNK_NS):
+        content = START_NS + 10_000_000 + k * CHUNK_NS
+        slot = content + offset
+        events.append({"event": "audio_write_completed", "scheduled_ns": content,
+                       "scheduled_end_ns": content + CHUNK_NS, "playout_offset_ns": offset,
+                       "completed_ns": slot - 60_000_000, "presented_ns": slot + SINK_NS,
+                       "playback_slot_absence": None})
+    return events, offset
+
+
 def judge(smoke, contract, audio: list[dict], video: list[dict], clause: str) -> dict:
     valid, invalid = smoke._valid_audio(audio)
     assert invalid == 0
@@ -103,6 +130,21 @@ def main() -> int:
         result = judge(smoke, contract, audio, unheld, "cap")
         assert not result["passed"], result
         assert result["signed_p50_ms"] < -100, result
+
+    # N1: grouped delivery, video held for the reported offset versus a fixed
+    # 120 ms.
+    for burst in (2, 3, 4, 5):
+        audio, offset = burst_audio_events(70, burst)
+        followed = video_events(66, False, offset, random.Random(burst))
+        for clause in ("cap", "soak_rate"):
+            result = judge(smoke, contract, audio, followed, clause)
+            assert result["passed"], (burst, clause, result)
+            assert abs(result["signed_p50_ms"]) < 20, (burst, result)
+        fixed = video_events(66, False, DEPTH_NS, random.Random(burst))
+        result = judge(smoke, contract, audio, fixed, "cap")
+        if burst >= 3:
+            assert not result["passed"], (burst, result)
+        assert result["signed_p50_ms"] < -((burst - 1) * CHUNK_NS / 1e6) + 20, (burst, result)
 
     # Neon P2-4: the collector drops any write whose scheduled_ns does not
     # advance. When the playout offset steps up (a re-anchor, a burst showing

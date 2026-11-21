@@ -76,45 +76,80 @@ Policy (wired is unchanged: stop-and-wait and the arrival model with the
   continues. Playout never fails `late`. A stream silent more than 1 s past
   its slot (a pause without a stop message) re-anchors the same way but counts
   as a resume (`playout_anchors`, `playout_resumes`), not an underrun. Every
-  anchor logs `audio_playout_anchor` with the elapsed time it skipped, so a
-  large forward jump is always visible. The refill of a re-anchor is the
+  anchor logs `audio_playout_anchor` with the elapsed time it skipped (each
+  one, even several in one render step), so a large forward jump is always
+  visible. An arrival clock that runs backwards by more than 200 ms fails
+  closed `late`, as on the arrival model. The refill of a re-anchor is the
   buffer (at most the depth), not gap silence, and does not count against the
   200 ms aggregate silence cap, so two re-anchors in one render step (media
   and guidance) cannot end the session.
-- **Drift**: the buffer depth of a chunk is its slot minus its arrival. With
-  the credit window the phone releases chunks in groups, so single depths
-  rise by up to a chunk period per position in a group (window 10: 274 ms),
-  and a late chunk lowers one; both drain by themselves. Correction therefore
-  acts only on sustained error, once the last 4 s hold at least 2 s of
-  arrivals: a chunk loses the bounded drift trim (at most 5 ms) only when even
-  the least-buffered arrival is more than 20 ms above 120 ms (phone clock
-  faster, a backlog after an underrun), and at most 5 ms of silence is
-  inserted (`frames_padded`) only when even the best-buffered one is more than
-  20 ms below (phone clock slower, a slower path). Bursts and jitter never
-  trim or pad.
+- **Drift**: the buffer depth of a chunk is its slot minus its arrival. The
+  A26 delivers in groups (windows 10/11: `max_arrival_burst` 5). It captures
+  in real time (`Start capturing system audio with sampling rate: 48000,
+  buffer size: 65536, expected frame duration: 42.666667 ms`, an
+  `AudioRecord`) and its acks stay at real-time rate, so a group's chunks
+  were captured on time and delivered late, the last one on time. Single
+  depths therefore spread by up to the group (window 11: p1 44, p50 156,
+  p90 185 ms), and a late chunk lowers one; both drain by themselves.
+  Correction judges the window's smallest depth (the latest arrival, a
+  group's first chunk) once the last 4 s hold at least 2 s of arrivals:
+  - a chunk loses the bounded drift trim (at most 5 ms) only when it is more
+    than 20 ms above 120 ms (phone clock faster, a backlog after an
+    underrun);
+  - at most 5 ms of silence is inserted (`frames_padded`) only when it is
+    below 30 ms, a quarter of the depth (phone clock slower, a slower path),
+    so a jitter spike inside the buffer costs nothing;
+  - within 4 s of an underrun the window is the last 1 s and 0.5 s sustains,
+    so the backlog that follows starts draining within about a second
+    instead of after the whole 4 s window.
 
   Window 10 (8fe9ea5, 244 s, passed) showed why: the first rule took the
-  largest depth over 4 s as the reference, so every burst read as excess
+  largest depth over 4 s as the reference, so every group read as excess
   latency and was trimmed (0.81%) until the buffer was nearly empty
   (`playout_depth_min_ms` 1.0); ordinary 3-28 ms jitter then underran it
-  13 times. The replay tests now release chunks in groups of 2-4 and expect
-  no trim, silence or underrun.
+  13 times. The replay tests release chunks in groups of 2-5 and expect no
+  trim, silence or underrun, and pad tests run with groups of 3 and 4.
 - **Catch-up is not used for wireless.** `--audio-catch-up-watermark-ms`
   is accepted only with `--audio-playout-ms 0`, which restores the arrival
   model (with `--audio-max-unacked 1`, exactly #180's behaviour).
 - **Video** (`--video-delay-ms`, default `match`): the receiver holds every
-  video access unit for the same 120 ms before forwarding it, still stamped
-  with its arrival time.
+  video access unit, still stamped with its arrival time, for **the audio's
+  current playout offset**: the delay audio really plays with after on-time
+  content, exactly the `playout_offset_ns` `audio_write_completed` reports.
+  Until the first playout audio write it holds for the 120 ms depth. A
+  shorter hold never lets a frame overtake a held one. `--video-delay-ms N`
+  fixes the hold at N ms instead (it needs `--audio-playout-ms` > 0).
 
-Latency this adds over the wired arrival model: about 120 ms for audio
-(100-140 ms as the drift control keeps the buffer inside its band, more for a
-while after a drought until its backlog is trimmed), and 120 ms for video,
-which includes touch-to-photon on the projected UI and every IDR recovery.
-**The owner accepted this cost** when choosing "Credit window + playout,
-~100-150 ms buffer, video matched" on 2026-11-20. Lip sync stays where it was.
+  Why the hold follows the offset (window 11, N1): with grouped delivery the
+  audio anchored on a late chunk plays depth + (group - 1) chunk periods
+  after on-time content, not 120 ms. Window 11 (e1e70b1, 480 s, passed)
+  reported a playout offset of p50 167 ms (p90 205, p99 295) against a fixed
+  120 ms video hold. Its real A/V pairs, through the drive smoke's own
+  pairing and the signed contract, failed: p50 -24 ms, worst 5 s mean
+  -150 ms, 680 pairs over 90 ms. Re-judging the same records with each
+  frame held for the offset in force when it arrived gives p50 +19.6 ms
+  (the display's decode and paint after release), p99 46.8 ms, worst 5 s
+  mean +27 ms, and 2 pairs over 90 ms. Both are single late video paints
+  (+93 and +95 ms) at a steady 162.7 ms offset, so they are display-side
+  outliers, not the hold. Holding audio to a fixed 120 ms instead is what
+  window 10 effectively did (offset ~136 ms): on this link it underran
+  13 times in 4 minutes.
 
-IDR and recovery budgets with the 120 ms hold: a recovery IDR reaches the
-display 120 ms later, so each waiting_idr episode is 120 ms longer.
+Latency this adds over the wired arrival model: the playout offset, for audio
+and for video alike (the hold follows it), which includes touch-to-photon on
+the projected UI and every IDR recovery. It is the 120 ms buffer plus however
+late this phone's groups make the anchor chunk: window 11 settled at about
+150-170 ms (p50 167), more for a few seconds after a drought until its backlog
+is trimmed. **The owner accepted the cost** when choosing "Credit window +
+playout, ~100-150 ms buffer, video matched" on 2026-11-20. The buffer is
+still 120 ms; the extra 30-50 ms is the A26's grouped delivery, which a fixed
+120 ms delay cannot ride out without frequent underruns. Lip sync stays where
+it was.
+
+IDR and recovery budgets with the hold: a recovery IDR reaches the display
+one hold (120 ms nominal, ~165 ms on window 11's link) later, so each
+waiting_idr episode is that much longer. The figures below use 120 ms; on
+window 11's link the margins are ~45 ms smaller.
 - The drive smoke's `waiting_idr_max` (1.0 s per episode) keeps 880 ms for
   the request, the phone's response and decode.
 - The producer's IDR re-request interval (250 ms) may send one extra
@@ -130,18 +165,23 @@ disconnects, are dropped rather than sent after it.
 
 A/V gates: video is delayed rather than the metric relaxed. On the playout
 clock `audio_write_completed.scheduled_ns` is the content's arrival-clock time
-and `playout_offset_ns` reports the buffer: the depth of the least-delayed
-recent arrival, which for a phone releasing chunks in groups is the content
-clock. The reported content interval never starts before the previous one
-ended (the collector drops a write whose schedule does not advance), so an
-increase of the offset is absorbed at half rate and the end offset can
-briefly exceed the start offset. `presented_ns - scheduled_ns`
-therefore includes the 120 ms, and so does the display's paint latency for
-the held video. The signed contract (5 s mean within 40 ms, p99 50 ms, drive
-smoke max 90 ms, soak at most 1 pair over 90 ms per 30 min and none over
-150 ms) measures the same thing as on wired and is not relaxed.
-`--video-delay-ms 0` keeps video at arrival; the contract then sees the
-120 ms audio lag and fails, so the offset is never hidden.
+and `playout_offset_ns` the delay after it: the depth of the least-delayed
+recent arrival, which marks on-time content. The reported content interval
+never starts before the previous one ended (the collector drops a write whose
+schedule does not advance), so an increase of the offset is absorbed at half
+rate and the end offset can briefly exceed the start offset; the video hold
+follows the reported value, so the two move together. `presented_ns -
+scheduled_ns` therefore includes the offset, and so does the display's paint
+latency for the held video. The signed contract (5 s mean within 40 ms, p99
+50 ms, drive smoke max 90 ms, soak at most 1 pair over 90 ms per 30 min and
+none over 150 ms) measures the same thing as on wired and is not relaxed.
+`--video-delay-ms 0` keeps video at arrival; the contract then sees the audio
+lag and fails, so the offset is never hidden.
+
+The #60 stall bypass still starts 250 ms after a credit is first withheld.
+With the window of 4 the worker withholds credit only once its scaled
+reservation is full, about 500-680 ms of queued media, so on wireless the
+bypass engages later than on wired (~128 ms of queued audio).
 
 Telemetry for the next live window: `{"event":"wireless_media_policy",...}` at
 startup, and `media_timing` carries `frames_trimmed`, `frames_silence`,
@@ -161,14 +201,20 @@ What a live window should check:
 2. `CAR.AUDIO.STATS` ack latency stays well under 170 ms; acks/s stays near
    23.4 (real time) even through a spike second.
 3. `frames_trimmed` and `frames_silence` stay near 0 (window 10: 0.81% and
-   0.66% before the sustained-error rule), `playout_underruns` is 0 or rare,
-   every `audio_playout_underrun` has `late_ms` matching a Wi-Fi spike, and
+   0.66% before the sustained-error rule; window 11: 0.14% and 0.10%),
+   `playout_underruns` is 0 or rare (window 11: 4 in 8 min), every
+   `audio_playout_underrun` has `late_ms` matching a Wi-Fi spike, and
    `playout_depth_min_ms` stays well above 0 (window 10: 1.0 ms).
+   `playout_offset_ms` sits above 120 ms by about the phone's group span
+   (window 11: ~150-170 ms); that is the real delay, and the video hold
+   follows it.
 4. No `late` failure and no `audio_sink_failure`; the session outlasts the
    ~33.5 s of window 9.
-5. The drive smoke's signed A/V criterion passes with the video hold; its
-   median skew is near the wired value; every waiting_idr episode stays under
-   1.0 s with the 120 ms hold.
+5. The drive smoke's signed A/V criterion passes with the video hold
+   following the offset; its median skew is near the wired value (window 11
+   re-judged: +19.6 ms); every waiting_idr episode stays under 1.0 s with the
+   hold. Remaining pairs over 90 ms should be single late video paints, not
+   audio steps.
 
 ## Run
 

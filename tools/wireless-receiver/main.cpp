@@ -36,9 +36,10 @@ constexpr const char* usage =
     "                       (default 120, max 180; 0 = arrival-time model)\n"
     "  --audio-max-unacked N  audio credit window advertised to the phone (1..8,\n"
     "                       default 4; 1 = stop-and-wait)\n"
-    "  --video-delay-ms N|match  hold video N ms before forwarding it so it stays\n"
-    "                       aligned with the audio playout buffer (default match =\n"
-    "                       the --audio-playout-ms value; 0..180)\n"
+    "  --video-delay-ms N|match  hold video before forwarding it so it stays aligned\n"
+    "                       with audio (default match: follow the audio playout\n"
+    "                       offset, starting at --audio-playout-ms; N: fixed 0..180,\n"
+    "                       needs --audio-playout-ms > 0 when N > 0)\n"
     "  --diagnostics        emit redacted diagnostic JSON to stdout\n"
     "  --duration-ms N      bounded run (1..86400000 ms; omitted: until signal)\n"
     "  --ap-channel N       AP channel; must equal ap.conf (36, 40, 44 or 48; default 36)\n"
@@ -154,6 +155,8 @@ std::optional<Options> parse_options(int argc, char** argv) {
     // Catch-up trims audio the playout buffer exists to keep (rejected for
     // wireless, 2026-11-20): it applies only to the arrival model.
     if (options.audio_catch_up_watermark_ms > 0 && options.audio_playout_ms > 0) return std::nullopt;
+    // F8: a video hold without a playout buffer only skews A/V.
+    if (options.video_delay_ms && *options.video_delay_ms > 0 && options.audio_playout_ms == 0) return std::nullopt;
     aa::config::ensure_fallback_video_profile(options.video_profiles, options.exact_video_profiles);
     return options;
 }
@@ -254,11 +257,17 @@ int receiver_main(int argc, char** argv) {
     }
     Media media{audio_sink};
     const auto video_hold = video_delay(options->video_delay_ms, options->audio_playout_ms);
-    media.video.set_presentation_delay(video_hold);
+    if (options->video_delay_ms || options->audio_playout_ms == 0) {
+        media.video.set_presentation_delay(video_hold);
+    } else {
+        // match: follow the audio playout offset, starting at the depth.
+        media.match_video_to_audio(video_hold);
+    }
     log_line("{\"event\":\"wireless_media_policy\",\"audio_playout_ms\":" +
              std::to_string(options->audio_playout_ms) + ",\"audio_max_unacked\":" +
              std::to_string(options->audio_max_unacked) + ",\"video_delay_ms\":" +
-             std::to_string(video_hold.count()) + "}");
+             (options->video_delay_ms ? std::to_string(video_hold.count())
+                                      : std::string{"\"match\""}) + "}");
     // Receiver precedes ControlService so its confirmation observer is valid
     // throughout bus dispatch and the bus's final owner teardown.
     auto link_config = media.config(options->video_profiles);

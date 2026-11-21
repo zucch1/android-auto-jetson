@@ -14,6 +14,7 @@
 #include <aa/protocol/Protocol.hpp>
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
@@ -32,9 +33,10 @@ namespace aa::audio {
 // audio channel. 1 is stop-and-wait (wired, and the wireless legacy model):
 // one chunk in flight per channel. A window of N lets the phone keep N chunks
 // unacknowledged, so a credit round trip up to N chunk periods no longer
-// stalls it. The worker seeds N - 1 reserved permits at every channel reset
-// and scales each role's slot and byte capacity by N, so the full window
-// always fits without a queue rejection.
+// stalls it. For N > 1 the worker reserves all N permits the phone holds at
+// every channel reset and bypass exit, and scales each role's slot and byte
+// capacity by N, so a chunk the phone may legally send always fits without a
+// queue rejection (N == 1 keeps the historical accounting).
 struct AudioCreditPolicy final {
     static constexpr std::uint32_t kMaxWindow = 8;
     std::uint32_t window{1};
@@ -79,6 +81,12 @@ public:
     // Most chunks one channel has had accepted but not yet released for ACK
     // (our side; the phone's in-flight use shows as max_arrival_burst).
     [[nodiscard]] std::uint64_t max_unacked_held() const;
+    // The playout offset the latest audio write reported (0 before playout
+    // audio): how long after its content (arrival) time audio plays. Any
+    // thread; the wireless video hold follows it (--video-delay-ms match).
+    [[nodiscard]] std::chrono::nanoseconds current_playout_offset() const noexcept {
+        return std::chrono::nanoseconds{playout_offset_ns_.load(std::memory_order_relaxed)};
+    }
     [[nodiscard]] SinkReport sink_report();
 
     [[nodiscard]] core::Result<void>
@@ -175,8 +183,8 @@ private:
         const auto base = capacity(index);
         return {base.bytes * credit_window_, base.units * credit_window_};
     }
-    // The phone holds the whole window again after a channel reset: one
-    // permit is implicit (as with stop-and-wait), the other N - 1 are reserved.
+    // The phone holds the whole window again after a channel reset: all N
+    // permits are reserved (stop-and-wait keeps its single implicit permit).
     void seed_credits_locked(std::size_t index);
     void note_unacked_locked(std::size_t index);
 
@@ -265,6 +273,9 @@ private:
     const std::uint32_t credit_window_;
     std::array<std::uint64_t, 4> unacked_{};
     std::uint64_t max_unacked_held_{};
+    std::uint64_t playout_underruns_logged_{};
+    std::uint64_t playout_anchors_logged_{};
+    std::atomic<std::int64_t> playout_offset_ns_{0};
     std::optional<core::Nanoseconds> step_started_;
     std::optional<core::Nanoseconds> bypass_since_;
     std::uint64_t bypass_epoch_{1};

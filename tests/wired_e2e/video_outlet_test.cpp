@@ -2348,3 +2348,76 @@ TEST(WiredReceiver, PresentationDelayDropsHeldFramesWhenTheConsumerDisconnects) 
 }
 
 } // namespace
+
+namespace {
+
+// N1: on the wireless receiver the video hold follows the audio playout offset
+// (the delay audio really plays with), read per frame. A shorter hold never
+// lets a later frame overtake a held one; a longer one holds the next frames
+// longer.
+TEST(WiredReceiver, PresentationDelaySourceIsReadPerFrameAndKeepsOrder) {
+    using namespace std::chrono_literals;
+    auto now = std::chrono::steady_clock::time_point{} + 400s;
+    VideoOutlet outlet{[](const std::string&) {}};
+    VideoOutlet::IdrRecoveryHooks hooks;
+    hooks.clock = [&] { return now; };
+    outlet.set_idr_recovery(std::move(hooks));
+    auto pair = videotest::make_pair({});
+    ASSERT_TRUE(pair);
+    outlet.install(std::move(pair.value().producer));
+    std::chrono::nanoseconds hold = 120ms;
+    outlet.set_presentation_delay_source([&] { return hold; });
+    EXPECT_EQ(outlet.current_presentation_delay(), 120ms);
+    const auto complete = [&](Milliseconds wait) {
+        const auto received = pair.value().consumer.receive(wait);
+        return received && received.value() == aa::ipc::ReceiveStatus::complete;
+    };
+    const auto frame = [](std::uint64_t n) {
+        return p::MessageHeader{p::ChannelRole::video, n, aa::core::Nanoseconds{static_cast<std::int64_t>(n)}};
+    };
+    ASSERT_TRUE(outlet.on_message({frame(1), wiredtest::kVideoIdr})); // due +120
+    now += 10ms;
+    hold = 60ms;
+    ASSERT_TRUE(outlet.on_message({frame(2), wiredtest::kVideoIdr})); // +70, kept behind frame 1
+    now += 60ms;                                                     // t = 70
+    ASSERT_TRUE(outlet.service_pending());
+    EXPECT_FALSE(complete(Milliseconds{20}));
+    now += 50ms;                                                     // t = 120
+    ASSERT_TRUE(outlet.service_pending());
+    ASSERT_TRUE(complete(Milliseconds{500}));
+    EXPECT_EQ(pair.value().consumer.access_unit().timestamp_ns, 1U);
+    ASSERT_TRUE(complete(Milliseconds{500}));
+    EXPECT_EQ(pair.value().consumer.access_unit().timestamp_ns, 2U);
+    hold = 200ms;
+    ASSERT_TRUE(outlet.on_message({frame(3), wiredtest::kVideoIdr})); // due t = 320
+    now += 199ms;
+    ASSERT_TRUE(outlet.service_pending());
+    EXPECT_FALSE(complete(Milliseconds{20}));
+    now += 1ms;
+    ASSERT_TRUE(outlet.service_pending());
+    ASSERT_TRUE(complete(Milliseconds{500}));
+    EXPECT_EQ(pair.value().consumer.access_unit().timestamp_ns, 3U);
+}
+
+// F12 / N4: a replacement consumer does not receive frames held for the old one.
+TEST(WiredReceiver, PresentationDelayDropsHeldFramesWhenTheConsumerIsReplaced) {
+    using namespace std::chrono_literals;
+    auto now = std::chrono::steady_clock::time_point{} + 500s;
+    VideoOutlet outlet{[](const std::string&) {}};
+    VideoOutlet::IdrRecoveryHooks hooks;
+    hooks.clock = [&] { return now; };
+    outlet.set_idr_recovery(std::move(hooks));
+    auto first = videotest::make_pair({});
+    ASSERT_TRUE(first);
+    outlet.install(std::move(first.value().producer));
+    outlet.set_presentation_delay(120ms);
+    ASSERT_TRUE(outlet.on_message({p::MessageHeader{p::ChannelRole::video, 1, aa::core::Nanoseconds{1}},
+                                   wiredtest::kVideoIdr}));
+    EXPECT_EQ(outlet.delayed_units(), 1U);
+    auto second = videotest::make_pair({});
+    ASSERT_TRUE(second);
+    outlet.install(std::move(second.value().producer));
+    EXPECT_EQ(outlet.delayed_units(), 0U);
+}
+
+} // namespace
