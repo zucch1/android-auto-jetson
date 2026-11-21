@@ -182,9 +182,17 @@ core::Result<std::vector<std::byte>> encode(const VideoFocusNotification& notifi
 }
 
 core::Result<std::vector<std::byte>> encode_av_sink_ready(std::span<const std::uint32_t> indices) {
+    return encode_av_sink_ready(indices, 1);
+}
+
+core::Result<std::vector<std::byte>> encode_av_sink_ready(std::span<const std::uint32_t> indices,
+                                                          std::uint32_t max_unacked) {
+    if (max_unacked == 0 || max_unacked > static_cast<std::uint32_t>(INT32_MAX)) {
+        return aasdk_adapter::malformed();
+    }
     shared::Config wire;
     wire.set_status(shared::Config::STATUS_READY);
-    wire.set_max_unacked(1);
+    wire.set_max_unacked(max_unacked);
     if (indices.empty()) { wire.add_configuration_indices(0); }
     else { for (auto index : indices) { wire.add_configuration_indices(index); } }
     return aasdk_adapter::framed_id(ids::MEDIA_MESSAGE_CONFIG, wire);

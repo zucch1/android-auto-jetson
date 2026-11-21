@@ -491,7 +491,10 @@ struct RuntimeFixture final {
         helper_client = std::move(client_res).value();
 
         audio_worker = std::make_unique<audio::AudioRenderWorker>(
-            wr::audio_config(audio::SinkBackend::pulse, audio_catch_up_watermark),
+            wr::audio_config(audio::SinkBackend::pulse, audio_catch_up_watermark,
+                             // Catch-up applies to the arrival model only.
+                             audio_catch_up_watermark.count > 0 ? aa::core::Nanoseconds{0}
+                                                                : audio::kWirelessPlayoutDepth),
             wr::audio_telemetry(),
             custom_open ? custom_open : make_gated_router(gate));
         ASSERT_TRUE(audio_worker->ready());

@@ -52,6 +52,9 @@ struct AvSinkData final {
 [[nodiscard]] core::Result<std::vector<std::byte>> encode(const VideoFocusNotification&);
 // READY carries explicit channel indices and one credit; the legacy default is index 0.
 [[nodiscard]] core::Result<std::vector<std::byte>> encode_av_sink_ready(std::span<const std::uint32_t> indices = {});
+// As above, advertising a credit window of `max_unacked` (>= 1) data messages.
+[[nodiscard]] core::Result<std::vector<std::byte>> encode_av_sink_ready(std::span<const std::uint32_t> indices,
+                                                                        std::uint32_t max_unacked);
 [[nodiscard]] core::Result<std::vector<std::byte>> encode_av_sink_ack(std::int32_t session_id);
 
 } // namespace aa::protocol

@@ -32,6 +32,12 @@ struct AudioRenderWorker::SettlementDiagnostics {
         std::uint64_t events_lifetime;
         std::uint64_t frames_lifetime;
     };
+    struct Playout {
+        PlayoutEvent event;
+        // Underruns or anchors (start + resume) over the worker's life,
+        // including this one.
+        std::uint64_t lifetime;
+    };
     struct SinkStall {
         core::Nanoseconds start;
         core::Nanoseconds end;
@@ -50,6 +56,7 @@ struct AudioRenderWorker::SettlementDiagnostics {
     std::optional<IdleSkip> skipped;
     std::optional<IdleResume> resumed;
     std::optional<CatchUp> caught_up;
+    std::vector<Playout> playout;
 
     explicit SettlementDiagnostics(const AudioTelemetryCallbacks& callbacks) noexcept
         : telemetry(callbacks) {}
@@ -86,6 +93,29 @@ struct AudioRenderWorker::SettlementDiagnostics {
                 audio_catch_up_json(caught_up->frames, caught_up->total, caught_up->rate,
                                     caught_up->events_lifetime, caught_up->frames_lifetime));
         }
+        for (const auto& entry : playout) {
+            const auto& event = entry.event;
+            if (event.kind == PlayoutEvent::Kind::underrun) {
+                // Playout underrun: a chunk arrived late_ms after its slot, so
+                // the role was re-anchored depth_ms after that arrival. The
+                // elapsed hole is skipped (media_timing frames_skipped), the
+                // refill is silence (frames_silence).
+                telemetry.log_media("audio_playout_underrun",
+                    "{\"event\":\"audio_playout_underrun\",\"underruns_lifetime\":" +
+                    std::to_string(entry.lifetime) + ",\"late_ms\":" +
+                    format_ms(event.late) + ",\"depth_ms\":" + format_ms(event.depth) + "}");
+                continue;
+            }
+            // A stream (re)start on the playout clock. skipped_ms is the
+            // elapsed time it jumped over without a write: 0 at a stream
+            // start, the pause on a resume. Every one is logged, so a large
+            // forward jump is never silent (DeepSeek F3, N3).
+            telemetry.log_media("audio_playout_anchor",
+                std::string{"{\"event\":\"audio_playout_anchor\",\"reason\":\""} +
+                (event.kind == PlayoutEvent::Kind::resume ? "resume" : "start") +
+                "\",\"skipped_ms\":" + format_ms(event.late) + ",\"depth_ms\":" +
+                format_ms(event.depth) + ",\"anchors_lifetime\":" + std::to_string(entry.lifetime) + "}");
+        }
         if (skipped) {
             telemetry.log_media("audio_idle_skipped",
                 "{\"event\":\"audio_idle_skipped\",\"id\":" + std::to_string(skipped->id) +
@@ -120,13 +150,110 @@ AudioRenderWorker::AudioRenderWorker(RouterConfig config,
                                      AudioTelemetryCallbacks telemetry,
                                      OpenRouter open,
                                      IdleClock idle_clock,
-                                     std::chrono::milliseconds ack_release_timeout)
+                                     std::chrono::milliseconds ack_release_timeout,
+                                     AudioCreditPolicy credit)
     : telemetry_(std::move(telemetry)),
       idle_clock_(std::move(idle_clock)),
       ack_release_timeout_(std::max(std::chrono::milliseconds{1}, ack_release_timeout)),
-      thread_([this, config = std::move(config), open = std::move(open)] {
-          run(config, open);
-      }) {}
+      credit_window_(std::clamp<std::uint32_t>(credit.window, 1, AudioCreditPolicy::kMaxWindow)),
+      playout_depth_ns_(config.playout.enabled ? config.playout.depth.count : 0) {
+    for (std::size_t index = 0; index < credits_.size(); ++index) { seed_credits_locked(index); }
+    // Started last: every member above is initialized before run() reads it.
+    thread_ = std::thread([this, config = std::move(config), open = std::move(open)] {
+        run(config, open);
+    });
+}
+
+void AudioRenderWorker::note_unacked_locked(std::size_t index) {
+    ++unacked_[index];
+    max_unacked_held_ = std::max(max_unacked_held_, unacked_[index]);
+}
+
+void AudioRenderWorker::seed_credits_locked(std::size_t index) {
+    // Stop-and-wait keeps its historical accounting: the phone's single
+    // permit is checked against capacity when its chunk arrives. A window of
+    // N gives the phone N permits, and every one must be reserved, or a
+    // legally in-flight chunk is refused while the sink blocks (Neon P1-2).
+    credits_[index].assign(credit_window_ > 1 ? credit_window_ : 0, envelope(index));
+}
+
+std::chrono::nanoseconds AudioRenderWorker::playout_offset_at(core::Nanoseconds content) const {
+    // Its own lock: the render worker holds mutex_ while it submits a
+    // post-stall burst, and the video hold must never wait for that.
+    std::lock_guard lock(playout_mutex_);
+    if (playout_writes_.empty()) { return std::chrono::nanoseconds{0}; }
+    const auto t = content.count;
+    // Across a gap the router may lower the offset by half the OUTPUT gap at
+    // once: its clamp is previous_offset - (scheduled - previous_end) / 2,
+    // and scheduled/previous_end are output-clock times (an underrun's skip
+    // and refill, a short pause). In content time, with the drop d and
+    // content gap cg = og + d, d <= og / 2 is d <= cg / 3: a fall of a third
+    // of the content time past the last write, toward the depth it
+    // re-anchors with. The lookup predicts exactly that, so video arriving in
+    // a gap is never held for the old offset while the audio it pairs with
+    // on resume plays earlier (Neon P1 #1; round 6 Neon P2-1 reverted a
+    // misread 1/2).
+    const auto decayed = [&](const PlayoutWrite& last) {
+        const auto fallen = last.end_offset - (t - last.content_end) / 3;
+        return std::max(fallen, std::min(last.end_offset, playout_depth_ns_));
+    };
+    // Past this, a gap is a pause, not an underrun: no offset to follow, and
+    // the caller falls back to the depth (the offset a resume anchors with).
+    constexpr std::int64_t kStaleAfterNs = 1'000'000'000;
+    const auto& newest = playout_writes_.back();
+    if (t >= newest.content_end) {
+        // No audio for over a second (stopped without a stop message).
+        if (t - newest.content_end > kStaleAfterNs) { return std::chrono::nanoseconds{0}; }
+        return std::chrono::nanoseconds{decayed(newest)};
+    }
+    for (auto it = playout_writes_.rbegin(); it != playout_writes_.rend(); ++it) {
+        if (t < it->content_start) { continue; }
+        if (t >= it->content_end) {
+            // A recorded gap between this write and the next one: the line
+            // between their offsets (slope >= -1/3, the router's gap credit).
+            const auto next = it.base(); // the write after *it
+            if (next == playout_writes_.end()) { return std::chrono::nanoseconds{decayed(*it)}; }
+            // A recorded pause (over a second, resumed without a stop
+            // message) is treated like an open gap: the interpolation's
+            // product would overflow int64 past ~53 s (Neon P1-1), and the
+            // resume anchors at the depth anyway. Below a second the product
+            // is at most ~1e9 * 4e8, far inside int64.
+            const auto span = next->content_start - it->content_end;
+            if (span > kStaleAfterNs) {
+                // As if the gap were still open (the router saw it so).
+                return std::chrono::nanoseconds{
+                    t - it->content_end > kStaleAfterNs ? 0 : decayed(*it)};
+            }
+            return std::chrono::nanoseconds{it->end_offset
+                + (next->start_offset - it->end_offset) * (t - it->content_end)
+                    / std::max<std::int64_t>(1, span)};
+        }
+        // Inside a write: interpolated across its slew. The A/V contract
+        // compares the chunk's start offset; the two differ by at most half
+        // a chunk of slew (DeepSeek P3-1), and by nothing in steady state.
+        const auto span = it->content_end - it->content_start;
+        const auto into = t - it->content_start;
+        const auto delta = it->end_offset - it->start_offset;
+        // span <= 64 KiB of PCM (~340 ms in ns): the product cannot overflow.
+        return std::chrono::nanoseconds{it->start_offset + delta * into / std::max<std::int64_t>(1, span)};
+    }
+    return std::chrono::nanoseconds{playout_writes_.front().start_offset};
+}
+
+std::chrono::nanoseconds AudioRenderWorker::current_playout_offset() const {
+    std::lock_guard lock(playout_mutex_);
+    return std::chrono::nanoseconds{playout_writes_.empty() ? 0 : playout_writes_.back().end_offset};
+}
+
+void AudioRenderWorker::clear_playout_writes() {
+    std::lock_guard lock(playout_mutex_);
+    playout_writes_.clear();
+}
+
+std::uint64_t AudioRenderWorker::max_unacked_held() const {
+    std::lock_guard lock(mutex_);
+    return max_unacked_held_;
+}
 
 AudioRenderWorker::~AudioRenderWorker() { (void)finish(); }
 
@@ -165,8 +292,8 @@ AudioRenderWorker::submit(const protocol::MessageView& message, channels::AvDeli
     const auto reject = [&](diagnostics::QueueReason reason, std::size_t units) {
         last_queue_rejection_ = diagnostics::QueueRejection{
             diagnostics::QueueSource::audio_worker, reason, message.header.channel,
-            role_slots_[*role], kRoleSlots, role_bytes_[*role], capacity(*role).bytes,
-            role_units_[*role], capacity(*role).units, bytes, units, 1,
+            role_slots_[*role], role_slot_cap(), role_bytes_[*role], role_capacity(*role).bytes,
+            role_units_[*role], role_capacity(*role).units, bytes, units, 1,
             credits_[*role].empty() ? 0 : credits_[*role].size() - 1};
         last_queue_rejection_->reserved_bytes =
             last_queue_rejection_->remaining_permits * envelope(*role).bytes;
@@ -202,6 +329,7 @@ AudioRenderWorker::submit(const protocol::MessageView& message, channels::AvDeli
     maybe_bypass_locked(monotonic_now());
     if (bypass_since_ && bypass_epoch_ == session_epoch_) {
         ++bypass_dropped_;
+        note_unacked_locked(*role);
         completed_.push_back(id);
         auto observation = credit_event(channels::AvCreditEvent::granted, id);
         observation.message_sequence = message.header.sequence;
@@ -218,13 +346,13 @@ AudioRenderWorker::submit(const protocol::MessageView& message, channels::AvDeli
                        (*role == 0 ? 1 : 6);
     const auto permits = credits_[*role].empty() ? 0 : credits_[*role].size() - 1;
     const auto promised = envelope(*role);
-    if (role_slots_[*role] + permits >= kRoleSlots ||
-        role_bytes_[*role] + permits * promised.bytes + bytes > capacity(*role).bytes ||
-        role_units_[*role] + permits * promised.units + units > capacity(*role).units) {
+    if (role_slots_[*role] + permits >= role_slot_cap() ||
+        role_bytes_[*role] + permits * promised.bytes + bytes > role_capacity(*role).bytes ||
+        role_units_[*role] + permits * promised.units + units > role_capacity(*role).units) {
         return reject(
-            role_slots_[*role] + permits >= kRoleSlots
+            role_slots_[*role] + permits >= role_slot_cap()
                 ? diagnostics::QueueReason::slots
-                : role_bytes_[*role] + permits * promised.bytes + bytes > capacity(*role).bytes
+                : role_bytes_[*role] + permits * promised.bytes + bytes > role_capacity(*role).bytes
                       ? diagnostics::QueueReason::bytes
                       : diagnostics::QueueReason::weighted_units,
             units);
@@ -250,6 +378,7 @@ AudioRenderWorker::submit(const protocol::MessageView& message, channels::AvDeli
     role_units_[*role] += units;
     // This arrival consumed the role's oldest outstanding credit.
     if (!credits_[*role].empty()) { credits_[*role].pop_front(); }
+    note_unacked_locked(*role);
     // Each parent makes exactly one ACK decision. A credit reserves the
     // FULL supported next envelope, independently of this parent's size.
     deferred_[*role].push_back(DeferredCredit{id, envelope(*role), monotonic_now(), false,
@@ -270,7 +399,13 @@ void AudioRenderWorker::invalidate(protocol::ChannelRole role, std::uint64_t gen
     if (!index) { return; }
     if (generations_[*index] == generation) { return; }
     if (router_) { router_->cancel_pending(role); }
-    credits_[*index].clear();
+    seed_credits_locked(*index);
+    unacked_[*index] = 0;
+    // When no stream plays on the playout clock any more the hold falls back
+    // to the depth rather than a stale offset (P2-4), exactly when the router
+    // drops its own slew state; an overlay ending while another stream plays
+    // keeps the history, so the offset never steps.
+    if (!router_ || !router_->playout_anchored()) { clear_playout_writes(); }
     generations_[*index] = generation;
     const auto stale = [&](const auto& entry) {
         return entry.id.role == role && entry.id.generation != generation;
@@ -298,8 +433,11 @@ void AudioRenderWorker::begin_session() {
     discard_if(queued_, [](const auto&) { return true; });
     completed_.clear();
     credits_ = {};
+    for (std::size_t index = 0; index < credits_.size(); ++index) { seed_credits_locked(index); }
+    unacked_ = {};
     deferred_ = {};
     generations_ = {};
+    clear_playout_writes();
     last_queue_rejection_.reset();
     frozen_rejection_.reset();
     credit_ledger_.reset();
@@ -338,6 +476,9 @@ AudioRenderWorker::take_completion_with_epoch(std::uint64_t& session_epoch,
         completion = completed_.front();
         record_credit_locked(credit_event(channels::AvCreditEvent::taken, *completion));
         completed_.pop_front();
+        if (const auto index = audio_index(completion->role); index && unacked_[*index] != 0) {
+            --unacked_[*index];
+        }
         session_epoch = session_epoch_;
     }
     publish_bypass_logs(lock);
@@ -363,6 +504,8 @@ AudioRenderWorker::AckRelease AudioRenderWorker::try_begin_ack_release(
     }
     if (sink_state_ == SinkState::reopening) {
         completed_.push_front(completion);
+        // Taken again later: it is still unacknowledged.
+        if (idx) { ++unacked_[*idx]; }
         cv_.notify_all();
         return AckRelease::deferred;
     }
@@ -493,8 +636,8 @@ void AudioRenderWorker::record_credit_locked(const channels::AvObservation& valu
     AvCreditState state{};
     for (std::size_t i = 0; i < state.roles.size(); ++i) {
         state.roles[i] = {role_slots_[i], role_bytes_[i], role_units_[i], credits_[i].size(),
-                          deferred_[i].size(), 0, kRoleSlots, capacity(i).bytes,
-                          capacity(i).units, envelope(i).bytes};
+                          deferred_[i].size(), 0, role_slot_cap(), role_capacity(i).bytes,
+                          role_capacity(i).units, envelope(i).bytes};
         for (const auto& pending : deferred_[i]) {
             if (value.pending == pending.id) { state.pending_deferred = true; }
         }
@@ -582,9 +725,9 @@ void AudioRenderWorker::release(const Job& job) {
 
 bool AudioRenderWorker::can_credit(std::size_t index, Reservation next) const {
     const auto permits = credits_[index].size() + 1;
-    return role_slots_[index] + permits <= kRoleSlots &&
-           role_bytes_[index] + permits * next.bytes <= capacity(index).bytes &&
-           role_units_[index] + permits * next.units <= capacity(index).units;
+    return role_slots_[index] + permits <= role_slot_cap() &&
+           role_bytes_[index] + permits * next.bytes <= role_capacity(index).bytes &&
+           role_units_[index] + permits * next.units <= role_capacity(index).units;
 }
 
 void AudioRenderWorker::grant_deferred(SettlementDiagnostics& diagnostics) {
@@ -667,6 +810,7 @@ void AudioRenderWorker::enter_bypass_locked(const char* trigger) {
     }
     ++bypass_total_;
     cancel_all();
+    clear_playout_writes(); // the router dropped every stream (P2 #4)
     discard_if(queued_, [](const auto&) { return true; });
     credits_ = {};
     std::size_t granted = 0;
@@ -715,6 +859,11 @@ void AudioRenderWorker::exit_bypass_locked(const char* outcome) {
         ++(parent.rendered_any ? bypass_partial_ : bypass_discarded_);
     }
     bypass_in_flight_.clear();
+    // Every arrival during the bypass was released at once: the phone holds
+    // its whole window again.
+    for (std::size_t index = 0; index < credits_.size(); ++index) {
+        if (credits_[index].empty()) { seed_credits_locked(index); }
+    }
     dropped_total_ += bypass_dropped_;
     bypass_logs_.push_back(
         "{\"event\":\"audio_stall_bypass\",\"phase\":\"end\",\"outcome\":\"" +
@@ -761,11 +910,25 @@ void AudioRenderWorker::run(RouterConfig config, const OpenRouter& open) {
             if (observe) { observe(value); }
         };
     const auto completed = config.on_write_completed;
-    config.on_write_completed = [this](const auto& value) {
+    const bool playout = config.playout.enabled;
+    config.on_write_completed = [this, playout](const auto& value) {
         std::lock_guard lock(mutex_);
         if (active_step_epoch_ == session_epoch_) {
             last_completion_ = value;
             step_completion_ = value;
+            // Only this session's writes feed the video hold (P2-4), and
+            // not one that completes after bypass or after the last stream
+            // was cancelled (invalidate() already cleared the history: Neon
+            // P1-2). The gate is router-wide: a cancelled role's in-flight
+            // write still lands while another stream plays (DeepSeek T8).
+            // The router released its lock before this callback.
+            if (playout && !bypass_since_ && router_ && router_->playout_anchored()) {
+                std::lock_guard history(playout_mutex_);
+                playout_writes_.push_back({value.scheduled.count - value.playout_offset.count,
+                                           value.scheduled_end.count - value.playout_end_offset.count,
+                                           value.playout_offset.count, value.playout_end_offset.count});
+                if (playout_writes_.size() > kPlayoutHistory) { playout_writes_.pop_front(); }
+            }
         }
     };
     auto opened = open(config);
@@ -788,9 +951,23 @@ void AudioRenderWorker::run(RouterConfig config, const OpenRouter& open) {
         std::lock_guard lock(mutex_);
         router_ = &local_router;
     }
-    const auto emit_media_timing = [this](const auto& stats) {
+    // Counters of the routes a sink reopen replaced, so media_timing reports
+    // the receiver's life rather than the current route.
+    RouterStats lifetime{};
+    std::uint64_t sink_reopens = 0;
+    const auto timing_context = [&](std::uint64_t max_unacked) {
+        MediaTimingContext context;
+        context.sink_reopens = sink_reopens;
+        if (config.playout.enabled) { context.playout_target = config.playout.depth; }
+        context.credit_window = credit_window_;
+        context.max_unacked_held = max_unacked;
+        return context;
+    };
+    const auto emit_media_timing = [&](const RouterStats& route) {
+        const auto stats = accumulate_router_stats(lifetime, route);
         if (stats.frames_written == 0 || !telemetry_.log_media) { return; }
-        telemetry_.log_media("media_timing", media_timing_json(stats));
+        telemetry_.log_media("media_timing",
+                             media_timing_json(stats, timing_context(max_unacked_held())));
     };
     std::uint64_t chunks = 0;
     for (;;) {
@@ -882,6 +1059,11 @@ void AudioRenderWorker::run(RouterConfig config, const OpenRouter& open) {
         }
         in_flight_ = false;
         const auto stats = local_router.report().stats;
+        for (const auto& event : local_router.take_playout_events()) {
+            auto& count = event.kind == PlayoutEvent::Kind::underrun ? playout_underruns_logged_
+                                                                     : playout_anchors_logged_;
+            diagnostics.playout.push_back({event, ++count});
+        }
         // #155: the router trimmed this step's post-stall backlog (it happened
         // whatever the epoch, so it is always counted).
         if (stats.frames_caught_up > caught_up_before) {
@@ -1038,6 +1220,8 @@ void AudioRenderWorker::run(RouterConfig config, const OpenRouter& open) {
             // Arrivals keep dropping and ACKing while the failed sink is
             // replaced; the new route anchors on its first arrival.
             local_router.close();
+            lifetime = accumulate_router_stats(lifetime, local_router.report().stats);
+            ++sink_reopens;
             auto reopened = open(config);
             lock.lock();
             ++consecutive_reopens_;

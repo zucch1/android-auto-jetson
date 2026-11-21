@@ -536,7 +536,7 @@ def case_media_timing(tmp: Path) -> None:
         ("emit_media_timing(stats);", ""),
         ("emit_media_timing(stats);", "/* emit_media_timing(stats); */"),
         ("const auto stats = local_router.report().stats;", ""),
-        ("media_timing_json(stats)", "\"\""),
+        ("media_timing_json(stats,", "\"\"("),
         ("format_ms(stats.max_completion_skew)", "format_ms(0)"),
         ("format_ms(stats.max_path_latency)", "format_ms(0)"),
     ):

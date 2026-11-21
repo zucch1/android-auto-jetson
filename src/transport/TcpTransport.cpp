@@ -48,13 +48,10 @@ void TcpTransport::set_io_checkpoint_interval(std::chrono::milliseconds interval
 
 core::Result<std::unique_ptr<TcpTransport>>
 TcpTransport::connect(const char* host, std::uint16_t port) {
-    int fd = su::connect_socket(host, port);
+    // connect_socket() sets TCP_NODELAY (socket_util.hpp).
+    const int fd = su::connect_socket(host, port);
     if (fd < 0) {
         return Error{ErrorCode::transport_unavailable};
-    }
-    if (!su::set_no_delay(fd)) {
-        su::close_fd(fd);
-        return Error{ErrorCode::transport_io};
     }
     return std::unique_ptr<TcpTransport>(new TcpTransport(std::make_unique<Impl>(fd)));
 }

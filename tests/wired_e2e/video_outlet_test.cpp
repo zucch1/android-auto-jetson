@@ -8,6 +8,7 @@
 #include <aa/ipc/VideoSocket.hpp>
 #include <algorithm>
 #include <array>
+#include <map>
 #include <cerrno>
 #include <chrono>
 #include <cstring>
@@ -2189,3 +2190,552 @@ TEST(WiredReceiver, VideoOutletEpochChangeWhileHeldRestoresWaitingIdrAndDropsSta
         return s.find("\"event\":\"decode_stats\",\"frame_drops\":4") != std::string::npos;
     }), logs.end());
 }
+
+namespace {
+
+// Wireless playout (credit window + playout, 2026-11-20): video is held for the audio playout depth and then
+// forwarded with its arrival stamp, so the display's paint latency includes the
+// same offset as audio_write_completed's presented latency.
+TEST(WiredReceiver, PresentationDelayHoldsVideoForThePlayoutDepthWithItsArrivalStamp) {
+    using namespace std::chrono_literals;
+    std::vector<std::string> logs;
+    VideoOutlet outlet{[&](const std::string& line) { logs.push_back(line); }};
+    auto now = std::chrono::steady_clock::time_point{} + 10s;
+    VideoOutlet::IdrRecoveryHooks hooks;
+    hooks.clock = [&] { return now; };
+    outlet.set_idr_recovery(std::move(hooks));
+    auto pair = videotest::make_pair({});
+    ASSERT_TRUE(pair);
+    outlet.install(std::move(pair.value().producer));
+    outlet.set_presentation_delay(120ms);
+    const auto complete = [&](Milliseconds wait) {
+        const auto received = pair.value().consumer.receive(wait);
+        return received && received.value() == aa::ipc::ReceiveStatus::complete;
+    };
+    const p::MessageHeader header{p::ChannelRole::video, 1, aa::core::Nanoseconds{5'000'000'000}};
+    ASSERT_TRUE(outlet.on_message({header, wiredtest::kVideoIdr}));
+    EXPECT_TRUE(outlet.has_pending());
+    EXPECT_EQ(outlet.delayed_units(), 1U);
+    EXPECT_FALSE(complete(Milliseconds{20}));
+    now += 119ms;
+    ASSERT_TRUE(outlet.service_pending());
+    EXPECT_FALSE(complete(Milliseconds{20}));
+    now += 1ms;
+    ASSERT_TRUE(outlet.service_pending());
+    ASSERT_TRUE(complete(Milliseconds{500}));
+    EXPECT_EQ(pair.value().consumer.access_unit().timestamp_ns, 5'000'000'000ULL);
+    EXPECT_TRUE(pair.value().consumer.access_unit().idr);
+    EXPECT_FALSE(outlet.has_pending());
+
+    // Order is kept: a later frame never overtakes a held one.
+    const p::MessageHeader second{p::ChannelRole::video, 2, aa::core::Nanoseconds{5'100'000'000}};
+    const p::MessageHeader third{p::ChannelRole::video, 3, aa::core::Nanoseconds{5'110'000'000}};
+    ASSERT_TRUE(outlet.on_message({second, wiredtest::kVideoIdr}));
+    now += 10ms;
+    ASSERT_TRUE(outlet.on_message({third, wiredtest::kVideoIdr}));
+    EXPECT_EQ(outlet.delayed_units(), 2U);
+    now += 110ms; // only the second frame is due
+    ASSERT_TRUE(outlet.service_pending());
+    ASSERT_TRUE(complete(Milliseconds{500}));
+    EXPECT_EQ(pair.value().consumer.access_unit().timestamp_ns, 5'100'000'000ULL);
+    EXPECT_EQ(outlet.delayed_units(), 1U);
+    // A stream reset drops what is still held instead of sending it late.
+    outlet.reset();
+    EXPECT_FALSE(outlet.has_pending());
+    now += 1s;
+    ASSERT_TRUE(outlet.service_pending());
+    EXPECT_FALSE(complete(Milliseconds{20}));
+}
+
+// Without a delay (wired) a frame is forwarded during on_message as before.
+TEST(WiredReceiver, NoPresentationDelayForwardsAtOnce) {
+    VideoOutlet outlet{[](const std::string&) {}};
+    auto pair = videotest::make_pair({});
+    ASSERT_TRUE(pair);
+    outlet.install(std::move(pair.value().producer));
+    const p::MessageHeader header{p::ChannelRole::video, 1, aa::core::Nanoseconds{7}};
+    ASSERT_TRUE(outlet.on_message({header, wiredtest::kVideoIdr}));
+    EXPECT_FALSE(outlet.has_pending());
+    const auto received = pair.value().consumer.receive(Milliseconds{500});
+    ASSERT_TRUE(received);
+    EXPECT_EQ(received.value(), aa::ipc::ReceiveStatus::complete);
+    EXPECT_EQ(pair.value().consumer.access_unit().timestamp_ns, 7U);
+}
+
+} // namespace
+
+namespace {
+
+// Neon P3: frames still held for the playout delay are older than a
+// backpressure overflow's recovery IDR. They are dropped with the overflowed
+// queue instead of dripping out after it.
+TEST(WiredReceiver, PresentationDelayDropsHeldFramesOnBackpressureOverflow) {
+    using namespace std::chrono_literals;
+    auto now = std::chrono::steady_clock::time_point{} + 200s;
+    std::size_t idr_requests = 0;
+    std::vector<std::string> logs;
+    VideoOutlet outlet{[&](const std::string& line) { logs.push_back(line); }};
+    outlet.set_idr_recovery({
+        [] { return true; },
+        [&idr_requests]() -> aa::core::Result<void> { ++idr_requests; return {}; },
+        [&now] { return now; },
+    });
+    auto pair = videotest::make_pair({});
+    ASSERT_TRUE(pair);
+    bool force_would_block = false;
+    pair.value().producer.set_datagram_send_for_test(
+        [&force_would_block](int fd, const void* buf, std::size_t len, int flags,
+                             int& out_errno) -> std::ptrdiff_t {
+            if (force_would_block) { out_errno = EAGAIN; return -1; }
+            const auto sent = ::send(fd, buf, len, flags);
+            out_errno = (sent < 0) ? errno : 0;
+            return sent;
+        });
+    outlet.install(std::move(pair.value().producer));
+    outlet.set_presentation_delay(120ms);
+    const auto profile = p::VideoProfile{1920, 1080, 60, p::VideoCodec::h265};
+    p::MessageHeader hdr{p::ChannelRole::video, 1, {100}};
+    hdr.video_profile = profile;
+    hdr.video_session = 1;
+    hdr.video_generation = 1;
+    ASSERT_TRUE(outlet.on_message({hdr, make_h265_au(true, 16 * 1024, std::byte{0x10})}));
+    now += 120ms;
+    ASSERT_TRUE(outlet.service_pending());
+    ASSERT_TRUE(receive_complete_au(pair.value().consumer).has_value());
+
+    // The socket stalls. Five 100 KB P-frames arrive together, then three more
+    // 100 ms later; when the first five come due they overflow the byte budget.
+    force_would_block = true;
+    const auto chunk = make_h265_au(false, 100 * 1024, std::byte{0x22});
+    for (int i = 0; i < 5; ++i) {
+        ++hdr.sequence;
+        ASSERT_TRUE(outlet.on_message({hdr, chunk}));
+    }
+    now += 100ms;
+    for (int i = 0; i < 3; ++i) {
+        ++hdr.sequence;
+        ASSERT_TRUE(outlet.on_message({hdr, chunk}));
+    }
+    EXPECT_EQ(outlet.delayed_units(), 8U);
+    now += 20ms;
+    ASSERT_TRUE(outlet.service_pending());
+    EXPECT_EQ(idr_requests, 1U);
+    EXPECT_EQ(outlet.delayed_units(), 0U);
+    EXPECT_FALSE(outlet.has_pending());
+}
+
+// Neon P3: a consumer that disconnects takes the held frames with it.
+TEST(WiredReceiver, PresentationDelayDropsHeldFramesWhenTheConsumerDisconnects) {
+    using namespace std::chrono_literals;
+    auto now = std::chrono::steady_clock::time_point{} + 300s;
+    VideoOutlet outlet{[](const std::string&) {}};
+    VideoOutlet::IdrRecoveryHooks hooks;
+    hooks.clock = [&] { return now; };
+    outlet.set_idr_recovery(std::move(hooks));
+    auto pair = videotest::make_pair({});
+    ASSERT_TRUE(pair);
+    outlet.install(std::move(pair.value().producer));
+    outlet.set_presentation_delay(120ms);
+    const p::MessageHeader first{p::ChannelRole::video, 1, aa::core::Nanoseconds{1}};
+    const p::MessageHeader second{p::ChannelRole::video, 2, aa::core::Nanoseconds{2}};
+    ASSERT_TRUE(outlet.on_message({first, wiredtest::kVideoIdr}));
+    now += 50ms;
+    ASSERT_TRUE(outlet.on_message({second, wiredtest::kVideoIdr}));
+    pair.value().consumer.close();
+    now += 70ms; // only the first frame is due: its send finds the peer gone
+    ASSERT_TRUE(outlet.service_pending());
+    EXPECT_EQ(outlet.delayed_units(), 0U);
+    EXPECT_FALSE(outlet.has_pending());
+}
+
+} // namespace
+
+namespace {
+
+// N1: on the wireless receiver the video hold follows the audio playout offset
+// reported for the frame's own timestamp, read per frame. A shorter hold
+// never lets a later frame overtake a held one, and the applied hold falls by
+// at most half the time that passes, so no frame is pinned behind another's
+// due; a longer one holds the next frames longer at once.
+TEST(WiredReceiver, PresentationDelaySourceIsReadPerFrameAndKeepsOrder) {
+    using namespace std::chrono_literals;
+    auto now = std::chrono::steady_clock::time_point{} + 400s;
+    VideoOutlet outlet{[](const std::string&) {}};
+    VideoOutlet::IdrRecoveryHooks hooks;
+    hooks.clock = [&] { return now; };
+    outlet.set_idr_recovery(std::move(hooks));
+    auto pair = videotest::make_pair({});
+    ASSERT_TRUE(pair);
+    outlet.install(std::move(pair.value().producer));
+    // The hold is the offset of the audio each frame's content pairs with:
+    // frame n is keyed by its timestamp n.
+    std::map<std::int64_t, std::chrono::nanoseconds> hold{{1, 120ms}, {2, 60ms}, {3, 200ms}};
+    std::vector<std::int64_t> asked;
+    outlet.set_presentation_delay_source([&](aa::core::Nanoseconds content) {
+        asked.push_back(content.count);
+        const auto found = hold.find(content.count);
+        return found == hold.end() ? std::chrono::nanoseconds{120ms} : found->second;
+    });
+    EXPECT_EQ(outlet.presentation_delay_for(aa::core::Nanoseconds{7}), 120ms);
+    const auto complete = [&](Milliseconds wait) {
+        const auto received = pair.value().consumer.receive(wait);
+        return received && received.value() == aa::ipc::ReceiveStatus::complete;
+    };
+    const auto frame = [](std::uint64_t n) {
+        return p::MessageHeader{p::ChannelRole::video, n, aa::core::Nanoseconds{static_cast<std::int64_t>(n)}};
+    };
+    ASSERT_TRUE(outlet.on_message({frame(1), wiredtest::kVideoIdr})); // due +120
+    EXPECT_EQ(asked.back(), 1);                                        // asked for its own timestamp
+    now += 10ms;
+    ASSERT_TRUE(outlet.on_message({frame(2), wiredtest::kVideoIdr})); // 60, slewed: 120 - 5 = 115, due +125
+    now += 110ms;                                                     // t = 120
+    ASSERT_TRUE(outlet.service_pending());
+    ASSERT_TRUE(complete(Milliseconds{500}));
+    EXPECT_EQ(pair.value().consumer.access_unit().timestamp_ns, 1U);
+    EXPECT_FALSE(complete(Milliseconds{20}));
+    now += 5ms;                                                       // t = 125
+    ASSERT_TRUE(outlet.service_pending());
+    ASSERT_TRUE(complete(Milliseconds{500}));
+    EXPECT_EQ(pair.value().consumer.access_unit().timestamp_ns, 2U);
+    ASSERT_TRUE(outlet.on_message({frame(3), wiredtest::kVideoIdr})); // 200: due t = 325
+    now += 199ms;
+    ASSERT_TRUE(outlet.service_pending());
+    EXPECT_FALSE(complete(Milliseconds{20}));
+    now += 1ms;
+    ASSERT_TRUE(outlet.service_pending());
+    ASSERT_TRUE(complete(Milliseconds{500}));
+    EXPECT_EQ(pair.value().consumer.access_unit().timestamp_ns, 3U);
+}
+
+// Neon P1-1: when the offset drops (a burst peak ageing out, a re-anchor) the
+// frames after the drop must not be pinned behind the last held frame's due -
+// a ~drop-long freeze, then a burst, and an A/V excursion of (drop - frame
+// period). With the applied hold slewing down at half rate every frame is
+// released on its own, at least half a frame period after the previous one.
+TEST(WiredReceiver, PresentationDelayDownwardStepNeverPinsFrames) {
+    using namespace std::chrono_literals;
+    auto now = std::chrono::steady_clock::time_point{} + 600s;
+    VideoOutlet outlet{[](const std::string&) {}};
+    VideoOutlet::IdrRecoveryHooks hooks;
+    hooks.clock = [&] { return now; };
+    outlet.set_idr_recovery(std::move(hooks));
+    auto pair = videotest::make_pair({});
+    ASSERT_TRUE(pair);
+    outlet.install(std::move(pair.value().producer));
+    std::chrono::nanoseconds hold = 295ms;
+    outlet.set_presentation_delay_source([&](aa::core::Nanoseconds) { return hold; });
+    std::vector<std::chrono::steady_clock::time_point> released;
+    const auto drain = [&] {
+        for (;;) {
+            const auto received = pair.value().consumer.receive(Milliseconds{0});
+            if (!received || received.value() != aa::ipc::ReceiveStatus::complete) { break; }
+            released.push_back(now);
+        }
+    };
+    // 30 fps for 3 s; the source drops 295 -> 120 ms after 1 s.
+    const auto period = std::chrono::nanoseconds{33'333'333};
+    auto next_frame = now;
+    std::uint64_t n = 0;
+    for (auto end = now + 3s; now < end; now += 1ms) {
+        if (now >= next_frame) {
+            if (n == 30) { hold = 120ms; }
+            ASSERT_TRUE(outlet.on_message({p::MessageHeader{p::ChannelRole::video, ++n,
+                aa::core::Nanoseconds{static_cast<std::int64_t>(n)}}, wiredtest::kVideoIdr}));
+            next_frame += period;
+        }
+        ASSERT_TRUE(outlet.service_pending());
+        drain();
+    }
+    ASSERT_GT(released.size(), 70U);
+    for (std::size_t i = 1; i < released.size(); ++i) {
+        EXPECT_GE(released[i] - released[i - 1], period / 2 - 2ms) << "frame " << i;
+    }
+}
+
+// Neon P1-2 / DeepSeek R1: a hold above the cap is clamped, never silently:
+// every frame released with a capped hold is counted and logged (at release,
+// from the audio known then; Neon P3 round 4).
+TEST(WiredReceiver, PresentationDelayCapIsCountedAndLogged) {
+    using namespace std::chrono_literals;
+    auto now = std::chrono::steady_clock::time_point{} + 800s;
+    std::vector<std::string> media;
+    VideoOutlet outlet{[](const std::string&) {}, [&](std::string_view, const std::string& line) {
+        media.push_back(line);
+    }};
+    VideoOutlet::IdrRecoveryHooks hooks;
+    hooks.clock = [&] { return now; };
+    outlet.set_idr_recovery(std::move(hooks));
+    auto pair = videotest::make_pair({});
+    ASSERT_TRUE(pair);
+    outlet.install(std::move(pair.value().producer));
+    outlet.set_presentation_delay_source([](aa::core::Nanoseconds) { return std::chrono::nanoseconds{600ms}; });
+    ASSERT_TRUE(outlet.on_message({p::MessageHeader{p::ChannelRole::video, 1, aa::core::Nanoseconds{1}},
+                                   wiredtest::kVideoIdr}));
+    EXPECT_EQ(outlet.capped_holds(), 0U);
+    now += 399ms;
+    ASSERT_TRUE(outlet.release_held());
+    EXPECT_EQ(outlet.capped_holds(), 0U);
+    now += 1ms;
+    ASSERT_TRUE(outlet.release_held());
+    EXPECT_EQ(outlet.capped_holds(), 1U);
+    EXPECT_NE(std::find_if(media.begin(), media.end(), [](const std::string& line) {
+        return line.find("{\"event\":\"video_hold_capped\",\"requested_ms\":600,\"cap_ms\":400,") != std::string::npos;
+    }), media.end());
+}
+
+// F12 / N4: a replacement consumer does not receive frames held for the old one.
+TEST(WiredReceiver, PresentationDelayDropsHeldFramesWhenTheConsumerIsReplaced) {
+    using namespace std::chrono_literals;
+    auto now = std::chrono::steady_clock::time_point{} + 500s;
+    VideoOutlet outlet{[](const std::string&) {}};
+    VideoOutlet::IdrRecoveryHooks hooks;
+    hooks.clock = [&] { return now; };
+    outlet.set_idr_recovery(std::move(hooks));
+    auto first = videotest::make_pair({});
+    ASSERT_TRUE(first);
+    outlet.install(std::move(first.value().producer));
+    outlet.set_presentation_delay(120ms);
+    ASSERT_TRUE(outlet.on_message({p::MessageHeader{p::ChannelRole::video, 1, aa::core::Nanoseconds{1}},
+                                   wiredtest::kVideoIdr}));
+    EXPECT_EQ(outlet.delayed_units(), 1U);
+    auto second = videotest::make_pair({});
+    ASSERT_TRUE(second);
+    outlet.install(std::move(second.value().producer));
+    EXPECT_EQ(outlet.delayed_units(), 0U);
+}
+
+} // namespace
+
+namespace {
+
+// Window 12 at 349.5 s: a Wi-Fi stall blocked the session's outbound send for
+// ~90 ms, the runtime skipped service_pending() (it may make session sends)
+// and held frames left 89 ms late (+103 ms A/V). release_held() releases due
+// frames with no session I/O; an IDR request a release triggers (here a
+// backpressure overflow) waits for the next service_pending().
+TEST(WiredReceiver, ReleaseHeldNeedsNoSessionAndDefersItsIdrRequest) {
+    using namespace std::chrono_literals;
+    auto now = std::chrono::steady_clock::time_point{} + 700s;
+    std::size_t idr_requests = 0;
+    VideoOutlet outlet{[](const std::string&) {}};
+    outlet.set_idr_recovery({
+        [] { return true; },
+        [&idr_requests]() -> aa::core::Result<void> { ++idr_requests; return {}; },
+        [&now] { return now; },
+    });
+    auto pair = videotest::make_pair({});
+    ASSERT_TRUE(pair);
+    bool force_would_block = false;
+    pair.value().producer.set_datagram_send_for_test(
+        [&force_would_block](int fd, const void* buf, std::size_t len, int flags,
+                             int& out_errno) -> std::ptrdiff_t {
+            if (force_would_block) { out_errno = EAGAIN; return -1; }
+            const auto sent = ::send(fd, buf, len, flags);
+            out_errno = (sent < 0) ? errno : 0;
+            return sent;
+        });
+    outlet.install(std::move(pair.value().producer));
+    outlet.set_presentation_delay(120ms);
+    const auto profile = p::VideoProfile{1920, 1080, 60, p::VideoCodec::h265};
+    p::MessageHeader hdr{p::ChannelRole::video, 1, {100}};
+    hdr.video_profile = profile;
+    hdr.video_session = 1;
+    hdr.video_generation = 1;
+    ASSERT_TRUE(outlet.on_message({hdr, make_h265_au(true, 16 * 1024, std::byte{0x10})}));
+    now += 120ms;
+    ASSERT_TRUE(outlet.release_held());
+    ASSERT_TRUE(receive_complete_au(pair.value().consumer).has_value());
+    force_would_block = true;
+    const auto chunk = make_h265_au(false, 100 * 1024, std::byte{0x22});
+    for (int i = 0; i < 5; ++i) {
+        ++hdr.sequence;
+        ASSERT_TRUE(outlet.on_message({hdr, chunk}));
+    }
+    now += 120ms;
+    ASSERT_TRUE(outlet.release_held()); // overflows: the IDR request waits
+    EXPECT_EQ(idr_requests, 0U);
+    EXPECT_FALSE(outlet.has_pending());
+    ASSERT_TRUE(outlet.service_pending());
+    EXPECT_EQ(idr_requests, 1U);
+}
+
+} // namespace
+
+namespace {
+
+// Neon P1 #2 (round 4): release_held() defers the IDR request a waiting_idr
+// drop makes. When the batch it releases also carries the keyframe, the
+// episode closes there, and the deferred request is obsolete: dispatching it
+// later reopened a phantom waiting_idr episode and sent a spurious request.
+TEST(WiredReceiver, ReleaseHeldKeyframeInTheBatchCancelsTheDeferredIdrRequest) {
+    using namespace std::chrono_literals;
+    auto now = std::chrono::steady_clock::time_point{} + 900s;
+    std::size_t idr_requests = 0;
+    std::vector<std::string> logs;
+    VideoOutlet outlet{[&](const std::string& line) { logs.push_back(line); }};
+    outlet.set_idr_recovery({
+        [] { return true; },
+        [&idr_requests]() -> aa::core::Result<void> { ++idr_requests; return {}; },
+        [&now] { return now; },
+    });
+    auto pair = videotest::make_pair({});
+    ASSERT_TRUE(pair);
+    outlet.install(std::move(pair.value().producer));
+    outlet.set_presentation_delay(120ms);
+    now += 2s; // past the IDR startup grace: a dropped non-IDR asks for one
+    const auto profile = p::VideoProfile{1920, 1080, 60, p::VideoCodec::h265};
+    p::MessageHeader hdr{p::ChannelRole::video, 1, {100}};
+    hdr.video_profile = profile;
+    hdr.video_session = 1;
+    hdr.video_generation = 1;
+    ASSERT_TRUE(outlet.on_message({hdr, make_h265_au(false, 1024, std::byte{0x22})})); // non-IDR
+    ++hdr.sequence;
+    ASSERT_TRUE(outlet.on_message({hdr, make_h265_au(true, 1024, std::byte{0x10})}));  // IDR
+    now += 120ms;
+    ASSERT_TRUE(outlet.release_held());
+    ASSERT_TRUE(receive_complete_au(pair.value().consumer).has_value());
+    const auto waits_before = std::count_if(logs.begin(), logs.end(), [](const std::string& line) {
+        return line.find("\"event\":\"idr_wait_started\"") != std::string::npos;
+    });
+    ASSERT_TRUE(outlet.service_pending());
+    EXPECT_EQ(idr_requests, 0U);
+    const auto waits_after = std::count_if(logs.begin(), logs.end(), [](const std::string& line) {
+        return line.find("\"event\":\"idr_wait_started\"") != std::string::npos;
+    });
+    EXPECT_EQ(waits_after, waits_before);
+}
+
+// Window 13: a frame that leaves more than 20 ms after its due is counted and
+// logged (video_release_late), so the next window shows any release stall.
+TEST(WiredReceiver, LateReleaseIsCountedAndLogged) {
+    using namespace std::chrono_literals;
+    auto now = std::chrono::steady_clock::time_point{} + 1000s;
+    std::vector<std::string> media;
+    VideoOutlet outlet{[](const std::string&) {}, [&](std::string_view, const std::string& line) {
+        media.push_back(line);
+    }};
+    VideoOutlet::IdrRecoveryHooks hooks;
+    hooks.clock = [&] { return now; };
+    outlet.set_idr_recovery(std::move(hooks));
+    auto pair = videotest::make_pair({});
+    ASSERT_TRUE(pair);
+    outlet.install(std::move(pair.value().producer));
+    outlet.set_presentation_delay(120ms);
+    ASSERT_TRUE(outlet.on_message({p::MessageHeader{p::ChannelRole::video, 1, aa::core::Nanoseconds{1}},
+                                   wiredtest::kVideoIdr}));
+    now += 125ms; // 5 ms late: fine
+    ASSERT_TRUE(outlet.release_held());
+    EXPECT_EQ(outlet.late_releases(), 0U);
+    ASSERT_TRUE(outlet.on_message({p::MessageHeader{p::ChannelRole::video, 2, aa::core::Nanoseconds{2}},
+                                   wiredtest::kVideoIdr}));
+    now += 205ms; // 85 ms late, as in window 13
+    ASSERT_TRUE(outlet.release_held());
+    EXPECT_EQ(outlet.late_releases(), 1U);
+    EXPECT_NE(std::find_if(media.begin(), media.end(), [](const std::string& line) {
+        return line.find("{\"event\":\"video_release_late\",\"late_ms\":85,") != std::string::npos;
+    }), media.end());
+}
+
+// Window 14: the owner's checkpoint went 35-90 ms without running every ~2 s,
+// and ~270 held frames left more than 20 ms after their due. The wireless
+// outlet now releases held frames on a timer of its own: with no
+// release_held() call at all (an owner thread that never reaches a
+// checkpoint), every frame still reaches the consumer soon after its arrival
+// + hold. The last frames have no later arrival to release them, so only the
+// timer can. The bounds are loose enough for a loaded CI host (window 14's
+// late frames were 59-91 ms late); the measured lateness is printed.
+TEST(WiredReceiver, ReleaseTimerReleasesHeldFramesWithoutACheckpoint) {
+    using namespace std::chrono_literals;
+    using Clock = std::chrono::steady_clock;
+    VideoOutlet outlet{[](const std::string&) {}, [](std::string_view, const std::string&) {}};
+    auto pair = videotest::make_pair({});
+    ASSERT_TRUE(pair);
+    outlet.install(std::move(pair.value().producer));
+    constexpr auto kHold = 40ms;
+    constexpr std::size_t kFrames = 40;
+    outlet.set_presentation_delay(kHold);
+    outlet.start_release_timer();
+    std::vector<Clock::time_point> arrived(kFrames + 1);
+    std::vector<Clock::time_point> received(kFrames + 1);
+    // Bounded: a timer that never releases fails the test instead of hanging it.
+    const auto give_up = Clock::now() + 5s;
+    std::thread consumer([&] {
+        std::size_t got = 0;
+        while (got < kFrames && Clock::now() < give_up) {
+            const auto step = pair.value().consumer.receive(Milliseconds{20});
+            if (!step && step.error().code() == aa::ErrorCode::timeout) { continue; }
+            if (!step) { return; }
+            if (step.value() != aa::ipc::ReceiveStatus::complete) { continue; }
+            const auto frame = pair.value().consumer.access_unit().frame;
+            if (frame >= 1 && frame <= kFrames) { received[frame] = Clock::now(); ++got; }
+        }
+    });
+    for (std::uint64_t k = 1; k <= kFrames; ++k) {
+        arrived[k] = Clock::now();
+        ASSERT_TRUE(outlet.on_message({p::MessageHeader{p::ChannelRole::video, k, aa::core::Nanoseconds{
+                                           static_cast<std::int64_t>(k)}}, wiredtest::kVideoIdr}));
+        std::this_thread::sleep_for(k % 4 == 0 ? 37ms : 3ms); // grouped, as the A26 sends
+    }
+    consumer.join();
+    std::vector<double> late_ms;
+    for (std::size_t k = 1; k <= kFrames; ++k) {
+        ASSERT_NE(received[k], Clock::time_point{}) << "frame " << k << " never reached the consumer";
+        late_ms.push_back(std::chrono::duration<double, std::milli>(received[k] - (arrived[k] + kHold)).count());
+    }
+    std::sort(late_ms.begin(), late_ms.end());
+    std::printf("release lateness ms: p50 %.2f p90 %.2f max %.2f\n", late_ms[late_ms.size() / 2],
+                late_ms[late_ms.size() * 9 / 10], late_ms.back());
+    EXPECT_GE(late_ms.front(), -1.0) << "a frame left before its due";
+    EXPECT_LT(late_ms[late_ms.size() * 9 / 10], 10.0) << "p90 release lateness";
+    EXPECT_LT(late_ms.back(), 30.0) << "a frame left far after its due";
+    outlet.close();
+}
+
+// Round 6, Neon P2-2: a delivery error the timer latches is surfaced by the
+// next entry point the session calls (here on_message), before anything held
+// after the failed frame is released; reset() and install() drop a stale one,
+// so it never fails a later session or consumer.
+TEST(WiredReceiver, ReleaseTimerErrorIsSurfacedFirstAndClearedByResetAndInstall) {
+    using namespace std::chrono_literals;
+    VideoOutlet outlet{[](const std::string&) {}, [](std::string_view, const std::string&) {}};
+    auto pair = videotest::make_pair({});
+    ASSERT_TRUE(pair);
+    outlet.install(std::move(pair.value().producer));
+    outlet.set_presentation_delay(10ms);
+    outlet.start_release_timer();
+    const auto latch = [&](std::uint64_t base) {
+        // An empty access unit is refused by the producer (invalid_argument).
+        ASSERT_TRUE(outlet.on_message({p::MessageHeader{p::ChannelRole::video, base, aa::core::Nanoseconds{1}},
+                                       std::vector<std::byte>{}}));
+        ASSERT_TRUE(outlet.on_message({p::MessageHeader{p::ChannelRole::video, base + 1, aa::core::Nanoseconds{2}},
+                                       wiredtest::kVideoIdr}));
+        // The timer fails the first frame, latches, and holds the second.
+        const auto until = std::chrono::steady_clock::now() + 2s;
+        while (outlet.delayed_units() > 1 && std::chrono::steady_clock::now() < until) {
+            std::this_thread::sleep_for(1ms);
+        }
+        std::this_thread::sleep_for(40ms);
+        EXPECT_EQ(outlet.delayed_units(), 1U) << "released past the failed frame";
+    };
+    latch(1);
+    const auto surfaced = outlet.on_message({p::MessageHeader{p::ChannelRole::video, 3, aa::core::Nanoseconds{3}},
+                                             wiredtest::kVideoIdr});
+    ASSERT_FALSE(surfaced);
+    EXPECT_EQ(surfaced.error().code(), aa::ErrorCode::invalid_argument);
+    EXPECT_TRUE(outlet.release_held()) << "surfaced once";
+
+    outlet.reset();
+    latch(10);
+    outlet.reset(); // a session retired before the checkpoint saw it
+    EXPECT_TRUE(outlet.release_held()) << "stale timer error survived reset()";
+    EXPECT_TRUE(outlet.service_pending());
+
+    latch(20);
+    auto replacement = videotest::make_pair({});
+    ASSERT_TRUE(replacement);
+    outlet.install(std::move(replacement.value().producer));
+    EXPECT_TRUE(outlet.release_held()) << "stale timer error survived install()";
+    outlet.close();
+}
+
+} // namespace

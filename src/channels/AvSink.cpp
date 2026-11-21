@@ -24,7 +24,7 @@ void AvSink::observe(AvCreditEvent event, std::optional<ErrorCode> error, std::u
     value.delivery.generation = generation_;
     value.delivery.session_id = session_.value_or(0);
     value.session_active = session_.has_value();
-    value.pending = pending_;
+    value.pending = pending_.empty() ? std::nullopt : std::optional{pending_.front().id};
     value.error = error;
     value.count = count;
     value.at_ns = av_observation_now();
@@ -43,7 +43,7 @@ core::Result<void> AvSink::send_ack(std::int32_t session, AckFor for_message) {
 }
 
 void AvSink::invalidate_delivery() noexcept {
-    pending_.reset();
+    pending_.clear();
     auto& counter = generation_counter_ ? *generation_counter_ : generation_;
     // Exhaustion fails closed in data(); never wrap into a retired generation.
     if (counter != std::numeric_limits<std::uint64_t>::max()) { ++counter; }
@@ -53,10 +53,13 @@ void AvSink::invalidate_delivery() noexcept {
 }
 
 core::Result<void> AvSink::complete_av_delivery(AvDeliveryId id, core::Result<void> result) {
-    if (!pending_ || *pending_ != id || id.generation != generation_
-        || session_ != id.session_id) { return {}; }
-    current_observation_ = pending_observation_;
-    pending_.reset();
+    if (id.generation != generation_ || session_ != id.session_id) { return {}; }
+    // Completions arrive oldest first; a stale or duplicate ID matches nothing.
+    const auto match = std::find_if(pending_.begin(), pending_.end(),
+                                    [&](const PendingDelivery& entry) { return entry.id == id; });
+    if (match == pending_.end()) { return {}; }
+    current_observation_ = match->observation;
+    pending_.erase(match);
     if (!result) { return result.error(); }
     return send_ack(id.session_id, AckFor::data);
 }
@@ -140,8 +143,9 @@ core::Result<void> AvSink::setup(std::span<const std::byte> payload) {
             if (static_cast<unsigned>(profiles[i].codec) == static_cast<unsigned>(request.value().codec)) { announced_.push_back(i); }
         }
     } else { announced_.push_back(0); }
-    const auto result = send(protocol::encode_av_sink_ready(announced_));
-    observe(AvCreditEvent::ready, result ? std::nullopt : std::optional{result.error().code()}, 1);
+    const auto result = send(protocol::encode_av_sink_ready(announced_, video ? 1U : window()));
+    observe(AvCreditEvent::ready, result ? std::nullopt : std::optional{result.error().code()},
+            video ? 1U : window());
     if (!result) { return result.error(); }
     if (video) {
         if (auto result = send(protocol::encode(protocol::VideoFocusNotification{focus_, true})); !result) {
@@ -177,10 +181,10 @@ core::Result<void> AvSink::start(std::span<const std::byte> payload) {
 
 core::Result<void> AvSink::codec_config(std::span<const std::byte> payload) {
     if (!ready_ || (!session_ && staged_credit_)) { return malformed(); }
-    if (pending_) {
+    if (!pending_.empty()) {
         last_queue_rejection_ = diagnostics::QueueRejection{
             diagnostics::QueueSource::av_pending, diagnostics::QueueReason::codec_config,
-            service_.role, 1, 1, 0, 0, 0, 0, payload.size()};
+            service_.role, pending_.size(), window(), 0, 0, 0, 0, payload.size()};
         return Error{ErrorCode::ipc_queue_full};
     }
     const auto decoded = protocol::decode_av_sink_codec_config(payload);
@@ -198,10 +202,11 @@ core::Result<void> AvSink::codec_config(std::span<const std::byte> payload) {
 
 core::Result<void> AvSink::data(const protocol::MessageView& message) {
     if (!session_) { return malformed(); }
-    if (pending_) {
+    if (pending_.size() >= window()) {
+        // The phone sent past the advertised credit window.
         last_queue_rejection_ = diagnostics::QueueRejection{
             diagnostics::QueueSource::av_pending, diagnostics::QueueReason::data,
-            service_.role, 1, 1, 0, 0, 0, 0, message.payload.size()};
+            service_.role, pending_.size(), window(), 0, 0, 0, 0, message.payload.size()};
         return Error{ErrorCode::ipc_queue_full};
     }
     const auto decoded = protocol::decode_av_sink_data(message.payload);
@@ -239,14 +244,13 @@ core::Result<void> AvSink::data(const protocol::MessageView& message) {
                 return Error{ErrorCode::internal};
             }
             const AvDeliveryId id{service_.role, generation_, ++delivery_sequence_, *session_};
-            pending_ = id;
             current_observation_.delivery.sequence = id.sequence;
-            pending_observation_ = current_observation_;
+            pending_.push_back({id, current_observation_});
             if (auto submitted = deferred_->submit({header, media}, id); !submitted) {
                 if (submitted.error().code() == ErrorCode::ipc_queue_full && deferred_->rejection) {
                     last_queue_rejection_ = deferred_->rejection();
                 }
-                pending_.reset();
+                pending_.pop_back();
                 return submitted.error();
             }
             return {};

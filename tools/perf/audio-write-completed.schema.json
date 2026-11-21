@@ -22,6 +22,11 @@
       "type": "integer",
       "minimum": 0
     },
+    "playout_offset_ns": {
+      "description": "Wireless playout only: how long after scheduled_ns (the content's arrival-clock time) the piece was scheduled on the output clock. Absent on the arrival model.",
+      "type": "integer",
+      "minimum": 1
+    },
     "completed_ns": {
       "type": "integer",
       "minimum": 0

@@ -14,6 +14,7 @@
 #include <aa/protocol/Protocol.hpp>
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
@@ -27,6 +28,21 @@
 #include <vector>
 
 namespace aa::audio {
+
+// AAP audio credit window (max_unacked) the receiver advertises on every
+// audio channel. 1 is stop-and-wait (wired, and the wireless legacy model):
+// one chunk in flight per channel. A window of N lets the phone keep N chunks
+// unacknowledged, so a credit round trip up to N chunk periods no longer
+// stalls it. For N > 1 the worker reserves all N permits the phone holds at
+// every channel reset and bypass exit, and scales each role's slot and byte
+// capacity by N, so a chunk the phone may legally send always fits without a
+// queue rejection (N == 1 keeps the historical accounting).
+struct AudioCreditPolicy final {
+    static constexpr std::uint32_t kMaxWindow = 8;
+    std::uint32_t window{1};
+};
+
+// kWirelessCreditWindow (AudioRouter.hpp) is the wireless default.
 
 // Dedicated audio render thread decoupling protocol/session message dispatch
 // from blocking GStreamer sink writes. Preserves per-role bounded queues,
@@ -53,12 +69,29 @@ public:
         AudioTelemetryCallbacks telemetry = {},
         OpenRouter open = AudioRouter::open,
         IdleClock idle_clock = monotonic_now,
-        std::chrono::milliseconds ack_release_timeout = kDefaultAckReleaseDrainTimeout);
+        std::chrono::milliseconds ack_release_timeout = kDefaultAckReleaseDrainTimeout,
+        AudioCreditPolicy credit = {});
     ~AudioRenderWorker();
     AudioRenderWorker(const AudioRenderWorker&) = delete;
     AudioRenderWorker& operator=(const AudioRenderWorker&) = delete;
 
     [[nodiscard]] core::Result<void> ready();
+    // The max_unacked every audio channel advertises (AudioCreditPolicy).
+    [[nodiscard]] std::uint32_t credit_window() const noexcept { return credit_window_; }
+    // Most chunks one channel has had accepted but not yet released for ACK
+    // (our side; the phone's in-flight use shows as max_arrival_burst).
+    [[nodiscard]] std::uint64_t max_unacked_held() const;
+    // The playout offset audio_write_completed reported for content time
+    // `content` (interpolated over the write whose content interval holds it;
+    // past the newest write, that write's end offset), or 0 when no playout
+    // write of this session is known. Any thread. The wireless video hold is
+    // this value at the frame's own timestamp (--video-delay-ms match), which
+    // is exactly the audio the A/V contract pairs the frame with: sampling the
+    // newest write instead, which pulsesink accepts up to ~200 ms ahead, held
+    // frames for future audio's offset (window 12's startup pair, P2-5).
+    [[nodiscard]] std::chrono::nanoseconds playout_offset_at(core::Nanoseconds content) const;
+    // The newest write's end offset (0 when none).
+    [[nodiscard]] std::chrono::nanoseconds current_playout_offset() const;
     [[nodiscard]] SinkReport sink_report();
 
     [[nodiscard]] core::Result<void>
@@ -133,7 +166,8 @@ private:
 
     static constexpr std::size_t kAdvertisedRoles = 3;
     static constexpr std::size_t kRoleSlots = 4;
-    static constexpr std::size_t kMaxSlots = kAdvertisedRoles * kRoleSlots;
+    static constexpr std::size_t kMaxSlots =
+        kAdvertisedRoles * kRoleSlots * AudioCreditPolicy::kMaxWindow;
     // Sink-stall survival (#60): once a blocked write has kept a phone credit
     // waiting this long, the phone may send past max_unacked=1 (HU09 did after
     // ~470 ms), so stalled audio is dropped and ACKed instead of ending the
@@ -148,6 +182,16 @@ private:
         return index == 0 ? Reservation{38400, 38400} : Reservation{6400, 38400};
     }
     static std::optional<std::size_t> audio_index(protocol::ChannelRole role);
+    // Capacity of one role under the credit window (AudioCreditPolicy).
+    [[nodiscard]] std::size_t role_slot_cap() const noexcept { return kRoleSlots * credit_window_; }
+    [[nodiscard]] Reservation role_capacity(std::size_t index) const noexcept {
+        const auto base = capacity(index);
+        return {base.bytes * credit_window_, base.units * credit_window_};
+    }
+    // The phone holds the whole window again after a channel reset: all N
+    // permits are reserved (stop-and-wait keeps its single implicit permit).
+    void seed_credits_locked(std::size_t index);
+    void note_unacked_locked(std::size_t index);
 
     [[nodiscard]] channels::AvObservation
     credit_event(channels::AvCreditEvent event, channels::AvDeliveryId id) const;
@@ -231,6 +275,25 @@ private:
     // Catch-up (#155) totals over the worker's life, across sink reopens.
     std::uint64_t catch_up_events_lifetime_{};
     std::uint64_t catch_up_frames_lifetime_{};
+    const std::uint32_t credit_window_;
+    std::array<std::uint64_t, 4> unacked_{};
+    std::uint64_t max_unacked_held_{};
+    std::uint64_t playout_underruns_logged_{};
+    std::uint64_t playout_anchors_logged_{};
+    // Reported playout writes of the current session, oldest first: content
+    // interval and its start/end offsets (playout_offset_at).
+    struct PlayoutWrite final {
+        std::int64_t content_start;
+        std::int64_t content_end;
+        std::int64_t start_offset;
+        std::int64_t end_offset;
+    };
+    static constexpr std::size_t kPlayoutHistory = 256; // ~11 s of A26 chunks
+    // Guards playout_writes_ only (never held with mutex_ the other way round).
+    mutable std::mutex playout_mutex_;
+    std::deque<PlayoutWrite> playout_writes_{};
+    const std::int64_t playout_depth_ns_;
+    void clear_playout_writes();
     std::optional<core::Nanoseconds> step_started_;
     std::optional<core::Nanoseconds> bypass_since_;
     std::uint64_t bypass_epoch_{1};

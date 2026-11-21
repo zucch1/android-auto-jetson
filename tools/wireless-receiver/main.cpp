@@ -29,7 +29,17 @@ constexpr const char* usage =
     "  --idr-recovery auto|nudge|transition  IDR recovery strategy (default auto)\n"
     "  --audio-sink pulse|pipewire|automatic  audio routing element (default pulse)\n"
     "  --audio-catch-up-watermark-ms N        post-stall catch-up watermark in ms\n"
-    "                                         (0 disables catch-up, default 0; max 1000)\n"
+    "                                         (0 disables catch-up, default 0; max 1000;\n"
+    "                                         needs --audio-playout-ms 0)\n"
+    "  --audio-playout-ms N   wireless audio playout buffer in ms: chunks play back to\n"
+    "                       back N ms after the arrival that anchored the stream\n"
+    "                       (default 120, max 180; 0 = arrival-time model)\n"
+    "  --audio-max-unacked N  audio credit window advertised to the phone (1..8,\n"
+    "                       default 4; 1 = stop-and-wait)\n"
+    "  --video-delay-ms N|match  hold video before forwarding it so it stays aligned\n"
+    "                       with audio (default match: follow the audio playout\n"
+    "                       offset, starting at --audio-playout-ms; N: fixed 0..180,\n"
+    "                       needs --audio-playout-ms > 0 when N > 0)\n"
     "  --diagnostics        emit redacted diagnostic JSON to stdout\n"
     "  --duration-ms N      bounded run (1..86400000 ms; omitted: until signal)\n"
     "  --ap-channel N       AP channel; must equal ap.conf (36, 40, 44 or 48; default 36)\n"
@@ -51,6 +61,9 @@ struct Options final {
     ipc::IdrRecoveryStrategy idr_recovery{ipc::IdrRecoveryStrategy::auto_escalate};
     audio::SinkBackend audio_backend{audio::SinkBackend::pulse};
     std::int64_t audio_catch_up_watermark_ms{0};
+    std::int64_t audio_playout_ms{120};
+    std::uint32_t audio_max_unacked{audio::kWirelessCreditWindow};
+    std::optional<std::int64_t> video_delay_ms{}; // absent: match the audio playout
     std::int64_t duration_ms{};
     std::uint32_t ap_channel{36};
     bool exact_video_profiles{};
@@ -92,6 +105,28 @@ std::optional<Options> parse_options(int argc, char** argv) {
                 return std::nullopt;
             options.audio_catch_up_watermark_ms = static_cast<std::int64_t>(number);
         }
+        else if (arg == "--audio-playout-ms" || arg == "--audio-max-unacked") {
+            std::uint64_t number{};
+            const auto [end, error] = std::from_chars(value.data(), value.data() + value.size(), number);
+            if (error != std::errc{} || end != value.data() + value.size()) return std::nullopt;
+            if (arg == "--audio-playout-ms") {
+                if (number > 180) return std::nullopt;
+                options.audio_playout_ms = static_cast<std::int64_t>(number);
+            } else {
+                if (number == 0 || number > audio::AudioCreditPolicy::kMaxWindow) return std::nullopt;
+                options.audio_max_unacked = static_cast<std::uint32_t>(number);
+            }
+        }
+        else if (arg == "--video-delay-ms") {
+            if (value == "match") { options.video_delay_ms.reset(); }
+            else {
+                std::uint64_t number{};
+                const auto [end, error] = std::from_chars(value.data(), value.data() + value.size(), number);
+                if (error != std::errc{} || end != value.data() + value.size() || number > 180)
+                    return std::nullopt;
+                options.video_delay_ms = static_cast<std::int64_t>(number);
+            }
+        }
         else if (arg == "--helper-bus-address") options.helper_address = value;
         else if (arg == "--ap-channel") {
             std::uint32_t number{};
@@ -117,6 +152,11 @@ std::optional<Options> parse_options(int argc, char** argv) {
         !options.store_dir.is_absolute() || !std::filesystem::path{options.video_socket}.is_absolute() ||
         !std::filesystem::path{options.input_socket}.is_absolute() || options.video_socket == options.input_socket)
         return std::nullopt;
+    // Catch-up trims audio the playout buffer exists to keep (rejected for
+    // wireless, 2026-11-20): it applies only to the arrival model.
+    if (options.audio_catch_up_watermark_ms > 0 && options.audio_playout_ms > 0) return std::nullopt;
+    // F8: a video hold without a playout buffer only skews A/V.
+    if (options.video_delay_ms && *options.video_delay_ms > 0 && options.audio_playout_ms == 0) return std::nullopt;
     aa::config::ensure_fallback_video_profile(options.video_profiles, options.exact_video_profiles);
     return options;
 }
@@ -198,8 +238,11 @@ int receiver_main(int argc, char** argv) {
     aa::ipc::RandomPairingIdSource ids;
     aa::audio::AudioRenderWorker audio_sink{
         audio_config(options->audio_backend,
-                     aa::core::Nanoseconds{options->audio_catch_up_watermark_ms * 1'000'000LL}),
-        audio_telemetry()};
+                     aa::core::Nanoseconds{options->audio_catch_up_watermark_ms * 1'000'000LL},
+                     aa::core::Nanoseconds{options->audio_playout_ms * 1'000'000LL}),
+        audio_telemetry(), aa::audio::AudioRouter::open, aa::audio::AudioRenderWorker::monotonic_now,
+        aa::audio::AudioRenderWorker::kDefaultAckReleaseDrainTimeout,
+        aa::audio::AudioCreditPolicy{options->audio_max_unacked}};
     const auto opened = audio_sink.ready();
     if (!opened) { running.store(false); }
     if (const auto report_sink = audio_sink.sink_report();
@@ -213,6 +256,33 @@ int receiver_main(int argc, char** argv) {
         return 3;
     }
     Media media{audio_sink};
+    const auto video_hold = video_delay(options->video_delay_ms, options->audio_playout_ms);
+    const bool follow = !options->video_delay_ms && options->audio_playout_ms > 0;
+    if (follow) {
+        // match: follow the audio playout offset, starting at the depth.
+        media.match_video_to_audio(video_hold);
+    } else {
+        media.video.set_presentation_delay(video_hold);
+    }
+    // Held frames leave at their due on the outlet's own timer, not only
+    // when the owner thread next reaches a checkpoint (window 14).
+    if (follow || video_hold.count() > 0) {
+        try {
+            media.video.start_release_timer();
+        } catch (const std::system_error&) {
+            // Thread creation failed (EAGAIN under thread or memory limits).
+            report("video release timer", ErrorCode::internal);
+            log_line("{\"event\":\"video_release_timer_error\",\"reason\":\"start_failed\"}");
+            return 3;
+        }
+    }
+    // video_delay_ms is always a number: the fixed hold, or the hold used
+    // until the first playout write when video_hold is "match".
+    log_line("{\"event\":\"wireless_media_policy\",\"audio_playout_ms\":" +
+             std::to_string(options->audio_playout_ms) + ",\"audio_max_unacked\":" +
+             std::to_string(options->audio_max_unacked) + ",\"video_hold\":\"" +
+             (follow ? "match" : "fixed") + "\",\"video_delay_ms\":" +
+             std::to_string(video_hold.count()) + "}");
     // Receiver precedes ControlService so its confirmation observer is valid
     // throughout bus dispatch and the bus's final owner teardown.
     auto link_config = media.config(options->video_profiles);

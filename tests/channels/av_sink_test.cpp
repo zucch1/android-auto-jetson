@@ -5,6 +5,8 @@
 
 #include <gtest/gtest.h>
 
+#include <array>
+
 namespace {
 namespace p = aa::protocol;
 using Bytes = std::vector<std::byte>;
@@ -819,3 +821,106 @@ TEST_F(AvSinkWire, RequestVideoIdrPartialRestoreFailureLeavesNativeWithoutReplay
     }
 }
 
+
+namespace {
+
+// Credit window + playout (2026-11-20): a deferred audio sink advertises its
+// credit window as max_unacked and holds up to that many deliveries at once.
+struct WindowedSink final {
+    std::vector<Bytes> sent;
+    DeliveryRecorder delivery;
+    aa::channels::AvSink sink;
+
+    explicit WindowedSink(std::uint32_t window)
+        : sink{audio(), [&] {
+                   auto callbacks = delivery.callbacks();
+                   callbacks.window = window;
+                   return callbacks;
+               }(),
+               [this](Bytes bytes) -> aa::core::Result<void> {
+                   sent.push_back(std::move(bytes));
+                   return {};
+               }} {
+        delivery.submission = {};
+    }
+
+    aa::core::Result<void> on(const Bytes& bytes) {
+        return sink.on_message({{p::ChannelRole::media_audio, 42, aa::core::Nanoseconds{123}}, bytes});
+    }
+};
+
+} // namespace
+
+TEST(AvSinkCreditWindow, ReadyAdvertisesTheWindowAndHoldsThatManyDeliveries) {
+    WindowedSink windowed{4};
+    ASSERT_TRUE(windowed.on(p::encode(p::AvSinkSetup{p::AvSinkCodec::pcm}).value()));
+    ASSERT_EQ(windowed.sent.size(), 1u);
+    const std::array<std::uint32_t, 1> indices{0};
+    EXPECT_EQ(windowed.sent.front(), p::encode_av_sink_ready(indices, 4).value());
+    EXPECT_NE(windowed.sent.front(), p::encode_av_sink_ready().value());
+    ASSERT_TRUE(windowed.on(p::encode(p::AvSinkStart{-7, 0}).value()));
+    for (int i = 0; i < 4; ++i) { ASSERT_TRUE(windowed.on(data())); }
+    ASSERT_EQ(windowed.delivery.ids.size(), 4u);
+    // The phone may not send past its window: a fifth unacknowledged chunk is refused.
+    const auto over = windowed.on(data());
+    ASSERT_FALSE(over);
+    EXPECT_EQ(over.error().code(), aa::ErrorCode::ipc_queue_full);
+    ASSERT_TRUE(windowed.sink.last_queue_rejection());
+    EXPECT_EQ(windowed.sink.last_queue_rejection()->items, 4u);
+    EXPECT_EQ(windowed.sink.last_queue_rejection()->capacity, 4u);
+    EXPECT_EQ(windowed.sent.size(), 1u);
+    // Each completion sends exactly one ack and frees one slot of the window.
+    const auto& ids = windowed.delivery.ids;
+    ASSERT_TRUE(windowed.sink.complete_av_delivery(ids[0], {}));
+    EXPECT_EQ(windowed.sent.size(), 2u);
+    EXPECT_EQ(windowed.sent.back(), p::encode_av_sink_ack(-7).value());
+    ASSERT_TRUE(windowed.on(data()));
+    ASSERT_EQ(windowed.delivery.ids.size(), 5u);
+    // A duplicate or stale completion is ignored without an ack.
+    ASSERT_TRUE(windowed.sink.complete_av_delivery(ids[0], {}));
+    EXPECT_EQ(windowed.sent.size(), 2u);
+    // Completions are matched by ID, not position.
+    ASSERT_TRUE(windowed.sink.complete_av_delivery(ids[2], {}));
+    ASSERT_TRUE(windowed.sink.complete_av_delivery(ids[1], {}));
+    ASSERT_TRUE(windowed.sink.complete_av_delivery(ids[3], {}));
+    ASSERT_TRUE(windowed.sink.complete_av_delivery(ids[4], {}));
+    EXPECT_EQ(windowed.sent.size(), 6u);
+    for (std::size_t i = 1; i < windowed.sent.size(); ++i) {
+        EXPECT_EQ(windowed.sent[i], p::encode_av_sink_ack(-7).value());
+    }
+    for (int i = 0; i < 4; ++i) { ASSERT_TRUE(windowed.on(data())); }
+}
+
+TEST(AvSinkCreditWindow, StopInvalidatesEveryPendingDeliveryAndAFailureSendsNoAck) {
+    WindowedSink windowed{3};
+    ASSERT_TRUE(windowed.on(p::encode(p::AvSinkSetup{p::AvSinkCodec::pcm}).value()));
+    ASSERT_TRUE(windowed.on(p::encode(p::AvSinkStart{-7, 0}).value()));
+    for (int i = 0; i < 3; ++i) { ASSERT_TRUE(windowed.on(data())); }
+    const auto ids = windowed.delivery.ids;
+    // A failed delivery surfaces its error and still frees its slot, without an ack.
+    EXPECT_FALSE(windowed.sink.complete_av_delivery(ids[0], aa::Error{aa::ErrorCode::audio_sink_unavailable}));
+    EXPECT_EQ(windowed.sent.size(), 1u);
+    ASSERT_TRUE(windowed.on(data()));
+    ASSERT_TRUE(windowed.on(p::encode(p::AvSinkStop{}).value()));
+    ASSERT_FALSE(windowed.delivery.invalidations.empty());
+    // After the stop every old delivery is stale.
+    for (const auto& id : windowed.delivery.ids) {
+        ASSERT_TRUE(windowed.sink.complete_av_delivery(id, {}));
+    }
+    EXPECT_EQ(windowed.sent.size(), 1u);
+    ASSERT_TRUE(windowed.on(p::encode(p::AvSinkStart{-8, 0}).value()));
+    for (int i = 0; i < 3; ++i) { ASSERT_TRUE(windowed.on(data())); }
+    EXPECT_FALSE(windowed.on(data()));
+}
+
+TEST(AvSinkCreditWindow, StopAndWaitIsTheDefaultWindow) {
+    WindowedSink windowed{1};
+    ASSERT_TRUE(windowed.on(p::encode(p::AvSinkSetup{p::AvSinkCodec::pcm}).value()));
+    EXPECT_EQ(windowed.sent.front(), p::encode_av_sink_ready().value());
+    ASSERT_TRUE(windowed.on(p::encode(p::AvSinkStart{-7, 0}).value()));
+    ASSERT_TRUE(windowed.on(data()));
+    const auto over = windowed.on(data());
+    ASSERT_FALSE(over);
+    EXPECT_EQ(over.error().code(), aa::ErrorCode::ipc_queue_full);
+    EXPECT_EQ(aa::channels::DeferredAvDelivery{}.window, 1u);
+}

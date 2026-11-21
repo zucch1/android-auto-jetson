@@ -137,6 +137,12 @@ struct Runtime final {
                 report("idr recovery", pending.error().code());
             }
         }
+        // Held video leaves on time even while the session is mid-send: the
+        // release needs no session I/O (IDR requests wait for service_pending).
+        if (auto held = media.video.release_held(); !held) {
+            report("video held release", held.error().code());
+            if (auto* live = receiver.session(); live && !live->failure()) { (void)live->fail(held.error()); }
+        }
         if ((!recovery_session || !recovery_session->outbound_in_progress()) &&
             !media.video.idr_dispatching()) {
             if (auto pending_video = media.video.service_pending(); !pending_video) {

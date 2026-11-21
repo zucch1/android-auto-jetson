@@ -18,7 +18,8 @@ core::Result<void> register_deferred_audio_sinks(WiredSession& session,
                     audio.invalidate(invalidated_role, generation);
                 },
                 [&audio] { return audio.last_queue_rejection(); },
-                [&audio](const auto& value) { audio.observe_av(value); }});
+                [&audio](const auto& value) { audio.observe_av(value); },
+                audio.credit_window()});
             !result) {
             return result.error();
         }
