@@ -251,8 +251,13 @@ audio plays, the target of `audio_write_completed`'s `playout_offset_ns` and
 what the wireless video hold follows; above the depth by the phone's group
 span), `playout_underruns` (a chunk up to 1 s
 after its slot), `playout_anchors` (stream starts and resumes) and
-`playout_resumes` (anchors more than 1 s after the slot), `frames_padded`
-(drift pads, a subset of `frames_silence`), `credit_window` (the advertised
+`playout_resumes` (anchors more than 1 s after the slot),
+`playout_reported_offset_ms` (the slewed offset the latest write reported:
+the value the wireless video hold follows; it moves toward
+`playout_offset_ms` by at most half the output time that passes),
+`frames_padded` (drift pads, a subset of `frames_silence`), `frames_shed`
+(a post-drought backlog above 350 ms shed at 30% of each chunk, a subset of
+`frames_trimmed`), `credit_window` (the advertised
 `max_unacked`), `max_unacked_held` (the most chunks one audio channel had
 accepted and not yet released for ACK: our side, normally 1 because acks go
 out on receipt) and `max_arrival_burst` (the most chunks of one channel that
@@ -262,7 +267,9 @@ more than one credit at once). Each underrun also logs
 its slot the chunk arrived) and `depth_ms` (the depth it re-anchored with),
 and each anchor logs `audio_playout_anchor` with `reason` (`start` or
 `resume`), `skipped_ms` (elapsed time jumped over without a write),
-`depth_ms` and `anchors_lifetime`.
+`depth_ms` and `anchors_lifetime`. The wireless VideoOutlet logs
+`video_hold_capped` (`requested_ms`, `cap_ms` 400, `capped_frames`) when the
+offset it follows exceeds its hold cap.
 
 On the wireless playout clock `audio_write_completed.scheduled_ns` and
 `scheduled_end_ns` are the content's arrival-clock times and the additive

@@ -128,20 +128,31 @@ public:
         std::lock_guard lock(mutex_);
         delay_ = std::max(std::chrono::nanoseconds{0}, delay);
         delay_source_ = {};
+        last_released_.reset();
     }
 
-    // N1: the hold is read per frame from `source` (the wireless receiver
-    // passes the audio playout offset, the delay audio really plays with), so
-    // the two stay the same quantity. Bounded to kMaxPresentationDelay; a
-    // shorter hold never lets a frame overtake a held one.
-    void set_presentation_delay_source(std::function<std::chrono::nanoseconds()> source) {
+    // N1: the hold is read per frame from `source`, given the frame's own
+    // timestamp (the wireless receiver passes the audio playout offset
+    // reported for that content time: the delay the audio it pairs with
+    // really plays with), so the two stay the same quantity. The applied hold
+    // never falls faster than half the time that passes, so t + hold only
+    // ever rises and a frame is never pinned behind an earlier one's due
+    // (no freeze, then burst; Neon P1-1). Bounded to kMaxPresentationDelay,
+    // and every capped frame is counted and logged (video_hold_capped).
+    void set_presentation_delay_source(std::function<std::chrono::nanoseconds(core::Nanoseconds)> source) {
         std::lock_guard lock(mutex_);
         delay_source_ = std::move(source);
     }
 
-    [[nodiscard]] std::chrono::nanoseconds current_presentation_delay() const {
+    // The hold a frame with this timestamp would get now, before slewing.
+    [[nodiscard]] std::chrono::nanoseconds presentation_delay_for(core::Nanoseconds content) const {
         std::lock_guard lock(mutex_);
-        return presentation_delay_locked();
+        return requested_delay_locked(content);
+    }
+
+    [[nodiscard]] std::uint64_t capped_holds() const {
+        std::lock_guard lock(mutex_);
+        return capped_holds_;
     }
 
     [[nodiscard]] std::size_t delayed_units() const {
@@ -180,9 +191,28 @@ public:
         return dispatch_idr_request_locked(lock, now, reason);
     }
 
+    // Releases held frames that are due without any session I/O (it may run
+    // while the session is mid-send): an IDR request a release would make is
+    // deferred to the next service_pending(). Window 12 (349.5 s): during a
+    // Wi-Fi stall the session's outbound send blocked ~90 ms, the guarded
+    // service_pending() was skipped, and the held frames left 90 ms late.
+    [[nodiscard]] core::Result<void> release_held() {
+        std::unique_lock lock(mutex_);
+        if (idr_dispatching_.load(std::memory_order_acquire) || delayed_.empty()) { return {}; }
+        defer_idr_ = true;
+        auto released = release_due_locked(lock, now_locked());
+        defer_idr_ = false;
+        return released;
+    }
+
     [[nodiscard]] core::Result<void> service_pending() {
         std::unique_lock lock(mutex_);
         if (idr_dispatching_.load(std::memory_order_acquire)) { return {}; }
+        if (deferred_idr_reason_) {
+            const auto reason = std::exchange(deferred_idr_reason_, std::nullopt);
+            if (auto idr = maybe_request_idr_locked(lock, *reason); !idr) { return idr.error(); }
+            if (idr_dispatching_.load(std::memory_order_acquire)) { return {}; }
+        }
         if (auto released = release_due_locked(lock, now_locked()); !released) {
             return released.error();
         }
@@ -213,27 +243,27 @@ public:
 
     [[nodiscard]] core::Result<void> on_message(const protocol::MessageView& message) override {
         std::unique_lock lock(mutex_);
-        const auto hold = presentation_delay_locked();
-        if (hold.count() == 0 && delayed_.empty()) { return deliver_locked(lock, message); }
         const auto now = now_locked();
+        const bool holding = delay_source_ || delay_.count() > 0;
+        if (!holding && delayed_.empty()) { return deliver_locked(lock, message); }
         if (auto released = release_due_locked(lock, now); !released) { return released.error(); }
         // Bounded hold: past it the oldest unit leaves early rather than grow.
         while (!delayed_.empty() && (delayed_.size() >= kMaxDelayedUnits ||
                                      delayed_bytes_ + message.payload.size() > kMaxDelayedBytes)) {
             if (auto released = release_front_locked(lock); !released) { return released.error(); }
         }
-        if (hold.count() == 0) {
+        if (!holding) {
             while (!delayed_.empty()) {
                 if (auto released = release_front_locked(lock); !released) { return released.error(); }
             }
             return deliver_locked(lock, message);
         }
         delayed_bytes_ += message.payload.size();
-        auto due = now + std::chrono::duration_cast<std::chrono::steady_clock::duration>(hold);
-        if (!delayed_.empty()) { due = std::max(due, delayed_.back().due); }
+        note_capped_locked(message.header.timestamp);
         delayed_.push_back(DelayedMessage{message.header,
-            {message.payload.begin(), message.payload.end()}, due});
-        return {};
+            {message.payload.begin(), message.payload.end()}, now});
+        // A zero hold releases it at once, still in order.
+        return release_due_locked(lock, now);
     }
 
 private:
@@ -394,17 +424,52 @@ private:
     struct DelayedMessage final {
         protocol::MessageHeader header{};
         std::vector<std::byte> payload{};
-        std::chrono::steady_clock::time_point due{};
+        std::chrono::steady_clock::time_point arrived{};
     };
+    // Above this the hold is capped (and logged): it bounds touch latency and
+    // keeps 600 ms of the drive smoke's 1.0 s waiting_idr budget. The router
+    // sheds a backlog above 350 ms so the audio offset stays under it.
     static constexpr std::chrono::milliseconds kMaxPresentationDelay{400};
 
-    [[nodiscard]] std::chrono::nanoseconds presentation_delay_locked() const {
-        const auto hold = delay_source_ ? delay_source_() : delay_;
-        return std::clamp<std::chrono::nanoseconds>(hold, std::chrono::nanoseconds{0},
-                                                    kMaxPresentationDelay);
+    [[nodiscard]] std::chrono::nanoseconds requested_delay_locked(core::Nanoseconds content) const {
+        return std::max(std::chrono::nanoseconds{0}, delay_source_ ? delay_source_(content) : delay_);
     }
 
-    // 180 ms at 60 fps is 11 units; the byte bound covers IDR-heavy bursts.
+    // The hold of the frame at the front of the queue, decided when it is
+    // checked for release (the audio it pairs with may have been written
+    // since it arrived: a phone delivering in groups is up to a group late).
+    // It never falls faster than half the arrival spacing below the hold of
+    // the frame released before it, so arrival + hold only ever rises.
+    [[nodiscard]] std::chrono::nanoseconds front_hold_locked(const DelayedMessage& front) const {
+        auto hold = std::min(requested_delay_locked(front.header.timestamp),
+                             std::chrono::nanoseconds{kMaxPresentationDelay});
+        if (last_released_) {
+            const auto spacing = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                front.arrived - last_released_->arrived);
+            hold = std::max(hold, last_released_->hold - std::max(std::chrono::nanoseconds{0}, spacing) / 2);
+        }
+        return hold;
+    }
+
+    void note_released_locked(const DelayedMessage& front, std::chrono::nanoseconds hold) {
+        last_released_ = ReleasedHold{front.arrived, hold};
+    }
+
+    // Counts and logs a frame whose requested hold the cap clips (once per
+    // frame, when it is queued).
+    void note_capped_locked(core::Nanoseconds content) {
+        const auto requested = requested_delay_locked(content);
+        if (requested <= kMaxPresentationDelay) { return; }
+        ++capped_holds_;
+        if (capped_holds_ == 1 || capped_holds_ % 30 == 0) {
+            media("video_hold_capped", "{\"event\":\"video_hold_capped\",\"requested_ms\":" +
+                  std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(requested).count()) +
+                  ",\"cap_ms\":" + std::to_string(kMaxPresentationDelay.count()) +
+                  ",\"capped_frames\":" + std::to_string(capped_holds_) + "}");
+        }
+    }
+
+    // 400 ms at 60 fps is 24 units; the byte bound covers IDR-heavy bursts.
     static constexpr std::size_t kMaxDelayedUnits = 64;
     static constexpr std::size_t kMaxDelayedBytes = std::size_t{32} * 1024 * 1024;
 
@@ -412,13 +477,17 @@ private:
         auto item = std::move(delayed_.front());
         delayed_.pop_front();
         delayed_bytes_ -= item.payload.size();
+        note_released_locked(item, front_hold_locked(item));
         return deliver_locked(lock, protocol::MessageView{item.header, item.payload});
     }
 
     [[nodiscard]] core::Result<void> release_due_locked(std::unique_lock<std::mutex>& lock,
                                                         std::chrono::steady_clock::time_point now) {
-        while (!delayed_.empty() && delayed_.front().due <= now &&
-               !idr_dispatching_.load(std::memory_order_acquire)) {
+        while (!delayed_.empty() && !idr_dispatching_.load(std::memory_order_acquire)) {
+            const auto hold = front_hold_locked(delayed_.front());
+            if (delayed_.front().arrived + std::chrono::duration_cast<std::chrono::steady_clock::duration>(hold) > now) {
+                break;
+            }
             if (auto released = release_front_locked(lock); !released) { return released.error(); }
         }
         return {};
@@ -704,6 +773,12 @@ private:
         }
         const auto now = now_locked();
         begin_idr_wait_locked(now, reason);
+        if (defer_idr_) {
+            // release_held(): the session may be mid-send; service_pending()
+            // dispatches the request on the session's own turn.
+            deferred_idr_reason_ = std::string{reason};
+            return {};
+        }
         const auto dispatched = dispatch_idr_request_locked(lock, now, reason);
         if (!dispatched && dispatched.error().code() == ErrorCode::channel_focus_restore_failed) {
             return dispatched.error();
@@ -778,7 +853,15 @@ private:
     std::optional<std::chrono::steady_clock::time_point> producer_installed_at_{};
     std::deque<PendingAccessUnit> pending_queue_{};
     std::chrono::nanoseconds delay_{0};
-    std::function<std::chrono::nanoseconds()> delay_source_{};
+    std::function<std::chrono::nanoseconds(core::Nanoseconds)> delay_source_{};
+    struct ReleasedHold final {
+        std::chrono::steady_clock::time_point arrived;
+        std::chrono::nanoseconds hold;
+    };
+    std::optional<ReleasedHold> last_released_{};
+    std::uint64_t capped_holds_{0};
+    bool defer_idr_{false};
+    std::optional<std::string> deferred_idr_reason_{};
     std::deque<DelayedMessage> delayed_{};
     std::size_t delayed_bytes_{0};
     std::size_t pending_bytes_{0};

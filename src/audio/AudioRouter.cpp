@@ -42,6 +42,9 @@ constexpr std::int64_t kPlayoutSustainNs = 2'000'000'000;
 constexpr std::int64_t kPlayoutRecoverySustainNs = 500'000'000;
 constexpr std::int64_t kPlayoutRecoveryNs = 4'000'000'000;
 constexpr std::int64_t kPlayoutRecoveryWindowNs = 1'000'000'000;
+// Shed a backlog whose shallowest chunk is this far above the depth (350 ms
+// at the 120 ms default), so the offset stays under the 400 ms video hold cap.
+constexpr std::int64_t kPlayoutShedAboveNs = 230'000'000;
 // Playout fails closed, like the arrival model's late cap, when a role's
 // arrival clock runs backwards by more than this (N6).
 constexpr std::int64_t kPlayoutBackwardCapNs = 200'000'000;
@@ -88,8 +91,10 @@ struct PlayoutPlan final {
     // steady: bounded drift trim from the head, or silence inserted before it.
     std::uint64_t trim_frames{};
     std::uint64_t pad_frames{};
-    // The role's arrival clock ran backwards: fail closed (N6).
+    // The role's content timestamps ran backwards: fail closed (N6).
     bool backward{false};
+    // steady: the trim sheds a deep post-drought backlog fast.
+    bool shed{false};
     // steady: absolute start frame (back-to-back slot plus pad), fixed when
     // planned so a cached pad is applied once, never again to an advancing
     // cursor (Neon P1-1).
@@ -401,9 +406,9 @@ struct AudioRouter::Impl final {
 
     [[nodiscard]] bool playout_enabled() const noexcept { return config.playout.enabled; }
 
-    // Content-clock end of the last reported write (WriteCompletion): the
-    // reported schedule never moves backwards (Neon P2-4).
-    std::optional<std::int64_t> last_content_end_ns{};
+    // End (output clock) and end offset of the last reported write
+    // (WriteCompletion): the reported offset is slewed from it.
+    std::optional<std::pair<std::int64_t, std::int64_t>> last_reported{};
 
     void reset_playout(std::size_t role) noexcept {
         playout[role] = PlayoutRole{};
@@ -432,6 +437,10 @@ struct AudioRouter::Impl final {
         std::int64_t oldest = arrival;
         for (const auto& [at, value] : state.depths) {
             if (at < arrival - span) { continue; }
+            // While recovering, the re-anchor chunk itself says nothing: it
+            // sits at the depth by construction (P1-2: it held the floor down
+            // for a second before a deep backlog could be shed).
+            if (recovering && at == *state.recovering_since) { continue; }
             low = std::min(low, value);
             oldest = std::min(oldest, at);
         }
@@ -479,11 +488,21 @@ struct AudioRouter::Impl final {
         // buffer is spent down to that floor before it is refilled.
         const auto floor = window_floor(role, arrival, plan.depth_ns);
         const auto pad_floor = depth / 4;
-        if (floor.sustained && floor.low > depth) {
+        if (floor.sustained && floor.low > depth + kPlayoutShedAboveNs) {
+            // A backlog this deep (after a drought) is shed fast, 30% of each
+            // chunk, so audio comes back under the 400 ms video hold cap
+            // within about a second instead of dwelling above it at 5 ms per
+            // chunk (Neon P1-2, DeepSeek R1). Shedding f of a chunk lowers
+            // the offset by f while the output advances 1 - f, and the
+            // reported offset may fall by half of that: f <= 1/3 keeps the
+            // offset the video follows equal to the delay audio plays with.
+            plan.trim_frames = run.frames * 3 / 10;
+            plan.shed = true;
+        } else if (floor.sustained && floor.low > depth) {
             plan.trim_frames = playout_drift.trim_frames(core::Nanoseconds{floor.low - depth}, run.frames);
-        } else if (floor.sustained && floor.low < pad_floor && config.live_pcm_drift.enabled) {
-            // Refill to the floor plus the drift target, max_trim at a time.
-            const auto deficit = pad_floor + config.live_pcm_drift.target.count - floor.low;
+        } else if (floor.sustained && floor.low < pad_floor) {
+            // Refill toward half the depth, max_trim at a time (R6).
+            const auto deficit = depth / 2 - floor.low;
             plan.pad_frames = ns_to_frames(core::Nanoseconds{
                 std::min(deficit, config.live_pcm_drift.max_trim.count)});
         }
@@ -509,6 +528,7 @@ struct AudioRouter::Impl final {
             for (auto& [at, value] : state.depths) { value += adjust; }
             state.depths.emplace_back(run.timestamp.count, plan.depth_ns + adjust);
             stats.frames_padded += pad;
+            if (plan.shed) { stats.frames_shed += entry.head_trim_frames; }
             stats.playout_depth_min = stats.playout_depth_min
                 ? std::min(*stats.playout_depth_min, core::Nanoseconds{plan.depth_ns})
                 : core::Nanoseconds{plan.depth_ns};
@@ -553,7 +573,14 @@ struct AudioRouter::Impl final {
             run.playout_offset_ns = best;
             state.offset_ns = best;
         }
-        const auto from = run.timestamp.count - config.playout.window.count;
+        // While recovering the floor reads only the last second; entries it
+        // skips are dropped, so trims applied to them meanwhile can never
+        // bring them back below the floor when the window widens again
+        // (Neon P2-3).
+        const bool recovering = state.recovering_since
+            && run.timestamp.count - *state.recovering_since <= kPlayoutRecoveryNs;
+        const auto from = run.timestamp.count
+            - (recovering ? kPlayoutRecoveryWindowNs : config.playout.window.count);
         while (!state.depths.empty() && state.depths.front().first < from) { state.depths.pop_front(); }
         constexpr std::size_t kMaxPlayoutDepths = 512;
         while (state.depths.size() > kMaxPlayoutDepths) { state.depths.pop_front(); }
@@ -765,8 +792,10 @@ core::Result<AudioRouter> open_router_with(
     impl->drift = LivePcmDriftCorrector{config.live_pcm_drift,
                                         config.output_format.sample_rate_hz};
     if (config.playout.enabled) {
+        // R8: without the drift policy the playout clock would follow the
+        // phone's clock without bound; playout requires it.
         if (config.playout.depth.count <= 0 || config.playout.depth > kMaxPlayoutDepth
-            || config.playout.window.count <= 0) {
+            || config.playout.window.count <= 0 || !config.live_pcm_drift.enabled) {
             return core::Result<AudioRouter>{Error{ErrorCode::invalid_argument}};
         }
         // Playout keeps the drift trim bounded: never a catch-up.
@@ -1337,6 +1366,11 @@ void AudioRouter::cancel_pending(protocol::ChannelRole role) {
     std::lock_guard lock(impl_->pending_mutex);
     impl_->pending[role_index(*index)].clear();
     impl_->reset_playout(role_index(*index));
+    if (std::none_of(impl_->playout.begin(), impl_->playout.end(),
+                     [](const auto& state) { return state.anchored; })) {
+        impl_->last_reported.reset();
+        impl_->report.stats.playout_reported_offset = {};
+    }
     impl_->role_end_frames[role_index(*index)] = impl_->playback_cursor_frames;
     impl_->role_source_frontier_frames[role_index(*index)] = 0;
     ++impl_->generations[role_index(*index)];
@@ -1388,7 +1422,8 @@ void AudioRouter::reset_session_timeline() {
         ++impl_->generations[i];
     }
     impl_->timeline_base.reset();
-    impl_->last_content_end_ns.reset();
+    impl_->last_reported.reset();
+    impl_->report.stats.playout_reported_offset = {};
     impl_->playback_cursor_frames = 0;
     impl_->role_end_frames.fill(0);
     impl_->source_frontier_frames = 0;
@@ -1859,22 +1894,29 @@ core::Result<RenderStep> AudioRouter::render_step() {
         stats.max_completion_skew = std::max(stats.max_completion_skew, stats.last_completion_skew);
         std::int64_t playout_end_offset_ns = playout_offset_ns;
         if (impl_->playout_enabled()) {
-            // The reported content interval never starts before the last one
-            // ended, so the collector never drops a write (Neon P2-4). A step
-            // up of the offset (a re-anchor, a burst showing a later content
-            // clock) is absorbed by content advancing at half the playout
-            // rate until it has caught up; a step down jumps forward.
+            // The reported offset moves toward its target by at most half the
+            // output time that passes, in both directions (Neon P1-1): content
+            // then advances at between half and one and a half times the
+            // playout rate, so the reported content interval never starts
+            // before the last one ended (the collector never drops a write,
+            // Neon P2-4), and the video hold that follows it, t + O(t), only
+            // ever increases - frames are never pinned behind an earlier due
+            // (no freeze, then burst). Across an output gap (an underrun's
+            // skip and refill) it may fall by half the gap at once.
             const auto target = std::max<std::int64_t>(0, playout_offset_ns);
-            auto content_start = scheduled_ns - target;
-            auto content_end = end_ns - target;
-            if (impl_->last_content_end_ns && content_start < *impl_->last_content_end_ns) {
-                content_start = *impl_->last_content_end_ns;
-                content_end = std::max(content_end, content_start + std::max<std::int64_t>(1, (end_ns - scheduled_ns) / 2));
+            const auto length = end_ns - scheduled_ns;
+            auto start_offset = target;
+            if (impl_->last_reported) {
+                const auto [previous_end, previous_offset] = *impl_->last_reported;
+                const auto gap = std::max<std::int64_t>(0, scheduled_ns - previous_end);
+                start_offset = std::clamp(target, previous_offset - gap / 2, previous_offset + gap);
             }
-            playout_offset_ns = std::max<std::int64_t>(0, scheduled_ns - content_start);
-            playout_end_offset_ns = std::max<std::int64_t>(0, end_ns - content_end);
-            impl_->last_content_end_ns = end_ns - playout_end_offset_ns;
-            stats.playout_reported_offset = core::Nanoseconds{playout_offset_ns};
+            start_offset = std::max<std::int64_t>(0, start_offset);
+            const auto step = std::clamp(target - start_offset, -length / 2, length / 2);
+            playout_offset_ns = start_offset;
+            playout_end_offset_ns = std::max<std::int64_t>(0, start_offset + step);
+            impl_->last_reported = std::pair{end_ns, playout_end_offset_ns};
+            stats.playout_reported_offset = core::Nanoseconds{playout_end_offset_ns};
         }
         if (impl_->config.on_write_completed) {
             impl_->config.on_write_completed(WriteCompletion{core::Nanoseconds{scheduled_ns},

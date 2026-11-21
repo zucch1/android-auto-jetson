@@ -257,17 +257,20 @@ int receiver_main(int argc, char** argv) {
     }
     Media media{audio_sink};
     const auto video_hold = video_delay(options->video_delay_ms, options->audio_playout_ms);
-    if (options->video_delay_ms || options->audio_playout_ms == 0) {
-        media.video.set_presentation_delay(video_hold);
-    } else {
+    const bool follow = !options->video_delay_ms && options->audio_playout_ms > 0;
+    if (follow) {
         // match: follow the audio playout offset, starting at the depth.
         media.match_video_to_audio(video_hold);
+    } else {
+        media.video.set_presentation_delay(video_hold);
     }
+    // video_delay_ms is always a number: the fixed hold, or the hold used
+    // until the first playout write when video_hold is "match".
     log_line("{\"event\":\"wireless_media_policy\",\"audio_playout_ms\":" +
              std::to_string(options->audio_playout_ms) + ",\"audio_max_unacked\":" +
-             std::to_string(options->audio_max_unacked) + ",\"video_delay_ms\":" +
-             (options->video_delay_ms ? std::to_string(video_hold.count())
-                                      : std::string{"\"match\""}) + "}");
+             std::to_string(options->audio_max_unacked) + ",\"video_hold\":\"" +
+             (follow ? "match" : "fixed") + "\",\"video_delay_ms\":" +
+             std::to_string(video_hold.count()) + "}");
     // Receiver precedes ControlService so its confirmation observer is valid
     // throughout bus dispatch and the bus's final owner teardown.
     auto link_config = media.config(options->video_profiles);

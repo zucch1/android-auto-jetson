@@ -176,6 +176,34 @@ void AudioRenderWorker::seed_credits_locked(std::size_t index) {
     credits_[index].assign(credit_window_ > 1 ? credit_window_ : 0, envelope(index));
 }
 
+std::chrono::nanoseconds AudioRenderWorker::playout_offset_at(core::Nanoseconds content) const {
+    std::lock_guard lock(mutex_);
+    if (playout_writes_.empty()) { return std::chrono::nanoseconds{0}; }
+    const auto t = content.count;
+    if (t >= playout_writes_.back().content_end) {
+        // No audio for over a second (stopped without a stop message): no
+        // offset to follow; the caller falls back to the depth.
+        constexpr std::int64_t kStaleAfterNs = 1'000'000'000;
+        if (t - playout_writes_.back().content_end > kStaleAfterNs) { return std::chrono::nanoseconds{0}; }
+        return std::chrono::nanoseconds{playout_writes_.back().end_offset};
+    }
+    for (auto it = playout_writes_.rbegin(); it != playout_writes_.rend(); ++it) {
+        if (t < it->content_start) { continue; }
+        if (t >= it->content_end) { return std::chrono::nanoseconds{it->end_offset}; } // a gap
+        const auto span = it->content_end - it->content_start;
+        const auto into = t - it->content_start;
+        const auto delta = it->end_offset - it->start_offset;
+        // span <= 64 KiB of PCM (~340 ms in ns): the product cannot overflow.
+        return std::chrono::nanoseconds{it->start_offset + delta * into / std::max<std::int64_t>(1, span)};
+    }
+    return std::chrono::nanoseconds{playout_writes_.front().start_offset};
+}
+
+std::chrono::nanoseconds AudioRenderWorker::current_playout_offset() const {
+    std::lock_guard lock(mutex_);
+    return std::chrono::nanoseconds{playout_writes_.empty() ? 0 : playout_writes_.back().end_offset};
+}
+
 std::uint64_t AudioRenderWorker::max_unacked_held() const {
     std::lock_guard lock(mutex_);
     return max_unacked_held_;
@@ -327,6 +355,10 @@ void AudioRenderWorker::invalidate(protocol::ChannelRole role, std::uint64_t gen
     if (router_) { router_->cancel_pending(role); }
     seed_credits_locked(*index);
     unacked_[*index] = 0;
+    // The media stream restarts: until it writes again the hold falls back to
+    // the depth rather than a stale offset (P2-4). A guidance overlay ending
+    // keeps media's history, so its offset never steps.
+    if (role == protocol::ChannelRole::media_audio) { playout_writes_.clear(); }
     generations_[*index] = generation;
     const auto stale = [&](const auto& entry) {
         return entry.id.role == role && entry.id.generation != generation;
@@ -358,6 +390,7 @@ void AudioRenderWorker::begin_session() {
     unacked_ = {};
     deferred_ = {};
     generations_ = {};
+    playout_writes_.clear();
     last_queue_rejection_.reset();
     frozen_rejection_.reset();
     credit_ledger_.reset();
@@ -829,11 +862,19 @@ void AudioRenderWorker::run(RouterConfig config, const OpenRouter& open) {
             if (observe) { observe(value); }
         };
     const auto completed = config.on_write_completed;
-    config.on_write_completed = [this](const auto& value) {
+    const bool playout = config.playout.enabled;
+    config.on_write_completed = [this, playout](const auto& value) {
         std::lock_guard lock(mutex_);
         if (active_step_epoch_ == session_epoch_) {
             last_completion_ = value;
             step_completion_ = value;
+            if (playout) {
+                // Only this session's writes feed the video hold (P2-4).
+                playout_writes_.push_back({value.scheduled.count - value.playout_offset.count,
+                                           value.scheduled_end.count - value.playout_end_offset.count,
+                                           value.playout_offset.count, value.playout_end_offset.count});
+                if (playout_writes_.size() > kPlayoutHistory) { playout_writes_.pop_front(); }
+            }
         }
     };
     auto opened = open(config);
@@ -969,8 +1010,6 @@ void AudioRenderWorker::run(RouterConfig config, const OpenRouter& open) {
                                                                      : playout_anchors_logged_;
             diagnostics.playout.push_back({event, ++count});
         }
-        // The wireless video hold follows the offset audio really plays with.
-        playout_offset_ns_.store(stats.playout_reported_offset.count, std::memory_order_relaxed);
         // #155: the router trimmed this step's post-stall backlog (it happened
         // whatever the epoch, so it is always counted).
         if (stats.frames_caught_up > caught_up_before) {

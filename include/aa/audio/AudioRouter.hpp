@@ -266,26 +266,31 @@ private:
 //   write (frames_skipped), the rest is `depth` of silence (frames_silence),
 //   and the session continues: playout never fails `late`;
 // - drift: the buffer depth of a chunk is its slot minus its arrival. A phone
-//   delivering in groups (windows 10/11: up to 5 chunks; it captures in real
+//   delivering in groups (windows 10-12: up to 5 chunks; it captures in real
 //   time, so a group's chunks are late and its last on time) spreads single
 //   depths by the group, and a late chunk lowers one; both drain by
-//   themselves. Correction judges the window's smallest depth (the latest
-//   arrival, a group's first chunk) once the window holds 2 s of arrivals:
+//   themselves. Correction judges the window's smallest depth (the group's
+//   first, latest-delivered chunk) once the window holds 2 s of arrivals:
 //   the bounded LivePcmDriftPolicy trim (at most max_trim) only when it is
 //   more than the high watermark above `depth` (phone clock faster, a
-//   backlog), and up to max_trim of silence only when it is below a quarter
-//   of `depth` (phone clock slower, a slower path), so a jitter spike inside
-//   the buffer costs nothing. Within 4 s of an underrun the window is the last
-//   1 s and 0.5 s sustains, so the backlog that follows starts draining at
-//   once.
+//   backlog), and up to max_trim of silence (refilling toward half the
+//   depth) only when it is below a quarter of `depth` (phone clock slower, a
+//   slower path), so a jitter spike inside the buffer costs nothing. Within
+//   4 s of an underrun the window is the last 1 s (older entries are dropped,
+//   the re-anchor chunk itself ignored) and 0.5 s sustains, so the backlog
+//   that follows starts draining at once; a backlog more than 230 ms above
+//   the depth (350 ms) is shed at 30% of each chunk, keeping the offset under
+//   the wireless video hold cap (400 ms).
 // - offset: the depth of the least-delayed recent arrival, i.e. how long
-//   after on-time content audio plays. With grouped delivery that is depth +
-//   (group - 1) chunk periods, not `depth`. WriteCompletion reports it (never
-//   letting the reported content interval start before the previous one
-//   ended: an increase is absorbed at half rate), and the wireless receiver
-//   holds video for exactly the reported value (--video-delay-ms match).
-// - a role's arrival clock running backwards by more than 200 ms fails
-//   closed `late`, as the arrival model does.
+//   after on-time content audio plays (depth + (group - 1) chunk periods with
+//   grouped delivery). WriteCompletion reports it slewed: it moves toward
+//   that target by at most half the output time that passes, both ways, so
+//   the reported content clock never runs backwards and the video hold that
+//   follows it (--video-delay-ms match) never pins a frame behind another.
+// - a role's receiver arrival stamps (header.timestamp, the session's
+//   monotonic clock) running backwards by more than 200 ms fail closed
+//   `late`, as on the arrival model.
+// - playout requires LivePcmDriftPolicy::enabled (open fails otherwise).
 // Wired keeps the arrival model (disabled).
 struct PlayoutPolicy final {
     bool enabled{false};
@@ -415,9 +420,13 @@ struct RouterStats final {
     // Most chunks of one channel that arrived within 10 ms of each other: the
     // phone's credit use (our acks go out on receipt).
     std::uint64_t max_arrival_burst{};
-    // Offset the latest audio_write_completed reported (what the wireless
-    // video hold follows; below playout_offset while an increase is absorbed).
+    // Offset the latest audio_write_completed reported at its end: the
+    // target playout_offset slewed by at most half the output time, both
+    // ways. The wireless video hold follows the reported offsets.
     core::Nanoseconds playout_reported_offset{};
+    // Subset of frames_trimmed: a deep post-drought backlog shed at 30% of
+    // each chunk to stay under the video hold cap.
+    std::uint64_t frames_shed{};
 };
 
 // One playout re-anchor (stream start, resume, or underrun) of one role,

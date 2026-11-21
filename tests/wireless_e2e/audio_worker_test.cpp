@@ -595,6 +595,8 @@ TEST(WirelessAudioWorker, TelemetryEventParityWithCollectorAndSmokeContracts) {
     timing.playout_anchors = 2;
     timing.frames_padded = 240;
     timing.playout_resumes = 1;
+    timing.playout_reported_offset = aa::core::Nanoseconds{119'000'000};
+    timing.frames_shed = 96;
     timing.max_arrival_burst = 3;
     audio::MediaTimingContext context;
     context.sink_reopens = 1;
@@ -608,8 +610,9 @@ TEST(WirelessAudioWorker, TelemetryEventParityWithCollectorAndSmokeContracts) {
         "\"frames_caught_up\":509856,\"frames_silence\":1542356,\"frames_skipped\":4800,"
         "\"frames_idle_skipped\":17675,\"sink_reopens\":1,\"playout_target_ms\":120,"
         "\"playout_depth_ms\":118.5,\"playout_depth_min_ms\":61,\"playout_depth_max_ms\":124,"
-        "\"playout_offset_ms\":121,\"playout_underruns\":1,\"playout_anchors\":2,"
-        "\"playout_resumes\":1,\"frames_padded\":240,\"credit_window\":4,"
+        "\"playout_offset_ms\":121,\"playout_reported_offset_ms\":119,\"playout_underruns\":1,"
+        "\"playout_anchors\":2,\"playout_resumes\":1,\"frames_padded\":240,\"frames_shed\":96,"
+        "\"credit_window\":4,"
         "\"max_unacked_held\":3,\"max_arrival_burst\":3}");
     // Lifetime: a reopened route's counters add to the earlier routes'.
     audio::RouterStats earlier{};
@@ -1148,8 +1151,27 @@ struct WorkerReplay final {
     std::vector<std::string> anchors{};
     std::uint64_t max_unacked_held{};
     std::int64_t playout_offset{};
-    std::chrono::nanoseconds video_hold{};
+    // Every write's report, and (content time, hold the video source gave)
+    // for a frame arriving with each chunk.
+    std::vector<audio::WriteCompletion> completions{};
+    std::vector<std::pair<std::int64_t, std::chrono::nanoseconds>> holds{};
+    // After the run: the session reset and the hold fell back to the depth.
+    std::chrono::nanoseconds hold_after_reset{};
+    std::chrono::nanoseconds offset_after_reset{};
 };
+
+// The reported playout offset for content time `t`, from the write records.
+[[nodiscard]] std::optional<std::int64_t> reported_offset_at(
+    const std::vector<audio::WriteCompletion>& completions, std::int64_t t) {
+    for (const auto& c : completions) {
+        const auto start = c.scheduled.count - c.playout_offset.count;
+        const auto end = c.scheduled_end.count - c.playout_end_offset.count;
+        if (t < start || t >= end) { continue; }
+        return c.playout_offset.count
+            + (c.playout_end_offset.count - c.playout_offset.count) * (t - start) / std::max<std::int64_t>(1, end - start);
+    }
+    return std::nullopt;
+}
 
 // Window-9-style closed credit loop (see audio_pipeline_test run_playout_loop)
 // through the real session, AvSink, render worker and router with the
@@ -1159,12 +1181,16 @@ struct WorkerReplay final {
 // are really in flight at once.
 template <typename RoundTrip>
 [[nodiscard]] WorkerReplay replay_through_worker(std::int64_t seconds, RoundTrip round_trip_ms,
-                                                 std::uint64_t burst = 1) {
+                                                 std::uint64_t burst = 1, std::uint64_t later_burst = 0,
+                                                 std::int64_t burst_change_s = 0) {
     constexpr std::int64_t kStart = 1'000'000'000;
     WorkerReplay replay;
     auto gate = std::make_shared<SinkGate>();
     CollectedTelemetry telemetry;
-    audio::AudioRenderWorker audio{quiet_wireless_config(), telemetry.callbacks(), fake_router(gate),
+    auto completions = std::make_shared<std::vector<audio::WriteCompletion>>();
+    auto config = quiet_wireless_config();
+    config.on_write_completed = [completions](const audio::WriteCompletion& c) { completions->push_back(c); };
+    audio::AudioRenderWorker audio{config, telemetry.callbacks(), fake_router(gate),
                                    audio::AudioRenderWorker::monotonic_now,
                                    audio::AudioRenderWorker::kDefaultAckReleaseDrainTimeout,
                                    audio::AudioCreditPolicy{audio::kWirelessCreditWindow}};
@@ -1176,6 +1202,7 @@ template <typename RoundTrip>
     const auto chunk = pcm_chunk_2048();
     std::deque<std::int64_t> acked_at;
     std::int64_t last_arrival = 0;
+    std::deque<std::int64_t> frames;
     std::size_t unserviced = 0;
     std::size_t baseline = h.transport.sent_count();
     // Renders and acks everything submitted so far; each chunk must get its ack.
@@ -1197,8 +1224,15 @@ template <typename RoundTrip>
         baseline = h.transport.sent_count();
         return true;
     };
+    const auto change_chunk = static_cast<std::uint64_t>(burst_change_s * 1'000'000'000LL / kChunkNs);
     for (std::uint64_t k = 0;; ++k) {
-        const auto released = (k / burst) * burst + burst - 1;
+        auto released = (k / burst) * burst + burst - 1;
+        if (later_burst != 0 && k >= change_chunk) {
+            const auto j = k - change_chunk;
+            released = change_chunk + (j / later_burst) * later_burst + later_burst - 1;
+        } else if (later_burst != 0) {
+            released = std::min<std::uint64_t>(released, change_chunk - 1);
+        }
         const auto captured = static_cast<std::int64_t>(released) * kChunkNs;
         std::int64_t sent = captured;
         if (acked_at.size() >= audio::kWirelessCreditWindow) {
@@ -1209,6 +1243,17 @@ template <typename RoundTrip>
         const std::int64_t rtt = round_trip_ms(sent / 1'000'000'000LL) * 1'000'000LL;
         const std::int64_t arrival = std::max(last_arrival, kStart + sent + rtt / 2);
         if (arrival > last_arrival && !service()) { break; }
+        if (arrival > last_arrival && last_arrival != 0) {
+            // A video frame arriving with this chunk is held for the offset of
+            // the audio it pairs with (content time = its own timestamp),
+            // decided when the outlet checks it for release ~a hold later.
+            frames.push_back(last_arrival);
+            while (!frames.empty() && frames.front() + 200'000'000 <= arrival) {
+                replay.holds.emplace_back(frames.front(),
+                    media.video.presentation_delay_for(aa::core::Nanoseconds{frames.front()}));
+                frames.pop_front();
+            }
+        }
         last_arrival = arrival;
         h.clock.set(aa::core::Nanoseconds{arrival});
         if (auto sent_ok = h.send_service(100, av_data_message(k, chunk)); !sent_ok) {
@@ -1224,7 +1269,10 @@ template <typename RoundTrip>
     if (!replay.failure) { (void)service(); }
     replay.max_unacked_held = audio.max_unacked_held();
     replay.playout_offset = audio.current_playout_offset().count();
-    replay.video_hold = media.video.current_presentation_delay();
+    // P2-4: a new session drops the old session's offset; the hold falls back.
+    audio.begin_session();
+    replay.offset_after_reset = audio.playout_offset_at(aa::core::Nanoseconds{last_arrival});
+    replay.hold_after_reset = media.video.presentation_delay_for(aa::core::Nanoseconds{last_arrival});
     audio.stop();
     if (auto finished = audio.finish(); !finished && !replay.failure) {
         replay.failure = finished.error().code();
@@ -1233,6 +1281,7 @@ template <typename RoundTrip>
     replay.media_timing = telemetry.of("media_timing");
     replay.underruns = telemetry.of("audio_playout_underrun");
     replay.anchors = telemetry.of("audio_playout_anchor");
+    replay.completions = *completions;
     return replay;
 }
 
@@ -1324,7 +1373,8 @@ TEST(WirelessAudioWorker, PlayoutCoalescedBurstsThroughTheWorkerAreNotTrimmed) {
     // buffer (the anchor was a group's late first chunk), and the wireless
     // video hold follows that delay instead of staying at 120 ms.
     EXPECT_NEAR(static_cast<double>(replay.playout_offset), 120e6 + 2 * static_cast<double>(kChunkNs), 2e6);
-    EXPECT_EQ(replay.video_hold, std::chrono::nanoseconds{replay.playout_offset});
+    EXPECT_EQ(replay.offset_after_reset.count(), 0);
+    EXPECT_EQ(replay.hold_after_reset, std::chrono::milliseconds{120});
     EXPECT_GE(replay.max_unacked_held, 3U);
     EXPECT_GE(replay.stats.max_arrival_burst, 3U);
     EXPECT_EQ(replay.stats.frames_trimmed, 0U);
@@ -1402,6 +1452,33 @@ TEST(WirelessAudioWorker, CreditWindowSaturationWithABlockedSinkNeverRefusesALeg
         audio.stop();
         EXPECT_TRUE(audio.finish()) << c.label;
     }
+}
+
+
+// R3 / Neon P2-5: the hold must be the offset of the audio the frame pairs
+// with (the write whose content interval holds the frame's timestamp), also
+// while the offset moves: the phone changes from single chunks to groups of 4
+// mid-run, so the offset climbs by three chunk periods and is absorbed at half
+// rate. Sampling the newest write instead held frames for later audio.
+TEST(WirelessAudioWorker, VideoHoldIsTheOffsetOfTheAudioItPairsWithWhileTheOffsetMoves) {
+    const auto replay = replay_through_worker(16, [](std::int64_t) { return std::int64_t{20}; }, 1, 4, 6);
+    ASSERT_FALSE(replay.failure) << aa::to_string(*replay.failure);
+    std::size_t compared = 0;
+    std::int64_t worst = 0;
+    std::int64_t lowest = INT64_MAX;
+    std::int64_t highest = 0;
+    for (const auto& [content, hold] : replay.holds) {
+        const auto reported = reported_offset_at(replay.completions, content);
+        if (!reported) { continue; }
+        ++compared;
+        worst = std::max(worst, std::abs(hold.count() - *reported));
+        lowest = std::min(lowest, *reported);
+        highest = std::max(highest, *reported);
+    }
+    EXPECT_GT(compared, 150U);
+    EXPECT_LE(worst, 2'000'000) << "hold differs from the paired audio's reported offset";
+    // The offset really moved (by three chunk periods).
+    EXPECT_GT(highest - lowest, 100'000'000);
 }
 
 } // namespace

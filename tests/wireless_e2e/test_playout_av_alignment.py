@@ -99,6 +99,61 @@ def burst_audio_events(seconds: int, burst: int) -> list[dict]:
     return events, offset
 
 
+def step_audio_events(seconds: int, high: int, low: int, drop_at: int, slewed: bool) -> list[dict]:
+    """Writes whose reported offset drops from `high` to `low` at content `drop_at`.
+
+    The old router reported the drop at once; the new one moves the offset by
+    at most half the output time per write (AudioRouter, Neon P1-1).
+    """
+    events, offset = [], high
+    for k in range(seconds * 1_000_000_000 // CHUNK_NS):
+        content = START_NS + k * CHUNK_NS
+        target = high if content < drop_at else low
+        start_offset = offset
+        if slewed:
+            end_offset = start_offset + max(-CHUNK_NS // 2, min(CHUNK_NS // 2, target - start_offset))
+        else:
+            start_offset = end_offset = target
+        offset = end_offset
+        events.append({"event": "audio_write_completed", "scheduled_ns": content,
+                       "scheduled_end_ns": content + CHUNK_NS, "playout_offset_ns": start_offset,
+                       "completed_ns": content, "presented_ns": content + start_offset + SINK_NS,
+                       "playback_slot_absence": None, "_end_offset": end_offset})
+    return events
+
+
+def offset_at(audio: list[dict], t: int) -> int:
+    for a in audio:
+        if a["scheduled_ns"] <= t < a["scheduled_end_ns"]:
+            span = a["scheduled_end_ns"] - a["scheduled_ns"]
+            return a["playout_offset_ns"] + (a["_end_offset"] - a["playout_offset_ns"]) * (t - a["scheduled_ns"]) // span
+    return audio[-1]["_end_offset"]
+
+
+def outlet_video(seconds: int, audio: list[dict], new_outlet: bool) -> list[dict]:
+    """video_presented records through a model of VideoOutlet's hold queue.
+
+    Old outlet: hold read at arrival, due = max(arrival + hold, previous due),
+    so a frame after a drop is pinned behind the last held one. New outlet:
+    hold read at release, never falling faster than half the arrival spacing
+    below the previous frame's (VideoOutlet::front_hold_locked).
+    """
+    events, previous_due, previous = [], 0, None
+    for n in range(seconds * 1_000_000_000 // FRAME_NS):
+        arrival = START_NS + n * FRAME_NS + 10_000_000
+        hold = offset_at(audio, arrival)
+        if new_outlet:
+            if previous is not None:
+                hold = max(hold, previous[1] - (arrival - previous[0]) // 2)
+            due = arrival + hold
+            previous = (arrival, hold)
+        else:
+            due = max(arrival + hold, previous_due)
+        previous_due = due
+        events.append({"event": "video_presented", "scheduled_ns": arrival, "completed_ns": due + PAINT_NS})
+    return events
+
+
 def judge(smoke, contract, audio: list[dict], video: list[dict], clause: str) -> dict:
     valid, invalid = smoke._valid_audio(audio)
     assert invalid == 0
@@ -145,6 +200,19 @@ def main() -> int:
         if burst >= 3:
             assert not result["passed"], (burst, result)
         assert result["signed_p50_ms"] < -((burst - 1) * CHUNK_NS / 1e6) + 20, (burst, result)
+
+    # Neon P1-1: a downward offset step (a group's peak leaving the window
+    # 295 -> 167 ms, a re-anchor 400 -> 120 ms) through VideoOutlet's queue.
+    for high, low in ((295_000_000, 167_000_000), (400_000_000, 120_000_000)):
+        drop_at = START_NS + 30 * 1_000_000_000
+        old_audio = step_audio_events(70, high, low, drop_at, slewed=False)
+        old_result = judge(smoke, contract, old_audio, outlet_video(66, old_audio, new_outlet=False), "cap")
+        assert not old_result["passed"] and old_result["signed_max_ms"] > 90, (high, low, old_result)
+        new_audio = step_audio_events(70, high, low, drop_at, slewed=True)
+        for clause in ("cap", "soak_rate"):
+            new_result = judge(smoke, contract, new_audio, outlet_video(66, new_audio, new_outlet=True), clause)
+            assert new_result["passed"], (high, low, clause, new_result)
+            assert new_result["signed_max_ms"] < 20, (high, low, new_result)
 
     # Neon P2-4: the collector drops any write whose scheduled_ns does not
     # advance. When the playout offset steps up (a re-anchor, a burst showing

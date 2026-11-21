@@ -121,6 +121,7 @@ RouterStats accumulate_router_stats(const RouterStats& lifetime, const RouterSta
     out.playout_anchors += lifetime.playout_anchors;
     out.frames_padded += lifetime.frames_padded;
     out.playout_resumes += lifetime.playout_resumes;
+    out.frames_shed += lifetime.frames_shed;
     out.max_arrival_burst = std::max(out.max_arrival_burst, lifetime.max_arrival_burst);
     const auto fold = [](std::optional<core::Nanoseconds> a, std::optional<core::Nanoseconds> b,
                          bool lower) -> std::optional<core::Nanoseconds> {
@@ -161,10 +162,13 @@ std::string media_timing_json(const RouterStats& stats, const MediaTimingContext
             ",\"playout_depth_min_ms\":" + optional_ms(stats.playout_depth_min) +
             ",\"playout_depth_max_ms\":" + optional_ms(stats.playout_depth_max) +
             ",\"playout_offset_ms\":" + format_ms(stats.playout_offset) +
+            // R7: the slewed offset the writes report and the video hold follows.
+            ",\"playout_reported_offset_ms\":" + format_ms(stats.playout_reported_offset) +
             ",\"playout_underruns\":" + std::to_string(stats.playout_underruns) +
             ",\"playout_anchors\":" + std::to_string(stats.playout_anchors) +
             ",\"playout_resumes\":" + std::to_string(stats.playout_resumes) +
-            ",\"frames_padded\":" + std::to_string(stats.frames_padded);
+            ",\"frames_padded\":" + std::to_string(stats.frames_padded) +
+            ",\"frames_shed\":" + std::to_string(stats.frames_shed);
     }
     if (context.playout_target || context.credit_window > 1) {
         // Credit window advertised as max_unacked; the most chunks one

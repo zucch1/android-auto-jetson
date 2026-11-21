@@ -4702,7 +4702,10 @@ template <typename RoundTrip>
 [[nodiscard]] PlayoutLoopResult run_playout_loop(std::int64_t seconds, RoundTrip round_trip_ms,
                                                  std::uint32_t window,
                                                  aa::core::Nanoseconds depth = aa::audio::kWirelessPlayoutDepth,
-                                                 std::uint64_t burst = 1) {
+                                                 std::uint64_t burst = 1, std::uint64_t later_burst = 0,
+                                                 std::int64_t burst_change_s = 0,
+                                                 std::int64_t phone_buffer_ns = 0,
+                                                 std::int64_t burst_end_s = 0) {
     constexpr std::int64_t kSinkAheadNs = 232'000'000 + 500'000'000;
     constexpr std::uint64_t kChunkFrames = 2048;
     constexpr std::int64_t kStart = 1'000'000'000;
@@ -4731,7 +4734,17 @@ template <typename RoundTrip>
     for (std::uint64_t k = 0;; ++k) {
         // The phone releases chunks in groups of `burst`, when the group's last
         // chunk is captured (window 10: depths up to 274 ms = 3.6 chunks ahead).
-        const auto released = (k / burst) * burst + burst - 1;
+        const auto change_chunk = static_cast<std::uint64_t>(burst_change_s) * 48000ULL / kChunkFrames;
+        const auto end_chunk = static_cast<std::uint64_t>(burst_end_s) * 48000ULL / kChunkFrames;
+        auto released = (k / burst) * burst + burst - 1;
+        if (later_burst != 0 && burst_end_s > 0 && k >= end_chunk) {
+            released = k; // back to single chunks
+        } else if (later_burst != 0 && k >= change_chunk) {
+            const auto j = k - change_chunk;
+            released = change_chunk + (j / later_burst) * later_burst + later_burst - 1;
+        } else if (later_burst != 0) {
+            released = std::min<std::uint64_t>(released, change_chunk - 1);
+        }
         const auto captured = static_cast<std::int64_t>(released * kChunkFrames * 1'000'000'000ULL / 48000ULL);
         std::int64_t sent = captured;
         if (acked_at.size() >= window) {
@@ -4739,6 +4752,12 @@ template <typename RoundTrip>
             acked_at.pop_front();
         }
         if (sent >= seconds * 1'000'000'000LL) { break; }
+        // The A26 records into a 65536-byte AudioRecord buffer (341 ms): a
+        // chunk still unsent that long after its capture was overwritten.
+        if (phone_buffer_ns > 0 && sent - captured > phone_buffer_ns) {
+            acked_at.push_front(sent);
+            continue;
+        }
         std::uint64_t in_flight = 1;
         for (const auto at : acked_at) { if (at > sent) { ++in_flight; } }
         result.max_in_flight = std::max(result.max_in_flight, in_flight);
@@ -5114,7 +5133,108 @@ TEST_F(AudioPipelineRoute, PlayoutBacklogAfterADroughtStartsDrainingPromptly) {
     // floor's last-resort refills while the drought thinned the buffer.
     const auto& last = run.offsets.back();
     EXPECT_LE(last.offset, aa::audio::kWirelessPlayoutDepth.count + 25'000'000);
-    EXPECT_LE(run.stats.frames_padded, 48U * 30U);
+    // Neon P2-3: the buffer never thinned below its floor here, so any pad
+    // is a trimmed entry coming back when the recovery window widens.
+    EXPECT_EQ(run.stats.frames_padded, 0U);
+}
+
+// Neon P1-1 / R3: the reported offset (which the video hold follows) moves by
+// at most half the output time that passes, in both directions. Like window
+// 11's 10 s pattern of ack latency (~10 ms, then 40-95 ms), the one-way delay
+// rises by 50 ms for 6 s: once the low-delay arrivals leave the 4 s window the
+// offset (the least-delayed arrival's depth) falls 50 ms with no trim and no
+// pad. Reported at once, every video frame after the drop was pinned behind
+// the last held one's due: a freeze, then an excursion of (drop - frame
+// period). When the delay falls again the offset rises, half-rate.
+TEST_F(AudioPipelineRoute, PlayoutReportedOffsetSlewsDownAsWellAsUp) {
+    const auto run = run_playout_loop(30, [](std::int64_t second) {
+        return second >= 10 && second < 16 ? std::int64_t{120} : std::int64_t{20};
+    }, aa::audio::kWirelessCreditWindow);
+    ASSERT_FALSE(run.failure);
+    expect_monotonic_content_schedule(run, "delay step");
+    EXPECT_EQ(run.stats.frames_trimmed, 0U);
+    EXPECT_EQ(run.stats.frames_padded, 0U);
+    std::int64_t lowest = INT64_MAX;
+    std::int64_t highest = 0;
+    std::int64_t worst_drop = 0;
+    for (std::size_t i = 1; i < run.completions.size(); ++i) {
+        const auto& previous = run.completions[i - 1];
+        const auto& current = run.completions[i];
+        const auto elapsed = current.scheduled_end.count - previous.scheduled_end.count;
+        const auto moved = current.playout_end_offset.count - previous.playout_end_offset.count;
+        EXPECT_LE(std::abs(moved), elapsed / 2 + 1000) << "write " << i;
+        worst_drop = std::max(worst_drop, -moved);
+        lowest = std::min(lowest, current.playout_end_offset.count);
+        highest = std::max(highest, current.playout_end_offset.count);
+    }
+    // It really fell by the delay step, never more than half a chunk a write.
+    EXPECT_GT(highest - lowest, 45'000'000);
+    EXPECT_LE(worst_drop, 22'000'000);
+}
+
+// Neon P1-2 / DeepSeek R1: after a drought the phone's backlog sits on top of
+// the refilled buffer and the offset climbs above the 400 ms video hold cap,
+// so audio and video diverge for as long as it stays there. The A26 keeps at
+// most its 341 ms AudioRecord buffer of backlog (older audio is overwritten),
+// which bounds the peak near 460 ms; a phone with a larger buffer can leave a
+// deeper one. A backlog more than 350 ms deep is shed at 30% of each chunk
+// instead of 5 ms, so the time above the cap is bounded, and every write
+// still reports the delay it plays with (the shed stays under the reported
+// offset's slew).
+TEST_F(AudioPipelineRoute, PlayoutDeepBacklogIsShedUnderTheVideoHoldCap) {
+    struct Case final {
+        std::int64_t phone_buffer_ns;
+        std::int64_t max_above_cap_ns;
+    };
+    for (const auto& c : {Case{341'000'000, 900'000'000}, Case{682'000'000, 2'200'000'000}}) {
+        const auto run = run_playout_loop(30, [](std::int64_t second) {
+            return second == 10 ? std::int64_t{800} : std::int64_t{20};
+        }, aa::audio::kWirelessCreditWindow, aa::audio::kWirelessPlayoutDepth, 1, 0, 0, c.phone_buffer_ns);
+        const auto label = "phone buffer " + std::to_string(c.phone_buffer_ns / 1'000'000) + " ms";
+        ASSERT_FALSE(run.failure) << label;
+        ASSERT_GE(run.stats.playout_underruns, 1U) << label;
+        EXPECT_GT(run.stats.frames_shed, 0U) << label;
+        EXPECT_EQ(run.stats.frames_caught_up, 0U) << label;
+        // Output time spent reporting more than the 400 ms cap.
+        std::int64_t above = 0;
+        for (const auto& completion : run.completions) {
+            if (completion.playout_end_offset.count > 400'000'000) {
+                above += completion.scheduled_end.count - completion.scheduled.count;
+            }
+        }
+        EXPECT_LE(above, c.max_above_cap_ns) << label;
+        // The router's own estimate agrees with what was reported at the end.
+        EXPECT_LE(std::abs(run.stats.playout_offset.count - run.completions.back().playout_end_offset.count),
+                  5'000'000) << label;
+        expect_monotonic_content_schedule(run, label.c_str());
+    }
+}
+
+// Neon P2-3: a backlog that builds over a second after an underrun (the round
+// trip comes down 800 -> 100 -> 20 ms, never thinning the re-anchored buffer)
+// straddles the end of the 4 s recovery; entries the 1 s recovery window
+// skipped were trimmed meanwhile and came back below the floor when the
+// window widened, padding silence into a buffer that was never thin.
+TEST_F(AudioPipelineRoute, PlayoutRecoveryEndNeverPadsAHealthyBuffer) {
+    const auto run = run_playout_loop(30, [](std::int64_t second) {
+        if (second == 10) { return std::int64_t{800}; }
+        if (second == 11) { return std::int64_t{100}; }
+        return std::int64_t{20};
+    }, aa::audio::kWirelessCreditWindow);
+    ASSERT_FALSE(run.failure);
+    ASSERT_GE(run.stats.playout_underruns, 1U);
+    EXPECT_EQ(run.stats.frames_padded, 0U);
+    EXPECT_LE(run.offsets.back().offset, aa::audio::kWirelessPlayoutDepth.count + 25'000'000);
+}
+
+// R8: playout without the drift policy would follow the phone's clock without
+// bound, so it is refused.
+TEST_F(AudioPipelineRoute, PlayoutRequiresTheDriftPolicy) {
+    auto config = pcm_router_config();
+    config.playout.enabled = true;
+    config.live_pcm_drift.enabled = false;
+    EXPECT_FALSE(aa::audio::detail::open_router_with_sink_for_test(
+        config, std::make_unique<RecordingAudioSink>()));
 }
 
 // N6 / F7: playout skips the arrival model's 200 ms `late` check, so a
@@ -5286,6 +5406,7 @@ TEST_F(AudioPipelineRoute, PlayoutResumeAfterAPauseReanchorsWithoutUnderrun) {
 // A playout depth must leave the refill under the 200 ms silence cap.
 TEST_F(AudioPipelineRoute, PlayoutRejectsADepthBeyondTheSilenceCap) {
     auto config = pcm_router_config();
+    config.live_pcm_drift.enabled = true;
     config.playout.enabled = true;
     config.playout.depth = aa::core::Nanoseconds{aa::audio::kMaxPlayoutDepth.count + 1};
     EXPECT_FALSE(aa::audio::detail::open_router_with_sink_for_test(

@@ -97,10 +97,10 @@ private:
     return config;
 }
 
-// Video presentation delay (credit window + playout, 2026-11-20): by default (`video_delay_ms` absent, the
-// CLI's "match") video is held exactly the audio playout depth, so audio and
-// video leave the receiver the same time after their arrival and the A/V
-// contract (which pairs them on the arrival clock) still holds.
+// Video presentation delay (credit window + playout, 2026-11-20): with a fixed
+// --video-delay-ms N it is N; with the default "match" this is only the hold
+// used before the first playout audio write (the configured depth) - after
+// it the hold follows the audio playout offset (match_video_to_audio).
 [[nodiscard]] inline std::chrono::milliseconds video_delay(std::optional<std::int64_t> video_delay_ms,
                                                            std::int64_t audio_playout_ms) {
     return std::chrono::milliseconds{video_delay_ms.value_or(audio_playout_ms)};
@@ -138,8 +138,8 @@ struct Media final {
     // than the buffer, and the hold follows. `fallback` (the configured
     // depth) holds video until the first playout audio write.
     void match_video_to_audio(std::chrono::nanoseconds fallback) {
-        video.set_presentation_delay_source([this, fallback] {
-            const auto offset = audio.current_playout_offset();
+        video.set_presentation_delay_source([this, fallback](core::Nanoseconds content) {
+            const auto offset = audio.playout_offset_at(content);
             return offset.count() > 0 ? offset : fallback;
         });
     }

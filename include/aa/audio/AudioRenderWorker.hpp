@@ -81,12 +81,17 @@ public:
     // Most chunks one channel has had accepted but not yet released for ACK
     // (our side; the phone's in-flight use shows as max_arrival_burst).
     [[nodiscard]] std::uint64_t max_unacked_held() const;
-    // The playout offset the latest audio write reported (0 before playout
-    // audio): how long after its content (arrival) time audio plays. Any
-    // thread; the wireless video hold follows it (--video-delay-ms match).
-    [[nodiscard]] std::chrono::nanoseconds current_playout_offset() const noexcept {
-        return std::chrono::nanoseconds{playout_offset_ns_.load(std::memory_order_relaxed)};
-    }
+    // The playout offset audio_write_completed reported for content time
+    // `content` (interpolated over the write whose content interval holds it;
+    // past the newest write, that write's end offset), or 0 when no playout
+    // write of this session is known. Any thread. The wireless video hold is
+    // this value at the frame's own timestamp (--video-delay-ms match), which
+    // is exactly the audio the A/V contract pairs the frame with: sampling the
+    // newest write instead, which pulsesink accepts up to ~200 ms ahead, held
+    // frames for future audio's offset (window 12's startup pair, P2-5).
+    [[nodiscard]] std::chrono::nanoseconds playout_offset_at(core::Nanoseconds content) const;
+    // The newest write's end offset (0 when none).
+    [[nodiscard]] std::chrono::nanoseconds current_playout_offset() const;
     [[nodiscard]] SinkReport sink_report();
 
     [[nodiscard]] core::Result<void>
@@ -275,7 +280,16 @@ private:
     std::uint64_t max_unacked_held_{};
     std::uint64_t playout_underruns_logged_{};
     std::uint64_t playout_anchors_logged_{};
-    std::atomic<std::int64_t> playout_offset_ns_{0};
+    // Reported playout writes of the current session, oldest first: content
+    // interval and its start/end offsets (playout_offset_at).
+    struct PlayoutWrite final {
+        std::int64_t content_start;
+        std::int64_t content_end;
+        std::int64_t start_offset;
+        std::int64_t end_offset;
+    };
+    static constexpr std::size_t kPlayoutHistory = 256; // ~11 s of A26 chunks
+    std::deque<PlayoutWrite> playout_writes_{};
     std::optional<core::Nanoseconds> step_started_;
     std::optional<core::Nanoseconds> bypass_since_;
     std::uint64_t bypass_epoch_{1};
