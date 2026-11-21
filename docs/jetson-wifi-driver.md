@@ -1,6 +1,6 @@
 # Jetson RTL8822CE rebuild (issue #73)
 
-Target: Orin Nano Super, L4T R39.2.1, kernel `6.8.12-1021-tegra`.
+Target: Orin Nano Super. Originally L4T R39.2.1 (kernel `6.8.12-1021-tegra`); rebuilt for R39.2.2 (kernel `6.8.12-1029-tegra`) on 2026-11-21, see [R39.2.2 rebuild](#r3922-rebuild-2026-11-21).
 Operate only over `ssh zucchi@192.168.55.3` (Ethernet); Wi-Fi is the only
 internet uplink. Download all inputs before unloading the module.
 
@@ -126,3 +126,52 @@ was not performed. Keep issue #73 open for the remaining qualification.
 
 Full operator log: `/home/zucchi/aa-research/issue73-rebuild-log.md` on the laptop;
 raw trial/build/AP logs are outside the repository.
+
+## R39.2.2 rebuild (2026-11-21)
+
+**Every L4T BSP update reverts this.** `nvidia-l4t-kernel-oot-modules` owns
+`/lib/modules/<kver>/updates/drivers/net/wireless/realtek/rtl8822ce/rtl8822ce.ko`.
+An upgrade installs NVIDIA's stock driver for the new kernel. On the next boot the radio is self-managed with the
+world plan again (`iw reg get` shows `phy#0 (self-managed)` / `country 00`), and
+channels 36–48 are NO_IR for AP use. Before any `apt full-upgrade` that touches
+`nvidia-l4t-*`, plan this rebuild. Then upgrade, reboot, rebuild, trial and install.
+
+What changed in R39.2.2:
+- The kernel is `6.8.12-1029-tegra`, so the module directory changed. The stale 1021 tree keeps only
+  `rtl8822ce.ko.orig`.
+- Sources: `https://developer.nvidia.com/downloads/embedded/L4T/r39_Release_v2.2/sources/public_sources.tbz2`
+  (outer SHA-256 `5cab0eff33610f0605ebda3e7d9c5deb950a538556cb4cdf198021d48f9897ef`). The nested
+  `kernel_oot_modules_src.tbz2` SHA-1 `a9da605a0fba96da8445b481dacd3859215a3545` matches NVIDIA's list.
+- The driver version string is unchanged (`v5.14.0.4-261-g3e7be62b5.20250204_COEX20240327-2727`),
+  but NVIDIA changed about 20 source files. Both `CONFIG_REGD_SRC_FROM_OS` and
+  `CONFIG_FORCE_SW_CHANNEL_PLAN` paths are still present, and the regulatory/channel-plan code is unchanged.
+- The Makefile adds `CONFIG_RTW_DBG_PROC = n`, so `/proc/net/rtl88x2ce/<if>/chan_plan`
+  no longer exists. Verify with `iw reg get` (no `self-managed` phy) and `iw phy` (36–48 without
+  `no IR`, 52+ `radar detection`).
+
+Build for the target kernel explicitly. The Makefile defaults `KVER` to `uname -r`, so this
+also works before rebooting into the new kernel:
+
+```sh
+K=6.8.12-1029-tegra
+make -j4 ARCH=arm64 KVER=$K KSRC=/lib/modules/$K/build \
+  srctree.nvidia-oot="$HOME/rtl8822ce-r39.2.2/source/nvidia-oot" \
+  USER_EXTRA_CFLAGS='-DCONFIG_REGD_SRC_FROM_OS -DCONFIG_FORCE_SW_CHANNEL_PLAN'
+```
+
+Verification record:
+- The candidate's vermagic matches `6.8.12-1029-tegra SMP preempt mod_unload modversions aarch64`.
+  SHA-256 is `401a4a0ee26241a5025c65c5f7e5d737e8519d8d9ea12444c81209e3b6d1626d`. The stock R39.2.2 module
+  (`897448534f1e9a40e51c3238e1843cc4c9b2bfd90a6b0c19f19409b52af92b8d`) is kept as `rtl8822ce.ko.orig`
+  beside the installed one.
+- The detached trial (`rtl8822ce-trial.sh`, mode `os`, with the stock module as the known-good fallback)
+  passed in 5 s: US/OS regulatory, 36–48 without NO_IR, 52+ radar detection, uplink and an interface-bound
+  ping recovered, deadman cancelled.
+- Installed with `depmod -a 6.8.12-1029-tegra`. After a reboot, the candidate loaded at boot with
+  the same regulatory state and the uplink working.
+- Temporary NetworkManager AP on channel 36/5180 MHz: held 5 minutes (65/65 checks), then three
+  `aa-system-helper` restarts. The profile was removed and the uplink restored afterwards.
+- Live receiver window (A26, production `ap.conf` channel 44, 480 s): projection painted after 13 s and the
+  A/V contract passed (p99 +42.0 ms, max +54.7 ms). The receiver-owned AP on channel 36 is still the open item in #73.
+- Power mode stayed MAXN_SUPER. `net.core.wmem_max` stayed 8 MiB. The shim/watchdog units
+  stayed disabled, and `wifi-regdom.service` stayed enabled.
