@@ -145,7 +145,8 @@ READY_TIMEOUT_S = 25.0
 # - tools/wireless-receiver/Runtime.hpp:251 (attempt held while bootstrapping)
 # - include/aa/app/HandoffEligibility.hpp:45,47 (40 s bootstrap #170 + 5 s connect)
 # - src/app/WirelessLink.cpp:58,84,143-146 (10 s post-TCP negotiation before ACTIVE)
-# - Bounded D-Bus helper overhead (5 s) + collector readiness/polling slack (5 s)
+# - src/helper/BusClient.cpp:21,104,176,184 (2 x 4 helper RPCs @ 1 s)
+# - Ready poll (5 s) + display probe fallback (5 s) + safety margin (12 s) = 120 s
 WIRELESS_STARTUP_BUDGET_S = float(transport.WIRELESS_STARTUP_BUDGET_S)
 # tools/wireless-receiver/main.cpp:146 caps --duration-ms at 86,400,000 ms (86,400 s).
 _RECEIVER_MAX_LIFETIME_S = 86_400

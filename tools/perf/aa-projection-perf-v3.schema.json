@@ -726,9 +726,7 @@
         "string",
         "null"
       ],
-      "minLength": 1,
-      "maxLength": 15,
-      "pattern": "^[A-Za-z0-9_][A-Za-z0-9_.-]{0,14}$"
+      "minLength": 1
     },
     "ap_channel": {
       "type": [

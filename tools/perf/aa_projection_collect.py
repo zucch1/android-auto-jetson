@@ -126,7 +126,8 @@ _PROJECTION_STARTUP_TIMEOUT_SECONDS = 60
 # - tools/wireless-receiver/Runtime.hpp:251 (attempt held while bootstrapping)
 # - include/aa/app/HandoffEligibility.hpp:45,47 (40 s bootstrap #170 + 5 s connect)
 # - src/app/WirelessLink.cpp:58,84,143-146 (10 s post-TCP negotiation before ACTIVE)
-# - Bounded D-Bus helper overhead (5 s) + collector readiness/polling slack (5 s)
+# - src/helper/BusClient.cpp:21,104,176,184 (2 x 4 helper RPCs @ 1 s)
+# - Ready poll (5 s) + display probe fallback (5 s) + safety margin (12 s) = 120 s
 WIRELESS_STARTUP_BUDGET_S = transport.WIRELESS_STARTUP_BUDGET_S
 _MEDIA_STALL_SECONDS = 10
 # A normal sample interval is at most 5 s (see the sleeps in collect) plus a short
@@ -1210,10 +1211,13 @@ def collect(args: argparse.Namespace, build: dict | None = None) -> dict:
     observed_duration = 0.0
     catch_up_doubts_at_cutoff: int | None = None
     deadline = start + startup_timeout
+    startup_active_at_s: float | None = None
 
     def read_sample() -> Sample:
-        nonlocal inventory
+        nonlocal inventory, startup_active_at_s
         parser.poll(str(receiver_log))
+        if wireless and startup_active_at_s is None and parser.projection_active:
+            startup_active_at_s = time.monotonic_ns() / 1e9
         if display is not None:
             parser.poll(str(display_log))
         observed = _thermal_inventory() if thermal_policy is not None else None
@@ -1308,6 +1312,8 @@ def collect(args: argparse.Namespace, build: dict | None = None) -> dict:
             while True:
                 parser.poll(str(receiver_log))
                 now = time.monotonic_ns() / 1e9
+                if wireless and startup_active_at_s is None and parser.projection_active:
+                    startup_active_at_s = now
                 if receiver.poll() is not None:
                     early_exit = True
                     break
@@ -1335,14 +1341,13 @@ def collect(args: argparse.Namespace, build: dict | None = None) -> dict:
                     if workload is not None and display.stdin is not None:
                         os.set_blocking(display.stdin.fileno(), False)
 
+        post_prepare_pending = False
         while True:
-            now = time.monotonic_ns() / 1e9
             if display is not None:
                 display_connected = _display_connected()
                 if not display_connected:
                     break
-            if now >= deadline:
-                break
+            now = time.monotonic_ns() / 1e9
             if receiver.poll() is not None:
                 early_exit = True
                 break
@@ -1351,12 +1356,17 @@ def collect(args: argparse.Namespace, build: dict | None = None) -> dict:
                 break
             if parser.terminal_errors:
                 break
-            if wireless and not prepared and parser.projection_active:
+            if (wireless and not prepared and parser.projection_active
+                    and startup_active_at_s is not None and startup_active_at_s <= deadline):
                 if not bind_and_prepare():
                     early_exit = True
                     break
                 prepared = True
+                post_prepare_pending = True
                 continue  # the next sample is the first that may start the window
+            if now >= deadline and not post_prepare_pending:
+                break
+            post_prepare_pending = False
             if prepared:
                 sample_host_usb()
             if (workload is not None and stimulus is None and display is not None
