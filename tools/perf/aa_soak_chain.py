@@ -298,7 +298,8 @@ def stage_command(args: argparse.Namespace, seconds: int) -> list[str]:
                         ("--build-dir", args.build_dir), ("--thermal-policy", args.thermal_policy),
                         ("--provenance", args.provenance), ("--display-env", args.display_env),
                         ("--phone-id", args.phone_id), ("--ap-interface", args.ap_interface),
-                        ("--ap-channel", args.ap_channel)):
+                        ("--ap-channel", args.ap_channel),
+                        ("--startup-timeout-seconds", getattr(args, "startup_timeout_seconds", None))):
         if value:
             command += [flag, str(value)]
     return command
@@ -455,6 +456,8 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--ap-interface", help="wireless: the helper's AP interface (required)")
     parser.add_argument("--ap-channel", type=int, choices=(36, 40, 44, 48),
                         help="wireless: the AP channel the helper's ap.conf names")
+    parser.add_argument("--startup-timeout-seconds", type=int, default=None,
+                        help="wireless: extend startup budget (must be >= derived wireless floor)")
     parser.add_argument("--host", default="localhost")
     parser.add_argument("--receiver")
     parser.add_argument("--display")

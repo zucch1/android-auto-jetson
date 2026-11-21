@@ -721,6 +721,26 @@
     "link": {
       "$ref": "#/$defs/wireless_link"
     },
+    "ap_interface": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "minLength": 1
+    },
+    "ap_channel": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "enum": [
+        36,
+        40,
+        44,
+        48,
+        null
+      ]
+    },
     "startup_basis": {
       "enum": [
         "receiver",

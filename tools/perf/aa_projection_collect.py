@@ -120,6 +120,12 @@ CAPTURE_SCHEMA = "aa-projection-perf-capture/3"
 _AV_SERIES_LIMIT = 1_000_000
 _TERMINATE_GRACE_SECONDS = 5.0
 _PROJECTION_STARTUP_TIMEOUT_SECONDS = 60
+# Derived wireless startup floor from aa_transport.WIRELESS_STARTUP_BUDGET_S:
+# - tools/wireless-receiver/Runtime.hpp:228 (15 s per admission attempt)
+# - tools/wireless-receiver/Runtime.hpp:35,207,242 (250 ms initial backoff, 5 s cap)
+# - tools/wireless-receiver/Runtime.hpp:251 (attempt held while bootstrapping)
+# - include/aa/app/HandoffEligibility.hpp:45,47 (40 s bootstrap #170 + 5 s connect)
+WIRELESS_STARTUP_BUDGET_S = transport.WIRELESS_STARTUP_BUDGET_S
 _MEDIA_STALL_SECONDS = 10
 # A normal sample interval is at most 5 s (see the sleeps in collect) plus a short
 # parse. Anything beyond this is the collector itself having been frozen, so it is
@@ -1077,6 +1083,27 @@ def build_record(args: argparse.Namespace, build_type: str | None = None,
     return record
 
 
+def startup_timeout_seconds(transport_name: str, override_s: int | None = None) -> int:
+    """Resolve and validate the startup deadline: wired stays <= 60 s; wireless >= derived floor."""
+    if transport_name == "wireless":
+        if override_s is None:
+            return WIRELESS_STARTUP_BUDGET_S
+        if (type(override_s) is not int or override_s < WIRELESS_STARTUP_BUDGET_S
+                or override_s > _RECEIVER_MAX_LIFETIME_MS // 1000):
+            raise ValueError(
+                f"--startup-timeout-seconds for wireless must be in "
+                f"[{WIRELESS_STARTUP_BUDGET_S}, {_RECEIVER_MAX_LIFETIME_MS // 1000}]"
+            )
+        return override_s
+    if override_s is None:
+        return _PROJECTION_STARTUP_TIMEOUT_SECONDS
+    if type(override_s) is not int or not 0 < override_s <= _PROJECTION_STARTUP_TIMEOUT_SECONDS:
+        raise ValueError(
+            f"--startup-timeout-seconds must be in [1, {_PROJECTION_STARTUP_TIMEOUT_SECONDS}]"
+        )
+    return override_s
+
+
 def collect(args: argparse.Namespace, build: dict | None = None) -> dict:
     selected_policy = getattr(args, "thermal_policy", "strict-all-zones")
     hardware = _target_hardware_state() if selected_policy != "strict-all-zones" else None
@@ -1086,11 +1113,15 @@ def collect(args: argparse.Namespace, build: dict | None = None) -> dict:
     receiver_log = state_dir / "receiver.log"
     display_log = state_dir / "display.log"
 
-    startup_timeout = getattr(args, "startup_timeout_seconds", _PROJECTION_STARTUP_TIMEOUT_SECONDS)
+    wireless = getattr(args, "transport", transport.DEFAULT_TRANSPORT) == "wireless"
+    raw_startup = getattr(args, "startup_timeout_seconds", None)
+    startup_timeout = (
+        raw_startup if raw_startup is not None
+        else (WIRELESS_STARTUP_BUDGET_S if wireless else _PROJECTION_STARTUP_TIMEOUT_SECONDS)
+    )
     managed_display = bool(args.display and not args.no_display)
     video_socket = getattr(args, "video_socket", None)
     input_socket = getattr(args, "input_socket", None)
-    wireless = getattr(args, "transport", transport.DEFAULT_TRANSPORT) == "wireless"
     lifetime_s = args.duration_seconds + startup_timeout + 10
     if wireless:
         # Wireless binds adb and prepares the phone after the receiver is up
@@ -1518,7 +1549,12 @@ def collect(args: argparse.Namespace, build: dict | None = None) -> dict:
                            if workload is not None else {"kind": "none"})
     capture["concurrent_builds"] = concurrent_builds
     if wireless:
+        ap_channel = getattr(args, "ap_channel", None)
         capture["link"] = link
+        capture["ap_interface"] = getattr(args, "ap_interface", None)
+        capture["ap_channel"] = (
+            ap_channel if ap_channel is not None else transport.DEFAULT_AP_CHANNEL
+        )
         capture["startup_basis"] = "harness_launch_to_active"
         capture["media_telemetry_dropped"] = parser.media_telemetry_dropped
     if thermal_policy is not None:
@@ -1560,8 +1596,10 @@ def _cli(argv: list[str]) -> int:
     parser.add_argument("--thermal-policy", choices=("strict-all-zones", NANO_PROFILE),
                         default="strict-all-zones", help="explicit approved Nano CV availability exception")
     parser.add_argument("--startup-timeout-seconds", type=int,
-                        default=_PROJECTION_STARTUP_TIMEOUT_SECONDS,
-                        help="startup timeout, may only shorten the default 60-second grace")
+                        default=None,
+                        help=f"startup timeout (wired: [1, {_PROJECTION_STARTUP_TIMEOUT_SECONDS}], "
+                             f"default {_PROJECTION_STARTUP_TIMEOUT_SECONDS}; wireless: >= "
+                             f"{WIRELESS_STARTUP_BUDGET_S}, default {WIRELESS_STARTUP_BUDGET_S})")
     parser.add_argument("--build-dir", default=os.environ.get("AA_BUILD_DIR"),
                         help="build directory (CMakeCache.txt) that produced the launched binaries; "
                              "required for a live qualification stage")
@@ -1629,8 +1667,12 @@ def _run(args: argparse.Namespace) -> int:
         print("error: --workload moving-map needs --media-component PKG/ACTIVITY, so the media "
               "player can be stopped and verified after the stage", file=sys.stderr)
         return 2
-    if not 0 < args.startup_timeout_seconds <= _PROJECTION_STARTUP_TIMEOUT_SECONDS:
-        print("error: --startup-timeout-seconds must be in [1, 60]", file=sys.stderr)
+    try:
+        args.startup_timeout_seconds = startup_timeout_seconds(
+            args.transport, args.startup_timeout_seconds
+        )
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
         return 2
     if not math.isfinite(args.interval) or args.interval <= 0:
         print("error: --interval must be positive", file=sys.stderr)
