@@ -57,20 +57,25 @@ public:
         std::function<void()> stop;
     };
     using Timing = HandoffTiming;
+    enum class Retirement { before_reconnect, respect_backoff };
     HandoffEligibilityCoordinator(const trust::TrustStore&, HandoffOperations, Listener, Timing = {});
     ~HandoffEligibilityCoordinator();
     HandoffEligibilityCoordinator(const HandoffEligibilityCoordinator&) = delete;
     HandoffEligibilityCoordinator& operator=(const HandoffEligibilityCoordinator&) = delete;
     // Starts an attempt. A retry with the same source while this coordinator's bootstrap is
     // still in progress keeps it (no retirement, no denial, no re-observation, #161). A fresh
-    // attempt's caller first retires the previous one with retire(), which settles its denial
-    // with the helper; begin()'s own retirement only queues it (#169 review).
+    // attempt's caller first retires the previous one with retire(), which settles its denial.
+    // Retirement in begin() queues the denial for tick() (#169 review).
     void begin(helper::Source source);
     void consumer(std::optional<core::ConsumerId> live);
     void tick(bool active = false);
-    // Retires the attempt and, before returning, sends its denial to the helper (after any
-    // operation still in flight), so a fresh attempt never starts against the retired one.
-    void retire();
+    // Collects in-flight work, then makes at most one synchronous denial call. Reconnect
+    // bypasses backoff for an unparked denial so the helper can clear the old lease.
+    // The reconnect path can spend up to 5 s on handoff helper work: up to 3 s to
+    // collect validation (poll, credentials and an inline deny on credential failure),
+    // 1 s for the synchronous deny, and 1 s for BusClient::reconnect. A deferred
+    // consumer invalidation flushed by the receiver has a separate 500 ms budget.
+    void retire(Retirement retirement = Retirement::before_reconnect);
     // Retires a still-pending bootstrap; ACTIVE and consumer grace require success.
     void confirm_completion();
     [[nodiscard]] bool bootstrap_completed() const;
