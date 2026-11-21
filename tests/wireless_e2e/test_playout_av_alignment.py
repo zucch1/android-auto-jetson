@@ -157,16 +157,17 @@ def outlet_video(seconds: int, audio: list[dict], new_outlet: bool) -> list[dict
 def gap_audio_events(seconds: int, high: int, gap_at: int, content_gap: int) -> list[dict]:
     """Writes at offset `high`, an underrun's content gap, then the router's resume.
 
-    Across an output gap og the router may lower the offset by og/2 at once;
-    with content gap cg = og + (high - start) that is start = high - cg/3. It
-    then slews to the 120 ms depth by at most half a chunk per write.
+    Across a gap the router may lower the offset by half the content gap at
+    once (its clamp is previous_offset - (scheduled - previous_end) / 2, both
+    content times), toward the 120 ms depth it re-anchors with; it then slews
+    by at most half a chunk per write.
     """
     events, offset, content = [], high, START_NS
     resumed = False
     while content < START_NS + seconds * 1_000_000_000:
         if not resumed and content >= gap_at:
             content += content_gap
-            offset = max(DEPTH_NS, high - content_gap // 3)
+            offset = max(DEPTH_NS, high - content_gap // 2)
             resumed = True
         target = high if not resumed else DEPTH_NS
         start_offset = offset

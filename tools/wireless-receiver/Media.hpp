@@ -24,14 +24,22 @@
 namespace aa::wireless_receiver {
 inline std::atomic<bool> running{true};
 
+// One line per call, whole: the session, render worker and video release
+// threads all log, and fputs + fputc from two threads could interleave.
+inline void write_stdout_line(const std::string& line) {
+    ::flockfile(stdout);
+    std::fputs(line.c_str(), stdout);
+    std::fputc('\n', stdout);
+    std::fflush(stdout);
+    ::funlockfile(stdout);
+}
+
 inline void log_line(const std::string& line) {
     if (auto* writer = diagnostics::active_stdout_log.load()) {
         if (writer->submit(line)) { running.store(false); }
         return;
     }
-    std::fputs(line.c_str(), stdout);
-    std::fputc('\n', stdout);
-    std::fflush(stdout);
+    write_stdout_line(line);
 }
 
 inline void log_media(std::string_view kind, const std::string& line) {
@@ -39,9 +47,7 @@ inline void log_media(std::string_view kind, const std::string& line) {
         if (writer->submit_media(kind, line)) { running.store(false); }
         return;
     }
-    std::fputs(line.c_str(), stdout);
-    std::fputc('\n', stdout);
-    std::fflush(stdout);
+    write_stdout_line(line);
 }
 
 inline void log_line_nonblocking(const std::string& line) {
@@ -49,9 +55,7 @@ inline void log_line_nonblocking(const std::string& line) {
         if (writer->submit_pending(line)) { running.store(false); }
         return;
     }
-    std::fputs(line.c_str(), stdout);
-    std::fputc('\n', stdout);
-    std::fflush(stdout);
+    write_stdout_line(line);
 }
 
 [[nodiscard]] inline audio::AudioTelemetryCallbacks audio_telemetry() {

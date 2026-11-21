@@ -445,7 +445,8 @@ struct AudioRouter::Impl final {
             // While recovering, the re-anchor chunk itself says nothing: it
             // sits at the depth by construction (P1-2: it held the floor down
             // for a second before a deep backlog could be shed).
-            if (recovering && at - *state.recovering_since < kPlayoutReanchorGroupNs) { continue; }
+            if (recovering && at >= *state.recovering_since
+                && at - *state.recovering_since < kPlayoutReanchorGroupNs) { continue; }
             low = std::min(low, value);
             oldest = std::min(oldest, at);
         }
@@ -514,9 +515,8 @@ struct AudioRouter::Impl final {
         // buffer below the trim threshold).
         const auto shed_above = std::min(depth + kPlayoutShedAboveNs, kPlayoutShedCeilingNs);
         const auto over_full = depth + config.live_pcm_drift.high_watermark.count;
-        const auto& role_state = playout[role];
-        const bool recovering = role_state.recovering_since
-            && arrival - *role_state.recovering_since <= kPlayoutRecoveryNs;
+        const bool recovering = state.recovering_since
+            && arrival - *state.recovering_since <= kPlayoutRecoveryNs;
         // After an underrun the backlog that follows is expected: the chunks
         // arriving deep are the ones to shed, and the shallow ones of the
         // backlog's ramp have already played, so the current chunk's own
@@ -608,7 +608,7 @@ struct AudioRouter::Impl final {
             run.playout_offset_ns = best;
             state.offset_ns = best;
         }
-        // While recovering the floor reads only the last second; entries it
+        // While recovering the floor reads only the last 0.5 s; entries it
         // skips are dropped, so trims applied to them meanwhile can never
         // bring them back below the floor when the window widens again
         // (Neon P2-3).
@@ -833,7 +833,6 @@ core::Result<AudioRouter> open_router_with(
             || config.playout.window.count <= 0 || !config.live_pcm_drift.enabled) {
             return core::Result<AudioRouter>{Error{ErrorCode::invalid_argument}};
         }
-        // Playout keeps the drift trim bounded: never a catch-up.
         // Playout keeps its trims bounded: never a catch-up.
         auto bounded = config.live_pcm_drift;
         bounded.catch_up_watermark = core::Nanoseconds{0};
@@ -1953,9 +1952,17 @@ core::Result<RenderStep> AudioRouter::render_step() {
             // ever increases - frames are never pinned behind an earlier due
             // (no freeze, then burst). Across an output gap (an underrun's
             // skip and refill) it may fall by half the gap at once.
+            //
+            // last_reported is shared with cancel_pending() on the session
+            // thread, so it is read and written under pending_mutex (Neon
+            // P1-2), and a write that completes after every stream was
+            // cancelled no longer seeds the next stream's slew. The lock is
+            // released again before on_write_completed: that callback takes
+            // the render worker's mutex, which is ordered before this one.
             const auto target = std::max<std::int64_t>(0, playout_offset_ns);
             const auto length = end_ns - scheduled_ns;
             auto start_offset = target;
+            lock.lock();
             if (impl_->last_reported) {
                 const auto [previous_end, previous_offset] = *impl_->last_reported;
                 const auto gap = std::max<std::int64_t>(0, scheduled_ns - previous_end);
@@ -1965,8 +1972,12 @@ core::Result<RenderStep> AudioRouter::render_step() {
             const auto step = std::clamp(target - start_offset, -length / 2, length / 2);
             playout_offset_ns = start_offset;
             playout_end_offset_ns = std::max<std::int64_t>(0, start_offset + step);
-            impl_->last_reported = std::pair{end_ns, playout_end_offset_ns};
-            stats.playout_reported_offset = core::Nanoseconds{playout_end_offset_ns};
+            if (std::any_of(impl_->playout.begin(), impl_->playout.end(),
+                            [](const auto& state) { return state.anchored; })) {
+                impl_->last_reported = std::pair{end_ns, playout_end_offset_ns};
+                stats.playout_reported_offset = core::Nanoseconds{playout_end_offset_ns};
+            }
+            lock.unlock();
         }
         if (impl_->config.on_write_completed) {
             impl_->config.on_write_completed(WriteCompletion{core::Nanoseconds{scheduled_ns},

@@ -1163,6 +1163,9 @@ struct WorkerReplay final {
         std::int64_t slope_milli;
     };
     std::vector<GapSample> gaps{};
+    // Recorded pauses (over a second, resumed without a stop message): the
+    // lookup 50 ms before the resume, and the offset before the pause.
+    std::vector<std::pair<std::int64_t, std::int64_t>> pauses{};
     // After the run: the session reset and the hold fell back to the depth.
     std::chrono::nanoseconds hold_after_reset{};
     std::chrono::nanoseconds offset_after_reset{};
@@ -1283,6 +1286,12 @@ template <typename RoundTrip>
         const auto a_end = a.scheduled_end.count - a.playout_end_offset.count;
         const auto b_start = b.scheduled.count - b.playout_offset.count;
         if (b_start - a_end < 5'000'000 || b_start < last_arrival - 8'000'000'000LL) { continue; }
+        if (b_start - a_end > 1'000'000'000) {
+            replay.pauses.emplace_back(
+                audio.playout_offset_at(aa::core::Nanoseconds{b_start - 50'000'000}).count(),
+                a.playout_end_offset.count);
+            continue;
+        }
         const auto t = a_end + (b_start - a_end) / 2;
         const auto expected = a.playout_end_offset.count
             + (b.playout_offset.count - a.playout_end_offset.count) * (t - a_end) / (b_start - a_end);
@@ -1503,11 +1512,11 @@ TEST(WirelessAudioWorker, VideoHoldIsTheOffsetOfTheAudioItPairsWithWhileTheOffse
 
 
 // Neon P1 #1 (round 4): across an output gap (an underrun's skip and refill)
-// the router may lower the offset by half the gap at once. The video lookup
-// returned the old offset flat across the gap, so frames arriving in it were
-// held for it and the down-slew floor kept the first frames after the resume
-// up to ~160 ms too long. It now draws the router's own line across the gap
-// (slope >= -1/3 of content time, which is what half the output gap is).
+// the router may lower the offset by half the content gap at once. The video
+// lookup returned the old offset flat across the gap, so frames arriving in it
+// were held for it and the down-slew floor kept the first frames after the
+// resume up to ~160 ms too long. It now draws the router's own line across the
+// gap (slope >= -1/2 of content time: the router's clamp, DeepSeek P3-1).
 TEST(WirelessAudioWorker, PlayoutOffsetLookupFollowsTheRouterAcrossGaps) {
     const auto replay = replay_through_worker(16, [](std::int64_t second) {
         return second == 10 ? std::int64_t{800} : std::int64_t{20};
@@ -1518,10 +1527,25 @@ TEST(WirelessAudioWorker, PlayoutOffsetLookupFollowsTheRouterAcrossGaps) {
     bool fell = false;
     for (const auto& gap : replay.gaps) {
         EXPECT_NEAR(static_cast<double>(gap.lookup), static_cast<double>(gap.expected), 1e6);
-        EXPECT_GE(gap.slope_milli, -334);
+        EXPECT_GE(gap.slope_milli, -500);
         fell = fell || gap.slope_milli < 0;
     }
     EXPECT_TRUE(fell) << "no gap lowered the offset";
+}
+
+// Neon P1-1 (round 5): a pause without a stop message leaves the history in
+// place and the resume anchors at the depth. Interpolating across a 120 s
+// recorded gap multiplied ~-130 ms by ~120 s in int64 (UB; wrapped to a
+// ~270 ms hold here). Past a second the lookup now falls back to the depth.
+TEST(WirelessAudioWorker, PlayoutOffsetLookupAcrossALongPauseFallsBackToTheDepth) {
+    const auto replay = replay_through_worker(128, [](std::int64_t second) {
+        return second == 5 ? std::int64_t{240'000} : std::int64_t{20};
+    }, 4);
+    ASSERT_FALSE(replay.failure) << aa::to_string(*replay.failure);
+    ASSERT_EQ(replay.pauses.size(), 1U);
+    const auto [lookup, before] = replay.pauses.front();
+    EXPECT_GT(before, 200'000'000) << "the grouped phone should hold the offset well above the depth";
+    EXPECT_EQ(lookup, 0) << "fallback (the caller holds the depth)";
 }
 
 // Neon P2 #4 (round 4): the history the video hold reads is dropped exactly
@@ -1550,6 +1574,33 @@ TEST(WirelessAudioWorker, PlayoutHistoryClearsWhenNoStreamIsAnchored) {
     ASSERT_GT(audio.playout_offset_at(t1).count(), 0);
     audio.invalidate(media, 1); // media stops; guidance still plays
     EXPECT_GT(audio.playout_offset_at(t1).count(), 0);
+    audio.stop();
+    EXPECT_TRUE(audio.finish());
+}
+
+// Neon P1-2 (round 5): a sink write in flight when the last stream is
+// cancelled completed afterwards and pushed the cancelled stream's offset back
+// into the history invalidate() had just cleared (and re-seeded the router's
+// slew). A write completing with no stream anchored now records nothing.
+TEST(WirelessAudioWorker, PlayoutWriteCompletingAfterTheLastStreamStopsLeavesNoHistory) {
+    auto gate = std::make_shared<SinkGate>();
+    gate->block_first_write = true;
+    audio::AudioRenderWorker audio{quiet_wireless_config(), {}, fake_router(gate)};
+    ASSERT_TRUE(audio.ready());
+    const auto guidance = proto::ChannelRole::guidance_audio;
+    const std::vector<std::byte> voice(6400, std::byte{0x10});
+    const aa::core::Nanoseconds t0{1'000'000'000};
+    ASSERT_TRUE(audio.submit({{guidance, 1, t0}, voice}, {guidance, 0, 1, 1}));
+    ASSERT_TRUE(gate->wait_entered(1));
+    audio.invalidate(guidance, 1); // the stream stops mid-write
+    EXPECT_EQ(audio.playout_offset_at(t0).count(), 0);
+    gate->release();
+    ASSERT_TRUE(audio.wait_idle(std::chrono::steady_clock::now() + std::chrono::seconds{2}));
+    {
+        std::unique_lock lock(gate->mutex);
+        ASSERT_TRUE(gate->cv.wait_for(lock, std::chrono::seconds{2}, [&] { return gate->writes_completed >= 1U; }));
+    }
+    EXPECT_EQ(audio.playout_offset_at(t0).count(), 0) << "the stale write repopulated the history";
     audio.stop();
     EXPECT_TRUE(audio.finish());
 }

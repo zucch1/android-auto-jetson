@@ -4685,6 +4685,7 @@ struct PlayoutLoopResult final {
         std::int64_t offset;
         std::uint64_t trimmed;
         std::uint64_t underruns;
+        std::uint64_t shed{};
     };
     std::vector<Sample> offsets{};
 };
@@ -4786,7 +4787,8 @@ template <typename RoundTrip>
         const std::int64_t acked = std::max(arrival, written_end_ns() - kSinkAheadNs);
         acked_at.push_back(acked - kStart + (rtt - rtt / 2));
         result.offsets.push_back({arrival, route.report().stats.playout_offset.count,
-                                  route.report().stats.frames_trimmed, route.report().stats.playout_underruns});
+                                  route.report().stats.frames_trimmed, route.report().stats.playout_underruns,
+                                  route.report().stats.frames_shed});
     }
     result.stats = route.report().stats;
     result.completions = *completions;
@@ -5243,23 +5245,25 @@ TEST_F(AudioPipelineRoute, PlayoutShedKeepsTheOffsetUnderTheCapWhileThePhoneBurs
 // Neon P2-3 (round 4): the re-anchor's co-arriving chunks carry live stamps
 // microseconds apart; skipping only the exact re-anchor stamp let the next
 // chunk (depth + one period) hold the recovery floor down for the whole 1 s
-// window. After an underrun the shed now starts on the first deep chunk of
-// the backlog (it arrives as a ramp: groups of 4 every ~20 ms here).
+// window. The phone groups chunks in 4s here (DeepSeek P3-2: with single
+// chunks no two share a re-anchor group, and the 10 ms group skip is never
+// exercised), with the A26's 341 ms AudioRecord buffer behind the drought:
+// after the underrun the shed itself starts within 0.6 s.
 TEST_F(AudioPipelineRoute, PlayoutShedStartsPromptlyWithLiveArrivalStamps) {
     const auto run = run_playout_loop(30, [](std::int64_t second) {
         return second == 10 ? std::int64_t{800} : std::int64_t{20};
-    }, aa::audio::kWirelessCreditWindow, aa::audio::kWirelessPlayoutDepth, 1, 0, 0, 682'000'000);
+    }, aa::audio::kWirelessCreditWindow, aa::audio::kWirelessPlayoutDepth, 4, 0, 0, 341'000'000);
     ASSERT_FALSE(run.failure);
     std::optional<std::int64_t> last_underrun;
-    std::optional<std::int64_t> first_trim;
+    std::optional<std::int64_t> first_shed;
     for (std::size_t i = 1; i < run.offsets.size(); ++i) {
         const auto& sample = run.offsets[i];
-        if (sample.underruns > run.offsets[i - 1].underruns) { last_underrun = sample.arrival; first_trim.reset(); }
-        if (last_underrun && !first_trim && sample.trimmed > run.offsets[i - 1].trimmed) { first_trim = sample.arrival; }
+        if (sample.underruns > run.offsets[i - 1].underruns) { last_underrun = sample.arrival; first_shed.reset(); }
+        if (last_underrun && !first_shed && sample.shed > run.offsets[i - 1].shed) { first_shed = sample.arrival; }
     }
     ASSERT_TRUE(last_underrun);
-    ASSERT_TRUE(first_trim);
-    EXPECT_LE(*first_trim - *last_underrun, 600'000'000LL);
+    ASSERT_TRUE(first_shed) << "the post-drought backlog was never shed";
+    EXPECT_LE(*first_shed - *last_underrun, 600'000'000LL);
 }
 
 // Window 13: with playout, media PCM already in the output format skips the

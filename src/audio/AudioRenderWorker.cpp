@@ -183,20 +183,23 @@ std::chrono::nanoseconds AudioRenderWorker::playout_offset_at(core::Nanoseconds 
     std::lock_guard lock(playout_mutex_);
     if (playout_writes_.empty()) { return std::chrono::nanoseconds{0}; }
     const auto t = content.count;
-    // Across output gaps the router may lower the offset by half the gap
-    // (an underrun's skip and refill, a short pause): that is exactly a fall
-    // of one third of the content time the gap spans. The lookup follows the
-    // same model, so video arriving in a gap is never held for the old offset
-    // while the audio it pairs with on resume plays earlier (Neon P1 #1).
+    // Across a gap the router may lower the offset by half the content gap
+    // at once (its clamp is previous_offset - (scheduled - previous_end) / 2,
+    // both content times: an underrun's skip and refill, a short pause),
+    // toward the depth it re-anchors with. The lookup predicts exactly that,
+    // so video arriving in a gap is never held for the old offset while the
+    // audio it pairs with on resume plays earlier (Neon P1 #1, DeepSeek
+    // P3-1).
     const auto decayed = [&](const PlayoutWrite& last) {
-        const auto fallen = last.end_offset - (t - last.content_end) / 3;
+        const auto fallen = last.end_offset - (t - last.content_end) / 2;
         return std::max(fallen, std::min(last.end_offset, playout_depth_ns_));
     };
+    // Past this, a gap is a pause, not an underrun: no offset to follow, and
+    // the caller falls back to the depth (the offset a resume anchors with).
+    constexpr std::int64_t kStaleAfterNs = 1'000'000'000;
     const auto& newest = playout_writes_.back();
     if (t >= newest.content_end) {
-        // No audio for over a second (stopped without a stop message): no
-        // offset to follow; the caller falls back to the depth.
-        constexpr std::int64_t kStaleAfterNs = 1'000'000'000;
+        // No audio for over a second (stopped without a stop message).
         if (t - newest.content_end > kStaleAfterNs) { return std::chrono::nanoseconds{0}; }
         return std::chrono::nanoseconds{decayed(newest)};
     }
@@ -207,9 +210,20 @@ std::chrono::nanoseconds AudioRenderWorker::playout_offset_at(core::Nanoseconds 
             // between their offsets (slope >= -1/3, the router's gap credit).
             const auto next = it.base(); // the write after *it
             if (next == playout_writes_.end()) { return std::chrono::nanoseconds{decayed(*it)}; }
-            const auto span = std::max<std::int64_t>(1, next->content_start - it->content_end);
+            // A recorded pause (over a second, resumed without a stop
+            // message) is treated like an open gap: the interpolation's
+            // product would overflow int64 past ~53 s (Neon P1-1), and the
+            // resume anchors at the depth anyway. Below a second the product
+            // is at most ~1e9 * 4e8, far inside int64.
+            const auto span = next->content_start - it->content_end;
+            if (span > kStaleAfterNs) {
+                // As if the gap were still open (the router saw it so).
+                return std::chrono::nanoseconds{
+                    t - it->content_end > kStaleAfterNs ? 0 : decayed(*it)};
+            }
             return std::chrono::nanoseconds{it->end_offset
-                + (next->start_offset - it->end_offset) * (t - it->content_end) / span};
+                + (next->start_offset - it->end_offset) * (t - it->content_end)
+                    / std::max<std::int64_t>(1, span)};
         }
         // Inside a write: interpolated across its slew. The A/V contract
         // compares the chunk's start offset; the two differ by at most half
@@ -899,8 +913,11 @@ void AudioRenderWorker::run(RouterConfig config, const OpenRouter& open) {
         if (active_step_epoch_ == session_epoch_) {
             last_completion_ = value;
             step_completion_ = value;
-            if (playout) {
-                // Only this session's writes feed the video hold (P2-4).
+            // Only this session's writes feed the video hold (P2-4), and
+            // not one that completes after bypass or after every stream was
+            // cancelled (invalidate() already cleared the history: Neon
+            // P1-2). The router released its lock before this callback.
+            if (playout && !bypass_since_ && router_ && router_->playout_anchored()) {
                 std::lock_guard history(playout_mutex_);
                 playout_writes_.push_back({value.scheduled.count - value.playout_offset.count,
                                            value.scheduled_end.count - value.playout_end_offset.count,

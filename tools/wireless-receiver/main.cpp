@@ -264,6 +264,9 @@ int receiver_main(int argc, char** argv) {
     } else {
         media.video.set_presentation_delay(video_hold);
     }
+    // Held frames leave at their due on the outlet's own timer, not only
+    // when the owner thread next reaches a checkpoint (window 14).
+    if (follow || video_hold.count() > 0) { media.video.start_release_timer(); }
     // video_delay_ms is always a number: the fixed hold, or the hold used
     // until the first playout write when video_hold is "match".
     log_line("{\"event\":\"wireless_media_policy\",\"audio_playout_ms\":" +

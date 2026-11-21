@@ -2636,4 +2636,51 @@ TEST(WiredReceiver, LateReleaseIsCountedAndLogged) {
     }), media.end());
 }
 
+// Window 14: the owner's checkpoint went 35-90 ms without running every ~2 s,
+// and ~270 held frames left more than 20 ms after their due. The wireless
+// outlet now releases held frames on a timer of its own: with no
+// release_held() call at all (an owner thread that never reaches a
+// checkpoint), every frame still reaches the consumer within a few ms of its
+// arrival + hold.
+TEST(WiredReceiver, ReleaseTimerReleasesHeldFramesAtTheirDueWithoutACheckpoint) {
+    using namespace std::chrono_literals;
+    using Clock = std::chrono::steady_clock;
+    VideoOutlet outlet{[](const std::string&) {}, [](std::string_view, const std::string&) {}};
+    auto pair = videotest::make_pair({});
+    ASSERT_TRUE(pair);
+    outlet.install(std::move(pair.value().producer));
+    constexpr auto kHold = 40ms;
+    constexpr std::size_t kFrames = 40;
+    outlet.set_presentation_delay(kHold);
+    outlet.start_release_timer();
+    std::vector<Clock::time_point> arrived(kFrames + 1);
+    std::vector<Clock::time_point> received(kFrames + 1);
+    std::thread consumer([&] {
+        for (std::size_t n = 0; n < kFrames; ++n) {
+            const auto au = receive_complete_au(pair.value().consumer);
+            if (!au) { return; }
+            if (au->frame <= kFrames) { received[au->frame] = Clock::now(); }
+        }
+    });
+    for (std::uint64_t k = 1; k <= kFrames; ++k) {
+        arrived[k] = Clock::now();
+        ASSERT_TRUE(outlet.on_message({p::MessageHeader{p::ChannelRole::video, k, aa::core::Nanoseconds{
+                                           static_cast<std::int64_t>(k)}}, wiredtest::kVideoIdr}));
+        std::this_thread::sleep_for(k % 4 == 0 ? 37ms : 3ms); // grouped, as the A26 sends
+    }
+    consumer.join();
+    std::vector<double> late_ms;
+    for (std::size_t k = 1; k <= kFrames; ++k) {
+        ASSERT_NE(received[k], Clock::time_point{}) << "frame " << k << " never reached the consumer";
+        late_ms.push_back(std::chrono::duration<double, std::milli>(received[k] - (arrived[k] + kHold)).count());
+    }
+    std::sort(late_ms.begin(), late_ms.end());
+    std::printf("release lateness ms: p50 %.2f p90 %.2f max %.2f\n", late_ms[late_ms.size() / 2],
+                late_ms[late_ms.size() * 9 / 10], late_ms.back());
+    EXPECT_GE(late_ms.front(), -0.5) << "a frame left before its due";
+    EXPECT_LT(late_ms.back(), 5.0) << "a frame left more than 5 ms after its due";
+    EXPECT_EQ(outlet.late_releases(), 0U);
+    outlet.close();
+}
+
 } // namespace
