@@ -5198,6 +5198,8 @@ TEST_F(AudioPipelineRoute, PlayoutDeepBacklogIsShedUnderTheVideoHoldCap) {
         ASSERT_FALSE(run.failure) << label;
         ASSERT_GE(run.stats.playout_underruns, 1U) << label;
         EXPECT_GT(run.stats.frames_shed, 0U) << label;
+        EXPECT_GT(run.stats.playout_shed_residual_chunks, 0U) << label;
+        EXPECT_GT(run.stats.playout_shed_residual_peak.count, 0) << label;
         EXPECT_EQ(run.stats.frames_caught_up, 0U) << label;
         // Output time spent reporting more than the 400 ms cap.
         std::int64_t above = 0;
@@ -5317,6 +5319,20 @@ TEST_F(AudioPipelineRoute, PlayoutRequiresTheDriftPolicy) {
     config.live_pcm_drift.enabled = false;
     EXPECT_FALSE(aa::audio::detail::open_router_with_sink_for_test(
         config, std::make_unique<RecordingAudioSink>()));
+}
+
+TEST_F(AudioPipelineRoute, PlayoutRejectsDepthAboveSupportedMaximum) {
+    auto config = pcm_router_config();
+    config.playout.enabled = true;
+    config.live_pcm_drift.enabled = true;
+    config.playout.depth = aa::audio::kMaxPlayoutDepth;
+    EXPECT_TRUE(aa::audio::detail::open_router_with_sink_for_test(
+        config, std::make_unique<RecordingAudioSink>()));
+    ++config.playout.depth.count;
+    const auto rejected = aa::audio::detail::open_router_with_sink_for_test(
+        config, std::make_unique<RecordingAudioSink>());
+    ASSERT_FALSE(rejected);
+    EXPECT_EQ(rejected.error().code(), aa::ErrorCode::invalid_argument);
 }
 
 // N6 / F7: playout skips the arrival model's 200 ms `late` check, so a

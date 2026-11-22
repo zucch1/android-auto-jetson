@@ -467,6 +467,10 @@ struct AudioRouter::Impl final {
         return high;
     }
 
+    [[nodiscard]] std::int64_t shed_threshold() const noexcept {
+        return std::min(config.playout.depth.count + kPlayoutShedAboveNs, kPlayoutShedCeilingNs);
+    }
+
     // Playout decision for an unplaced run whose back-to-back slot is
     // `slot_frame`. False when a time cannot be represented (schedule
     // rejection, like every other conversion failure).
@@ -513,7 +517,6 @@ struct AudioRouter::Impl final {
         // delivery (DeepSeek N1) - so it is gated on that, and only while the
         // floor itself is over-full (shedding never thins the latest chunk's
         // buffer below the trim threshold).
-        const auto shed_above = std::min(depth + kPlayoutShedAboveNs, kPlayoutShedCeilingNs);
         const auto over_full = depth + config.live_pcm_drift.high_watermark.count;
         const bool recovering = state.recovering_since
             && arrival - *state.recovering_since <= kPlayoutRecoveryNs;
@@ -523,7 +526,7 @@ struct AudioRouter::Impl final {
         // buffer is the margin to keep. Otherwise the window's floor is.
         const bool shed_margin = recovering ? plan.depth_ns > over_full
                                             : floor.sustained && floor.low > over_full;
-        if (shed_margin && window_max(role, arrival, plan.depth_ns) > shed_above) {
+        if (shed_margin && window_max(role, arrival, plan.depth_ns) > shed_threshold()) {
             // A backlog this deep (after a drought) is shed fast, 30% of each
             // chunk, so audio comes back under the 400 ms video hold cap
             // within about a second instead of dwelling above it at 5 ms per
@@ -607,6 +610,13 @@ struct AudioRouter::Impl final {
             }
             run.playout_offset_ns = best;
             state.offset_ns = best;
+            // A burst can keep the offset above the threshold even when
+            // the buffer minimum leaves no room for another shed.
+            if (const auto excess = best - shed_threshold(); excess > 0) {
+                ++stats.playout_shed_residual_chunks;
+                stats.playout_shed_residual_peak =
+                    std::max(stats.playout_shed_residual_peak, core::Nanoseconds{excess});
+            }
         }
         // While recovering the floor reads only the last 0.5 s; entries it
         // skips are dropped, so trims applied to them meanwhile can never

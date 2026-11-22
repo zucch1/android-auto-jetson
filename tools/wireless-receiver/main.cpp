@@ -203,8 +203,12 @@ int receiver_main(int argc, char **argv) {
         },
         options->idr_recovery,
     });
+    // The display's RequestIdrRecovery is honoured only once the session is
+    // active (or degraded): the startup IDR is requested at video start, so a
+    // consumer request before then is redundant and would only add noise.
     auto bus = aa::ipc::ControlBusService::start({aa::ipc::current_uid()},
-                                                 {ids, phones, &receiver.confirmation()});
+                                                 {ids, phones, &receiver.confirmation(),
+                                                  [&receiver] { return receiver.active(); }});
     if (!bus) {
         report("session control bus", bus.error().code());
         return 3;

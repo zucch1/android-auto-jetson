@@ -230,6 +230,9 @@ core::Result<void> ControlService::request_idr_recovery(const BusName& caller) {
     if (projection_ != ProjectionState::projecting) {
         return Error{ErrorCode::session_illegal_transition};
     }
+    if (session_active_ && !session_active_()) {
+        return Error{ErrorCode::session_illegal_transition};
+    }
     idr_recovery_requested_.store(true);
     events_.emit(DiagnosticEmitted{DiagnosticSeverity::info, "idr_recovery_requested",
                                    active.value().consumer.value});

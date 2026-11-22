@@ -174,7 +174,15 @@ core::Result<void> AvSink::start(std::span<const std::byte> payload) {
     }
     session_ = request.value().session_id;
     if (std::exchange(staged_credit_, false)) {
-        return send_ack(*session_, AckFor::codec_config);
+        if (auto ack = send_ack(*session_, AckFor::codec_config); !ack) { return ack.error(); }
+    }
+    if (on_video_start_ && video_projecting()) {
+        // The startup IDR request is best effort: only a failed focus restore
+        // is fatal to the session; anything else is retried by IDR recovery.
+        if (auto started = on_video_start_();
+            !started && started.error().code() == ErrorCode::channel_focus_restore_failed) {
+            return started.error();
+        }
     }
     return {};
 }

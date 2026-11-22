@@ -60,15 +60,21 @@ Policy (wired is unchanged: stop-and-wait and the arrival model with the
   phone holds at every channel reset and bypass exit, and scales each role's
   slots and byte reservation by the window, so a chunk the phone may legally
   send is never refused while the sink blocks; `AvSink` holds up to that many
-  pending deliveries and acks each one as it completes. Stop-and-wait (N = 1,
-  wired) keeps its historical accounting byte for byte.
+  pending deliveries and acks each one as it completes. The A26 honored the
+  window in live testing. A delivery beyond the advertised window is refused
+  because the worker reserves capacity for exactly N. Stop-and-wait (N = 1,
+  wired) keeps its historical accounting.
 - **Playout clock** (`--audio-playout-ms`, default 120, max 180): each role's
   stream is anchored 120 ms after the arrival of its first chunk, and every
   later chunk plays back to back after the previous one. Bursts and droughts
   inside the buffer therefore cost no trim and no silence. 120 ms covers a
   one-way delay excursion of 120 ms (a round trip near 250 ms on a 10 ms link)
-  and keeps the written-ahead audio (120 ms plus one chunk) inside the 200 ms
-  pulsesink ring, so the worker does not block on the sink in steady state.
+  and leaves room for a 42.67 ms chunk in the 200 ms PulseAudio ring when
+  deliveries are evenly spaced. At 180 ms, even one full chunk can exceed the
+  ring. Grouped deliveries can exceed it at 120 ms too (the offset reached
+  308 ms in window 11). A full ring can block the worker and, once the
+  reserved worker queue fills, withhold credits from the phone. The block
+  duration was not measured in that window.
 - **Underrun**: a chunk arriving after its slot re-anchors the role 120 ms
   after that arrival. The elapsed hole is skipped without a write
   (`frames_skipped`), the refill is at most 120 ms of silence
@@ -117,7 +123,10 @@ Policy (wired is unchanged: stop-and-wait and the arrival model with the
     most 0.9 s (the replay tests' bound, with the phone grouping 4 or 5
     chunks); while it is above, video plays early by that excess. The shed
     target is absolute (350 ms), which is why `--audio-playout-ms` stops at
-    180: a deeper buffer would be drained to it.
+    180: a deeper buffer would be drained to it. `playout_shed_residual_chunks`
+    counts chunks whose committed offset still exceeds the shed target,
+    including when the buffer minimum prevents further shedding.
+    `playout_shed_residual_peak_ms` is the largest remaining excess.
 
   Window 10 (8fe9ea5, 244 s, passed) showed why: the first rule took the
   largest depth over 4 s as the reference, so every group read as excess
@@ -260,9 +269,16 @@ drive smoke's `waiting_idr_max` (1.0 s per episode) that leaves 880 ms at the
 120 ms depth, ~780-830 ms at windows 11-12's 170-220 ms, and 600 ms at the
 400 ms cap. The producer's IDR re-request interval (250 ms) may send one or
 two extra requests while a recovery IDR is held, and the focus-transition
-escalation (after 1.0 s) has one hold less margin. Windows 10-12 had no
+escalation (after three nudges or 1.0 s) has one hold less margin. Windows 10-12 had no
 mid-session recovery episode to measure this (only startup episodes). The
 next drive smoke must show recovery episodes under 1.0 s with the hold.
+On wireless, video setup sends the initial focus notification. The receiver
+requests an IDR at the first accepted video start for the stream, after any
+staged codec-config ACK. This can precede the transition to active. With a
+consumer attached, the receiver checks for a retry at its session checkpoints
+using the 250 ms interval even if no frame arrives. The display's request
+is accepted once the link is active. Measure the startup budget from the
+active transition to the consumer's first recovery.
 Frames still held when a backpressure overflow requests a recovery IDR, when
 the consumer disconnects, or when a consumer is replaced, are dropped rather
 than sent after it.

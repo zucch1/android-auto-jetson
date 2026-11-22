@@ -209,12 +209,17 @@ public:
         pending_attempt_.reset();
     }
 
-    void note_request_failed(Clock::time_point now) noexcept {
+    void note_request_failed(Clock::time_point now, bool exponential_backoff = true) noexcept {
         if (pending_attempt_.has_value()) {
             const auto attempt = *pending_attempt_;
             restore_snapshot(attempt.snapshot);
             consecutive_failures_ = attempt.prior_failures;
         } else if (!waiting_) {
+            return;
+        }
+        if (!exponential_backoff) {
+            consecutive_failures_ = 0;
+            retry_after_ = now + config_.min_interval;
             return;
         }
         const std::uint32_t shift = std::min<std::uint32_t>(consecutive_failures_, 3U);

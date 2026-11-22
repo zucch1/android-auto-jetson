@@ -28,10 +28,12 @@ struct Fixture final {
     aa::ipc::test::RecordingEventSink events{};
     aa::ipc::test::SequencePairingIds ids{};
     aa::ipc::test::RecordingPhoneDirectory phones{};
+    bool session_active{true};
     ControlService service;
 
     Fixture() : service(ControlServiceConfig{kSessionUid},
-                        ControlServiceDeps{credentials, events, ids, phones}) {}
+                        ControlServiceDeps{credentials, events, ids, phones, nullptr, {},
+                                           [this] { return session_active; }}) {}
 };
 
 TEST(ControlService, DummyConsumerRunsHappyStartStopStateFlow) {
@@ -600,6 +602,14 @@ TEST(ControlService, RequestIdrRecoveryRequiresProjectingActiveConsumer) {
     EXPECT_EQ(unauthorized.error().code(), ErrorCode::ipc_peer_unauthorized);
     EXPECT_FALSE(fixture.service.consume_idr_recovery_request());
 
+    fixture.session_active = false;
+    const auto event_count = fixture.events.events.size();
+    const auto no_session = fixture.service.request_idr_recovery(connection);
+    ASSERT_FALSE(no_session);
+    EXPECT_EQ(no_session.error().code(), ErrorCode::session_illegal_transition);
+    EXPECT_FALSE(fixture.service.consume_idr_recovery_request());
+    EXPECT_EQ(fixture.events.events.size(), event_count);
+    fixture.session_active = true;
     ASSERT_TRUE(fixture.service.request_idr_recovery(connection).has_value());
     EXPECT_TRUE(fixture.service.consume_idr_recovery_request());
     EXPECT_FALSE(fixture.service.consume_idr_recovery_request());
