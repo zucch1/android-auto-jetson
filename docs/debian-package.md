@@ -22,10 +22,14 @@ rm -r -- "$stage"
 ```
 
 The output is `build/dist/android-auto-receiver_<version>_arm64.deb`.
-A `vMAJOR.MINOR.PATCH` Git tag determines a release version. Later commits add
+A plain `vMAJOR.MINOR.PATCH` Git tag determines a release version; pre-release
+tags such as `v1.0.0-rc1` are ignored. Later commits add
 `+git<distance>.g<hash>`. Untagged history uses `0.0.0+git<count>.g<hash>`.
 Use a clean, detached checkout with full Git history and tags for a release.
 Assembly is reproducible from identical staged files and a fixed Git revision.
+With `AA_ENABLE_DEB_PACKAGE=ON`, source, build and every `CMAKE_PREFIX_PATH`
+dependency prefix are remapped in embedded file paths, so a private dependency
+prefix (as on the Jetson) never reaches the package.
 The commit timestamp is the default `SOURCE_DATE_EPOCH`. The package uses
 Ubuntu 24.04 runtime dependencies. The NVIDIA GStreamer plugin, if required,
 comes from the Jetson software stack managed by the operator.
@@ -61,7 +65,12 @@ The receiver unit is installed in `/usr/lib/systemd/user`. Its reference
 command starts the wireless receiver in pairing-only mode and uses the
 user manager's state directory. The helper is a separate system unit.
 Package configuration checks that the shipped default-deny helper policy
-is present. Both services require explicit operator activation.
+is present and reloads udev so the packaged USB rule applies without a reboot.
+Both services require explicit operator activation; the maintainer scripts
+never enable or start a unit. On removal, `prerm` stops an already-running
+`aa-system-helper.service` before its default-deny policy is removed, and
+`postrm` reloads udev. An upgrade leaves a running helper alone: restart it
+after refreshing the receiver digest.
 
 [System helper provisioning](system-helper.md#explicit-fail-closed-provisioning-not-installed-by-this-task)
 covers the session UID, receiver executable digest, and per-user D-Bus

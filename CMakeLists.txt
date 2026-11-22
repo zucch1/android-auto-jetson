@@ -34,6 +34,16 @@ option(AA_ENABLE_DEB_PACKAGE "Expose the Debian package staging component" OFF)
 if(AA_ENABLE_DEB_PACKAGE)
     add_compile_options("-ffile-prefix-map=${CMAKE_SOURCE_DIR}=."
                         "-ffile-prefix-map=${CMAKE_BINARY_DIR}=./build")
+    # Header paths from a private dependency prefix (for example the Jetson's
+    # ~/aa-build/prefix/usr) survive stripping in __FILE__-style strings such as
+    # Boost.Asio source locations; map each prefix to the /usr it stands for.
+    foreach(_aa_prefix IN LISTS CMAKE_PREFIX_PATH)
+        get_filename_component(_aa_prefix "${_aa_prefix}" REALPATH)
+        if(NOT _aa_prefix STREQUAL "/usr")
+            add_compile_options("-ffile-prefix-map=${_aa_prefix}=/usr")
+        endif()
+    endforeach()
+    unset(_aa_prefix)
 endif()
 set(FETCHCONTENT_SOURCE_DIR_GOOGLETEST "${AA_DEPENDENCY_STAGE}/googletest" CACHE PATH "Verified source" FORCE)
 set(AASDK_TEST ON)

@@ -2,10 +2,22 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 set -eu
 
+# Apply the packaged USB rule now instead of at the next boot (Ubuntu's udev
+# trigger does not cover rules.d). Skipped for an offline DPKG_ROOT, outside a
+# running udev, or when udevadm is absent; a failed reload never fails dpkg.
+reload_udev() {
+    [ -z "${DPKG_ROOT:-}" ] || return 0
+    [ -d /run/udev ] || return 0
+    command -v udevadm >/dev/null 2>&1 || return 0
+    udevadm control --reload || true
+    udevadm trigger --subsystem-match=usb --action=change || true
+}
+
 if [ "$1" = configure ]; then
     policy="${DPKG_ROOT:-}/usr/share/dbus-1/system.d/org.custom.AndroidAutoSystemHelper.conf"
     if [ ! -s "$policy" ]; then
         echo "android-auto-receiver: missing packaged system-helper D-Bus policy" >&2
         exit 1
     fi
+    reload_udev
 fi

@@ -54,7 +54,11 @@ def git(*args):
 
 
 def package_version():
-    tag = git("describe", "--long", "--always", "--match", "v[0-9]*", "--abbrev=12")
+    # Only plain vMAJOR.MINOR.PATCH tags are releases; pre-release tags such as
+    # v1.0.0-rc1 are skipped so describe falls through to an earlier release or
+    # to the 0.0.0+git fallback instead of aborting.
+    tag = git("describe", "--long", "--always", "--match", "v[0-9]*.[0-9]*.[0-9]*",
+              "--exclude", "*-*", "--abbrev=12")
     match = re.fullmatch(r"v(\d+\.\d+\.\d+)-(\d+)-g([0-9a-f]+)", tag)
     if match:
         release, distance, commit = match.groups()
@@ -158,7 +162,8 @@ def build(stage, output, architecture):
         for source, destination in DATA.items():
             copy_file(regular_file(ROOT / source, ROOT), payload / destination)
 
-        copy_file(regular_file(ROOT / "packaging/debian/postinst", ROOT), control / "postinst", 0o755)
+        for script in ("postinst", "prerm", "postrm"):
+            copy_file(regular_file(ROOT / "packaging/debian" / script, ROOT), control / script, 0o755)
         changelog = (
             f"{NAME} ({version}) noble; urgency=medium\n\n"
             "  * Build the Android Auto Receiver and reference tools.\n\n"

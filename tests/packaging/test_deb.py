@@ -94,10 +94,12 @@ def inspect(package, owner, arch):
     control = owner / "control"
     run("dpkg-deb", "--extract", package, extracted)
     run("dpkg-deb", "--control", package, control)
-    assert {p.name for p in control.iterdir()} == {"control", "md5sums", "postinst"}
+    assert {p.name for p in control.iterdir()} == {"control", "md5sums", "postinst", "prerm", "postrm"}
     run("md5sum", "--check", control / "md5sums", cwd=extracted)
     script_env = {**os.environ, "DPKG_ROOT": str(extracted), "PATH": "/nonexistent"}
     run(control / "postinst", "configure", env=script_env)
+    run(control / "prerm", "remove", env=script_env)
+    run(control / "postrm", "purge", env=script_env)
     (extracted / POLICY).unlink()
     failed = subprocess.run([control / "postinst", "configure"], env=script_env,
                             text=True, stderr=subprocess.PIPE)

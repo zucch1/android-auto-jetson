@@ -1,0 +1,11 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Stop (never start or enable) a running helper before its files and default-deny
+# D-Bus policy are removed. Upgrades keep it running; the new postinst does not
+# restart it, so the operator restarts after the receiver digest is refreshed.
+set -eu
+
+if [ "$1" = remove ] && [ -z "${DPKG_ROOT:-}" ] && [ -d /run/systemd/system ] \
+        && command -v systemctl >/dev/null 2>&1; then
+    systemctl stop aa-system-helper.service || true
+fi
