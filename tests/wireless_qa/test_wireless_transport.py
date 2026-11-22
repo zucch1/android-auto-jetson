@@ -49,9 +49,9 @@ STATION = "10.42.0.23"
 
 
 def bare_state(session: int, mono_ns: int, state: str) -> str:
-    """One session_state_changed line exactly as aa-wireless-receiver on main prints it."""
+    """One session_state_changed line exactly as aa-wireless-receiver prints it (#183: transport wireless)."""
     return (f'{{"kind":"session_state_changed","session":{session},"mono_ns":{mono_ns},'
-            f'"to_state":"{state}","transport":"usb"}}')
+            f'"to_state":"{state}","transport":"wireless"}}')
 
 
 def wrapped_state(session: int, mono_ns: int, state: str) -> str:

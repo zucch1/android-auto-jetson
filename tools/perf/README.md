@@ -258,7 +258,10 @@ the value the wireless video hold follows; it moves toward
 `frames_padded` (drift pads, a subset of `frames_silence`), `frames_shed`
 (a backlog whose offset is above min(depth + 230 ms, 350 ms) shed at 30% of
 each chunk, a subset of
-`frames_trimmed`), `credit_window` (the advertised
+`frames_trimmed`), `playout_shed_residual_chunks` (chunks whose committed
+offset still exceeded the shed target, including when the buffer minimum
+prevented further shedding), `playout_shed_residual_peak_ms` (the largest such
+remaining excess), `credit_window` (the advertised
 `max_unacked`), `max_unacked_held` (the most chunks one audio channel had
 accepted and not yet released for ACK: our side, normally 1 because acks go
 out on receipt) and `max_arrival_burst` (the most chunks of one channel that

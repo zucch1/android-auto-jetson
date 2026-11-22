@@ -18,6 +18,7 @@
 #include <poll.h>
 #include <string>
 #include <string_view>
+#include <new>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -568,7 +569,12 @@ private:
         delayed_.pop_front();
         delayed_bytes_ -= item.payload.size();
         note_released_locked(item, applied.hold);
-        return deliver_locked(lock, protocol::MessageView{item.header, item.payload}, /*released=*/true);
+        try {
+            return deliver_locked(lock, protocol::MessageView{item.header, item.payload}, /*released=*/true);
+        } catch (const std::bad_alloc&) {
+            record_drop("release_error", frame_cadence(profile_));
+            throw;
+        }
     }
 
     [[nodiscard]] core::Result<void> release_due_locked(std::unique_lock<std::mutex>& lock,
@@ -613,7 +619,8 @@ private:
     };
 
     // Capture records under the outlet lock, then hand off the batch before
-    // invoking any sink. Empty batches need no unlock/re-lock cycle.
+    // invoking any sink. Empty batches need no unlock/re-lock cycle. Every
+    // `kind` is a string literal (static storage), so the view outlives the batch.
     using LogBatch = std::vector<std::pair<std::string_view, std::string>>;
     void defer_media(std::string_view kind, std::string line) {
         deferred_media_.emplace_back(kind, std::move(line));

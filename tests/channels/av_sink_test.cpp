@@ -692,6 +692,29 @@ TEST_F(AvSinkWire, RequestVideoIdrResendsProjectedVideoFocusNotificationOnlyWhen
     EXPECT_EQ(sent.size(), count_after_native + 2u);
 }
 
+TEST_F(AvSinkWire, VideoStartCallbackIsBestEffortExceptFocusRestoreFailure) {
+    // #183 review: the startup IDR request made at video start must not tear
+    // the session down on a transient failure; only a failed focus restore is
+    // fatal, as on every other IDR path.
+    for (const auto code : {aa::ErrorCode::transport_closed, aa::ErrorCode::session_illegal_transition,
+                            aa::ErrorCode::channel_focus_restore_failed}) {
+        aa::channels::AvSink v{video(), raw, send};
+        int calls = 0;
+        v.set_on_video_start([&]() -> aa::core::Result<void> { ++calls; return aa::Error{code}; });
+        auto call = [&](const Bytes& b) { return v.on_message({{p::ChannelRole::video, 0, {}}, b}); };
+        ASSERT_TRUE(call(p::encode(p::AvSinkSetup{p::AvSinkCodec::h264}).value()));
+        const auto started = call(p::encode(p::AvSinkStart{1, 0}).value());
+        EXPECT_EQ(calls, 1);
+        if (code == aa::ErrorCode::channel_focus_restore_failed) {
+            ASSERT_FALSE(started);
+            EXPECT_EQ(started.error().code(), code);
+        } else {
+            EXPECT_TRUE(started) << static_cast<int>(code);
+            EXPECT_TRUE(v.video_projecting());
+        }
+    }
+}
+
 TEST_F(AvSinkWire, RequestVideoIdrTransitionTogglesNativeThenRestoresExactPriorFocus) {
     aa::channels::AvSink v{video(), raw, send};
     auto call = [&](const Bytes& b) { return v.on_message({{p::ChannelRole::video, 0, {}}, b}); };
