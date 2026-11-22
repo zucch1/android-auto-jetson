@@ -219,6 +219,13 @@ if(_aa_hardened_executables)
     set_tests_properties(build_hardening PROPERTIES TIMEOUT 120)
 endif()
 if(NOT CMAKE_CROSSCOMPILING)
+    add_test(NAME integration_contract_check COMMAND "${Python3_EXECUTABLE}" -B
+        "${CMAKE_SOURCE_DIR}/tools/contract/check_integration.py"
+        --root "${CMAKE_SOURCE_DIR}")
+    set_tests_properties(integration_contract_check PROPERTIES TIMEOUT 60)
+    add_test(NAME integration_contract_negative COMMAND "${Python3_EXECUTABLE}" -B
+        "${CMAKE_SOURCE_DIR}/tests/contract/test_integration_contract.py")
+    set_tests_properties(integration_contract_negative PROPERTIES TIMEOUT 60)
     add_test(NAME build_hardening_checker COMMAND "${Python3_EXECUTABLE}" -B
         "${CMAKE_SOURCE_DIR}/tests/build/hardening.py")
     set_tests_properties(build_hardening_checker PROPERTIES TIMEOUT 120)
