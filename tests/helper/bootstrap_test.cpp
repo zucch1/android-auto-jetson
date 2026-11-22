@@ -551,7 +551,7 @@ TEST_F(BlueZHeldBootstrapTest, JoinExtensionAfterTheWorkerFiredFailsTheExchange)
             }
             return true;
         });
-    ASSERT_TRUE(eof) << "the expiry worker never fired";
+    EXPECT_TRUE(eof) << "the expiry worker never fired";
     EXPECT_EQ(bootstrap->failure(), HandoffFailure::timeout);
     EXPECT_FALSE(bootstrap->live()) << "the exchange runs on after the phone's channel was shut down";
     bootstrap.reset(); // its clock borrows this test's locals

@@ -31,5 +31,17 @@ TEST_F(WirelessRecovery, ReconnectRetiresThePreviousHandoffWithoutAnExplicitStop
     ASSERT_TRUE(fresh);
     EXPECT_NE(fresh->handle, old_handle);
 }
+
+TEST_F(WirelessRecovery, ReconnectRetiresThePreviousHandoffEvenForAnUnknownPhone) {
+    ASSERT_NO_FATAL_FAILURE(setup_admission());
+    ASSERT_EQ(bluez.command("wire-read"), "open");
+    const trust::TransportIdentity unknown{trust::WirelessIdentity{"02:00:00:00:00:02", "02:00:00:00:00:AA"}};
+    const auto result = receiver->reconnect(*control, unknown);
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.error().code(), ErrorCode::trust_unknown_phone);
+    EXPECT_EQ(bluez.command("wire-read"), "closed");
+    EXPECT_FALSE(occupied());
+    EXPECT_FALSE(client->get_ap_credentials({consumer.value, 0}, old_handle));
+}
 }
 }

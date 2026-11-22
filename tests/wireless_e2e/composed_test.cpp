@@ -207,6 +207,26 @@ TEST_F(WirelessComposed, InFlightDenialTimeoutIsRetriedBeforeReconnect) {
     EXPECT_TRUE(client->bootstrap_wait({8, 0})) << "reconnect kept the old lease";
 }
 
+TEST_F(WirelessComposed, TickRetriesTimedOutBootstrapDenial) {
+    const Source old_source{7, 1};
+    const Source fresh_source{8, 0};
+    ASSERT_NO_FATAL_FAILURE(admit(old_source));
+    ASSERT_NO_FATAL_FAILURE(complete_bootstrap());
+    ASSERT_FALSE(client->bootstrap_wait(fresh_source));
+
+    authorization_code = -1;
+    fail_next_deny = true;
+    coordinator->consumer(std::nullopt);
+    ASSERT_TRUE(eventually([&] {
+        coordinator->tick();
+        return denial_attempts.load() >= 2U && authorization_code.load() == 0;
+    }, 3s));
+    EXPECT_EQ(denial_attempts.load(), 2U);
+    EXPECT_EQ(bluez.command("wire-read"), "closed");
+    ASSERT_TRUE(client->reconnect(identity));
+    EXPECT_TRUE(client->bootstrap_wait(fresh_source));
+}
+
 // #169 review (Neon P2, variant of the above): the attempt is retired while its initial
 // observation is in flight, after PollBootstrapV1 bound the phone's live bootstrap to {7, 1}.
 // Its reply must not be dropped: the bound handle is denied before the next ReconnectPeerV1,
