@@ -16,13 +16,15 @@ Checks:
   3. System Helper D-Bus XML (docs/dbus/org.custom.AndroidAutoSystemHelper1.xml)
      and BusService.hpp runtime identity constants (bus name, object path,
      interface) match the contract tables exactly.
-  4. AF_UNIX video and input framing constants, codec field offsets/sizes
-     (VideoCodec.cpp, InputCodec.cpp), and socket paths in
-     include/aa/ipc/{VideoSocket,InputSocket}.hpp and
+  4. AF_UNIX video and input framing constants, codec field offsets/sizes on
+     both the encode and decode paths (VideoCodec.cpp, InputCodec.cpp), and
+     socket paths in include/aa/ipc/{VideoSocket,InputSocket}.hpp and
      src/ipc/{video/VideoChannel,input/InputChannel}.cpp match the contract.
-  5. Packaging systemd unit effective directives (aa-system-helper.service),
-     D-Bus XML policy semantics (org.custom.AndroidAutoSystemHelper.conf),
-     AP config example, and udev rules exist and agree with the contract.
+  5. Packaging systemd unit effective directives (aa-system-helper.service,
+     including the effective UnsetEnvironment= list), D-Bus XML policy
+     semantics as they take effect (org.custom.AndroidAutoSystemHelper.conf,
+     document order, last matching rule wins), AP config example, and udev
+     rules exist and agree with the contract.
   6. Every in-tree repo file path referenced in backticks in
      docs/INTEGRATION-CONTRACT.md exists.
 
@@ -114,6 +116,9 @@ BACKTICK_RE: Final[re.Pattern[str]] = re.compile(r"`([^`\n]+)`")
 SEMVER_RE: Final[re.Pattern[str]] = re.compile(r"^\d+\.\d+\.\d+$")
 PUT_CALL_RE: Final[re.Pattern[str]] = re.compile(
     r"\bput\s*\(\s*[A-Za-z_][A-Za-z0-9_]*\s*,\s*(\d+)\s*,\s*([^,]+?)\s*,\s*(\d+)\s*\)"
+)
+GET_CALL_RE: Final[re.Pattern[str]] = re.compile(
+    r"\bget\s*<\s*(\d+)\s*>\s*\(\s*[A-Za-z_][A-Za-z0-9_]*\s*,\s*(\d+)\s*\)"
 )
 
 
@@ -232,6 +237,16 @@ def extract_put_layout(body: str, field_classifier: dict[str, str]) -> dict[str,
     return layout
 
 
+def extract_get_layout(body: str) -> set[tuple[int, int]]:
+    """Collect every (offset, size) the decoder reads via get<size>(buf, offset).
+
+    The consumer decodes what the producer encodes, so the same field layout must
+    be checked on both paths: a one-sided offset change (e.g. the video
+    timestamp) corrupts every decoded timestamp while the contract still passes.
+    """
+    return {(int(match.group(2)), int(match.group(1))) for match in GET_CALL_RE.finditer(body)}
+
+
 def parse_doc_layout_table(doc: str, heading: str) -> dict[str, tuple[int, int]]:
     layout: dict[str, tuple[int, int]] = {}
     for row in parse_markdown_table(doc, heading):
@@ -245,6 +260,24 @@ def parse_doc_layout_table(doc: str, heading: str) -> dict[str, tuple[int, int]]
             continue
         layout[field] = (offset, size)
     return layout
+
+
+def effective_unset_environment(values: list[str]) -> list[str]:
+    """Resolve UnsetEnvironment= as systemd does: an empty assignment resets the list.
+
+    Values accumulate in file order and each value may name several variables.
+    A bare `UnsetEnvironment=` therefore clears everything named before it, so
+    checking for a membership anywhere in the raw list would accept a unit that
+    re-enables G_DBUS_DEBUG logging (AP PSK leak, #89 L9).
+    """
+    effective: list[str] = []
+    for value in values:
+        names = value.split()
+        if not names:
+            effective = []
+            continue
+        effective.extend(names)
+    return effective
 
 
 def parse_systemd_unit(text: str) -> dict[str, dict[str, list[str]]]:
@@ -296,62 +329,76 @@ def parse_dbus_xml(path: Path) -> tuple[str, str, str, dict[str, tuple[str, str]
     return obj_path, iface_name, semver, methods, signals, properties
 
 
+SUPPORTED_POLICY_RULES: Final[frozenset[str]] = frozenset({"own", "send_destination"})
+
+
 def check_dbus_policy_xml(conf_path: Path, bus_name: str) -> list[Violation]:
-    """Validate default-deny and root-only own semantics of the helper D-Bus policy."""
+    """Validate the helper D-Bus policy as it takes effect, not as it reads.
+
+    dbus-daemon applies policy rules in document order and a later matching rule
+    overrides an earlier one, so "a root allow exists" is not the effective
+    answer: a later `<deny own=.../>` in the same policy would win. The model
+    below tracks the last matching rule per (context, attribute) and requires the
+    effective result to be default-deny both for owning and for referencing the
+    name, plus a root-only own allow.
+
+    Only the exact supported shape is accepted; anything else fails closed rather
+    than being silently ignored (this checker is a drift gate, not a D-Bus
+    policy engine). Unsupported: a `<policy>` other than `context="default"` or
+    `user="root"`, both context and user on one element, rules whose attributes
+    are not exactly one of `own`/`send_destination`, and any child element that
+    is not such an allow/deny rule.
+    """
     violations: list[Violation] = []
+
+    def drift(detail: str) -> None:
+        violations.append(Violation("INTEGRATION_CONTRACT_DBUS_POLICY_DRIFT", detail))
+
     root = ET.fromstring(conf_path.read_text(encoding="utf-8"))
     if root.tag != "busconfig":
         return [Violation("INTEGRATION_CONTRACT_DBUS_POLICY_DRIFT", f"{conf_path.name} root tag is not <busconfig>")]
 
-    default_deny_own = False
-    default_deny_send = False
-    root_allow_own = False
+    # Effective rule per (context, attribute); document order, last match wins.
+    effective: dict[tuple[str, str], str] = {}
     for policy in root.findall("policy"):
         context = policy.get("context")
         user = policy.get("user")
+        if context is not None and user is not None:
+            drift(f"policy sets both context and user ({policy.attrib})")
+            continue
         if context == "default":
-            for child in policy:
-                if child.tag == "deny" and child.get("own") == bus_name:
-                    default_deny_own = True
-                elif child.tag == "deny" and child.get("send_destination") == bus_name:
-                    default_deny_send = True
-                elif child.tag == "allow" and (
-                    child.get("own") == bus_name or child.get("send_destination") == bus_name
-                ):
-                    violations.append(Violation(
-                        "INTEGRATION_CONTRACT_DBUS_POLICY_DRIFT",
-                        f"default policy allows {bus_name}",
-                    ))
+            scope = "default"
         elif user == "root":
-            for child in policy:
-                if child.tag == "allow" and child.get("own") == bus_name:
-                    root_allow_own = True
+            scope = "root"
         else:
-            for child in policy:
-                if child.tag == "allow" and (
-                    child.get("own") == bus_name or child.get("send_destination") == bus_name
-                ):
-                    violations.append(Violation(
-                        "INTEGRATION_CONTRACT_DBUS_POLICY_DRIFT",
-                        f"non-root policy ({policy.attrib}) allows {bus_name}",
-                    ))
+            drift(f"unsupported policy scope ({policy.attrib}); expected context=default or user=root")
+            continue
+        for child in policy:
+            if child.tag not in ("allow", "deny"):
+                drift(f"unsupported rule <{child.tag}> in {scope} policy")
+                continue
+            if set(child.attrib) - SUPPORTED_POLICY_RULES:
+                drift(f"unsupported rule attributes in {scope} policy ({child.attrib})")
+                continue
+            if len(child.attrib) != 1:
+                drift(f"rule must name exactly one of own/send_destination ({child.attrib})")
+                continue
+            attribute = next(iter(child.attrib))
+            if child.get(attribute) != bus_name:
+                # Rules for other names do not affect this contract; ignore them.
+                continue
+            effective[(scope, attribute)] = child.tag
 
-    if not default_deny_own:
-        violations.append(Violation(
-            "INTEGRATION_CONTRACT_DBUS_POLICY_DRIFT",
-            f"missing default <deny own={bus_name!r}/>",
-        ))
-    if not default_deny_send:
-        violations.append(Violation(
-            "INTEGRATION_CONTRACT_DBUS_POLICY_DRIFT",
-            f"missing default <deny send_destination={bus_name!r}/>",
-        ))
-    if not root_allow_own:
-        violations.append(Violation(
-            "INTEGRATION_CONTRACT_DBUS_POLICY_DRIFT",
-            f"missing root <allow own={bus_name!r}/>",
-        ))
+    for scope, attribute, expected, label in (
+        ("default", "own", "deny", "default <deny own=...>"),
+        ("default", "send_destination", "deny", "default <deny send_destination=...>"),
+        ("root", "own", "allow", "root <allow own=...>"),
+    ):
+        got = effective.get((scope, attribute))
+        if got != expected:
+            drift(f"effective {label} for {bus_name!r} is {got!r} (a later matching rule wins)")
     return violations
+
 
 
 def check_contract(root: Path) -> list[Violation]:
@@ -593,6 +640,21 @@ def check_contract(root: Path) -> list[Violation]:
             if code_frame != doc_frame:
                 fail("INTEGRATION_CONTRACT_VIDEO_LAYOUT_DRIFT",
                      f"frame header layout mismatch: doc={doc_frame!r} code={code_frame!r}")
+
+            # The consumer side must read the SAME layout it is sent. The
+            # encoder check alone accepts a decoder-only offset change (e.g.
+            # timestamp_ns 36 -> 35), which corrupts every decoded timestamp.
+            decode_body = extract_cpp_function_body(vc_text, "decode_frame_header")
+            if decode_body is None:
+                fail("INTEGRATION_CONTRACT_VIDEO_LAYOUT_DRIFT",
+                     "missing decode_frame_header (decoder reads unchecked)")
+            else:
+                code_decode = extract_get_layout(decode_body)
+                doc_pairs = set(doc_frame.values())
+                if code_decode != doc_pairs:
+                    fail("INTEGRATION_CONTRACT_VIDEO_LAYOUT_DRIFT",
+                         f"decoder frame header layout mismatch: doc={sorted(doc_pairs)!r} "
+                         f"code={sorted(code_decode)!r}")
     else:
         fail("INTEGRATION_CONTRACT_MISSING_SOURCE", VIDEO_CODEC_CPP_REL)
 
@@ -690,9 +752,9 @@ def check_contract(root: Path) -> list[Violation]:
             fail("INTEGRATION_CONTRACT_UNIT_DRIFT", f"{HELPER_SERVICE_REL} [Unit] missing Requires=dbus.service")
         if "dbus.service" not in unit_sec.get("After", []):
             fail("INTEGRATION_CONTRACT_UNIT_DRIFT", f"{HELPER_SERVICE_REL} [Unit] missing After=dbus.service")
-        if "G_DBUS_DEBUG" not in svc.get("UnsetEnvironment", []):
+        if "G_DBUS_DEBUG" not in effective_unset_environment(svc.get("UnsetEnvironment", [])):
             fail("INTEGRATION_CONTRACT_UNIT_DRIFT",
-                 f"{HELPER_SERVICE_REL} [Service] missing UnsetEnvironment=G_DBUS_DEBUG")
+                 f"{HELPER_SERVICE_REL} effective UnsetEnvironment= does not unset G_DBUS_DEBUG")
         if "multi-user.target" not in install_sec.get("WantedBy", []):
             fail("INTEGRATION_CONTRACT_UNIT_DRIFT",
                  f"{HELPER_SERVICE_REL} [Install] missing WantedBy=multi-user.target")

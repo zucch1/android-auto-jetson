@@ -531,6 +531,11 @@ rejection_shape() {
 # unchanged). Prints "phone_id<TAB>port" for the first record that names the
 # link error AND a rejection code AND both attribution fields; fails when the
 # rejection cannot be attributed to a concrete attempt.
+#
+# Both fields are PSEUDONYMS (trust::redacted_label / aa::diagnostics::
+# redact_identifier: "id-" + 16 hex, salted per process), never raw values, so
+# this function cannot compare anything against a raw port. Correlation is done
+# against attempt_startup_port() below - same process, same salt.
 attributed_rejection() {
     local window="${1:-}" line phone_id port
     local id_re='"phone_id":"([^"]*)"'
@@ -545,6 +550,27 @@ attributed_rejection() {
         port="${BASH_REMATCH[1]}"
         [[ -n "$phone_id" && -n "$port" ]] || continue
         printf '%s\t%s\n' "$phone_id" "$port"
+        return 0
+    done <<< "$window"
+    return 1
+}
+
+# The pseudonym of the USB port the attempt itself was opened on: the startup
+# `connecting` record (run-wired-receiver logs the port through
+# aa::diagnostics::redact_identifier before opening the link). The raw port
+# cannot be recomputed here - the salt is per process - but the startup and
+# refusal records of ONE attempt come from the same process, so equal
+# pseudonyms prove the refusal names this attempt's port. Absence of the
+# startup record means nothing can be correlated (fail closed, never PASS).
+attempt_startup_port() {
+    local window="${1:-}" line port
+    local port_re='"port":"([^"]*)"'
+    while IFS= read -r line; do
+        [[ "$line" == *'"event":"connecting"'* ]] || continue
+        [[ "$line" =~ $port_re ]] || continue
+        port="${BASH_REMATCH[1]}"
+        [[ -n "$port" ]] || continue
+        printf '%s\n' "$port"
         return 0
     done <<< "$window"
     return 1
@@ -957,7 +983,7 @@ scenario_unknown_phone() {
     # receiver's: an empty generation range leaves just the attempt.
     SCENARIO_GEN_LO=$(( RECEIVER_GENERATION + 1 ))
     drive_admission_attempt "${d2_port}"
-    local window attribution phone_id attempt_port
+    local window attribution phone_id attempt_port startup_port
     window="$(attempt_window)"
     case "${ATTEMPT_RC}" in
         3) ;;
@@ -973,11 +999,18 @@ scenario_unknown_phone() {
     if attribution="$(attributed_rejection "${window}")"; then
         phone_id="${attribution%%$'\t'*}"
         attempt_port="${attribution#*$'\t'}"
-        if [[ "${attempt_port}" == "${PORT}" ]]; then
-            record unknown_phone FAILED "" "" "rejection+approved_port" "rejection_attributed_to_approved_phone"
+        # Both values are per-process pseudonyms, so the refusal is correlated
+        # with the STARTUP record of this very attempt: equal pseudonyms mean the
+        # refusal names the port this attempt was opened on (d2_port, which the
+        # selection above guarantees differs from the approved PORT in identity
+        # and port). A refusal naming any other port - including the approved
+        # phone's - fails the equality and lands in the mismatch branch below.
+        # ADB device selection stays raw-port based and independent of this.
+        if ! startup_port="$(attempt_startup_port "${window}")"; then
+            record unknown_phone BLOCKED "" "" "rejection_unattributed" "attempt_port_pseudonym_unobserved"
             return
         fi
-        if [[ "${attempt_port}" != "${d2_port}" ]]; then
+        if [[ "${attempt_port}" != "${startup_port}" ]]; then
             record unknown_phone FAILED "" "" "rejection+other_port" "rejection_attributed_to_other_device"
             return
         fi

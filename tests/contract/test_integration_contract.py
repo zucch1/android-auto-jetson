@@ -47,9 +47,13 @@ COPIED_FILES = (
     "src/ipc/ControlService.cpp",
     "src/ipc/ControlPairing.cpp",
     "src/ipc/ControlComparison.cpp",
+    "src/ipc/ControlRevocation.cpp",
     "src/ipc/PairingGate.cpp",
+    "src/helper/BusClient.cpp",
+    "src/helper/bluez_adapter/Peers.cpp",
     "src/ipc/dbus_adapter/BusWire.hpp",
     "src/ipc/dbus_adapter/ControlDispatcher.cpp",
+    "src/ipc/dbus_adapter/PropertiesDispatch.cpp",
     "src/ipc/dbus_adapter/DispatchReply.hpp",
     "src/ipc/video/VideoCodec.cpp",
     "src/ipc/video/VideoChannel.cpp",
@@ -199,6 +203,25 @@ class IntegrationContractTests(unittest.TestCase):
             self.assertEqual(res.returncode, 1, msg=res.stdout + res.stderr)
             self.assertIn("INTEGRATION_CONTRACT_VIDEO_LAYOUT_DRIFT", res.stdout)
 
+    def test_video_decoder_timestamp_offset_drift_fails(self) -> None:
+        # The consumer reads what the producer wrote: a decoder-only offset
+        # change must fail even though every put() call is still correct.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            stage_tree(root)
+            codec = root / "src/ipc/video/VideoCodec.cpp"
+            codec.write_text(
+                codec.read_text(encoding="utf-8").replace(
+                    "header.timestamp_ns = get<8>(record, 36);",
+                    "header.timestamp_ns = get<8>(record, 35);",
+                ),
+                encoding="utf-8",
+            )
+            res = run_checker(root)
+            self.assertEqual(res.returncode, 1, msg=res.stdout + res.stderr)
+            self.assertIn("INTEGRATION_CONTRACT_VIDEO_LAYOUT_DRIFT", res.stdout)
+            self.assertIn("decoder", res.stdout)
+
     def test_input_framing_constant_drift_fails(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -242,6 +265,62 @@ class IntegrationContractTests(unittest.TestCase):
             res = run_checker(root)
             self.assertEqual(res.returncode, 1, msg=res.stdout + res.stderr)
             self.assertIn("INTEGRATION_CONTRACT_DBUS_POLICY_DRIFT", res.stdout)
+
+    def test_helper_dbus_policy_superseding_deny_fails(self) -> None:
+        # A later matching rule wins in dbus-daemon: appending a root deny after
+        # the root allow revokes ownership even though an allow is still present.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            stage_tree(root)
+            conf = root / "packaging/dbus/org.custom.AndroidAutoSystemHelper.conf"
+            conf.write_text(
+                conf.read_text(encoding="utf-8").replace(
+                    '    <allow own="org.custom.AndroidAutoSystemHelper"/>\n  </policy>',
+                    '    <allow own="org.custom.AndroidAutoSystemHelper"/>\n'
+                    '    <deny own="org.custom.AndroidAutoSystemHelper"/>\n  </policy>',
+                ),
+                encoding="utf-8",
+            )
+            res = run_checker(root)
+            self.assertEqual(res.returncode, 1, msg=res.stdout + res.stderr)
+            self.assertIn("INTEGRATION_CONTRACT_DBUS_POLICY_DRIFT", res.stdout)
+
+    def test_helper_dbus_policy_unsupported_rule_shape_fails(self) -> None:
+        # Effective-rule modelling covers own/send_destination in the default and
+        # root policies only; anything else fails closed instead of being ignored.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            stage_tree(root)
+            conf = root / "packaging/dbus/org.custom.AndroidAutoSystemHelper.conf"
+            conf.write_text(
+                conf.read_text(encoding="utf-8").replace(
+                    '    <allow own="org.custom.AndroidAutoSystemHelper"/>\n  </policy>',
+                    '    <allow own="org.custom.AndroidAutoSystemHelper"/>\n'
+                    '    <allow send_interface="org.custom.AndroidAutoSystemHelper1"/>\n  </policy>',
+                ),
+                encoding="utf-8",
+            )
+            res = run_checker(root)
+            self.assertEqual(res.returncode, 1, msg=res.stdout + res.stderr)
+            self.assertIn("INTEGRATION_CONTRACT_DBUS_POLICY_DRIFT", res.stdout)
+
+    def test_helper_unit_unset_environment_reset_fails(self) -> None:
+        # systemd: a bare UnsetEnvironment= resets the list, so a later empty
+        # assignment re-enables G_DBUS_DEBUG logging (AP PSK leak).
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            stage_tree(root)
+            unit = root / "packaging/systemd/aa-system-helper.service"
+            unit.write_text(
+                unit.read_text(encoding="utf-8").replace(
+                    "UnsetEnvironment=G_DBUS_DEBUG\n",
+                    "UnsetEnvironment=G_DBUS_DEBUG\nUnsetEnvironment=\n",
+                ),
+                encoding="utf-8",
+            )
+            res = run_checker(root)
+            self.assertEqual(res.returncode, 1, msg=res.stdout + res.stderr)
+            self.assertIn("INTEGRATION_CONTRACT_UNIT_DRIFT", res.stdout)
 
     def test_missing_systemd_unit_fails(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
