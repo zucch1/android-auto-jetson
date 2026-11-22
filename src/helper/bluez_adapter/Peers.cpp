@@ -151,6 +151,8 @@ core::Result<State> BluezBackend::reconnect_peer(std::uint64_t handle) {
     if (!observed || !impl_->exact(*observed, true, &live) || !impl_->admitted(observed->device.identity))
         return Error{ErrorCode::helper_rejected};
     const auto& identity = observed->device.identity;
+    // Reconnect can arrive between platform ticks, after the bootstrap's backstop.
+    if (impl_->bootstrap) (void)impl_->bootstrap->expire();
     // A retry for the phone whose window is still open changes nothing: the window is opened
     // at most once per 60 s, and a bootstrap in progress keeps running (#161).
     if (impl_->allowed && impl_->allowed->device.identity == identity && !impl_->pairing_enabled &&

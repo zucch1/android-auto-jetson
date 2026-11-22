@@ -95,6 +95,7 @@ void WirelessLink::checkpoint(HandoffEligibilityCoordinator& coordinator, const 
         (void)session_->apply(session::Event::degrade);
 }
 core::Result<bool> WirelessLink::poll(HandoffEligibilityCoordinator& coordinator, std::function<void()> work) {
+    using Retirement = HandoffEligibilityCoordinator::Retirement;
     last_reject_.reset();
     last_queue_rejection_.reset();
     coordinator_ = &coordinator;
@@ -102,7 +103,7 @@ core::Result<bool> WirelessLink::poll(HandoffEligibilityCoordinator& coordinator
     if (session_ && session_->failure()) {
         capture_session_errors();
         const auto error = *session_->failure();
-        stop(); coordinator.retire(); return error;
+        stop(); coordinator.retire(Retirement::respect_backoff); return error;
     }
     if (!session_) {
         if (!listener_ || !coordinator.admitting()) return false;
@@ -125,11 +126,15 @@ core::Result<bool> WirelessLink::poll(HandoffEligibilityCoordinator& coordinator
         const auto phone = coordinator.phone();
         if (!phone || !coordinator.admitting() || coordinator.snapshot_generation() != generation_)
             return Error{ErrorCode::transport_unauthorized_peer};
-        if (auto attached = attach(std::move(tcp).value(), *phone); !attached) { capture_session_errors(); stop(); coordinator.retire(); return attached.error(); }
+        if (auto attached = attach(std::move(tcp).value(), *phone); !attached) {
+            capture_session_errors(); stop(); coordinator.retire(Retirement::respect_backoff); return attached.error();
+        }
         close_admission();
         transport_->set_io_checkpoint([this, &coordinator, work] { checkpoint(coordinator, work); });
         transport_->set_io_checkpoint_interval(io_checkpoint_interval_);
-        if (auto sent = session_->send_version_request(1, 6); !sent) { capture_session_errors(); stop(); coordinator.retire(); return sent.error(); }
+        if (auto sent = session_->send_version_request(1, 6); !sent) {
+            capture_session_errors(); stop(); coordinator.retire(Retirement::respect_backoff); return sent.error();
+        }
         return true;
     }
     auto result = session_->poll_transport();
@@ -138,7 +143,7 @@ core::Result<bool> WirelessLink::poll(HandoffEligibilityCoordinator& coordinator
         capture_session_errors();
         const auto error = session_->failure() ? *session_->failure()
                            : (result ? Error{ErrorCode::cancelled} : result.error());
-        stop(); coordinator.retire(); return error;
+        stop(); coordinator.retire(Retirement::respect_backoff); return error;
     }
     if (session_->authenticated() && session_->channel_opens() && session_->state() == session::State::negotiating) {
         if (coordinator.bootstrap_completed()) (void)session_->apply(session::Event::negotiation_succeeded);

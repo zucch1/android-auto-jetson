@@ -18,5 +18,18 @@ namespace {
 #include "hardkill.inc"
 #include "consumer.inc"
 #include "active.inc"
+
+TEST_F(WirelessRecovery, ReconnectRetiresThePreviousHandoffWithoutAnExplicitStop) {
+    ASSERT_NO_FATAL_FAILURE(setup_admission());
+    ASSERT_EQ(bluez.command("wire-read"), "open");
+    ASSERT_TRUE(receiver->reconnect(*control, identity));
+    EXPECT_EQ(bluez.command("wire-read"), "closed");
+    EXPECT_FALSE(occupied());
+    EXPECT_TRUE(client->bootstrap_wait({consumer.value + 1, 0})) << "the old source still owns the lease";
+    ASSERT_EQ(bluez.command("NewConnection"), "allowed");
+    const auto fresh = observe_snapshot();
+    ASSERT_TRUE(fresh);
+    EXPECT_NE(fresh->handle, old_handle);
+}
 }
 }

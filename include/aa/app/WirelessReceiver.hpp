@@ -52,6 +52,7 @@ public:
     core::Result<void> reconnect(ipc::ControlService& control, const trust::TransportIdentity& identity) {
         const auto state = control.state();
         if (!state.consumer.value) return Error{ErrorCode::ipc_consumer_rejected};
+        stop(HandoffEligibilityCoordinator::Retirement::before_reconnect);
         const auto result = helper_.reconnect(identity);
         if (!result) return result.error();
         return begin(control, {state.consumer.value, 0});
@@ -68,9 +69,7 @@ public:
     }
     // The session and listener close first; the coordinator's retirement then settles its denial
     // with the helper (bounded), still before any fresh attempt (#169 review).
-    void stop() {
-        link_.stop(); eligibility_.retire(); confirmation_.flush(true); last_source_.reset();
-    }
+    void stop() { stop(HandoffEligibilityCoordinator::Retirement::respect_backoff); }
     void set_io_checkpoint_interval(std::chrono::milliseconds interval) noexcept {
         link_.set_io_checkpoint_interval(interval);
     }
@@ -85,6 +84,9 @@ public:
         return session && (session->state() == session::State::active || session->state() == session::State::degraded);
     }
 private:
+    void stop(HandoffEligibilityCoordinator::Retirement retirement) {
+        link_.stop(); eligibility_.retire(retirement); confirmation_.flush(true); last_source_.reset();
+    }
     helper::BusClient& helper_;
     std::uint32_t ap_channel_;
     std::optional<helper::Source> last_source_;
