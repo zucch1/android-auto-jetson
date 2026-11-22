@@ -537,6 +537,12 @@ def build_result(capture: dict, *, duration_requested: str | None, now: str,
             gap = wireless_link_gap(capture)
             if gap is not None:
                 unavailable.append("run_evidence:" + gap)
+            if capture.get("mode") == "wireless":
+                if not transport.valid_interface(capture.get("ap_interface")):
+                    unavailable.append("run_evidence:ap_interface")
+                raw_ch = capture.get("ap_channel")
+                if type(raw_ch) is not int or raw_ch not in transport.AP_CHANNELS:
+                    unavailable.append("run_evidence:ap_channel")
             # Rate-limited media telemetry (#163) loses A/V evidence: a named
             # gap, so a coverage miss is not read as a product failure alone.
             if capture.get("mode") == "wireless" and capture.get("media_telemetry_dropped"):
@@ -664,6 +670,12 @@ def build_result(capture: dict, *, duration_requested: str | None, now: str,
         result["workload"] = _workload_record(capture.get("workload"), window)
         if capture["mode"] == "wireless":
             result["link"] = _result_link(capture.get("link"))
+            raw_iface = capture.get("ap_interface")
+            raw_ch = capture.get("ap_channel")
+            result["ap_interface"] = raw_iface if transport.valid_interface(raw_iface) else None
+            result["ap_channel"] = (
+                raw_ch if (type(raw_ch) is int and raw_ch in transport.AP_CHANNELS) else None
+            )
             # Harness-measured (launch to the active diagnostic), not the wired
             # receiver's own startup clock: never compare the two.
             result["startup_basis"] = "harness_launch_to_active"

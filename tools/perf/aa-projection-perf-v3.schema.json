@@ -721,6 +721,26 @@
     "link": {
       "$ref": "#/$defs/wireless_link"
     },
+    "ap_interface": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "minLength": 1
+    },
+    "ap_channel": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "enum": [
+        36,
+        40,
+        44,
+        48,
+        null
+      ]
+    },
     "startup_basis": {
       "enum": [
         "receiver",
@@ -1416,6 +1436,63 @@
       "required": [
         "link",
         "startup_basis"
+      ],
+      "anyOf": [
+        {
+          "properties": {
+            "verdict": {
+              "enum": [
+                "FAIL",
+                "BLOCKED"
+              ]
+            },
+            "qualification_status": {
+              "const": "INCOMPLETE"
+            }
+          }
+        },
+        {
+          "properties": {
+            "measurement_origin": {
+              "const": "offline"
+            },
+            "qualification_status": {
+              "const": "OFFLINE_ONLY"
+            }
+          }
+        },
+        {
+          "properties": {
+            "measurement_origin": {
+              "const": "live"
+            },
+            "verdict": {
+              "const": "PASS"
+            },
+            "qualification_status": {
+              "const": "COMPLETE_LIVE"
+            },
+            "ap_interface": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 15,
+              "pattern": "^[A-Za-z0-9_][A-Za-z0-9_.-]{0,14}$"
+            },
+            "ap_channel": {
+              "type": "integer",
+              "enum": [
+                36,
+                40,
+                44,
+                48
+              ]
+            }
+          },
+          "required": [
+            "ap_interface",
+            "ap_channel"
+          ]
+        }
       ]
     }
   ]
