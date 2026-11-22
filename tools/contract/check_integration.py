@@ -10,15 +10,19 @@
 Checks:
   1. Contract SemVer header and required top-level sections exist.
   2. Receiver D-Bus XML (docs/dbus/org.custom.AndroidAutoReceiver1.xml),
-     Contract.hpp constants, BusWire.hpp max message size, and DispatchReply.hpp
-     error names match the contract tables exactly.
+     Contract.hpp runtime identity constants (bus name, object path, interface,
+     major), BusWire.hpp max message size, and DispatchReply.hpp custom error
+     names match the contract tables exactly.
   3. System Helper D-Bus XML (docs/dbus/org.custom.AndroidAutoSystemHelper1.xml)
-     and BusService.hpp constants match the contract tables exactly.
-  4. AF_UNIX video and input framing constants and socket paths in
+     and BusService.hpp runtime identity constants (bus name, object path,
+     interface) match the contract tables exactly.
+  4. AF_UNIX video and input framing constants, codec field offsets/sizes
+     (VideoCodec.cpp, InputCodec.cpp), and socket paths in
      include/aa/ipc/{VideoSocket,InputSocket}.hpp and
      src/ipc/{video/VideoChannel,input/InputChannel}.cpp match the contract.
-  5. Packaging systemd unit, D-Bus policy, AP config example, and udev rules
-     exist and agree with the contract.
+  5. Packaging systemd unit effective directives (aa-system-helper.service),
+     D-Bus XML policy semantics (org.custom.AndroidAutoSystemHelper.conf),
+     AP config example, and udev rules exist and agree with the contract.
   6. Every in-tree repo file path referenced in backticks in
      docs/INTEGRATION-CONTRACT.md exists.
 
@@ -43,8 +47,10 @@ BUS_WIRE_HPP_REL: Final[str] = "src/ipc/dbus_adapter/BusWire.hpp"
 DISPATCH_REPLY_HPP_REL: Final[str] = "src/ipc/dbus_adapter/DispatchReply.hpp"
 HELPER_BUS_HPP_REL: Final[str] = "include/aa/helper/BusService.hpp"
 VIDEO_SOCKET_HPP_REL: Final[str] = "include/aa/ipc/VideoSocket.hpp"
+VIDEO_CODEC_CPP_REL: Final[str] = "src/ipc/video/VideoCodec.cpp"
 VIDEO_CHANNEL_CPP_REL: Final[str] = "src/ipc/video/VideoChannel.cpp"
 INPUT_SOCKET_HPP_REL: Final[str] = "include/aa/ipc/InputSocket.hpp"
+INPUT_CODEC_CPP_REL: Final[str] = "src/ipc/input/InputCodec.cpp"
 INPUT_CHANNEL_CPP_REL: Final[str] = "src/ipc/input/InputChannel.cpp"
 HELPER_SERVICE_REL: Final[str] = "packaging/systemd/aa-system-helper.service"
 HELPER_DBUS_CONF_REL: Final[str] = "packaging/dbus/org.custom.AndroidAutoSystemHelper.conf"
@@ -54,7 +60,7 @@ UDEV_RULES_REL: Final[str] = "tools/usb-policy/70-android-auto-receiver.rules"
 REQUIRED_SECTIONS: Final[tuple[str, ...]] = (
     "1. Ownership and Scope Boundaries",
     "2. Session D-Bus Control Contract",
-    "3. AF_UNIX Video and Input Framing ABI and Geometry Negotiation",
+    "3. AF_UNIX Video and Input Framing ABI and Display Geometry",
     "4. Consumer-Helper Usage (`libaareceiver-consumer`)",
     "5. Autostart Ownership",
     "6. Privileged System Helper Replacement API",
@@ -106,6 +112,9 @@ REPO_PATH_PREFIXES: Final[tuple[str, ...]] = (
 
 BACKTICK_RE: Final[re.Pattern[str]] = re.compile(r"`([^`\n]+)`")
 SEMVER_RE: Final[re.Pattern[str]] = re.compile(r"^\d+\.\d+\.\d+$")
+PUT_CALL_RE: Final[re.Pattern[str]] = re.compile(
+    r"\bput\s*\(\s*[A-Za-z_][A-Za-z0-9_]*\s*,\s*(\d+)\s*,\s*([^,]+?)\s*,\s*(\d+)\s*\)"
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -183,6 +192,80 @@ def extract_cpp_string_constant(text: str, name: str) -> str | None:
     return match.group(1) if match else None
 
 
+def extract_cpp_function_body(text: str, func_name: str) -> str | None:
+    """Extract the brace-delimited body of a C++ function definition."""
+    match = re.search(rf"\b{re.escape(func_name)}\s*\([^)]*\)[^{{;]*\{{", text, re.DOTALL)
+    if not match:
+        return None
+    start = match.end()
+    depth = 1
+    idx = start
+    while idx < len(text) and depth > 0:
+        ch = text[idx]
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+        idx += 1
+    return text[start : idx - 1] if depth == 0 else None
+
+
+def extract_put_layout(body: str, field_classifier: dict[str, str]) -> dict[str, tuple[int, int]]:
+    """Map logical field names to (offset, size) from put(buf, offset, expr, size) calls."""
+    layout: dict[str, tuple[int, int]] = {}
+    reserved_idx = 0
+    for match in PUT_CALL_RE.finditer(body):
+        offset = int(match.group(1))
+        expr = match.group(2).strip()
+        size = int(match.group(3))
+        field_name: str | None = None
+        if expr == "0":
+            field_name = f"reserved_{reserved_idx}"
+            reserved_idx += 1
+        else:
+            for token, logical in field_classifier.items():
+                if token in expr:
+                    field_name = logical
+                    break
+        if field_name is not None:
+            layout[field_name] = (offset, size)
+    return layout
+
+
+def parse_doc_layout_table(doc: str, heading: str) -> dict[str, tuple[int, int]]:
+    layout: dict[str, tuple[int, int]] = {}
+    for row in parse_markdown_table(doc, heading):
+        if len(row) < 3:
+            continue
+        field = unquote_code(row[0])
+        try:
+            offset = int(unquote_code(row[1]), 0)
+            size = int(unquote_code(row[2]), 0)
+        except ValueError:
+            continue
+        layout[field] = (offset, size)
+    return layout
+
+
+def parse_systemd_unit(text: str) -> dict[str, dict[str, list[str]]]:
+    """Parse a systemd unit file into section -> directive -> [values]."""
+    sections: dict[str, dict[str, list[str]]] = {}
+    current: str | None = None
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith(("#", ";")):
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            current = line[1:-1].strip()
+            sections.setdefault(current, {})
+            continue
+        if current is None or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        sections[current].setdefault(key.strip(), []).append(value.strip())
+    return sections
+
+
 def parse_dbus_xml(path: Path) -> tuple[str, str, str, dict[str, tuple[str, str]], dict[str, str], dict[str, tuple[str, str]]]:
     root = ET.fromstring(path.read_text(encoding="utf-8"))
     obj_path = root.get("name", "")
@@ -213,6 +296,64 @@ def parse_dbus_xml(path: Path) -> tuple[str, str, str, dict[str, tuple[str, str]
     return obj_path, iface_name, semver, methods, signals, properties
 
 
+def check_dbus_policy_xml(conf_path: Path, bus_name: str) -> list[Violation]:
+    """Validate default-deny and root-only own semantics of the helper D-Bus policy."""
+    violations: list[Violation] = []
+    root = ET.fromstring(conf_path.read_text(encoding="utf-8"))
+    if root.tag != "busconfig":
+        return [Violation("INTEGRATION_CONTRACT_DBUS_POLICY_DRIFT", f"{conf_path.name} root tag is not <busconfig>")]
+
+    default_deny_own = False
+    default_deny_send = False
+    root_allow_own = False
+    for policy in root.findall("policy"):
+        context = policy.get("context")
+        user = policy.get("user")
+        if context == "default":
+            for child in policy:
+                if child.tag == "deny" and child.get("own") == bus_name:
+                    default_deny_own = True
+                elif child.tag == "deny" and child.get("send_destination") == bus_name:
+                    default_deny_send = True
+                elif child.tag == "allow" and (
+                    child.get("own") == bus_name or child.get("send_destination") == bus_name
+                ):
+                    violations.append(Violation(
+                        "INTEGRATION_CONTRACT_DBUS_POLICY_DRIFT",
+                        f"default policy allows {bus_name}",
+                    ))
+        elif user == "root":
+            for child in policy:
+                if child.tag == "allow" and child.get("own") == bus_name:
+                    root_allow_own = True
+        else:
+            for child in policy:
+                if child.tag == "allow" and (
+                    child.get("own") == bus_name or child.get("send_destination") == bus_name
+                ):
+                    violations.append(Violation(
+                        "INTEGRATION_CONTRACT_DBUS_POLICY_DRIFT",
+                        f"non-root policy ({policy.attrib}) allows {bus_name}",
+                    ))
+
+    if not default_deny_own:
+        violations.append(Violation(
+            "INTEGRATION_CONTRACT_DBUS_POLICY_DRIFT",
+            f"missing default <deny own={bus_name!r}/>",
+        ))
+    if not default_deny_send:
+        violations.append(Violation(
+            "INTEGRATION_CONTRACT_DBUS_POLICY_DRIFT",
+            f"missing default <deny send_destination={bus_name!r}/>",
+        ))
+    if not root_allow_own:
+        violations.append(Violation(
+            "INTEGRATION_CONTRACT_DBUS_POLICY_DRIFT",
+            f"missing root <allow own={bus_name!r}/>",
+        ))
+    return violations
+
+
 def check_contract(root: Path) -> list[Violation]:
     violations: list[Violation] = []
 
@@ -236,7 +377,7 @@ def check_contract(root: Path) -> list[Violation]:
         if not re.search(rf"^###\s+{re.escape(sub)}\s*$", doc, re.MULTILINE):
             fail("INTEGRATION_CONTRACT_MISSING_CHECKLIST", sub)
 
-    # 2. Receiver D-Bus contract
+    # 2. Receiver D-Bus contract (XML + C++ runtime identity)
     rx_xml = root / RECEIVER_XML_REL
     contract_hpp = root / CONTRACT_HPP_REL
     bus_wire_hpp = root / BUS_WIRE_HPP_REL
@@ -253,9 +394,22 @@ def check_contract(root: Path) -> list[Violation]:
         if contract_hpp.is_file():
             chpp = contract_hpp.read_text(encoding="utf-8")
             bus_name = extract_cpp_string_constant(chpp, "kContractBusName")
+            cpp_obj_path = extract_cpp_string_constant(chpp, "kContractObjectPath")
+            cpp_iface = extract_cpp_string_constant(chpp, "kContractInterface")
+            cpp_major = extract_cpp_int_constant(chpp, "kContractMajor")
             if rx_meta.get("Service name") != bus_name:
                 fail("INTEGRATION_CONTRACT_RECEIVER_BUS_NAME",
                      f"doc={rx_meta.get('Service name')!r} code={bus_name!r}")
+            if cpp_obj_path != obj_path:
+                fail("INTEGRATION_CONTRACT_RECEIVER_PATH",
+                     f"code={cpp_obj_path!r} xml={obj_path!r}")
+            if cpp_iface != iface_name:
+                fail("INTEGRATION_CONTRACT_RECEIVER_INTERFACE",
+                     f"code={cpp_iface!r} xml={iface_name!r}")
+            xml_major = int(semver.split(".")[0]) if SEMVER_RE.match(semver) else None
+            if cpp_major is None or cpp_major != xml_major or not iface_name.endswith(str(cpp_major)):
+                fail("INTEGRATION_CONTRACT_RECEIVER_MAJOR",
+                     f"code={cpp_major!r} xml_semver={semver!r} iface={iface_name!r}")
         else:
             fail("INTEGRATION_CONTRACT_MISSING_SOURCE", CONTRACT_HPP_REL)
 
@@ -326,9 +480,10 @@ def check_contract(root: Path) -> list[Violation]:
     else:
         fail("INTEGRATION_CONTRACT_MISSING_SOURCE", DISPATCH_REPLY_HPP_REL)
 
-    # 3. System Helper D-Bus contract
+    # 3. System Helper D-Bus contract (XML + C++ runtime identity)
     helper_xml = root / HELPER_XML_REL
     helper_bus_hpp = root / HELPER_BUS_HPP_REL
+    helper_bus_name = "org.custom.AndroidAutoSystemHelper"
     if not helper_xml.is_file():
         fail("INTEGRATION_CONTRACT_MISSING_SOURCE", HELPER_XML_REL)
     else:
@@ -341,9 +496,17 @@ def check_contract(root: Path) -> list[Violation]:
         if helper_bus_hpp.is_file():
             hb = helper_bus_hpp.read_text(encoding="utf-8")
             h_bus_name = extract_cpp_string_constant(hb, "kBusName")
+            h_cpp_path = extract_cpp_string_constant(hb, "kObjectPath")
+            h_cpp_iface = extract_cpp_string_constant(hb, "kInterface")
+            if h_bus_name:
+                helper_bus_name = h_bus_name
             if h_meta.get("Service name") != h_bus_name:
                 fail("INTEGRATION_CONTRACT_HELPER_BUS_NAME",
                      f"doc={h_meta.get('Service name')!r} code={h_bus_name!r}")
+            if h_cpp_path != h_path:
+                fail("INTEGRATION_CONTRACT_HELPER_PATH", f"code={h_cpp_path!r} xml={h_path!r}")
+            if h_cpp_iface != h_iface:
+                fail("INTEGRATION_CONTRACT_HELPER_INTERFACE", f"code={h_cpp_iface!r} xml={h_iface!r}")
         else:
             fail("INTEGRATION_CONTRACT_MISSING_SOURCE", HELPER_BUS_HPP_REL)
 
@@ -366,7 +529,7 @@ def check_contract(root: Path) -> list[Violation]:
         for name in sorted(set(doc_h_methods) - set(h_methods)):
             fail("INTEGRATION_CONTRACT_HELPER_EXTRA_METHOD", name)
 
-    # 4. Video and Input framing constants and socket paths
+    # 4. Video and Input framing constants, codec field layouts, and socket paths
     video_hpp = root / VIDEO_SOCKET_HPP_REL
     if video_hpp.is_file():
         vh_text = video_hpp.read_text(encoding="utf-8")
@@ -390,6 +553,49 @@ def check_contract(root: Path) -> list[Violation]:
     else:
         fail("INTEGRATION_CONTRACT_MISSING_SOURCE", VIDEO_SOCKET_HPP_REL)
 
+    video_codec = root / VIDEO_CODEC_CPP_REL
+    if video_codec.is_file():
+        vc_text = video_codec.read_text(encoding="utf-8")
+        limits_body = extract_cpp_function_body(vc_text, "encode_limits_record")
+        frame_body = extract_cpp_function_body(vc_text, "encode_frame_header")
+        if limits_body is None or frame_body is None:
+            fail("INTEGRATION_CONTRACT_VIDEO_LAYOUT_DRIFT", "missing encode_limits_record or encode_frame_header")
+        else:
+            code_limits = extract_put_layout(limits_body, {
+                "kVideoLimitsMagic": "magic",
+                "kVideoProtocolVersion": "version",
+                "kLimitsRecordBytes": "record_size",
+                "kLimitsRecordKind": "kind",
+                "limits.max_datagram_payload": "max_datagram_payload",
+                "limits.max_access_unit_bytes": "max_access_unit_bytes",
+                "limits.socket_budget_bytes": "socket_budget_bytes",
+            })
+            doc_limits = parse_doc_layout_table(doc, "Video Limits Record Layout")
+            if code_limits != doc_limits:
+                fail("INTEGRATION_CONTRACT_VIDEO_LAYOUT_DRIFT",
+                     f"limits layout mismatch: doc={doc_limits!r} code={code_limits!r}")
+
+            code_frame = extract_put_layout(frame_body, {
+                "kVideoFrameMagic": "magic",
+                "kVideoProtocolVersion": "version",
+                "kFrameHeaderBytes": "header_size",
+                "header.idr": "idr",
+                "header.frame_bytes": "frame_bytes",
+                "header.frame": "frame",
+                "header.index": "index",
+                "header.count": "count",
+                "header.sequence": "sequence",
+                "header.timestamp_ns": "timestamp_ns",
+                "header.payload_bytes": "payload_bytes",
+                "metadata": "metadata",
+            })
+            doc_frame = parse_doc_layout_table(doc, "Video Fragment Header Layout")
+            if code_frame != doc_frame:
+                fail("INTEGRATION_CONTRACT_VIDEO_LAYOUT_DRIFT",
+                     f"frame header layout mismatch: doc={doc_frame!r} code={code_frame!r}")
+    else:
+        fail("INTEGRATION_CONTRACT_MISSING_SOURCE", VIDEO_CODEC_CPP_REL)
+
     input_hpp = root / INPUT_SOCKET_HPP_REL
     if input_hpp.is_file():
         ih_text = input_hpp.read_text(encoding="utf-8")
@@ -412,6 +618,29 @@ def check_contract(root: Path) -> list[Violation]:
             fail("INTEGRATION_CONTRACT_INPUT_EXTRA_CONSTANT", extra)
     else:
         fail("INTEGRATION_CONTRACT_MISSING_SOURCE", INPUT_SOCKET_HPP_REL)
+
+    input_codec = root / INPUT_CODEC_CPP_REL
+    if input_codec.is_file():
+        ic_text = input_codec.read_text(encoding="utf-8")
+        input_body = extract_cpp_function_body(ic_text, "encode_input_record")
+        if input_body is None:
+            fail("INTEGRATION_CONTRACT_INPUT_LAYOUT_DRIFT", "missing encode_input_record")
+        else:
+            code_input = extract_put_layout(input_body, {
+                "kInputRecordMagic": "magic",
+                "kInputProtocolVersion": "version",
+                "kInputRecordBytes": "record_size",
+                "header.kind": "kind",
+                "header.a": "a",
+                "header.b": "b",
+                "header.c": "c",
+            })
+            doc_input = parse_doc_layout_table(doc, "Input Record Layout")
+            if code_input != doc_input:
+                fail("INTEGRATION_CONTRACT_INPUT_LAYOUT_DRIFT",
+                     f"input record layout mismatch: doc={doc_input!r} code={code_input!r}")
+    else:
+        fail("INTEGRATION_CONTRACT_MISSING_SOURCE", INPUT_CODEC_CPP_REL)
 
     for rel, expected_sock in (
         (VIDEO_CHANNEL_CPP_REL, "android-auto-receiver/video.sock"),
@@ -438,27 +667,41 @@ def check_contract(root: Path) -> list[Violation]:
 
     helper_service = root / HELPER_SERVICE_REL
     if helper_service.is_file():
-        svc_text = helper_service.read_text(encoding="utf-8")
-        for token in (
-            "ExecStart=/usr/libexec/aa-system-helper",
-            "Requires=dbus.service",
-            "After=dbus.service",
-            "StateDirectory=aa-system-helper",
-            "LimitCORE=0",
-            "UnsetEnvironment=G_DBUS_DEBUG",
-            "WantedBy=multi-user.target",
+        unit = parse_systemd_unit(helper_service.read_text(encoding="utf-8"))
+        svc = unit.get("Service", {})
+        unit_sec = unit.get("Unit", {})
+        install_sec = unit.get("Install", {})
+
+        # Single-valued security/runtime directives must appear exactly once with the expected value.
+        for key, expected_val in (
+            ("User", "root"),
+            ("Group", "root"),
+            ("ExecStart", "/usr/libexec/aa-system-helper"),
+            ("StateDirectory", "aa-system-helper"),
+            ("LimitCORE", "0"),
+            ("NoNewPrivileges", "yes"),
         ):
-            if token not in svc_text:
-                fail("INTEGRATION_CONTRACT_UNIT_DRIFT", f"{HELPER_SERVICE_REL} missing {token}")
+            got_vals = svc.get(key, [])
+            if got_vals != [expected_val]:
+                fail("INTEGRATION_CONTRACT_UNIT_DRIFT",
+                     f"{HELPER_SERVICE_REL} [Service] {key}={got_vals!r} expected [{expected_val!r}]")
+
+        if "dbus.service" not in unit_sec.get("Requires", []):
+            fail("INTEGRATION_CONTRACT_UNIT_DRIFT", f"{HELPER_SERVICE_REL} [Unit] missing Requires=dbus.service")
+        if "dbus.service" not in unit_sec.get("After", []):
+            fail("INTEGRATION_CONTRACT_UNIT_DRIFT", f"{HELPER_SERVICE_REL} [Unit] missing After=dbus.service")
+        if "G_DBUS_DEBUG" not in svc.get("UnsetEnvironment", []):
+            fail("INTEGRATION_CONTRACT_UNIT_DRIFT",
+                 f"{HELPER_SERVICE_REL} [Service] missing UnsetEnvironment=G_DBUS_DEBUG")
+        if "multi-user.target" not in install_sec.get("WantedBy", []):
+            fail("INTEGRATION_CONTRACT_UNIT_DRIFT",
+                 f"{HELPER_SERVICE_REL} [Install] missing WantedBy=multi-user.target")
         if "/usr/libexec/aa-system-helper" not in doc:
             fail("INTEGRATION_CONTRACT_UNIT_UNDOCUMENTED", "/usr/libexec/aa-system-helper")
 
     helper_conf = root / HELPER_DBUS_CONF_REL
     if helper_conf.is_file():
-        conf_text = helper_conf.read_text(encoding="utf-8")
-        if 'own="org.custom.AndroidAutoSystemHelper"' not in conf_text:
-            fail("INTEGRATION_CONTRACT_DBUS_POLICY_DRIFT",
-                 f"{HELPER_DBUS_CONF_REL} missing own=org.custom.AndroidAutoSystemHelper")
+        violations.extend(check_dbus_policy_xml(helper_conf, helper_bus_name))
 
     # 6. Every backticked in-tree repo file reference in the contract exists
     in_handoff = False

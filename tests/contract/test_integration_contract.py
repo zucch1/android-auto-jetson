@@ -45,11 +45,21 @@ COPIED_FILES = (
     "include/aa/audio/AudioMix.hpp",
     "include/aa/audio/AudioRouter.hpp",
     "src/ipc/ControlService.cpp",
+    "src/ipc/ControlPairing.cpp",
+    "src/ipc/ControlComparison.cpp",
+    "src/ipc/PairingGate.cpp",
     "src/ipc/dbus_adapter/BusWire.hpp",
+    "src/ipc/dbus_adapter/ControlDispatcher.cpp",
     "src/ipc/dbus_adapter/DispatchReply.hpp",
     "src/ipc/video/VideoCodec.cpp",
     "src/ipc/video/VideoChannel.cpp",
+    "src/ipc/input/InputCodec.cpp",
     "src/ipc/input/InputChannel.cpp",
+    "src/input/Capability.cpp",
+    "src/input/InputService.cpp",
+    "src/display/DisplayController.cpp",
+    "src/display/qt_adapter/ProjectionWidget.cpp",
+    "src/helper/SystemHelper.cpp",
     "src/app/WiredSession.cpp",
     "packaging/systemd/aa-system-helper.service",
     "packaging/dbus/org.custom.AndroidAutoSystemHelper.conf",
@@ -61,6 +71,11 @@ COPIED_FILES = (
     "tools/contract/check_integration.py",
     "tools/dummy-display/main.cpp",
     "tools/wired-enrol/main.cpp",
+    "tools/wired-receiver/main.cpp",
+    "tools/wireless-receiver/Runtime.hpp",
+    "tools/wireless-receiver/ServiceDescription.hpp",
+    "tools/wireless-receiver/AdmissionEvents.hpp",
+    "tools/wireless-receiver/Options.hpp",
 )
 
 
@@ -110,6 +125,22 @@ class IntegrationContractTests(unittest.TestCase):
             self.assertEqual(res.returncode, 1, msg=res.stdout + res.stderr)
             self.assertIn("INTEGRATION_CONTRACT_RECEIVER_METHOD_DRIFT", res.stdout)
 
+    def test_runtime_receiver_object_path_drift_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            stage_tree(root)
+            hdr = root / "include/aa/ipc/Contract.hpp"
+            hdr.write_text(
+                hdr.read_text(encoding="utf-8").replace(
+                    'kContractObjectPath = "/org/custom/AndroidAutoReceiver";',
+                    'kContractObjectPath = "/org/custom/AndroidAutoReceiverDrift";',
+                ),
+                encoding="utf-8",
+            )
+            res = run_checker(root)
+            self.assertEqual(res.returncode, 1, msg=res.stdout + res.stderr)
+            self.assertIn("INTEGRATION_CONTRACT_RECEIVER_PATH", res.stdout)
+
     def test_receiver_error_drift_fails(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -152,6 +183,22 @@ class IntegrationContractTests(unittest.TestCase):
             self.assertEqual(res.returncode, 1, msg=res.stdout + res.stderr)
             self.assertIn("INTEGRATION_CONTRACT_VIDEO_CONSTANT_DRIFT", res.stdout)
 
+    def test_video_frame_timestamp_offset_drift_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            stage_tree(root)
+            codec = root / "src/ipc/video/VideoCodec.cpp"
+            codec.write_text(
+                codec.read_text(encoding="utf-8").replace(
+                    "put(record_prefix, 36, header.timestamp_ns, 8);",
+                    "put(record_prefix, 35, header.timestamp_ns, 8);",
+                ),
+                encoding="utf-8",
+            )
+            res = run_checker(root)
+            self.assertEqual(res.returncode, 1, msg=res.stdout + res.stderr)
+            self.assertIn("INTEGRATION_CONTRACT_VIDEO_LAYOUT_DRIFT", res.stdout)
+
     def test_input_framing_constant_drift_fails(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -166,6 +213,35 @@ class IntegrationContractTests(unittest.TestCase):
             res = run_checker(root)
             self.assertEqual(res.returncode, 1, msg=res.stdout + res.stderr)
             self.assertIn("INTEGRATION_CONTRACT_INPUT_CONSTANT_DRIFT", res.stdout)
+
+    def test_helper_service_user_nobody_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            stage_tree(root)
+            unit = root / "packaging/systemd/aa-system-helper.service"
+            unit.write_text(
+                unit.read_text(encoding="utf-8").replace("[Service]\n", "[Service]\nUser=nobody\n", 1),
+                encoding="utf-8",
+            )
+            res = run_checker(root)
+            self.assertEqual(res.returncode, 1, msg=res.stdout + res.stderr)
+            self.assertIn("INTEGRATION_CONTRACT_UNIT_DRIFT", res.stdout)
+
+    def test_helper_dbus_policy_default_allow_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            stage_tree(root)
+            conf = root / "packaging/dbus/org.custom.AndroidAutoSystemHelper.conf"
+            conf.write_text(
+                conf.read_text(encoding="utf-8").replace(
+                    '<deny send_destination="org.custom.AndroidAutoSystemHelper"/>',
+                    '<allow send_destination="org.custom.AndroidAutoSystemHelper"/>',
+                ),
+                encoding="utf-8",
+            )
+            res = run_checker(root)
+            self.assertEqual(res.returncode, 1, msg=res.stdout + res.stderr)
+            self.assertIn("INTEGRATION_CONTRACT_DBUS_POLICY_DRIFT", res.stdout)
 
     def test_missing_systemd_unit_fails(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
