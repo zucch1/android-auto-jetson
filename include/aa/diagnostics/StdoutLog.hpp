@@ -312,6 +312,11 @@ public:
         const std::lock_guard lock(state_->mutex);
         return state_->abandoned;
     }
+    // Queued plus parked records left behind when finish() abandoned a stalled sink.
+    [[nodiscard]] std::size_t undelivered() const {
+        const std::lock_guard lock(state_->mutex);
+        return state_->undelivered;
+    }
 
     std::error_code flush() {
         State &s = *state_;

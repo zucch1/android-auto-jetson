@@ -98,7 +98,11 @@ if [[ "$cmd" == *nohup*--test-only-autostart* ]]; then
         [[ "$#" == 3 && "$2" == --test-only-autostart && "$3" == --test-only-control-stdin ]]
         [[ -p /dev/stdin && "${FAKE_CONTROL_READY:-1}" == 1 ]]
         touch "$FAKE_TARGET/control-ready"
+        return "${FAKE_DISPLAY_EXIT:-0}"
     }; '"$cmd"'; wait' >/dev/null
+    if [[ "${FAKE_DISPLAY_EXIT_MISSING:-0}" == 1 ]]; then
+        rm -f "$FAKE_TARGET/aa-wired-display.exit"
+    fi
     echo 4343
     exit 0
 fi
@@ -745,6 +749,35 @@ class LiveQaGates(unittest.TestCase):
         self.assertNotIn(sentinel, dumped)
         self.assertTrue(doc.get("host"), doc)
         self.assertNotEqual(doc["host"], sentinel)
+
+    # ---- #174: display exit code gate ----
+    def test_nonzero_display_exit_after_telemetry_complete_is_failed(self) -> None:
+        code, doc = self.run_qa(False, projection_timeout_ms=PASS_BUDGET_MS,
+                                FAKE_DISPLAY_EXIT="3")
+        self.assertEqual(code, 4, doc)
+        self.assertEqual(doc["status"], "FAILED")
+        self.assertEqual(doc["blocked_on"], "display_exit_3")
+
+    def test_nonzero_display_exit_without_telemetry_complete_is_failed(self) -> None:
+        code, doc = self.run_qa(False, projection_timeout_ms=PASS_BUDGET_MS,
+                                FAKE_DISPLAY_EXIT="3", FAKE_NO_TELEMETRY_COMPLETE="1")
+        self.assertEqual(code, 4, doc)
+        self.assertEqual(doc["status"], "FAILED")
+        self.assertEqual(doc["blocked_on"], "display_exit_3")
+
+    def test_missing_display_exit_turns_pass_into_failed(self) -> None:
+        code, doc = self.run_qa(False, projection_timeout_ms=PASS_BUDGET_MS,
+                                FAKE_DISPLAY_EXIT_MISSING="1")
+        self.assertEqual(code, 4, doc)
+        self.assertEqual(doc["status"], "FAILED")
+        self.assertEqual(doc["blocked_on"], "display_exit_missing")
+
+    def test_missing_display_exit_does_not_override_blocked(self) -> None:
+        code, doc = self.run_qa(False, projection_timeout_ms=PASS_BUDGET_MS,
+                                FAKE_DISPLAY_EXIT_MISSING="1", FAKE_NO_TELEMETRY_COMPLETE="1")
+        self.assertEqual(code, 3, doc)
+        self.assertEqual(doc["status"], "BLOCKED")
+        self.assertEqual(doc["blocked_on"], "display_log_incomplete")
 
 
 if __name__ == "__main__":

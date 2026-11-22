@@ -482,21 +482,28 @@ def analyze(receiver: list[dict], display: list[dict], sidecar: list[dict] | Non
     else:
         verdict = "PASS"
     failure = None
-    # PASS needs a receiver that exited 0 (#163 review). A nonzero exit or a
-    # latched stdout logger error (sink failure, pending_lossless overflow) is a
-    # confirmed receiver failure that no lost record could have produced or
-    # excused, so it is FAIL even where log loss left criteria BLOCKED. A missing
-    # or null exit code only means the run cannot show a clean end: it never
-    # passes (FAIL), but it does not override a BLOCKED verdict.
+    # PASS needs both receiver and display to exit 0 (#163 review, #174). A
+    # nonzero exit or a latched stdout logger error (sink failure,
+    # pending_lossless overflow) is a confirmed process failure that no lost
+    # record could have produced or excused, so it is FAIL even where log loss
+    # left criteria BLOCKED. A missing or null exit code only means the run
+    # cannot show a clean end: it never passes (FAIL), but it does not override
+    # a BLOCKED verdict.
     receiver_exit = run.get("receiver_exit")
-    confirmed_receiver_failure = False
+    display_exit = run.get("display_exit")
+    confirmed_process_failure = False
     if type(receiver_exit) is not int or receiver_exit != 0:
         failure = f"receiver_exit_{'missing' if receiver_exit is None else receiver_exit}"
-        confirmed_receiver_failure = type(receiver_exit) is int
+        confirmed_process_failure = type(receiver_exit) is int
     elif run.get("logger_error"):
         failure = run["logger_error"]
-        confirmed_receiver_failure = True
-    if failure and (verdict == "PASS" or (verdict == "BLOCKED" and confirmed_receiver_failure)):
+        confirmed_process_failure = True
+    if not confirmed_process_failure and (type(display_exit) is not int or display_exit != 0):
+        display_confirmed = type(display_exit) is int
+        if failure is None or display_confirmed:
+            failure = f"display_exit_{'missing' if display_exit is None else display_exit}"
+            confirmed_process_failure = display_confirmed
+    if failure and (verdict == "PASS" or (verdict == "BLOCKED" and confirmed_process_failure)):
         verdict = "FAIL"
         blocked_on = None
     for c in criteria:
@@ -1211,7 +1218,7 @@ def _run_cli(args) -> int:
         for sig, handler in previous.items():
             signal.signal(sig, handler)
         return _blocked(out, base, "phone_command_failed")
-    # analyze() fails a PASS on a nonzero or missing receiver exit and on a latched
+    # analyze() fails a PASS on a nonzero or missing receiver/display exit and on a latched
     # logger error, reading the run.json written just above.
     result = {**base, **analyze_dir(out), "finished_utc": datetime.now(timezone.utc).isoformat()}
     result["media_relaunches"] = run["media_relaunches"]

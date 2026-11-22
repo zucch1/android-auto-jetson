@@ -7735,7 +7735,9 @@ TEST(WiredReceiver, RuntimeDiagnosticsAndAudioReopenKeepTimingOnStalledStdout) {
     ASSERT_TRUE(audio.wait_idle(LogClock::now() + std::chrono::milliseconds{1500}));
     EXPECT_TRUE(audio.finish());
 
-    // Then: unblocking stdout drains cleanly with no errors and loss is counted in-band.
+    // Then: all five lossless records were parked while stdout stayed stalled,
+    // and unblocking stdout drains them cleanly, in order, with no errors (#174).
+    EXPECT_EQ(log.pending_lossless(), 5U);
     probe.release();
     EXPECT_FALSE(log.finish());
     EXPECT_TRUE(running.load());
@@ -7747,6 +7749,21 @@ TEST(WiredReceiver, RuntimeDiagnosticsAndAudioReopenKeepTimingOnStalledStdout) {
     EXPECT_EQ(count_substr(probe.bytes, "{\"event\":\"diag\",\"kind\":\"stall_diag_probe\",\"emit_ns\":"), 1U);
     EXPECT_EQ(count_substr(probe.bytes, "\"event\":\"audio_stall_bypass\",\"phase\":\"begin\""), 1U);
     EXPECT_EQ(count_substr(probe.bytes, "\"event\":\"audio_stall_bypass\",\"phase\":\"end\""), 1U);
+    const auto diag_at = probe.bytes.find("{\"event\":\"diag\",\"kind\":\"stall_diag_probe\",\"emit_ns\":");
+    const auto reopen1_at = probe.bytes.find("\"event\":\"audio_sink_selected\",\"origin\":\"reopen\"");
+    const auto reopen2_at = probe.bytes.find("\"event\":\"audio_sink_selected\",\"origin\":\"reopen\"", reopen1_at + 1);
+    const auto bypass_begin_at = probe.bytes.find("\"event\":\"audio_stall_bypass\",\"phase\":\"begin\"");
+    const auto bypass_end_at = probe.bytes.find("\"event\":\"audio_stall_bypass\",\"phase\":\"end\"");
+    ASSERT_NE(diag_at, std::string::npos);
+    ASSERT_NE(reopen1_at, std::string::npos);
+    ASSERT_NE(reopen2_at, std::string::npos);
+    ASSERT_NE(bypass_begin_at, std::string::npos);
+    ASSERT_NE(bypass_end_at, std::string::npos);
+    EXPECT_LT(diag_at, reopen1_at);
+    EXPECT_LT(reopen1_at, bypass_begin_at);
+    EXPECT_LT(bypass_begin_at, bypass_end_at);
+    EXPECT_LT(reopen1_at, reopen2_at);
+    EXPECT_LT(reopen2_at, bypass_end_at);
 }
 
 TEST(WiredReceiver, WiredReceiverEndToEndKeepsAvAudioAndControlTimingDuringStdoutStall) {
@@ -8373,7 +8390,10 @@ TEST(WiredReceiver, StdoutLogParkedStateSlotIsBoundedAndCountsOverflow) {
     } probe_guard{probe};
     std::atomic<bool> running{true};
     g_log_fake_ns = 0;
-    aa::wired_receiver::StdoutLog log{running, LogWriteProbe::write, log_fake_now};
+    // Enable completion_record so the test also pins that overflow suppresses
+    // log_complete (StdoutLog.hpp:694, #174).
+    aa::wired_receiver::StdoutLog log{running, LogWriteProbe::write, log_fake_now, {},
+                                      aa::wired_receiver::StdoutLog::default_finish_timeout, true};
     fill_log_queue(log);
     constexpr auto cap = aa::wired_receiver::StdoutLog::pending_lossless_capacity;
     for (std::size_t i = 0; i < cap; ++i) {
@@ -8393,35 +8413,71 @@ TEST(WiredReceiver, StdoutLogParkedStateSlotIsBoundedAndCountsOverflow) {
     probe.release();
     EXPECT_EQ(log.finish().value(), ENOBUFS);
     EXPECT_EQ(log.latched_error().value(), ENOBUFS);
-    // Every parked record still drains, in order, after the latch.
+    // Every parked record still drains, in order, after the latch, and no
+    // log_complete proof is emitted after an overflow latch (#174).
     EXPECT_EQ(count_substr(probe.bytes, "{\"event\":\"err\",\"detail\":\"x\"}"), cap);
     EXPECT_EQ(sum_runtime_dropped(probe.bytes), 1U);
+    EXPECT_EQ(probe.bytes.find("log_complete"), std::string::npos);
     // The gate-visible loss is named in-band, separately from droppable records.
     EXPECT_EQ(count_substr(probe.bytes, "\"event\":\"runtime_log_dropped\",\"backpressure\":1,\"state_overflow\":1"), 1U);
 }
 
 TEST(WiredReceiver, StdoutLogPendingLosslessByteBoundLatchesOverflow) {
-    LogWriteProbe probe;
-    LogWriteProbe::active = &probe;
-    struct ProbeGuard {
-        LogWriteProbe &p;
-        ~ProbeGuard() {
-            p.release();
-            LogWriteProbe::active = nullptr;
-        }
-    } probe_guard{probe};
-    std::atomic<bool> running{true};
-    g_log_fake_ns = 0;
-    aa::wired_receiver::StdoutLog log{running, LogWriteProbe::write, log_fake_now};
-    fill_log_queue(log);
-    // Few records, but more parked bytes than the bound allows.
-    const std::string big(aa::wired_receiver::StdoutLog::pending_lossless_byte_capacity / 2, 'b');
-    EXPECT_FALSE(log.submit_pending("{\"event\":\"p\",\"pad\":\"" + big + "\"}"));
-    EXPECT_EQ(log.submit_pending("{\"event\":\"p\",\"pad\":\"" + big + big + "\"}").value(), EMSGSIZE);
-    EXPECT_FALSE(running.load());
-    EXPECT_EQ(log.state_overflow_drops(), 1U);
-    probe.release();
-    EXPECT_EQ(log.finish().value(), EMSGSIZE);
+    // 1. Accumulated-bytes ENOBUFS branch (#174): each record individually fits
+    // within pending_lossless_byte_capacity, but together they exceed it.
+    {
+        LogWriteProbe probe;
+        LogWriteProbe::active = &probe;
+        struct ProbeGuard {
+            LogWriteProbe &p;
+            ~ProbeGuard() {
+                p.release();
+                LogWriteProbe::active = nullptr;
+            }
+        } probe_guard{probe};
+        std::atomic<bool> running{true};
+        g_log_fake_ns = 0;
+        aa::wired_receiver::StdoutLog log{running, LogWriteProbe::write, log_fake_now, {},
+                                          aa::wired_receiver::StdoutLog::default_finish_timeout, true};
+        fill_log_queue(log);
+        const std::string half(aa::wired_receiver::StdoutLog::pending_lossless_byte_capacity / 2, 'b');
+        const std::string record = "{\"event\":\"p\",\"pad\":\"" + half + "\"}";
+        ASSERT_LE(record.size(), aa::wired_receiver::StdoutLog::pending_lossless_byte_capacity);
+        ASSERT_GT(record.size() * 2, aa::wired_receiver::StdoutLog::pending_lossless_byte_capacity);
+        EXPECT_FALSE(log.submit_pending(record));
+        EXPECT_EQ(log.pending_lossless(), 1U);
+        EXPECT_EQ(log.submit_pending(record).value(), ENOBUFS);
+        EXPECT_FALSE(running.load());
+        EXPECT_EQ(log.state_overflow_drops(), 1U);
+        probe.release();
+        EXPECT_EQ(log.finish().value(), ENOBUFS);
+        EXPECT_EQ(probe.bytes.find("log_complete"), std::string::npos);
+    }
+    // 2. Single-record EMSGSIZE branch: one record larger than pending_lossless_byte_capacity.
+    {
+        LogWriteProbe probe;
+        LogWriteProbe::active = &probe;
+        struct ProbeGuard {
+            LogWriteProbe &p;
+            ~ProbeGuard() {
+                p.release();
+                LogWriteProbe::active = nullptr;
+            }
+        } probe_guard{probe};
+        std::atomic<bool> running{true};
+        g_log_fake_ns = 0;
+        aa::wired_receiver::StdoutLog log{running, LogWriteProbe::write, log_fake_now, {},
+                                          aa::wired_receiver::StdoutLog::default_finish_timeout, true};
+        fill_log_queue(log);
+        const std::string big(aa::wired_receiver::StdoutLog::pending_lossless_byte_capacity / 2, 'b');
+        EXPECT_FALSE(log.submit_pending("{\"event\":\"p\",\"pad\":\"" + big + "\"}"));
+        EXPECT_EQ(log.submit_pending("{\"event\":\"p\",\"pad\":\"" + big + big + "\"}").value(), EMSGSIZE);
+        EXPECT_FALSE(running.load());
+        EXPECT_EQ(log.state_overflow_drops(), 1U);
+        probe.release();
+        EXPECT_EQ(log.finish().value(), EMSGSIZE);
+        EXPECT_EQ(probe.bytes.find("log_complete"), std::string::npos);
+    }
 }
 
 TEST(WiredReceiver, StdoutLogDropSummaryNeverTakesTheSlotAFreedRecordNeeds) {
@@ -8755,6 +8811,35 @@ TEST(WiredReceiver, StdoutLogAbandonedSinkNeverWritesACompletionRecord) {
         EXPECT_TRUE(log.timed_out());
     }
     // Then: even after the sink recovers, the detached worker writes no proof.
+    probe->release();
+    std::this_thread::sleep_for(std::chrono::milliseconds{100});
+    {
+        const std::lock_guard lock(probe->mutex);
+        EXPECT_EQ(probe->bytes.find("log_complete"), std::string::npos);
+    }
+    LogWriteProbe::active = nullptr;
+}
+
+// #174: finish() abandoning a stalled sink with parked records reports
+// ETIMEDOUT, records queued + parked in undelivered(), and writes no log_complete.
+TEST(WiredReceiver, StdoutLogFinishAbandonsStalledSinkWithParkedRecords) {
+    auto *probe = new LogWriteProbe; // Intentionally leaked: the worker outlives this test.
+    LogWriteProbe::active = probe;
+    std::atomic<bool> running{true};
+    {
+        aa::wired_receiver::StdoutLog log{running, LogWriteProbe::write,
+                                          &aa::wired_receiver::StdoutLog::Clock::now, {},
+                                          aa::wired_receiver::StdoutLog::default_finish_timeout, true};
+        fill_log_queue(log);
+        constexpr std::size_t parked_count = 3;
+        for (std::size_t i = 0; i < parked_count; ++i) {
+            EXPECT_FALSE(log.submit_pending("{\"event\":\"parked\",\"seq\":" + std::to_string(i) + "}"));
+        }
+        EXPECT_EQ(log.pending_lossless(), parked_count);
+        EXPECT_EQ(log.finish(std::chrono::milliseconds{100}).value(), ETIMEDOUT);
+        EXPECT_TRUE(log.timed_out());
+        EXPECT_EQ(log.undelivered(), aa::wired_receiver::StdoutLog::entry_capacity + parked_count);
+    }
     probe->release();
     std::this_thread::sleep_for(std::chrono::milliseconds{100});
     {
