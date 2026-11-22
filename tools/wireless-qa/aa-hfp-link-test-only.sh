@@ -53,6 +53,8 @@ journal_cursor() {
 }
 
 # Primary signal: bluetoothd -d per-device Hands-Free state transitions in the bluetooth journal.
+# Only the local `Hands-Free unit` service (remote HFP AG, the UUID this tool connects) counts;
+# `Hands-Free Voice gateway` is the opposite role and never proves this link (#198 review).
 # Optional argument $1: `--after-cursor` value (empty reads the current boot's bluetooth journal).
 # Prints "<code> <reason>" where code is:
 #   0: latest Hands-Free transition for this device is -> connected
@@ -78,7 +80,7 @@ import os, re, sys
 address = os.environ["AA_HFP_ADDRESS"].upper()
 pattern = re.compile(
     r"change_state\(\).*?\bdevice\s+([0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){5})\s+"
-    r"profile\s+Hands-Free[^\n]*?\s+state changed:\s+\S+\s*->\s*([A-Za-z0-9_-]+)"
+    r"profile\s+Hands-Free\s+unit\s+state changed:\s+\S+\s*->\s*([A-Za-z0-9_-]+)"
 )
 saw_change_state = False
 latest = None

@@ -57,6 +57,10 @@ if [ "$1" = call ]; then
       echo 'b true' > "$state/connected"
       printf 'src/service.c:change_state() 0xaaaa2222: device %s profile gap-profile state changed: connecting -> connected (0)\n' "$AA_STUB_ADDRESS" >> "$state/journal"
       ;;
+    gateway-only)
+      echo 'b true' > "$state/connected"
+      printf 'src/service.c:change_state() 0xaaaa3333: device %s profile Hands-Free Voice gateway state changed: connecting -> connected (0)\n' "$AA_STUB_ADDRESS" >> "$state/journal"
+      ;;
     no-debug)
       echo 'b true' > "$state/connected"
       printf 'bluetoothd[999]: Endpoint registered\n' >> "$state/journal"
@@ -197,7 +201,7 @@ class HfpLinkTool(unittest.TestCase):
                 self.assertEqual(self.calls(), [])
 
     def test_connect_rejects_le_only_or_other_device_or_immediate_drop_or_stale_connected(self) -> None:
-        for mode in ("le", "hfp-then-drop", "no-debug"):
+        for mode in ("le", "hfp-then-drop", "no-debug", "gateway-only"):
             with self.subTest(mode=mode):
                 for p in ("hfp", "connected", "calls", "journal"):
                     (self.stub / p).unlink(missing_ok=True)
