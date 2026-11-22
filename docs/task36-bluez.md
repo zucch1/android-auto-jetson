@@ -168,7 +168,7 @@ fsync affects only the receiver fixture; production trust persistence is unchang
 The suite uses a real60s monotonic wait, not a configurable production deadline.
 
 ```sh
-cmake --preset host-dev -DAA_GOOGLETEST_ARCHIVE=/home/zucchi/android-auto-jetson/.omo/worktrees/delivery-task27/.local/dependencies/googletest-v1.15.2.tar.gz
+cmake --preset host-dev -DAA_GOOGLETEST_ARCHIVE=/path/to/googletest-v1.15.2.tar.gz
 cmake --build build/host-dev --parallel 2
 ctest --test-dir build/host-dev -R 'system_helper|trust_store|dbus_contract|architecture_boundary' --output-on-failure
 python3 -B tests/helper/bluez_runtime.py build/host-dev

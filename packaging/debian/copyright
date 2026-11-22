@@ -1,0 +1,13 @@
+Android Auto Receiver
+Source: https://github.com/zucch1/android-auto-jetson
+
+Copyright (C) 2026 Android Auto Receiver contributors
+Copyright (C) 2018 f1x.studio (Michal Szwaj)
+Copyright (C) 2025 OpenCarDev Team
+
+Project code is licensed under GPL-3.0-or-later. AASDK includes GPL-3.0-or-later code and
+GPL-3.0 schemas. The combined binary distribution is under GPL version 3.
+See THIRD_PARTY_NOTICES.md for detailed attribution and the pinned source.
+
+On Debian systems, the complete text of the GNU General Public License
+version 3 is available in /usr/share/common-licenses/GPL-3.
