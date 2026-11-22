@@ -22,8 +22,12 @@ tools/wireless-qa/aa-hfp-link-test-only.sh connect "<phone Bluetooth alias>"
 tools/wireless-qa/aa-hfp-link-test-only.sh disconnect "<phone Bluetooth alias>"
 ```
 
-The tool exits 0 only after it has confirmed the result in WirePlumber's bluez5
-device profile (`headset-head-unit*`); `Device1.Connected` alone is not HFP (BlueZ
+The tool exits 0 only after it has confirmed the result in `bluetoothd -d`'s
+per-device HFP transition log (`journalctl -u bluetooth -o cat`, matching
+`src/service.c:change_state()` for the phone's MAC and profile `Hands-Free*`
+after a pre-action `--show-cursor` / `--after-cursor` cursor), or
+`Device1.Connected=false` for disconnect; WirePlumber/PipeWire (`pw-dump`) is
+optional secondary info only. `Device1.Connected=true` alone is not HFP (BlueZ
 5.72 may satisfy `ConnectProfile` with an LE ATT link on a dual-mode phone). A
 failed or unverified connect or disconnect exits 1.
 

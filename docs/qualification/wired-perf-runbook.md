@@ -301,17 +301,20 @@ the target, and requires:
 
 The record is strict JSON (`NaN` and `Infinity` are refused), and every field
 the gate reads must be present with the right type (`video_profiles` must be
-present and `null`; `phone_serial` and all `configuration` keys must be
-present). The record schema is `aa-drive-smoke/2`: records written before the
-signed A/V contract are refused as `drive_smoke_missing`. Both binaries must hash on the target
-to a 64-hex-digit sha256. A display that cannot be hashed, or a stage with no
-display, is blocked.
+present and `null`; `phone_serial`, `display_exit` (integer `0`), and all
+`configuration` keys must be present). The record schema is `aa-drive-smoke/2`:
+records written before the signed A/V contract are refused as
+`drive_smoke_missing`, and earlier `aa-drive-smoke/2` records without integer
+`display_exit` evidence are refused as `drive_smoke_display_exit_missing`. Both
+binaries must hash on the target to a 64-hex-digit sha256. A display that cannot
+be hashed, or a stage with no display, is blocked.
 
 Otherwise the stage is `BLOCKED` with `drive_smoke_missing`,
 `drive_smoke_malformed`, `drive_smoke_hash_failed`, `drive_smoke_not_passed`,
-`drive_smoke_build_mismatch`, `drive_smoke_phone_unverified`,
-`drive_smoke_phone_mismatch`, `drive_smoke_configuration`,
-`drive_smoke_profile`, `drive_smoke_short` or `drive_smoke_stale`; and a stage
+`drive_smoke_display_exit_missing`, `drive_smoke_build_mismatch`,
+`drive_smoke_phone_unverified`, `drive_smoke_phone_mismatch`,
+`drive_smoke_configuration`, `drive_smoke_profile`, `drive_smoke_short` or
+`drive_smoke_stale`; and a stage
 whose receiver found another phone on the port is `BLOCKED
 phone_identity_mismatch`. Offline `--capture` replay and
 `--readiness-only` do not need a record.

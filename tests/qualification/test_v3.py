@@ -97,6 +97,10 @@ class V3PackageTests(PackageTest):
                 concurrent_builds=[{'t_s': 600.0, 'processes': ['4242 cc1plus']}]),
             'no build watch': lambda d: d['run_status'].update(concurrent_builds=None),
             'build watch dropped': lambda d: d['run_status'].pop('concurrent_builds'),
+            'display exit 3': lambda d: d['run_status'].update(display_exit_code=3),
+            'display exit -15': lambda d: d['run_status'].update(display_exit_code=-15),
+            'display exit null': lambda d: d['run_status'].update(display_exit_code=None),
+            'display exit absent': lambda d: d['run_status'].pop('display_exit_code'),
         }
         for label, change in cases.items():
             for field in ('perf_30m', 'soak_2h'):
@@ -119,6 +123,24 @@ class V2HistoryTests(PackageTest):
         rebind(self.manifest, 'soak_2h')
         with self.assertRaises(EvidenceError):
             check(self.manifest)
+
+    def test_v2_live_stage_rejects_missing_or_nonzero_display_exit_code(self) -> None:
+        for field, filename in (('perf_30m', 'perf.json'), ('soak_2h', 'soak.json')):
+            for label, mutate in (
+                ('exit_3', lambda d: d['run_status'].update(display_exit_code=3)),
+                ('exit_neg15', lambda d: d['run_status'].update(display_exit_code=-15)),
+                ('null', lambda d: d['run_status'].update(display_exit_code=None)),
+                ('absent', lambda d: d['run_status'].pop('display_exit_code')),
+            ):
+                with self.subTest(field=field, case=label):
+                    manifest = make_package(self.root, version=2)
+                    path = self.root / filename
+                    doc = load(path).values
+                    mutate(doc)
+                    write(path, doc)
+                    rebind(manifest, field)
+                    with self.assertRaises(EvidenceError):
+                        check(manifest)
 
 
 if __name__ == '__main__':

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""#160/#179: the test-only HFP operator tool verifies HFP via bluetoothd journal and fails loudly.
+"""#160/#179: the test-only HFP operator tool verifies HFP via bluetoothd journal cursors.
 
 busctl, sudo, journalctl and pw-dump are stubbed on PATH; no Bluetooth, PipeWire or root is touched.
 """
@@ -92,10 +92,37 @@ fi
 exit 9
 '''
 SUDO = '#!/usr/bin/env bash\n[ "$1" = -n ] && shift\n[ "$1" = timeout ] && shift 2\nexec "$@"\n'
+# Stubs real journalctl cursor semantics:
+#   - `--show-cursor` returns `-- cursor: line=<current line count of $state/journal>`
+#   - `--after-cursor line=<N>` emits ONLY lines strictly after line N (so same-second
+#     transitions written after the cursor are returned, and stale lines before the cursor
+#     are never returned).
 JOURNALCTL = r'''#!/usr/bin/env bash
 state=$AA_STUB_DIR
 echo "$*" >> "$state/journalctl-args"
 [ -f "$state/journal-unreadable" ] && { echo "No journal files were opened due to insufficient permissions." >&2; exit 1; }
+for arg in "$@"; do
+  if [ "$arg" = "--show-cursor" ]; then
+    [ -f "$state/journal-no-cursor" ] && exit 0
+    lines=0
+    [ -f "$state/journal" ] && lines=$(wc -l < "$state/journal")
+    printf -- '-- cursor: line=%s\n' "$lines"
+    exit 0
+  fi
+done
+after=""
+prev=""
+for arg in "$@"; do
+  if [ "$prev" = "--after-cursor" ]; then after=$arg; fi
+  prev=$arg
+done
+if [ -n "$after" ]; then
+  n=${after#line=}
+  if [ -f "$state/journal" ]; then
+    tail -n +"$((n + 1))" "$state/journal"
+  fi
+  exit 0
+fi
 cat "$state/journal" 2>/dev/null || true
 exit 0
 '''
@@ -135,11 +162,17 @@ class HfpLinkTool(unittest.TestCase):
         path = self.stub / "calls"
         return path.read_text().splitlines() if path.exists() else []
 
-    def test_connect_verified_by_bluetooth_journal_even_when_pipewire_empty_or_broken(self) -> None:
+    def test_connect_verified_by_cursor_in_same_second_even_when_pipewire_empty_or_broken(self) -> None:
         for pw_flag in ("pw-empty", "pw-broken"):
             with self.subTest(pw_flag=pw_flag):
                 for p in ("pw-empty", "pw-broken", "hfp", "connected", "calls", "journal", "journalctl-args"):
                     (self.stub / p).unlink(missing_ok=True)
+                # Pre-existing stale disconnected line before cursor; connect transition lands
+                # immediately (same second) after the cursor.
+                (self.stub / "journal").write_text(
+                    f"src/service.c:change_state() 0x0: device {ADDRESS} "
+                    "profile Hands-Free unit state changed: disconnecting -> disconnected (0)\n"
+                )
                 (self.stub / pw_flag).touch()
                 result = self.run_tool("connect")
                 self.assertEqual(result.returncode, 0, result.stderr)
@@ -147,16 +180,32 @@ class HfpLinkTool(unittest.TestCase):
                 self.assertIn("source=journal", result.stdout)
                 self.assertEqual(self.calls(), [f"ConnectProfile {HFP_AG}"])
                 jargs = (self.stub / "journalctl-args").read_text()
-                self.assertIn("-u bluetooth -o cat --since ", jargs)
+                self.assertIn("-u bluetooth -n 0 --show-cursor -o cat", jargs)
+                self.assertIn("-u bluetooth -o cat --after-cursor line=1", jargs)
+                self.assertNotIn("--since", jargs)
 
-    def test_connect_rejects_le_only_or_other_device_or_immediate_drop(self) -> None:
+    def test_connect_fails_unknown_when_cursor_unavailable(self) -> None:
+        for flag in ("journal-unreadable", "journal-no-cursor"):
+            with self.subTest(flag=flag):
+                for p in ("journal-unreadable", "journal-no-cursor", "calls"):
+                    (self.stub / p).unlink(missing_ok=True)
+                (self.stub / flag).touch()
+                result = self.run_tool("connect")
+                self.assertEqual(result.returncode, 1)
+                self.assertTrue(result.stdout.startswith("HFP=unknown"), result.stdout)
+                self.assertIn("cursor", result.stderr)
+                self.assertEqual(self.calls(), [])
+
+    def test_connect_rejects_le_only_or_other_device_or_immediate_drop_or_stale_connected(self) -> None:
         for mode in ("le", "hfp-then-drop", "no-debug"):
             with self.subTest(mode=mode):
                 for p in ("hfp", "connected", "calls", "journal"):
                     (self.stub / p).unlink(missing_ok=True)
                 (self.stub / "pw-empty").touch()
-                # Another device's Hands-Free transition must never count for our phone.
+                # Pre-cursor connected line for this device AND another device must not count.
                 (self.stub / "journal").write_text(
+                    f"src/service.c:change_state() 0xaaaa: device {ADDRESS} "
+                    "profile Hands-Free unit state changed: connecting -> connected (0)\n"
                     f"src/service.c:change_state() 0xbbbb: device {OTHER_ADDRESS} "
                     "profile Hands-Free unit state changed: connecting -> connected (0)\n"
                 )
@@ -182,7 +231,6 @@ class HfpLinkTool(unittest.TestCase):
         self.assertEqual(res_up.returncode, 0, res_up.stderr)
         self.assertTrue(res_up.stdout.startswith("HFP=up Connected=b true"), res_up.stdout)
 
-        # Latest transition wins (connected -> disconnecting -> disconnected).
         with (self.stub / "journal").open("a") as fh:
             fh.write(
                 f"src/service.c:change_state() 0x1: device {ADDRESS} "
@@ -192,27 +240,24 @@ class HfpLinkTool(unittest.TestCase):
         self.assertEqual(res_down.returncode, 0, res_down.stderr)
         self.assertTrue(res_down.stdout.startswith("HFP=down Connected=b true"), res_down.stdout)
 
-        # No change_state lines (bluetoothd not in -d mode) -> HFP=unknown with clear reason.
         (self.stub / "journal").write_text("bluetoothd[1]: Started\n")
         res_nodbg = self.run_tool("status")
         self.assertEqual(res_nodbg.returncode, 0, res_nodbg.stderr)
         self.assertTrue(res_nodbg.stdout.startswith("HFP=unknown"), res_nodbg.stdout)
         self.assertIn("no-bluetoothd-change-state-lines", res_nodbg.stdout)
 
-        # Unreadable journal -> HFP=unknown, never down.
         (self.stub / "journal-unreadable").touch()
         res_unr = self.run_tool("status")
         self.assertEqual(res_unr.returncode, 0, res_unr.stderr)
         self.assertTrue(res_unr.stdout.startswith("HFP=unknown"), res_unr.stdout)
         self.assertIn("journal-unreadable", res_unr.stdout)
 
-        # Device1.Connected=false proves down even if journal is unreadable.
         (self.stub / "connected").write_text("b false")
         res_disc = self.run_tool("status")
         self.assertEqual(res_disc.returncode, 0, res_disc.stderr)
         self.assertTrue(res_disc.stdout.startswith("HFP=down Connected=b false"), res_disc.stdout)
 
-    def test_disconnect_verified_by_journal_or_bearer_down(self) -> None:
+    def test_disconnect_verified_by_post_cursor_journal_or_bearer_down(self) -> None:
         for mode, expected_prefix in (("down-keep-link", "HFP=down Connected=b true"),
                                       ("down-bearer-only", "HFP=down Connected=b false")):
             with self.subTest(mode=mode):
@@ -225,12 +270,24 @@ class HfpLinkTool(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertTrue(result.stdout.startswith(expected_prefix), result.stdout)
 
+    def test_disconnect_ignores_stale_disconnected_transition_before_cursor(self) -> None:
+        # P3 regression: a stale `-> disconnected` transition before the cursor must NEVER
+        # satisfy DisconnectProfile while Device1.Connected is still true.
+        (self.stub / "connected").write_text("b true")
+        (self.stub / "pw-empty").touch()
+        (self.stub / "journal").write_text(
+            f"src/service.c:change_state() 0x1: device {ADDRESS} "
+            "profile Hands-Free unit state changed: disconnecting -> disconnected (0)\n"
+        )
+        (self.stub / "disconnect").write_text("stuck-keep-link")
+        result = self.run_tool("disconnect")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("unverifiable", result.stderr)
+
     def test_disconnect_never_reports_down_when_journal_or_pipewire_unreadable(self) -> None:
-        # Regression for P2: even if HFP was up and pw-dump breaks or journalctl fails,
-        # disconnect must NEVER report HFP=down while Device1.Connected=true.
-        for flag in ("pw-broken", "journal-unreadable"):
+        for flag in ("pw-broken", "journal-unreadable", "journal-no-cursor"):
             with self.subTest(flag=flag):
-                for p in ("pw-broken", "journal-unreadable", "journal"):
+                for p in ("pw-broken", "journal-unreadable", "journal-no-cursor", "journal"):
                     (self.stub / p).unlink(missing_ok=True)
                 (self.stub / "connected").write_text("b true")
                 (self.stub / "hfp").touch()

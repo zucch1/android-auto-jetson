@@ -225,7 +225,9 @@ teardown() {
         # Up to 10 s for a clean exit: the receiver logger's bounded shutdown
         # (admission plus drain, about 4 s) writes the log_complete record the
         # verdict requires (#90 review). A KILLed receiver leaves no proof.
-        remote "kill $pid 2>/dev/null || true; for n in \$(seq 1 100); do kill -0 $pid 2>/dev/null || exit 0; sleep 0.1; done; kill -KILL $pid 2>/dev/null || true; sleep 0.1; ! kill -0 $pid 2>/dev/null" || return 1
+        # If escalation is still needed after 10 s, kill child processes too so
+        # a wedged display is never orphaned (#174 re-review).
+        remote "kill $pid 2>/dev/null || true; for n in \$(seq 1 100); do kill -0 $pid 2>/dev/null || exit 0; sleep 0.1; done; pkill -KILL -P $pid 2>/dev/null || true; kill -KILL -- -$pid 2>/dev/null || true; kill -KILL $pid 2>/dev/null || true; sleep 0.1; ! kill -0 $pid 2>/dev/null" || return 1
     done
     receiver_pid=""; display_pid=""
 }
@@ -245,9 +247,13 @@ receiver_pid="$(remote "nohup $(shq "$RECEIVER") --port ${PORT_Q} > ${REMOTE_QA_
 # Run the display under a small supervisor process whose PID we track for
 # teardown (#174 review): the supervisor owns the display child, forwards
 # SIGTERM to it (never signalling a reused numeric PID after an early crash),
-# waits for the child to finish draining and exit, and atomically publishes
+# escalates to SIGKILL inside a bounded grace window (8 s, under teardown's
+# 10 s ceiling) if the display wedges in TERM so it is never orphaned, traps
+# EXIT to clean up any live child, and atomically publishes
 # aa-wired-display.exit BEFORE the supervisor itself exits.
-display_pid="$(remote "mkfifo ${REMOTE_QA_DIR_Q}/aa-disp.in && { ( child=''; stop_child() { [ -n \"\$child\" ] && kill -TERM \"\$child\" 2>/dev/null || true; }; trap stop_child TERM; nohup $(shq "$DISPLAY") --test-only-autostart --test-only-control-stdin <>${REMOTE_QA_DIR_Q}/aa-disp.in > ${REMOTE_QA_DIR_Q}/aa-wired-display.log 2>&1 & child=\$!; rc=0; while true; do rc=0; wait \"\$child\" && break || rc=\$?; kill -0 \"\$child\" 2>/dev/null || break; done; printf '%s\n' \"\$rc\" > ${REMOTE_QA_DIR_Q}/aa-wired-display.exit.tmp && mv ${REMOTE_QA_DIR_Q}/aa-wired-display.exit.tmp ${REMOTE_QA_DIR_Q}/aa-wired-display.exit ) </dev/null >/dev/null 2>&1 & echo \$!; }")"
+display_stop_steps="${AA_DISPLAY_STOP_GRACE_STEPS:-80}"
+[[ "$display_stop_steps" =~ ^[1-9][0-9]*$ ]] || display_stop_steps=80
+display_pid="$(remote "mkfifo ${REMOTE_QA_DIR_Q}/aa-disp.in && { ( child=''; stopping=0; stop_child() { stopping=1; [ -n \"\$child\" ] && kill -TERM \"\$child\" 2>/dev/null || true; }; cleanup_child() { [ -n \"\$child\" ] && kill -KILL \"\$child\" 2>/dev/null || true; }; trap stop_child TERM; trap cleanup_child EXIT; nohup $(shq "$DISPLAY") --test-only-autostart --test-only-control-stdin <>${REMOTE_QA_DIR_Q}/aa-disp.in > ${REMOTE_QA_DIR_Q}/aa-wired-display.log 2>&1 & child=\$!; rc=0; while true; do rc=0; wait \"\$child\" && break || rc=\$?; kill -0 \"\$child\" 2>/dev/null || break; if [ \"\$stopping\" = 1 ]; then for _ in \$(seq 1 ${display_stop_steps}); do kill -0 \"\$child\" 2>/dev/null || break; sleep 0.1; done; if kill -0 \"\$child\" 2>/dev/null; then kill -KILL \"\$child\" 2>/dev/null || true; fi; rc=0; wait \"\$child\" || rc=\$?; break; fi; done; child=''; printf '%s\n' \"\$rc\" > ${REMOTE_QA_DIR_Q}/aa-wired-display.exit.tmp && mv ${REMOTE_QA_DIR_Q}/aa-wired-display.exit.tmp ${REMOTE_QA_DIR_Q}/aa-wired-display.exit ) </dev/null >/dev/null 2>&1 & echo \$!; }")"
 
 projection="false"
 session_active="false"; video="false"; audio="false"; input="false"

@@ -107,6 +107,9 @@ class WiredTests(PackageTest):
             ('perf_30m', ('metrics', 'decode_fps', 'value'), None),
             ('perf_30m', ('run_status', 'active_projection_seconds'), 1799),
             ('perf_30m', ('run_status', 'display_connected'), False),
+            ('perf_30m', ('run_status', 'display_exit_code'), 3),
+            ('perf_30m', ('run_status', 'display_exit_code'), -15),
+            ('perf_30m', ('run_status', 'display_exit_code'), None),
             ('perf_30m', ('run_status', 'projection_failure'), 'frozen'),
             ('perf_30m', ('crashes',), 1),
             ('perf_30m', ('capture',), {'path': '/private/raw.json', 'sha256': 'a' * 64}),
@@ -114,6 +117,9 @@ class WiredTests(PackageTest):
             ('perf_30m', ('provenance', 'package_digest'), 'f' * 64),
             ('soak_2h', ('duration_seconds',), 7199),
             ('soak_2h', ('run_status', 'active_projection_seconds'), 1800),
+            ('soak_2h', ('run_status', 'display_exit_code'), 3),
+            ('soak_2h', ('run_status', 'display_exit_code'), -15),
+            ('soak_2h', ('run_status', 'display_exit_code'), None),
             ('soak_2h', ('provenance', 'source_digest'), 'e' * 64),
         )
         for field, keys, value in mutations:

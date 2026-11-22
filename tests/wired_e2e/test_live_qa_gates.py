@@ -803,6 +803,9 @@ class LiveQaGates(unittest.TestCase):
             ("early_crash_exit_3",
              'exit 3\n',
              4, "FAILED", "display_exit_3"),
+            ("wedged_ignores_term_killed_not_orphaned",
+             'trap "" TERM\nwhile true; do sleep 0.2; done\n',
+             4, "FAILED", "display_exit_137"),
         ):
             with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
                 target = Path(directory)
@@ -820,11 +823,16 @@ class LiveQaGates(unittest.TestCase):
                 try:
                     code, doc = self.run_qa(
                         False, projection_timeout_ms=PASS_BUDGET_MS, FAKE_PROCESSES="1",
-                        FAKE_TARGET=directory,
+                        FAKE_TARGET=directory, AA_DISPLAY_STOP_GRACE_STEPS="5",
                     )
                     self.assertEqual(code, expect_code, doc)
                     self.assertEqual(doc["status"], expect_status, doc)
                     self.assertEqual(doc["blocked_on"], expect_reason, doc)
+                    for actual in target.glob("*.actual-pid"):
+                        pid = int(actual.read_text(encoding="utf-8"))
+                        proc = Path(f"/proc/{pid}/stat")
+                        self.assertTrue(not proc.exists() or proc.read_text().split()[2] == "Z",
+                                        f"display process {pid} was orphaned")
                 finally:
                     for actual in target.glob("*.actual-pid"):
                         try:

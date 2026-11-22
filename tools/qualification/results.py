@@ -136,6 +136,7 @@ def performance(doc: Document, seconds: int) -> None:
         run.equal(name, True)
     run.equal('early_exit', False)
     run.equal('receiver_exit_code', 0)
+    run.equal('display_exit_code', 0)
     run.equal('projection_failure', None)
     run.equal('terminal_errors', [])
     active = run.number('active_projection_seconds')
