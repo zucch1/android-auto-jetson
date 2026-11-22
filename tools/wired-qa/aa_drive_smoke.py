@@ -148,7 +148,7 @@ READY_TIMEOUT_S = 25.0
 # - src/helper/BusClient.cpp:21,104,176,184 (2 x 4 helper RPCs @ 1 s)
 # - Ready poll (5 s) + display probe fallback (5 s) + safety margin (12 s) = 120 s
 WIRELESS_STARTUP_BUDGET_S = float(transport.WIRELESS_STARTUP_BUDGET_S)
-# tools/wireless-receiver/main.cpp:146 caps --duration-ms at 86,400,000 ms (86,400 s).
+# tools/wireless-receiver/Options.hpp (--duration-ms parsing) caps --duration-ms at 86,400,000 ms (86,400 s).
 _RECEIVER_MAX_LIFETIME_S = 86_400
 # The soak gate. Same bytes are checked by hash. The age bound keeps the phone,
 # its Android Auto / Maps versions and the target's state close to what the

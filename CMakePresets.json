@@ -24,6 +24,7 @@
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
         "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "AA_ENABLE_TEST_HELPER_BUS": "OFF",
         "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/toolchains/jetson-aarch64.cmake",
         "AA_SYSROOT_ROOTFS": "$env{AA_SYSROOT_ROOTFS}",
         "AA_SYSROOT_MANIFEST": "$env{AA_SYSROOT_MANIFEST}",

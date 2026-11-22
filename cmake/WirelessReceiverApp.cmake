@@ -1,11 +1,14 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 option(AA_ENABLE_TEST_HELPER_BUS
     "Allow --helper-bus-address in aa-wireless-receiver for host test builds" OFF)
-if(AA_ENABLE_TEST_HELPER_BUS AND
-        (CMAKE_CROSSCOMPILING OR NOT CMAKE_BUILD_TYPE STREQUAL "Debug"))
+include("${CMAKE_CURRENT_LIST_DIR}/TestHelperBusGate.cmake")
+get_property(_aa_multi_config GLOBAL PROPERTY GENERATOR_IS_MULTI_CONFIG)
+if(AA_ENABLE_TEST_HELPER_BUS AND _aa_multi_config)
     message(FATAL_ERROR
-        "AA_WIRELESS_TEST_HELPER_BUS_DISALLOWED: --helper-bus-address is only permitted in native Debug test builds")
+        "AA_WIRELESS_TEST_HELPER_BUS_DISALLOWED: --helper-bus-address is not supported with multi-config generators")
 endif()
+unset(_aa_multi_config)
+aa_check_test_helper_bus("${AA_ENABLE_TEST_HELPER_BUS}" "${CMAKE_CROSSCOMPILING}" "${CMAKE_BUILD_TYPE}")
 
 if(NOT CMAKE_CROSSCOMPILING)
     add_executable(aa-wireless-receiver tools/wireless-receiver/main.cpp)
@@ -119,6 +122,14 @@ else()
         message(FATAL_ERROR "production build pairing-only did not reject --helper-bus-address: ${result}: ${error}")
     endif()
     execute_process(COMMAND "$<TARGET_FILE:aa-wireless-receiver>"
+        --store-dir "${directory}" --phone-id 1 "--helper-bus-address=unix:path=${directory}/absent-bus"
+        --duration-ms 100
+        RESULT_VARIABLE result OUTPUT_VARIABLE output ERROR_VARIABLE error TIMEOUT 5)
+    if(NOT "${result}" STREQUAL "2" OR NOT error MATCHES "--helper-bus-address is only supported in test builds")
+        file(REMOVE_RECURSE "${directory}")
+        message(FATAL_ERROR "production build did not reject --helper-bus-address=: ${result}: ${error}")
+    endif()
+    execute_process(COMMAND "$<TARGET_FILE:aa-wireless-receiver>"
         --store-dir "${directory}" --phone-id 1 --helper-bus-address
         RESULT_VARIABLE result OUTPUT_VARIABLE output ERROR_VARIABLE error TIMEOUT 5)
     file(REMOVE_RECURSE "${directory}")
@@ -136,5 +147,8 @@ endif()
         "-DAA_ALLOW_HELPER_BUS=${_aa_allow_helper_bus}"
         -P "${CMAKE_CURRENT_BINARY_DIR}/wireless-receiver-smoke.cmake")
     unset(_aa_allow_helper_bus)
+    add_test(NAME wireless_receiver_helper_bus_gate COMMAND "${CMAKE_COMMAND}"
+        "-DAA_GATE=${CMAKE_CURRENT_LIST_DIR}/TestHelperBusGate.cmake"
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/cmake/test_helper_bus_gate.cmake")
     set_tests_properties(wireless_receiver_smoke PROPERTIES TIMEOUT 25)
 endif()
