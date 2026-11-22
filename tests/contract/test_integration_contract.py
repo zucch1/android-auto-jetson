@@ -304,6 +304,24 @@ class IntegrationContractTests(unittest.TestCase):
             self.assertEqual(res.returncode, 1, msg=res.stdout + res.stderr)
             self.assertIn("INTEGRATION_CONTRACT_DBUS_POLICY_DRIFT", res.stdout)
 
+    def test_helper_dbus_policy_top_level_include_fails(self) -> None:
+        # <include>/<includedir> load more rules at their position; they are not
+        # modelled, so they must fail closed instead of being skipped.
+        for directive in ('<include ignore_missing="yes">/etc/dbus-1/extra.conf</include>',
+                          '<includedir>/etc/dbus-1/extra.d</includedir>'):
+            with self.subTest(directive=directive), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                stage_tree(root)
+                conf = root / "packaging/dbus/org.custom.AndroidAutoSystemHelper.conf"
+                conf.write_text(
+                    conf.read_text(encoding="utf-8").replace(
+                        "</busconfig>", f"  {directive}\n</busconfig>"),
+                    encoding="utf-8",
+                )
+                res = run_checker(root)
+                self.assertEqual(res.returncode, 1, msg=res.stdout + res.stderr)
+                self.assertIn("INTEGRATION_CONTRACT_DBUS_POLICY_DRIFT", res.stdout)
+
     def test_helper_dbus_policy_unsupported_rule_shape_fails(self) -> None:
         # Effective-rule modelling covers own/send_destination in the default and
         # root policies only; anything else fails closed instead of being ignored.

@@ -358,6 +358,15 @@ def check_dbus_policy_xml(conf_path: Path, bus_name: str) -> list[Violation]:
     if root.tag != "busconfig":
         return [Violation("INTEGRATION_CONTRACT_DBUS_POLICY_DRIFT", f"{conf_path.name} root tag is not <busconfig>")]
 
+    # Only <policy> children are modelled. dbus-daemon also honours <include>,
+    # <includedir>, <limit> and other top-level directives at their position,
+    # which can add rules after ours; anything other than <policy> (and the
+    # standard DOCTYPE-free comments) fails closed.
+    for child in root:
+        if child.tag != "policy":
+            violations.append(Violation(
+                "INTEGRATION_CONTRACT_DBUS_POLICY_DRIFT",
+                f"unsupported top-level <{child.tag}> in {conf_path.name}; only <policy> is modelled"))
     # Effective rule per (context, attribute); document order, last match wins.
     effective: dict[tuple[str, str], str] = {}
     for policy in root.findall("policy"):
