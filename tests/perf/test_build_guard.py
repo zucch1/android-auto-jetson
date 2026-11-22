@@ -491,7 +491,7 @@ def live_capture(root: Path, **build) -> Path:
     """A capture that reports PASS when replayed as a live run."""
     capture = json.loads(NOMINAL.read_text(encoding="utf-8"))
     capture.update(early_exit=False, display_connected=True, receiver_exit_code=0,
-                   display_survived=True, terminal_errors=[],
+                   display_survived=True, display_exit_code=0, terminal_errors=[],
                    receiver_stopped_by_collector=False)
     digest = "sha256:" + "a" * 64
     capture["provenance"] = {
@@ -542,7 +542,7 @@ def drive_smoke_record(root: Path) -> Path:
     """A passing #137 drive smoke for the stub's binary hashes (the soak gate)."""
     path = root / "drive-smoke.json"
     path.write_text(json.dumps({
-        "schema": "aa-drive-smoke/2", "verdict": "PASS", "duration_s": 600,
+        "schema": "aa-drive-smoke/2", "verdict": "PASS", "display_exit": 0, "duration_s": 600,
         "video_profiles": None, "phone_serial": "TESTPHONE01",
         "configuration": {"receiver_flags": [], "display_flags": [], "receiver_decoder": "default",
                           "display_decoder": "default", "presentation": "default"},

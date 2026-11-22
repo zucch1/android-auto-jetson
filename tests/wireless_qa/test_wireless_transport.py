@@ -406,7 +406,7 @@ class GateTransportTests(unittest.TestCase):
     """A wired smoke never qualifies a wireless soak, nor the reverse; wireless binds the phone id."""
 
     def record(self, **fields) -> dict:
-        record = {"schema": smoke.SCHEMA, "verdict": "PASS", "duration_s": 600,
+        record = {"schema": smoke.SCHEMA, "verdict": "PASS", "display_exit": 0, "duration_s": 600,
                   "finished_utc": datetime.now(timezone.utc).isoformat(), "video_profiles": None,
                   "phone_serial": "SER", "configuration": dict(smoke.DEFAULT_CONFIGURATION),
                   "binaries": {"receiver": {"sha256": "a" * 64}, "display": {"sha256": "b" * 64}}}
@@ -438,6 +438,14 @@ class GateTransportTests(unittest.TestCase):
         self.assertIsNone(self.check(self.wireless(), "wireless", 1))
         self.assertIsNone(self.check(self.record(transport="wired"), "wired"))
         self.assertIsNone(self.check(self.record(), "wired"))  # legacy wired: no link needed
+
+    def test_wireless_stored_pass_requires_zero_display_exit(self) -> None:
+        # #174 review: wireless soak gate also refuses pre-change or nonzero display_exit PASS.
+        pre_change = self.wireless()
+        pre_change.pop("display_exit")
+        self.assertEqual(self.check(pre_change, "wireless", 1), "drive_smoke_display_exit_missing")
+        self.assertEqual(self.check(self.wireless(display_exit=3), "wireless", 1),
+                         "drive_smoke_not_passed")
 
     def test_wireless_pass_needs_bound_cable_out_link_evidence(self) -> None:
         dirty = dict(self.CLEAN, phone_attached=True)

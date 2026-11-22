@@ -38,7 +38,7 @@ def capture(seconds: int, provenance: dict[str, JSON]) -> dict[str, JSON]:
         'monotonic_origin_ns': 100_000_000_000, 'cpu_ticks_per_second': 100,
         'crashes': 0, 'early_exit': False, 'receiver_exit_code': 0,
         'receiver_stopped_by_collector': True, 'display_survived': True,
-        'display_connected': True, 'terminal_errors': [], 'invalid_telemetry': [],
+        'display_exit_code': 0, 'display_connected': True, 'terminal_errors': [], 'invalid_telemetry': [],
         'samples': samples, 'video_evidence': {
             'blocks': blocks, 'ipc_latency_ns': [1_000_000] * retained,
             'decode_latency_ns': [100_000_000] * retained,

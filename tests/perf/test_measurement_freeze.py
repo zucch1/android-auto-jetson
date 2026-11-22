@@ -199,8 +199,14 @@ def test_lifecycle_failures_remain_live() -> None:
                 ("forced_kill" if mode == "forced" else "unreaped")}]
     owned = virtual("owned_display")
     assert owned["display_survived"] is True and owned["crashes"] == 0
-    # (v3: only the fixture's missing audio coverage may be a violation, #137.)
-    assert all(v["metric"].startswith("av_") for v in helper.result(owned, "3s")["violations"])
+    # #174: the shipped display traps SIGTERM and exits 0; an untrapped -15
+    # return code is now a display_exit_code violation, while a healthy display
+    # exiting 0 has no display_exit_code violation.
+    assert owned["display_exit_code"] == -15
+    assert "display_exit_code" in {v["metric"] for v in helper.result(owned, "3s")["violations"]}
+    healthy = virtual("healthy_display")
+    assert healthy["display_survived"] is True and healthy["display_exit_code"] == 0
+    assert all(v["metric"].startswith("av_") for v in helper.result(healthy, "3s")["violations"])
 
 
 def test_admitted_startup_peaks_are_not_reset_at_active_start() -> None:

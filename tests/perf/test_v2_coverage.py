@@ -45,7 +45,7 @@ def synthetic(seconds: int = 1800) -> dict:
             "active_projection_seconds": seconds, "measurement_origin": "offline",
             "crashes": 0, "early_exit": False, "receiver_exit_code": 0,
             "receiver_stopped_by_collector": True, "display_survived": True,
-            "display_connected": True, "terminal_errors": [], "invalid_telemetry": [],
+            "display_exit_code": 0, "display_connected": True, "terminal_errors": [], "invalid_telemetry": [],
             "samples": samples, "video_evidence": {"blocks": blocks,
                 "ipc_latency_ns": [1_000_000] * min(4096, len(blocks)),
                 "decode_latency_ns": [40_000_000] * min(4096, len(blocks))},

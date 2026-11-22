@@ -225,7 +225,9 @@ teardown() {
         # Up to 10 s for a clean exit: the receiver logger's bounded shutdown
         # (admission plus drain, about 4 s) writes the log_complete record the
         # verdict requires (#90 review). A KILLed receiver leaves no proof.
-        remote "kill $pid 2>/dev/null || true; for n in \$(seq 1 100); do kill -0 $pid 2>/dev/null || exit 0; sleep 0.1; done; kill -KILL $pid 2>/dev/null || true; sleep 0.1; ! kill -0 $pid 2>/dev/null" || return 1
+        # If escalation is still needed after 10 s, kill child processes too so
+        # a wedged display is never orphaned (#174 re-review).
+        remote "kill $pid 2>/dev/null || true; for n in \$(seq 1 100); do kill -0 $pid 2>/dev/null || exit 0; sleep 0.1; done; pkill -KILL -P $pid 2>/dev/null || true; kill -KILL -- -$pid 2>/dev/null || true; kill -KILL $pid 2>/dev/null || true; sleep 0.1; ! kill -0 $pid 2>/dev/null" || return 1
     done
     receiver_pid=""; display_pid=""
 }
@@ -242,7 +244,18 @@ trap 'exit 129' HUP
 receiver_pid="$(remote "nohup $(shq "$RECEIVER") --port ${PORT_Q} > ${REMOTE_QA_DIR_Q}/aa-wired-receiver.log 2>&1 & echo \$!")"
 # Open the FIFO read/write so startup does not wait for a separate writer and
 # the test-only channel stays open between bounded status/input requests.
-display_pid="$(remote "mkfifo ${REMOTE_QA_DIR_Q}/aa-disp.in && { nohup $(shq "$DISPLAY") --test-only-autostart --test-only-control-stdin <>${REMOTE_QA_DIR_Q}/aa-disp.in > ${REMOTE_QA_DIR_Q}/aa-wired-display.log 2>&1 & echo \$!; }")"
+# Run the display under a small supervisor process whose PID we track for
+# teardown (#174 review): the supervisor owns the display child, forwards
+# SIGTERM to it (never signalling a reused numeric PID after an early crash),
+# escalates to SIGKILL inside a bounded grace window (8 s, under teardown's
+# 10 s ceiling) if the display wedges in TERM so it is never orphaned, traps
+# EXIT to clean up any live child, and atomically publishes
+# aa-wired-display.exit BEFORE the supervisor itself exits. A TERM-interrupted
+# wait returns 143, so once the child is gone the supervisor re-waits it to
+# publish its real recorded status, not the interrupted wait's (#198 review).
+display_stop_steps="${AA_DISPLAY_STOP_GRACE_STEPS:-80}"
+[[ "$display_stop_steps" =~ ^[1-9][0-9]*$ ]] || display_stop_steps=80
+display_pid="$(remote "mkfifo ${REMOTE_QA_DIR_Q}/aa-disp.in && { ( child=''; stopping=0; stop_child() { stopping=1; [ -n \"\$child\" ] && kill -TERM \"\$child\" 2>/dev/null || true; }; cleanup_child() { [ -n \"\$child\" ] && kill -KILL \"\$child\" 2>/dev/null || true; }; trap stop_child TERM; trap cleanup_child EXIT; nohup $(shq "$DISPLAY") --test-only-autostart --test-only-control-stdin <>${REMOTE_QA_DIR_Q}/aa-disp.in > ${REMOTE_QA_DIR_Q}/aa-wired-display.log 2>&1 & child=\$!; rc=0; while true; do rc=0; wait \"\$child\" && break || rc=\$?; if ! kill -0 \"\$child\" 2>/dev/null; then rc=0; wait \"\$child\" || rc=\$?; break; fi; if [ \"\$stopping\" = 1 ]; then for _ in \$(seq 1 ${display_stop_steps}); do kill -0 \"\$child\" 2>/dev/null || break; sleep 0.1; done; if kill -0 \"\$child\" 2>/dev/null; then kill -KILL \"\$child\" 2>/dev/null || true; fi; rc=0; wait \"\$child\" || rc=\$?; break; fi; done; child=''; printf '%s\n' \"\$rc\" > ${REMOTE_QA_DIR_Q}/aa-wired-display.exit.tmp && mv ${REMOTE_QA_DIR_Q}/aa-wired-display.exit.tmp ${REMOTE_QA_DIR_Q}/aa-wired-display.exit ) </dev/null >/dev/null 2>&1 & echo \$!; }")"
 
 projection="false"
 session_active="false"; video="false"; audio="false"; input="false"
@@ -319,10 +332,13 @@ fi
 log_audit="$(printf '%s\n' "$log_stream" | python3 -I "$INTEGRITY_TOOL" generations)" || log_audit=""
 # The display's telemetry log must end with its single completion record: its
 # SIGTERM path drains the writer first (#90 review 4). Exactly one line names
-# telemetry_complete, and it is the last record (#90 review 5).
-display_last="$(remote "f=${REMOTE_QA_DIR_Q}/aa-wired-display.log; [ -r \"\$f\" ] || exit 1; grep -cF '\"event\":\"telemetry_complete\"' \"\$f\"; echo '### last'; grep '^{' \"\$f\" | tail -n 1; echo '### end'" 2>/dev/null)" || display_last=""
+# telemetry_complete, and it is the last record (#90 review 5). Also read the
+# display's exit code published by the supervisor before it exited (#174).
+display_last="$(remote "f=${REMOTE_QA_DIR_Q}/aa-wired-display.log; e=${REMOTE_QA_DIR_Q}/aa-wired-display.exit; echo '### exit'; [ -r \"\$e\" ] && cat \"\$e\" || echo ''; echo '### count'; if [ -r \"\$f\" ]; then grep -cF '\"event\":\"telemetry_complete\"' \"\$f\" || true; echo '### last'; grep '^{' \"\$f\" | tail -n 1; echo '### end'; fi" 2>/dev/null)" || display_last=""
+display_exit="$(sed -n '/^### exit$/{n;p;q}' <<< "$display_last" | tr -d '[:space:]')"
+display_complete_count="$(sed -n '/^### count$/{n;p;q}' <<< "$display_last" | tr -d '[:space:]')"
 display_complete=false
-if [[ "$display_last" == *"### end"* && "${display_last%%$'\n'*}" == 1 ]] && python3 -I -c '
+if [[ "$display_last" == *"### end"* && "$display_complete_count" == 1 ]] && python3 -I -c '
 import json, sys
 try:
     sys.exit(0 if json.loads(sys.argv[1]) == {"event": "telemetry_complete"} else 1)
@@ -331,6 +347,10 @@ except ValueError:
 ' "$(sed -n '/^### last$/{n;p;q}' <<< "$display_last")"; then
     display_complete=true
 fi
+display_exit_nonzero=false
+if [[ "$display_exit" =~ ^[0-9]+$ ]] && (( display_exit != 0 )); then
+    display_exit_nonzero=true
+fi
 log_audit="${log_audit%%$'\n'*}"  # the overall line (one receiver log here)
 log_flag() { [[ " ${log_audit} " == *" $1=1 "* ]]; }
 [[ "$log_audit" == *"complete="* ]] || log_audit="complete=0 state_lost=1 media_lost=1 runtime_lost=1 late_delivery=1"
@@ -338,6 +358,12 @@ evidence_doubtful=false
 if ! log_flag complete || log_flag state_lost || log_flag media_lost || log_flag runtime_lost ||
         log_flag late_delivery; then
     evidence_doubtful=true
+fi
+# A confirmed non-zero display exit (early crash or shutdown failure) is always
+# FAILED, never BLOCKED on incomplete display/receiver evidence (#174 review).
+if [[ "$display_exit_nonzero" == true ]]; then
+    write_result "FAILED" "display_exit_${display_exit}" "$projection" "$video" "$audio" "$input" "$budget_ms"
+    exit 4
 fi
 if [[ "$projection" != "true" || "$session_active" != "true" || "$video" != "true" ||
       "$audio" != "true" || "$input" != "true" ]]; then
@@ -361,6 +387,9 @@ if [[ "$projection" != "true" || "$session_active" != "true" || "$video" != "tru
         write_result "BLOCKED" "display_log_incomplete" "$projection" "$video" "$audio" "$input" "$budget_ms"
         exit 3
     fi
+elif [[ "$display_exit_nonzero" == true ]]; then
+    write_result "FAILED" "display_exit_${display_exit}" "$projection" "$video" "$audio" "$input" "$budget_ms"
+    exit 4
 elif [[ "$evidence_doubtful" == true ]]; then
     # PASS needs a complete log with no reported loss and prompt delivery:
     # every observable here was timed by when its record reached the log.
@@ -377,6 +406,14 @@ if [[ "$projection" != "true" || "$session_active" != "true" ]]; then
 fi
 if [[ "$video" != "true" || "$audio" != "true" || "$input" != "true" ]]; then
     write_result "FAILED" "observable_missing" "$projection" "$video" "$audio" "$input" "$budget_ms"
+    exit 4
+fi
+if [[ "$display_exit_nonzero" == true ]]; then
+    write_result "FAILED" "display_exit_${display_exit}" "$projection" "$video" "$audio" "$input" "$budget_ms"
+    exit 4
+fi
+if [[ ! "$display_exit" =~ ^[0-9]+$ ]]; then
+    write_result "FAILED" "display_exit_missing" "$projection" "$video" "$audio" "$input" "$budget_ms"
     exit 4
 fi
 write_result "PASS" "" "$projection" "$video" "$audio" "$input" "$budget_ms"

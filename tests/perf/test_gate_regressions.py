@@ -81,7 +81,7 @@ def finite(tmp: Path) -> None:
 
 def interruption(tmp: Path) -> None:
     for field, value in (("early_exit", True), ("receiver_exit_code", 2),
-                         ("display_survived", False),
+                         ("display_survived", False), ("display_exit_code", 3),
                          ("terminal_errors", [{"event": "err", "code": "transport_io"}])):
         capture = nominal()
         capture[field] = value
@@ -151,7 +151,7 @@ def completeness(tmp: Path) -> None:
     capture = synthetic(1800)
     capture.update(measurement_origin="live", observed_duration_seconds=1800,
                    early_exit=False, receiver_exit_code=0, display_survived=True,
-                   display_connected=True)
+                   display_exit_code=0, display_connected=True)
     capture["events"].update(startup_ms=10, video_units=100, audio_chunks=100)
     capture["provenance"].update(source_digest="a" * 64, build_artifact_digest="b" * 64,
                                  configuration_digest="c" * 64,

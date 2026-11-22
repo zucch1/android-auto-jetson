@@ -53,7 +53,7 @@ class Run:
         self.run = {"duration_s": duration, "active_ns": ACTIVE,
                     "window_end_ns": self.first + duration * S + S // 2,
                     "receiver_alive_at_end": True, "display_alive_at_end": True,
-                    "receiver_exit": 0}
+                    "receiver_exit": 0, "display_exit": 0}
         rate = painted_fps or fps
         count = int((duration + 1) * rate)
         self.paints = [self.first + int(i * S / rate) for i in range(count)]
@@ -571,6 +571,54 @@ class AnalyzerTests(unittest.TestCase):
                 out = run.write(Path(directory))
                 self.assertEqual(smoke.analyze_dir(out)["verdict"], "FAIL")
 
+    def test_nonzero_display_exit_is_not_pass(self) -> None:
+        # #174: a display that exits non-zero after writing telemetry_complete must FAIL
+        # and check_record must refuse the resulting document.
+        with tempfile.TemporaryDirectory(prefix="drive-smoke-disp-exit-") as directory:
+            root = Path(directory)
+            run = Run()
+            run.run["display_exit"] = 3
+            res = smoke.analyze_dir(run.write(root))
+            self.assertEqual(res["verdict"], "FAIL", res)
+            self.assertEqual(res["failure"], "display_exit_3")
+            gate_doc = record(verdict=res["verdict"])
+            self.assertEqual(
+                smoke.check_record(gate_doc, receiver_sha256=A, display_sha256=B,
+                                   phone_serial=PHONE, now=NOW)[0],
+                "drive_smoke_not_passed",
+            )
+
+        # A confirmed non-zero display exit overrides a BLOCKED verdict too.
+        with tempfile.TemporaryDirectory(prefix="drive-smoke-disp-exit-blocked-") as directory:
+            root = Path(directory)
+            run = Run()
+            run.display_tail = []  # would otherwise be BLOCKED on display_log_incomplete
+            run.run["display_exit"] = 3
+            res = smoke.analyze_dir(run.write(root))
+            self.assertEqual(res["verdict"], "FAIL", res)
+            self.assertEqual(res["failure"], "display_exit_3")
+
+    def test_missing_or_null_display_exit_is_not_pass(self) -> None:
+        # #174: missing or null display_exit turns PASS into FAIL, but does not override BLOCKED.
+        for label, mutate in (("missing", lambda r: r.pop("display_exit")),
+                              ("null", lambda r: r.update(display_exit=None))):
+            with self.subTest(label), tempfile.TemporaryDirectory(prefix=f"drive-smoke-disp-{label}-") as directory:
+                run = Run()
+                self.assertEqual(self.analyze(run)["verdict"], "PASS")
+                mutate(run.run)
+                res = self.analyze(run)
+                self.assertEqual(res["verdict"], "FAIL", res)
+                self.assertEqual(res["failure"], "display_exit_missing")
+                out = run.write(Path(directory))
+                self.assertEqual(smoke.analyze_dir(out)["verdict"], "FAIL")
+
+                # Does not override a BLOCKED verdict.
+                blocked = Run()
+                blocked.display_tail = []
+                mutate(blocked.run)
+                res_blocked = self.analyze(blocked)
+                self.assertEqual(res_blocked["verdict"], "BLOCKED", res_blocked)
+
 
 NOW = datetime(2026, 11, 16, 12, tzinfo=timezone.utc)
 A, B = "a" * 64, "b" * 64
@@ -580,7 +628,8 @@ PHONE = "TESTPHONE01"  # synthetic serial; no real phone identifiers in fixtures
 
 
 def record(finished: datetime = NOW - timedelta(hours=2), **changes) -> dict:
-    doc = {"schema": smoke.SCHEMA, "verdict": "PASS", "duration_s": 600, "video_profiles": None,
+    doc = {"schema": smoke.SCHEMA, "verdict": "PASS", "display_exit": 0, "duration_s": 600,
+           "video_profiles": None,
            "finished_utc": finished.isoformat(), "phone_serial": PHONE,
            "configuration": dict(smoke.DEFAULT_CONFIGURATION),
            "binaries": {"receiver": {"sha256": A}, "display": {"sha256": B}}}
@@ -603,6 +652,18 @@ class GateTests(unittest.TestCase):
 
     def test_fresh_pass_for_the_same_bytes_admits_the_soak(self) -> None:
         self.assertIsNone(self.check(record()))
+
+    def test_stored_pass_requires_zero_display_exit(self) -> None:
+        # #174 review: a pre-change PASS without display_exit, or with non-zero/non-int
+        # display_exit, must never open the soak gate.
+        pre_change = record()
+        pre_change.pop("display_exit")
+        self.assertEqual(self.check(pre_change), "drive_smoke_display_exit_missing")
+        for bad in (None, False, True, "0"):
+            with self.subTest(bad=bad):
+                self.assertEqual(self.check(record(display_exit=bad)),
+                                 "drive_smoke_display_exit_missing")
+        self.assertEqual(self.check(record(display_exit=3)), "drive_smoke_not_passed")
 
     def test_refusals_are_named(self) -> None:
         cases = {
