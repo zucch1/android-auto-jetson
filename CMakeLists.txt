@@ -37,13 +37,22 @@ if(AA_ENABLE_DEB_PACKAGE)
     # Header paths from a private dependency prefix (for example the Jetson's
     # ~/aa-build/prefix/usr) survive stripping in __FILE__-style strings such as
     # Boost.Asio source locations; map each prefix to the /usr it stands for.
+    # Both the spelled and the resolved path are mapped, since __FILE__ keeps
+    # the spelling used on the include path. "/" and "/usr" are never mapped.
     foreach(_aa_prefix IN LISTS CMAKE_PREFIX_PATH)
-        get_filename_component(_aa_prefix "${_aa_prefix}" REALPATH)
-        if(NOT _aa_prefix STREQUAL "/usr")
-            add_compile_options("-ffile-prefix-map=${_aa_prefix}=/usr")
-        endif()
+        get_filename_component(_aa_real "${_aa_prefix}" REALPATH)
+        string(REGEX REPLACE "/+$" "" _aa_prefix "${_aa_prefix}")
+        string(REGEX REPLACE "/+$" "" _aa_real "${_aa_real}")
+        foreach(_aa_spelling IN ITEMS "${_aa_prefix}" "${_aa_real}")
+            if(_aa_spelling STREQUAL "" OR _aa_spelling STREQUAL "/usr")
+                continue()
+            endif()
+            add_compile_options("-ffile-prefix-map=${_aa_spelling}=/usr")
+        endforeach()
     endforeach()
     unset(_aa_prefix)
+    unset(_aa_real)
+    unset(_aa_spelling)
 endif()
 set(FETCHCONTENT_SOURCE_DIR_GOOGLETEST "${AA_DEPENDENCY_STAGE}/googletest" CACHE PATH "Verified source" FORCE)
 set(AASDK_TEST ON)

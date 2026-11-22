@@ -56,8 +56,9 @@ def git(*args):
 def package_version():
     # Only plain vMAJOR.MINOR.PATCH tags are releases; pre-release tags such as
     # v1.0.0-rc1 are skipped so describe falls through to an earlier release or
-    # to the 0.0.0+git fallback instead of aborting.
-    tag = git("describe", "--long", "--always", "--match", "v[0-9]*.[0-9]*.[0-9]*",
+    # to the 0.0.0+git fallback instead of aborting. --tags also accepts
+    # lightweight tags (`git tag v1.0.0`).
+    tag = git("describe", "--tags", "--long", "--always", "--match", "v[0-9]*.[0-9]*.[0-9]*",
               "--exclude", "*-*", "--abbrev=12")
     match = re.fullmatch(r"v(\d+\.\d+\.\d+)-(\d+)-g([0-9a-f]+)", tag)
     if match:
