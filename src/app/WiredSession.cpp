@@ -234,6 +234,9 @@ core::Result<void> WiredSession::register_av_sink(protocol::ChannelRole role,
         [this, role](std::vector<std::byte> payload) {
             return send_channel_payload(role, std::move(payload));
         });
+    if (role == protocol::ChannelRole::video) {
+        wrapper->set_on_video_start(config_.on_video_start);
+    }
     if (auto registered = registry_.register_sink(role, *wrapper); !registered) {
         return registered.error();
     }
@@ -260,6 +263,9 @@ core::Result<void> WiredSession::register_deferred_av_sink(protocol::ChannelRole
         [this, role](std::vector<std::byte> payload) {
             return send_channel_payload(role, std::move(payload));
         }, av_generation_);
+    if (role == protocol::ChannelRole::video) {
+        wrapper->set_on_video_start(config_.on_video_start);
+    }
     if (auto registered = registry_.register_sink(role, *wrapper); !registered) {
         return registered.error();
     }
@@ -827,7 +833,8 @@ void WiredSession::emit(std::string_view identity_key) {
     event.monotonic_time = deps_.clock.now();
     event.fields.push_back(diagnostics::EventField::text(
         "to_state", std::string{session::to_string(lifecycle_.state())}));
-    event.fields.push_back(diagnostics::EventField::text("transport", "usb"));
+    event.fields.push_back(diagnostics::EventField::text(
+        "transport", config_.lifecycle.link == session::LinkKind::wireless ? "wireless" : "usb"));
     if (lifecycle_.state() == session::State::failed) {
         if (const auto failure = lifecycle_.failure()) {
             event.fields.push_back(diagnostics::EventField::count(
@@ -947,7 +954,8 @@ void WiredSession::emit_recovery(const char *reason, RecoveryStatus status,
     if (code.has_value()) {
         event.fields.push_back(diagnostics::EventField::count("code", *code));
     }
-    event.fields.push_back(diagnostics::EventField::text("transport", "usb"));
+    event.fields.push_back(diagnostics::EventField::text(
+        "transport", config_.lifecycle.link == session::LinkKind::wireless ? "wireless" : "usb"));
     // Identity attribution (item 3, same attribution as the link-error event):
     // the recovery record names the admitted phone so a harness can correlate a
     // state/flow transition to the intended device. Pseudonymized by the
@@ -961,7 +969,11 @@ void WiredSession::emit_recovery(const char *reason, RecoveryStatus status,
 }
 
 bool WiredSession::video_projecting() const noexcept {
-    if (lifecycle_.state() != session::State::active || !authenticated()) {
+    // Wireless A/V can start while bootstrap confirmation still gates active.
+    const auto state = lifecycle_.state();
+    const bool wireless_negotiating = config_.lifecycle.link == session::LinkKind::wireless
+        && state == session::State::negotiating;
+    if ((state != session::State::active && !wireless_negotiating) || !authenticated()) {
         return false;
     }
     const auto video = av_sinks_.find(protocol::ChannelRole::video);

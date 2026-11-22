@@ -102,9 +102,10 @@ struct ControlBusService::Impl final {
     std::chrono::steady_clock::time_point next_refresh{std::chrono::steady_clock::now()};
 
     Impl(ControlServiceConfig config, PairingIdSource& ids, PhoneDirectory& directory,
-         helper::Confirmation* confirmation)
+         helper::Confirmation* confirmation, std::function<bool()> session_active)
         : pairing_ids(ids), phones(directory),
-          service(config, ControlServiceDeps{credentials, emitter, pairing_ids, phones, confirmation}),
+          service(config, ControlServiceDeps{credentials, emitter, pairing_ids, phones, confirmation,
+                                             {}, std::move(session_active)}),
           dispatcher(service) {}
 };
 
@@ -114,7 +115,8 @@ core::Result<ControlBusService> ControlBusService::start(Config config, Deps dep
         return connection.error();
     }
     auto impl = std::make_unique<Impl>(ControlServiceConfig{config.session_unix_uid},
-                                       deps.pairing_ids, deps.phones, deps.confirmation);
+                                       deps.pairing_ids, deps.phones, deps.confirmation,
+                                       std::move(deps.session_active));
     impl->connection = std::move(connection.value());
     impl->emitter.bind(&*impl->connection);
     const auto owned =

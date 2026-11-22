@@ -189,10 +189,9 @@ std::chrono::nanoseconds AudioRenderWorker::playout_offset_at(core::Nanoseconds 
     // and refill, a short pause). In content time, with the drop d and
     // content gap cg = og + d, d <= og / 2 is d <= cg / 3: a fall of a third
     // of the content time past the last write, toward the depth it
-    // re-anchors with. The lookup predicts exactly that, so video arriving in
-    // a gap is never held for the old offset while the audio it pairs with
-    // on resume plays earlier (Neon P1 #1; round 6 Neon P2-1 reverted a
-    // misread 1/2).
+    // re-anchors with. This predicts the maximum downward slew while a gap
+    // is open. After the next write, the lookup can interpolate between
+    // the offsets on either side.
     const auto decayed = [&](const PlayoutWrite& last) {
         const auto fallen = last.end_offset - (t - last.content_end) / 3;
         return std::max(fallen, std::min(last.end_offset, playout_depth_ns_));
@@ -997,6 +996,11 @@ void AudioRenderWorker::run(RouterConfig config, const OpenRouter& open) {
             if (job.epoch != step_epoch) { continue; }
             if (!job.dequeued_at) {
                 job.dequeued_at = monotonic_now();
+                // Keep decode and insertion in the same transaction as job
+                // admission. Invalidate holds this lock when it cancels a
+                // role's router work, so it cannot race a stale chunk back
+                // into the router during submission (including resampling
+                // guidance and system PCM).
                 const auto submitted = local_router.submit({job.header, job.pcm}, job.receiver_input_at);
                 if (!submitted) {
                     const AudioDispatchObservation parent{job.id, job.header.sequence,

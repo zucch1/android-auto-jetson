@@ -183,6 +183,7 @@ struct ControlServiceDeps final {
     PhoneDirectory& phones;
     helper::Confirmation* confirmation{nullptr};
     std::function<std::chrono::steady_clock::time_point()> clock{};
+    std::function<bool()> session_active{};
 };
 
 // Session D-Bus control dispatcher (task 21) for
@@ -207,7 +208,7 @@ public:
     ControlService(ControlServiceConfig config, ControlServiceDeps deps)
         : config_(config), credentials_(deps.credentials), events_(deps.events),
           phones_(deps.phones), gate_(deps.pairing_ids), confirmation_(deps.confirmation),
-          clock_(std::move(deps.clock)) {}
+          clock_(std::move(deps.clock)), session_active_(std::move(deps.session_active)) {}
 
     // RegisterConsumer / UnregisterConsumer.
     [[nodiscard]] core::Result<core::ConsumerId> register_consumer(const BusName& caller,
@@ -328,6 +329,7 @@ private:
     PairingGate gate_;
     helper::Confirmation* confirmation_{};
     std::function<std::chrono::steady_clock::time_point()> clock_{};
+    std::function<bool()> session_active_{};
     std::vector<PendingRevocation> revocations_;
     std::size_t source_retry_cursor_{0};
     bool reconcile_due_{true};

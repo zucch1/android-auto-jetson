@@ -122,6 +122,9 @@ RouterStats accumulate_router_stats(const RouterStats& lifetime, const RouterSta
     out.frames_padded += lifetime.frames_padded;
     out.playout_resumes += lifetime.playout_resumes;
     out.frames_shed += lifetime.frames_shed;
+    out.playout_shed_residual_chunks += lifetime.playout_shed_residual_chunks;
+    out.playout_shed_residual_peak =
+        std::max(out.playout_shed_residual_peak, lifetime.playout_shed_residual_peak);
     out.max_arrival_burst = std::max(out.max_arrival_burst, lifetime.max_arrival_burst);
     const auto fold = [](std::optional<core::Nanoseconds> a, std::optional<core::Nanoseconds> b,
                          bool lower) -> std::optional<core::Nanoseconds> {
@@ -179,6 +182,10 @@ std::string media_timing_json(const RouterStats& stats, const MediaTimingContext
         json += ",\"credit_window\":" + std::to_string(context.credit_window) +
             ",\"max_unacked_held\":" + std::to_string(context.max_unacked_held) +
             ",\"max_arrival_burst\":" + std::to_string(stats.max_arrival_burst);
+    }
+    if (context.playout_target) {
+        json += ",\"playout_shed_residual_chunks\":" + std::to_string(stats.playout_shed_residual_chunks) +
+            ",\"playout_shed_residual_peak_ms\":" + format_ms(stats.playout_shed_residual_peak);
     }
     return json + "}";
 }

@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cassert>
 #include <cerrno>
 #include <chrono>
 #include <condition_variable>
@@ -188,8 +189,17 @@ public:
         return idr_coordinator_.snapshot();
     }
 
+    [[nodiscard]] core::Result<void> request_startup_idr() {
+        std::unique_lock lock(mutex_);
+        const DeferredMedia logs{*this, lock};
+        if (!has_idr_request_hook_locked() || !projecting_locked()) { return {}; }
+        startup_idr_wait_ = true;
+        return maybe_request_idr_locked(lock, "video_start");
+    }
+
     [[nodiscard]] core::Result<bool> request_idr_external(std::string_view reason) {
         std::unique_lock lock(mutex_);
+        const DeferredMedia logs{*this, lock};
         if (idr_dispatching_.load(std::memory_order_acquire) ||
             !has_idr_request_hook_locked() || !projecting_locked()) {
             return false;
@@ -208,8 +218,8 @@ public:
     // the frames held then are older than the keyframe just requested, and
     // the consumer drops them anyway (DeepSeek P3-2).
     [[nodiscard]] core::Result<void> release_held() {
-        const DeferredMedia logs{*this};
         std::unique_lock lock(mutex_);
+        const DeferredMedia logs{*this, lock};
         last_checkpoint_ = now_locked();
         // A release the timer thread could not complete fails the session
         // here (or in on_message() / service_pending(), whichever runs first).
@@ -241,14 +251,16 @@ public:
             release_stop_ = true;
         }
         release_cv_.notify_all();
-        if (release_thread_.joinable() && release_thread_.get_id() != std::this_thread::get_id()) {
+        if (release_thread_.joinable()) {
+            // The owner must join: the release loop still uses this outlet.
+            assert(release_thread_.get_id() != std::this_thread::get_id());
             release_thread_.join();
         }
     }
 
     [[nodiscard]] core::Result<void> service_pending() {
-        const DeferredMedia logs{*this};
         std::unique_lock lock(mutex_);
+        const DeferredMedia logs{*this, lock};
         // A timer release that failed is surfaced by whichever entry point
         // runs first, before anything after the failed frame is released.
         if (release_error_) { return std::exchange(release_error_, std::nullopt).value(); }
@@ -264,23 +276,26 @@ public:
         if (auto released = release_due_locked(lock, now_locked(), "service"); !released) {
             return released.error();
         }
-        if (idr_dispatching_.load(std::memory_order_acquire) ||
-            pending_queue_.empty() || !producer_.has_value()) {
-            return {};
+        if (idr_dispatching_.load(std::memory_order_acquire) || !producer_.has_value()) { return {}; }
+        if (!pending_queue_.empty()) {
+            if (const auto drained = drain_pending_locked(lock); !drained) { return drained.error(); }
         }
-        const auto drained = drain_pending_locked(lock);
-        if (!drained) {
-            return drained.error();
+        if (startup_idr_wait_ && producer_.has_value() && projecting_locked()) {
+            // The phone can be silent while starting its encoder. Keep the
+            // coordinator running even without a delta frame or consumer IPC.
+            return maybe_request_idr_locked(lock, "video_start");
         }
         return {};
     }
 
     void reset() noexcept {
-        std::lock_guard lock(mutex_);
+        std::unique_lock lock(mutex_);
+        const DeferredMedia logs{*this, lock};
         clear_delayed_locked("reset");
         clear_pending_locked(/*abandon_partial=*/true, "reset");
         release_error_.reset();
         idr_coordinator_.reset();
+        startup_idr_wait_ = false;
         deferred_idr_reason_.reset();
         last_released_.reset();
         had_backpressure_ = false;
@@ -293,8 +308,8 @@ public:
     }
 
     [[nodiscard]] core::Result<void> on_message(const protocol::MessageView& message) override {
-        const DeferredMedia logs{*this};
         std::unique_lock lock(mutex_);
+        const DeferredMedia logs{*this, lock};
         if (release_error_) { return std::exchange(release_error_, std::nullopt).value(); }
         const auto now = now_locked();
         const bool holding = delay_source_ || delay_.count() > 0;
@@ -321,7 +336,8 @@ public:
 
 private:
     [[nodiscard]] core::Result<void> deliver_locked(std::unique_lock<std::mutex>& lock,
-                                                    const protocol::MessageView& message) {
+                                                    const protocol::MessageView& message,
+                                                    bool released = false) {
         if (!producer_.has_value()) {
             ++dropped_before_consumer_;
             record_drop("no_consumer", frame_cadence(message.header.video_profile));
@@ -339,7 +355,7 @@ private:
             generation_ = message.header.video_generation;
             av1_reduced_ = false;
             if (profile_) {
-                log_("{\"event\":\"video_profile\",\"width\":" + std::to_string(profile_->width)
+                defer_media({}, "{\"event\":\"video_profile\",\"width\":" + std::to_string(profile_->width)
                     + ",\"height\":" + std::to_string(profile_->height) + ",\"fps\":" + std::to_string(profile_->fps)
                     + ",\"codec\":\"" + protocol::codec_name(profile_->codec) + "\"}");
                 configure_buffer_locked(*profile_);
@@ -351,6 +367,7 @@ private:
         if (!pending_queue_.empty()) {
             const auto drained = drain_pending_locked(lock);
             if (!drained) {
+                if (released) { record_drop("release_error", frame_cadence(profile_)); }
                 return drained.error();
             }
             if (!producer_.has_value()) {
@@ -391,6 +408,7 @@ private:
             if (handle_transport_error_locked(sent.error(), /*extra_drops=*/1)) {
                 return {};
             }
+            if (released) { record_drop("release_error", frame_cadence(profile_)); }
             return sent.error();
         }
         switch (sent.value()) {
@@ -423,7 +441,8 @@ private:
 
 public:
     void install(ipc::VideoProducer producer) {
-        std::lock_guard lock(mutex_);
+        std::unique_lock lock(mutex_);
+        const DeferredMedia logs{*this, lock};
         // Frames held for the playout delay belonged to the old consumer (F12),
         // and so does any IDR request deferred for it.
         if (producer_.has_value()) { clear_delayed_locked("consumer_replaced"); }
@@ -435,11 +454,9 @@ public:
         // telemetry: rate-limited and never waiting for the sink. The producer only
         // observes send_started; receive_completed is a consumer-side kind.
         producer.set_observer([this](const ipc::VideoEndpoint& event) {
-            auto line = ipc::video_endpoint_json(event);
-            // Both endpoint kinds are per access unit: never the lifecycle sink.
-            media(event.kind == ipc::VideoEndpointKind::send_started ? "video_ipc_send"
-                                                                     : "video_ipc_receive",
-                  line);
+            defer_media(event.kind == ipc::VideoEndpointKind::send_started ? "video_ipc_send"
+                                                                           : "video_ipc_receive",
+                        ipc::video_endpoint_json(event));
         });
         if (producer_.has_value()) {
             producer_->close();
@@ -462,7 +479,8 @@ public:
 
     void close() noexcept {
         stop_release_timer();
-        std::lock_guard lock(mutex_);
+        std::unique_lock lock(mutex_);
+        const DeferredMedia logs{*this, lock};
         clear_delayed_locked("closed");
         clear_pending_locked(/*abandon_partial=*/false, "closed");
         release_error_.reset();
@@ -470,6 +488,7 @@ public:
         last_released_.reset();
         emit_drops(true);
         idr_coordinator_.reset();
+        startup_idr_wait_ = false;
         had_backpressure_ = false;
         replaced_consumer_ = false;
         armed_late_consumer_ = false;
@@ -544,12 +563,12 @@ private:
     [[nodiscard]] core::Result<void> release_front_locked(std::unique_lock<std::mutex>& lock,
                                                           std::optional<FrontHold> hold = {}) {
         const auto applied = hold ? *hold : front_hold_locked(delayed_.front());
+        note_capped_locked(applied.requested);
         auto item = std::move(delayed_.front());
         delayed_.pop_front();
         delayed_bytes_ -= item.payload.size();
-        note_capped_locked(applied.requested);
         note_released_locked(item, applied.hold);
-        return deliver_locked(lock, protocol::MessageView{item.header, item.payload});
+        return deliver_locked(lock, protocol::MessageView{item.header, item.payload}, /*released=*/true);
     }
 
     [[nodiscard]] core::Result<void> release_due_locked(std::unique_lock<std::mutex>& lock,
@@ -593,33 +612,51 @@ private:
         DeferIdr& operator=(const DeferIdr&) = delete;
     };
 
-    // Media records raised under the lock, logged after it is released
-    // (DeepSeek P3-7: never write a log line while holding the outlet).
-    // Declared before the entry point's lock, so it runs after the unlock.
+    // Capture records under the outlet lock, then hand off the batch before
+    // invoking any sink. Empty batches need no unlock/re-lock cycle.
+    using LogBatch = std::vector<std::pair<std::string_view, std::string>>;
     void defer_media(std::string_view kind, std::string line) {
-        deferred_media_.emplace_back(std::string{kind}, std::move(line));
+        deferred_media_.emplace_back(kind, std::move(line));
     }
+
+    void flush_deferred_media(std::unique_lock<std::mutex>& lock) noexcept {
+        if (deferred_media_.empty()) { return; }
+        const auto lines = std::exchange(deferred_media_, {});
+        const auto ticket = next_log_ticket_++;
+        lock.unlock();
+
+        // The timer and owner can both flush. Keep state order, especially
+        // the IDR openers and recovery that the performance parser pairs.
+        // Wait for the other sink call only after dropping the outlet lock.
+        for (auto turn = log_turn_.load(std::memory_order_acquire); turn != ticket;
+             turn = log_turn_.load(std::memory_order_acquire)) {
+            log_turn_.wait(turn, std::memory_order_acquire);
+        }
+        for (const auto& [kind, line] : lines) {
+            try {
+                if (kind.empty()) { log_(line); }
+                else { media(kind, line); }
+            } catch (...) {
+                // Telemetry failure must not interrupt media delivery or cleanup.
+            }
+        }
+        log_turn_.store(ticket + 1, std::memory_order_release);
+        log_turn_.notify_all();
+    }
+
     struct DeferredMedia final {
         VideoOutlet& outlet;
-        explicit DeferredMedia(VideoOutlet& owner) : outlet(owner) {}
-        ~DeferredMedia() { outlet.flush_deferred_media(); }
-        DeferredMedia(const DeferredMedia&) = delete;
-        DeferredMedia& operator=(const DeferredMedia&) = delete;
-    };
-    void flush_deferred_media() noexcept {
-        std::vector<std::pair<std::string, std::string>> lines;
-        {
-            std::lock_guard lock(mutex_);
-            lines.swap(deferred_media_);
+        std::unique_lock<std::mutex>& lock;
+
+        ~DeferredMedia() {
+            if (lock.owns_lock()) { outlet.flush_deferred_media(lock); }
         }
-        for (const auto& [kind, line] : lines) { media(kind, line); }
-    }
+    };
 
     static constexpr std::chrono::milliseconds kReleaseTimerSlice{5};
     void release_loop() {
         std::unique_lock lock(mutex_);
         while (!release_stop_) {
-            const auto now = now_locked();
             if (delayed_.empty()) {
                 // Idle until a frame is held (on_message notifies) or stop.
                 release_cv_.wait(lock, [&] { return release_stop_ || !delayed_.empty(); });
@@ -629,18 +666,18 @@ private:
                 release_cv_.wait_for(lock, kReleaseTimerSlice);
                 continue;
             }
-            const auto due = delayed_.front().arrived
-                + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-                      front_hold_locked(delayed_.front()).hold);
-            if (due > now) {
-                release_cv_.wait_for(lock, std::min<std::chrono::steady_clock::duration>(
-                                               due - now, kReleaseTimerSlice));
-                continue;
-            }
-            // A throw (an allocation in the delivery path) must not reach
-            // std::terminate from this thread: it is latched as a typed error
-            // for the session, like a delivery error, and logged.
+            // Both the delay source and delivery can throw. Surface either
+            // failure on the session thread just like a delivery error.
             try {
+                const auto now = now_locked();
+                const auto due = delayed_.front().arrived
+                    + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                          front_hold_locked(delayed_.front()).hold);
+                if (due > now) {
+                    release_cv_.wait_for(lock, std::min<std::chrono::steady_clock::duration>(
+                                                   due - now, kReleaseTimerSlice));
+                    continue;
+                }
                 const DeferIdr defer{defer_idr_};
                 if (auto released = release_due_locked(lock, now, "timer"); !released) {
                     release_error_ = released.error();
@@ -653,11 +690,8 @@ private:
                                 "{\"event\":\"video_release_timer_error\",\"reason\":\"exception\"}");
                 } catch (...) {}
             }
-            if (!deferred_media_.empty()) {
-                lock.unlock();
-                flush_deferred_media();
-                lock.lock();
-            }
+            flush_deferred_media(lock);
+            if (!lock.owns_lock()) { lock.lock(); }
         }
     }
 
@@ -721,7 +755,7 @@ private:
         hold_peak_bytes_ = std::max(hold_peak_bytes_, pending_bytes_);
         if (starting_hold) {
             hold_episode_started_at_ = now;
-            media("video_backpressure_held",
+            defer_media("video_backpressure_held",
                   ipc::video_backpressure_held_json(
                       pending_queue_.size(), pending_bytes_, 0, budget.max_bytes,
                       budget.max_age.count()));
@@ -734,11 +768,14 @@ private:
         armed_late_consumer_ = false;
         // A keyframe reached the consumer: a request deferred by release_held()
         // is obsolete (it would reopen a phantom waiting_idr episode).
-        if (is_idr) { deferred_idr_reason_.reset(); }
+        if (is_idr) {
+            deferred_idr_reason_.reset();
+            startup_idr_wait_ = false;
+        }
         if (is_idr && idr_coordinator_.waiting()) {
             const auto recovered = idr_coordinator_.on_idr_delivered(now);
             if (recovered.recovered) {
-                log_(ipc::idr_recovered_json("producer", recovered.latency_ms,
+                defer_media({}, ipc::idr_recovered_json("producer", recovered.latency_ms,
                                              recovered.episode_requests,
                                              recovered.total_requests));
             }
@@ -747,7 +784,7 @@ private:
         if (!has_sent_report_ || units_ - last_sent_report_unit_ >= frame_cadence(profile_)) {
             has_sent_report_ = true;
             last_sent_report_unit_ = units_;
-            media("video_sent", "{\"event\":\"video_sent\",\"units\":" + std::to_string(units_) + "}");
+            defer_media("video_sent", "{\"event\":\"video_sent\",\"units\":" + std::to_string(units_) + "}");
             emit_drops(false);
         }
     }
@@ -775,6 +812,7 @@ private:
         producer_->close();
         producer_.reset();
         idr_coordinator_.reset();
+        startup_idr_wait_ = false;
         had_backpressure_ = false;
         armed_late_consumer_ = false;
         producer_installed_at_.reset();
@@ -855,7 +893,7 @@ private:
                     hold_episode_units_ = 0;
                     hold_peak_bytes_ = 0;
                     hold_episode_started_at_ = {};
-                    media("video_backpressure_released",
+                    defer_media("video_backpressure_released",
                           ipc::video_backpressure_released_json(
                               held_units, held_bytes, age_ms));
                 }
@@ -885,7 +923,7 @@ private:
         }
     }
 
-    void emit_drops(bool final) {
+    void emit_drops(bool final) noexcept {
         const auto observations = units_ + dropped_;
         // The final cumulative record goes to the lifecycle sink once per count,
         // even when a periodic record with the same count went to the (lossy)
@@ -896,21 +934,21 @@ private:
         }
         exported_observations_ = observations;
         if (final) { final_observations_ = observations; }
-        const auto line = "{\"event\":\"decode_stats\",\"frame_drops\":" + std::to_string(dropped_) + "}";
-        if (final) {
-            log_(line);
-        } else {
-            media("decode_stats", line);
-        }
+        try {
+            defer_media(final ? std::string_view{} : "decode_stats",
+                        "{\"event\":\"decode_stats\",\"frame_drops\":" + std::to_string(dropped_) + "}");
+        } catch (...) {}
     }
 
-    void record_drop(const char* reason, std::uint64_t cadence) {
+    void record_drop(const char* reason, std::uint64_t cadence) noexcept {
         ++dropped_;
         if (!has_drop_report_ || dropped_ - last_drop_report_count_ >= cadence) {
             has_drop_report_ = true;
             last_drop_report_count_ = dropped_;
-            media("video_dropped", std::string{"{\"event\":\"video_dropped\",\"reason\":\""} + reason +
-                                       "\",\"count\":" + std::to_string(dropped_) + "}");
+            try {
+                defer_media("video_dropped", std::string{"{\"event\":\"video_dropped\",\"reason\":\""} +
+                            reason + "\",\"count\":" + std::to_string(dropped_) + "}");
+            } catch (...) {}
             emit_drops(false);
         }
     }
@@ -933,9 +971,9 @@ private:
             return;
         }
         if (const auto sized = producer_->configure_send_buffer(profile); sized.has_value()) {
-            log_(ipc::video_socket_buffer_json("producer", sized.value(), profile));
+            defer_media({}, ipc::video_socket_buffer_json("producer", sized.value(), profile));
             if (sized.value().has_warning()) {
-                log_(ipc::video_socket_buffer_warning_json("producer", sized.value(), profile));
+                defer_media({}, ipc::video_socket_buffer_warning_json("producer", sized.value(), profile));
             }
         }
     }
@@ -964,7 +1002,7 @@ private:
     // producer stall where every request fails still opens an episode.
     void begin_idr_wait_locked(std::chrono::steady_clock::time_point now, std::string_view reason) {
         if (!idr_coordinator_.waiting()) {
-            log_(ipc::idr_wait_started_json("producer", reason));
+            defer_media({}, ipc::idr_wait_started_json("producer", reason));
         }
         idr_coordinator_.begin_wait(now);
     }
@@ -983,8 +1021,17 @@ private:
         const auto ep_requests = idr_coordinator_.episode_requests();
         const auto tot_requests = idr_coordinator_.total_requests();
         idr_dispatching_.store(true, std::memory_order_release);
-        lock.unlock();
-        const auto sent = hook_with_mode ? hook_with_mode(use_transition) : hook();
+        flush_deferred_media(lock);
+        if (lock.owns_lock()) { lock.unlock(); }
+        const auto sent = [&]() {
+            try {
+                return hook_with_mode ? hook_with_mode(use_transition) : hook();
+            } catch (...) {
+                lock.lock();
+                idr_dispatching_.store(false, std::memory_order_release);
+                throw;
+            }
+        }();
         lock.lock();
         idr_dispatching_.store(false, std::memory_order_release);
         if (!sent) {
@@ -992,7 +1039,7 @@ private:
                 // Phone may have received the preceding `native` focus notification;
                 // preserve cooldown, request counts, and escalated_ state so native
                 // is never replayed, and propagate the terminal failure.
-                log_(ipc::idr_transition_failed_json("producer", "restore_focus", reason,
+                defer_media({}, ipc::idr_transition_failed_json("producer", "restore_focus", reason,
                                                      ep_requests, tot_requests,
                                                      to_string(sent.error().code())));
                 return sent.error();
@@ -1000,9 +1047,9 @@ private:
             idr_coordinator_.note_request_failed(now);
             return sent.error();
         }
-        log_(ipc::idr_requested_json("producer", reason));
+        defer_media({}, ipc::idr_requested_json("producer", reason));
         if (use_transition) {
-            log_(ipc::idr_escalated_json("producer", ipc::idr_recovery_step_name(step), reason,
+            defer_media({}, ipc::idr_escalated_json("producer", ipc::idr_recovery_step_name(step), reason,
                                          ep_requests, tot_requests));
         }
         return true;
@@ -1037,8 +1084,11 @@ private:
     static constexpr std::chrono::milliseconds kLateRelease{20};
     std::uint64_t late_releases_{0};
     bool defer_idr_{false};
+    bool startup_idr_wait_{false};
     std::optional<std::chrono::steady_clock::time_point> last_checkpoint_{};
-    std::vector<std::pair<std::string, std::string>> deferred_media_{};
+    LogBatch deferred_media_{};
+    std::uint64_t next_log_ticket_{};
+    std::atomic<std::uint64_t> log_turn_{};
     std::optional<Error> release_error_{};
     std::condition_variable release_cv_{};
     bool release_stop_{false};

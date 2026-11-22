@@ -63,7 +63,7 @@ std::vector<std::byte> pcm_50ms() {
 struct SinkGate final {
     std::mutex mutex;
     std::condition_variable cv;
-    bool block_first_write{false};
+    std::size_t block_write_index{0};
     bool released{false};
     bool fail_first_write{false};
     std::size_t fail_write_index{0};
@@ -106,7 +106,7 @@ public:
         gate_->timestamps.push_back(chunk.timestamp);
         gate_->cv.notify_all();
 
-        if (index == 1 && gate_->block_first_write) {
+        if (index == gate_->block_write_index) {
             if (!gate_->cv.wait_for(lock, std::chrono::seconds{5},
                                     [&] { return gate_->released; })) {
                 return aa::Error{aa::ErrorCode::timeout};
@@ -272,7 +272,7 @@ std::vector<std::string> split_lines(const std::string& text) {
 
 TEST(WirelessAudioWorker, StalledSinkDoesNotBlockSessionThreadOrIngress) {
     auto gate = std::make_shared<SinkGate>();
-    gate->block_first_write = true;
+    gate->block_write_index = 1;
 
     audio::AudioRenderWorker audio{wr::audio_config(audio::SinkBackend::pulse),
                                    wr::audio_telemetry(), fake_router(gate)};
@@ -356,7 +356,7 @@ TEST(WirelessAudioWorker, StalledSinkDoesNotBlockSessionThreadOrIngress) {
 TEST(WirelessAudioWorker, StallBypassTriggersAndReopensOnWriteError) {
     wr::running.store(true);
     auto gate = std::make_shared<SinkGate>();
-    gate->block_first_write = true;
+    gate->block_write_index = 1;
     gate->fail_first_write = true;
 
     std::string output;
@@ -597,6 +597,8 @@ TEST(WirelessAudioWorker, TelemetryEventParityWithCollectorAndSmokeContracts) {
     timing.playout_resumes = 1;
     timing.playout_reported_offset = aa::core::Nanoseconds{119'000'000};
     timing.frames_shed = 96;
+    timing.playout_shed_residual_chunks = 2;
+    timing.playout_shed_residual_peak = aa::core::Nanoseconds{75'000'000};
     timing.max_arrival_burst = 3;
     audio::MediaTimingContext context;
     context.sink_reopens = 1;
@@ -613,18 +615,23 @@ TEST(WirelessAudioWorker, TelemetryEventParityWithCollectorAndSmokeContracts) {
         "\"playout_offset_ms\":121,\"playout_reported_offset_ms\":119,\"playout_underruns\":1,"
         "\"playout_anchors\":2,\"playout_resumes\":1,\"frames_padded\":240,\"frames_shed\":96,"
         "\"credit_window\":4,"
-        "\"max_unacked_held\":3,\"max_arrival_burst\":3}");
+        "\"max_unacked_held\":3,\"max_arrival_burst\":3,"
+        "\"playout_shed_residual_chunks\":2,\"playout_shed_residual_peak_ms\":75}");
     // Lifetime: a reopened route's counters add to the earlier routes'.
     audio::RouterStats earlier{};
     earlier.frames_decoded = 100;
     earlier.frames_trimmed = 7;
     earlier.playout_underruns = 2;
+    earlier.playout_shed_residual_chunks = 3;
+    earlier.playout_shed_residual_peak = aa::core::Nanoseconds{80'000'000};
     earlier.max_path_latency = aa::core::Nanoseconds{9'000'000};
     earlier.playout_depth_min = aa::core::Nanoseconds{40'000'000};
     const auto total = audio::accumulate_router_stats(earlier, timing);
     EXPECT_EQ(total.frames_decoded, 11'534'436U);
     EXPECT_EQ(total.frames_trimmed, 1'526'743U);
     EXPECT_EQ(total.playout_underruns, 3U);
+    EXPECT_EQ(total.playout_shed_residual_chunks, 5U);
+    EXPECT_EQ(total.playout_shed_residual_peak.count, 80'000'000);
     EXPECT_EQ(total.max_path_latency, aa::core::Nanoseconds{9'000'000});
     EXPECT_EQ(total.playout_depth_min, aa::core::Nanoseconds{40'000'000});
     EXPECT_EQ(total.playout_depth, timing.playout_depth);
@@ -710,7 +717,7 @@ TEST(WirelessAudioWorker, SessionResetClearsPriorBypassAndProtectsNewPcmFromLate
     {
         wr::running.store(true);
         auto gate = std::make_shared<SinkGate>();
-        gate->block_first_write = true;
+        gate->block_write_index = 1;
 
         std::string output;
         bool ready_ok = false;
@@ -774,7 +781,7 @@ TEST(WirelessAudioWorker, SessionResetClearsPriorBypassAndProtectsNewPcmFromLate
     {
         wr::running.store(true);
         auto gate = std::make_shared<SinkGate>();
-        gate->block_first_write = true;
+        gate->block_write_index = 1;
         gate->fail_first_write = true;
 
         std::string output;
@@ -1091,7 +1098,7 @@ struct CollectedTelemetry final {
 
 TEST(WirelessAudioWorker, CreditWindowAdvertisesFourAndKeepsFourChunksInFlight) {
     auto gate = std::make_shared<SinkGate>();
-    gate->block_first_write = true;
+    gate->block_write_index = 1;
     CollectedTelemetry telemetry;
     audio::AudioRenderWorker audio{quiet_wireless_config(), telemetry.callbacks(), fake_router(gate),
                                    audio::AudioRenderWorker::monotonic_now,
@@ -1192,7 +1199,9 @@ struct WorkerReplay final {
 // production wireless policy. Arrival stamps are the session clock. The phone
 // releases chunks in groups of `burst`; a group arriving together is
 // submitted before the receiver services any completion, so several chunks
-// are really in flight at once.
+// are really in flight at once. The replay advances a virtual arrival
+// clock. The bounded wall-clock wait per group synchronizes the real worker
+// thread and never represents phone or sink pacing.
 template <typename RoundTrip>
 [[nodiscard]] WorkerReplay replay_through_worker(std::int64_t seconds, RoundTrip round_trip_ms,
                                                  std::uint64_t burst = 1, std::uint64_t later_burst = 0,
@@ -1463,7 +1472,7 @@ TEST(WirelessAudioWorker, CreditWindowSaturationWithABlockedSinkNeverRefusesALeg
                           Case{proto::ChannelRole::media_audio, 19200, "media bytes"},
                           Case{proto::ChannelRole::media_audio, 400, "media slots"}}) {
         auto gate = std::make_shared<SinkGate>();
-        gate->block_first_write = true;
+        gate->block_write_index = 1;
         audio::AudioRenderWorker audio{quiet_wireless_config(), {}, fake_router(gate),
                                        audio::AudioRenderWorker::monotonic_now,
                                        audio::AudioRenderWorker::kDefaultAckReleaseDrainTimeout,
@@ -1606,7 +1615,7 @@ TEST(WirelessAudioWorker, PlayoutHistoryClearsWhenNoStreamIsAnchored) {
 // slew). A write completing with no stream anchored now records nothing.
 TEST(WirelessAudioWorker, PlayoutWriteCompletingAfterTheLastStreamStopsLeavesNoHistory) {
     auto gate = std::make_shared<SinkGate>();
-    gate->block_first_write = true;
+    gate->block_write_index = 1;
     audio::AudioRenderWorker audio{quiet_wireless_config(), {}, fake_router(gate)};
     ASSERT_TRUE(audio.ready());
     const auto guidance = proto::ChannelRole::guidance_audio;
@@ -1624,6 +1633,34 @@ TEST(WirelessAudioWorker, PlayoutWriteCompletingAfterTheLastStreamStopsLeavesNoH
     }
     EXPECT_EQ(audio.playout_offset_at(t0).count(), 0) << "the stale write repopulated the history";
     audio.stop();
+    EXPECT_TRUE(audio.finish());
+}
+
+TEST(WirelessAudioWorker, PlayoutWriteCompletesWhenCancelledRoleHasAnAnchoredPeer) {
+    using namespace std::chrono_literals;
+    auto gate = std::make_shared<SinkGate>();
+    gate->block_write_index = 2;
+    audio::AudioRenderWorker audio{quiet_wireless_config(), {}, fake_router(gate)};
+    ASSERT_TRUE(audio.ready());
+    const auto media = proto::ChannelRole::media_audio;
+    const auto guidance = proto::ChannelRole::guidance_audio;
+    const aa::core::Nanoseconds first{1'000'000'000};
+    ASSERT_TRUE(audio.submit({{media, 1, first}, pcm_chunk_2048()}, {media, 0, 1, 1}));
+    ASSERT_TRUE(audio.wait_idle(std::chrono::steady_clock::now() + 2s));
+    ASSERT_GT(audio.playout_offset_at(first).count(), 0);
+
+    const std::vector<std::byte> voice(6400, std::byte{0x10});
+    const aa::core::Nanoseconds overlay{first.count + kChunkNs};
+    ASSERT_TRUE(audio.submit({{guidance, 2, overlay}, voice}, {guidance, 0, 2, 1}));
+    ASSERT_TRUE(gate->wait_entered(2));
+    audio.invalidate(guidance, 1);
+    EXPECT_GT(audio.playout_offset_at(first).count(), 0);
+    gate->release();
+    ASSERT_TRUE(audio.wait_idle(std::chrono::steady_clock::now() + 2s));
+    EXPECT_EQ(gate->writes_completed, 2U);
+    EXPECT_GT(audio.playout_offset_at(overlay).count(), 0);
+    audio.invalidate(media, 1);
+    EXPECT_EQ(audio.playout_offset_at(overlay).count(), 0);
     EXPECT_TRUE(audio.finish());
 }
 

@@ -429,6 +429,10 @@ struct RouterStats final {
     // Subset of frames_trimmed: a deep post-drought backlog shed at 30% of
     // each chunk to stay under the video hold cap.
     std::uint64_t frames_shed{};
+    // Committed offset above the shedding threshold, even when the buffer
+    // minimum prevents additional shedding.
+    std::uint64_t playout_shed_residual_chunks{};
+    core::Nanoseconds playout_shed_residual_peak{};
 };
 
 // One playout re-anchor (stream start, resume, or underrun) of one role,

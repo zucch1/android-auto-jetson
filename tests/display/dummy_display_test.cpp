@@ -3343,16 +3343,15 @@ TEST(DummyDisplayBackpressure, ConsumerSuppressesIdrRecoveryWhenNotProjecting) {
     server.value().close();
 }
 
-TEST(DummyDisplayBackpressure, ConsumerThrottlesPersistentDbusIdrRecoveryFailure) {
+static void check_dbus_idr_retries(bool idle_link) {
     OwnedRuntime runtime;
     ASSERT_FALSE(runtime.path().empty());
     ScriptedReceiver::Script script{};
     script["StartProjection"] = {ScriptedReply{.kind = ScriptedReply::Kind::ok}};
-    script["RequestIdrRecovery"] = {
-        ScriptedReply{.kind = ScriptedReply::Kind::error},
-        ScriptedReply{.kind = ScriptedReply::Kind::error},
-        ScriptedReply{.kind = ScriptedReply::Kind::ok},
-    };
+    const ScriptedReply refusal{.kind = ScriptedReply::Kind::error,
+        .error_name = idle_link ? "org.custom.AndroidAutoReceiver1.Error.IllegalTransition"
+                                : "org.freedesktop.DBus.Error.Failed"};
+    script["RequestIdrRecovery"] = {refusal, refusal, ScriptedReply{.kind = ScriptedReply::Kind::ok}};
     auto receiver = ScriptedReceiver::start(script);
     ASSERT_NE(receiver, nullptr);
 
@@ -3408,9 +3407,12 @@ TEST(DummyDisplayBackpressure, ConsumerThrottlesPersistentDbusIdrRecoveryFailure
                          "{\"event\":\"idr_requested\",\"source\":\"consumer\",\"reason\":\"decode_awaiting_idr\"}"),
               0);
 
-    // After the 2nd-failure backoff elapses (+500 ms), the 3rd attempt succeeds and counters
-    // remain unpolluted by the two failed calls.
-    now += std::chrono::milliseconds{500};
+    // Idle requests keep the normal interval while the phone connects.
+    // Other failures back off. Neither refusal is counted as a request.
+    now += std::chrono::milliseconds{249};
+    ASSERT_TRUE(controller.value().pump(Milliseconds{0}));
+    EXPECT_EQ(receiver->count_calls("RequestIdrRecovery"), 2u);
+    now += std::chrono::milliseconds{idle_link ? 1 : 251};
     ASSERT_TRUE(controller.value().pump(Milliseconds{0}));
     EXPECT_EQ(receiver->count_calls("RequestIdrRecovery"), 3u);
     EXPECT_EQ(std::count(diagnostics.begin(), diagnostics.end(),
@@ -3421,10 +3423,18 @@ TEST(DummyDisplayBackpressure, ConsumerThrottlesPersistentDbusIdrRecoveryFailure
     decoder.report.awaiting_idr = false;
     ASSERT_TRUE(controller.value().pump(Milliseconds{0}));
     EXPECT_NE(std::find(diagnostics.begin(), diagnostics.end(),
-                        "{\"event\":\"idr_recovered\",\"source\":\"consumer\",\"latency_ms\":800,\"episode_requests\":1,\"total_requests\":1}"),
+                        aa::ipc::idr_recovered_json("consumer", idle_link ? 550 : 800, 1, 1)),
               diagnostics.end());
 
     producer->close();
     controller.value().shutdown();
     server.value().close();
+}
+
+TEST(DummyDisplayBackpressure, ConsumerThrottlesPersistentDbusIdrRecoveryFailure) {
+    ASSERT_NO_FATAL_FAILURE(check_dbus_idr_retries(false));
+}
+
+TEST(DummyDisplayBackpressure, ConsumerSuppressesIdrRequestLogsUntilTheLinkIsActive) {
+    ASSERT_NO_FATAL_FAILURE(check_dbus_idr_retries(true));
 }

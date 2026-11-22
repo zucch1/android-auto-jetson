@@ -6,6 +6,7 @@
 #include <aa/ipc/ControlService.hpp>
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 
 namespace aa::ipc {
@@ -45,6 +46,7 @@ public:
         PairingIdSource& pairing_ids;
         PhoneDirectory& phones;
         helper::Confirmation* confirmation{nullptr};
+        std::function<bool()> session_active{};
     };
 
     // Connects to the session bus (DBUS_SESSION_BUS_ADDRESS), owns the

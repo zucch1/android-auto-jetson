@@ -124,7 +124,10 @@ struct DisplayController::Impl final {
             if (idr_recovery.try_request(current_time, state == DisplayState::projecting)) {
                 const auto requested = control.request_idr_recovery();
                 if (!requested.has_value()) {
-                    idr_recovery.note_request_failed(current_time);
+                    // An idle link may become active at any point. Keep the
+                    // normal cadence for that state and back off on I/O errors.
+                    const bool backoff = requested.error().code() != ErrorCode::session_illegal_transition;
+                    idr_recovery.note_request_failed(current_time, backoff);
                 } else {
                     emit_diagnostic(ipc::idr_requested_json("consumer", reason));
                 }

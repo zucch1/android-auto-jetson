@@ -190,7 +190,10 @@ int receiver_main(int argc, char** argv) {
         aa::app::WirelessReceiver receiver{{store, clock, diagnostics}, *helper.value(),
             aa::app::WirelessLink::Config{}};
         auto bus = aa::ipc::ControlBusService::start({aa::ipc::current_uid()},
-            {ids, phones, &receiver.confirmation()});
+            {ids, phones, &receiver.confirmation(), [&receiver] {
+            const auto* session = receiver.session();
+            return session && session->state() == aa::session::State::active;
+        }});
         if (!bus) { report("session control bus", bus.error().code()); return 3; }
         struct sigaction action{};
         action.sa_handler = on_signal;

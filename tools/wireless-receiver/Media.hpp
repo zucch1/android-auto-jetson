@@ -131,6 +131,7 @@ struct Media final {
         app::WirelessLink::Config config;
         config.session.input_enabled = true;
         config.session.input = capabilities;
+        config.session.on_video_start = [this] { return video.request_startup_idr(); };
         config.services = service_descriptors(capabilities, std::move(profiles));
         config.sinks = {{ChannelRole::input, &input}, {ChannelRole::sensors, &sensors},
             {ChannelRole::microphone, &microphone}};

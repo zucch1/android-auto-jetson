@@ -55,6 +55,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <memory>
 #include <optional>
@@ -79,6 +80,8 @@ struct WiredSessionConfig final {
     bool input_enabled{true};
     input::CapabilityDescriptor input = input::CapabilityDescriptor::bench_defaults();
     core::SessionId session{core::SessionId{1}};
+    // Owner-thread callback once a new video stream can accept a focus nudge.
+    std::function<core::Result<void>()> on_video_start{};
 };
 
 class WiredSession final {

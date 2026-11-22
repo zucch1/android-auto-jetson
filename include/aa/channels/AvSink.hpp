@@ -54,6 +54,9 @@ public:
     // independently even when their delivery has already been invalidated.
     [[nodiscard]] core::Result<void> complete_av_delivery(AvDeliveryId id, core::Result<void> result);
     void reset() noexcept;
+    void set_on_video_start(std::function<core::Result<void>()> callback) {
+        on_video_start_ = std::move(callback);
+    }
     void observe_receive(bool entering) const;
     [[nodiscard]] bool input_focus_allowed() const noexcept;
     [[nodiscard]] bool video_projecting() const noexcept;
@@ -85,6 +88,7 @@ private:
     protocol::MessageSink* raw_{};
     std::optional<DeferredAvDelivery> deferred_;
     Send send_;
+    std::function<core::Result<void>()> on_video_start_;
     std::uint64_t generation_{};
     std::uint64_t* generation_counter_{};
     std::uint64_t delivery_sequence_{};
