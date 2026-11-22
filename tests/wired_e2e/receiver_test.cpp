@@ -1768,6 +1768,7 @@ struct AdmissionResult {
     int switches = -1;
     int claims = -1;
     std::string expected_label;
+    std::string expected_port;
     std::string output;
 };
 
@@ -1785,6 +1786,7 @@ AdmissionResult run_admission_child(bool pre_admission_failure) {
             "04e8", "6860", "SECOND-PRIVATE-USB", "SAMSUNG", "SAMSUNG_Android",
             "SECOND-PRIVATE-AOA", "1-2.2"};
         const auto label = aa::trust::redacted_label(aa::trust::TransportIdentity{second});
+        const auto redacted_port = aa::diagnostics::redact_identifier(second.port_context);
         std::vector<std::string> args{"receiver", "--port", "1-2.2", "--no-bus", "--store",
             (root / "approved.json").string(), "--video-socket", (root / "video").string(),
             "--input-socket", (root / "input").string(), "--duration-ms", "100"};
@@ -1797,7 +1799,8 @@ AdmissionResult run_admission_child(bool pre_admission_failure) {
         {
             std::ofstream metrics(root / "metrics");
             metrics << runtime_connects.load() << ' ' << runtime_ciphers.load() << ' '
-                    << admission_state->switches() << ' ' << admission_state->claims() << ' ' << label;
+                    << admission_state->switches() << ' ' << admission_state->claims() << ' '
+                    << label << ' ' << redacted_port;
         }
         std::fflush(stdout);
         ::_exit(code);
@@ -1869,7 +1872,7 @@ AdmissionResult run_admission_child(bool pre_admission_failure) {
         result.output.assign(std::istreambuf_iterator<char>{capture}, {});
         std::ifstream metrics(root / "metrics");
         metrics >> result.connects >> result.ciphers >> result.switches >> result.claims
-                >> result.expected_label;
+                >> result.expected_label >> result.expected_port;
     }
     std::filesystem::remove_all(root);
     return result;
@@ -1905,20 +1908,23 @@ TEST(WiredReceiver, RejectedAttemptEmitsCapturedPseudonymAndPort) {
         "SECOND-PRIVATE-AOA", "1-2.2"};
     const auto result = run_admission_child(false);
     const auto &label = result.expected_label;
+    const auto &port = result.expected_port;
     ASSERT_FALSE(label.empty());
+    ASSERT_FALSE(port.empty());
     expect_admission_exit(result, 1);
     const auto errors = link_errors(result.output);
     ASSERT_EQ(errors.size(), 1U) << result.output;
     EXPECT_NE(errors[0].find("\"phone_id\":\"" + label + "\""), std::string::npos)
         << "CAPTURED_PSEUDONYM_MISSING: " << errors[0];
-    EXPECT_NE(errors[0].find("\"port\":\"1-2.2\""), std::string::npos)
+    EXPECT_NE(errors[0].find("\"port\":\"" + port + "\""), std::string::npos)
         << "SECOND_PORT_MISSING: " << errors[0];
     EXPECT_EQ(errors[0], "{\"event\":\"err\",\"detail\":\"link\",\"code\":\"transport_unauthorized_peer\","
-                         "\"phone_id\":\"" + label + "\",\"port\":\"1-2.2\"}");
+                         "\"phone_id\":\"" + label + "\",\"port\":\"" + port + "\"}");
     const auto key = aa::trust::validated_key(aa::trust::TransportIdentity{second});
     ASSERT_TRUE(key.has_value());
     for (const auto &raw : {second.usb_serial, second.aoa_serial, second.aoa_manufacturer,
-                            second.aoa_model, key.value(), std::string{"FIRST-PRIVATE"}}) {
+                            second.aoa_model, second.port_context, key.value(),
+                            std::string{"FIRST-PRIVATE"}}) {
         EXPECT_EQ(result.output.find(raw), std::string::npos) << "raw identity leaked: " << raw;
     }
 }

@@ -16,7 +16,11 @@ device). Each case asserts the exact JSON verdict and exit code:
        `connected` token passes.
   P2   every scenario needs OBSERVED evidence: a recovery without a state/flow
        dip is BLOCKED (never PASS), and an unknown phone without an observed
-       rejection is BLOCKED (never PASS).
+       rejection is BLOCKED (never PASS). The rejection is correlated with the
+       attempt's own startup `connecting` pseudonym: both records carry the
+       redacted port (id- + 16 hex, per-process salt), so only equality within
+       one attempt proves attribution; a mismatching or missing pseudonym never
+       passes.
   P2-G a GetState=projecting string with no media (painted frames / successful
        audio pump / "ok":"true" input) is NON-PASS, and each of the three
        media conjuncts is pinned independently (N1).
@@ -310,6 +314,29 @@ class RecoveryQaGates(unittest.TestCase):
     script = ""
     recovery_scenarios = ("receiver_restart", "consumer_restart", "usb_unplug_replug",
                           "phone_lock_unlock", "phone_aa_restart", "unknown_phone")
+    # run-wired-receiver logs identifier/port values through the repository
+    # redactor: "id-" + 16 hex, salted per process. One attempt's startup and
+    # refusal records share the salt, so the harness correlates them by equality
+    # and can never compare against a raw USB port.
+    PSEUDONYM = "id-0123456789abcdef"
+    OTHER_PSEUDONYM = "id-fedcba9876543210"
+
+    def attempt_log(self, port: str | None = None, startup: str | None = None,
+                    phone_id: str = "id-second") -> str:
+        """One admission attempt's log: the startup `connecting` record, then the
+        refusal. `startup=None` uses the refusal's own pseudonym (the passing
+        shape); a different value models a refusal naming another port."""
+        refusal_port = self.PSEUDONYM if port is None else port
+        startup_port = refusal_port if startup is None else startup
+        lines = [f'{{"event":"connecting","port":"{startup_port}"}}']
+        lines.append('{"event":"err","detail":"link","code":"transport_unauthorized_peer",'
+                     f'"phone_id":"{phone_id}","port":"{refusal_port}"}}')
+        return "\n".join(lines)
+
+    def refusal(self, port: str | None = None, phone_id: str = "id-second") -> str:
+        """The refusal record alone (for windows that model no startup record)."""
+        return ('{"event":"err","detail":"link","code":"transport_unauthorized_peer",'
+                f'"phone_id":"{phone_id}","port":"{self.PSEUDONYM if port is None else port}"}}')
 
     def passing_env(self) -> dict[str, str]:
         return {
@@ -317,9 +344,7 @@ class RecoveryQaGates(unittest.TestCase):
             "FAKE_MEDIA_TIMING": "1", "FAKE_INPUT_OK": "1",
             "FAKE_LOG_WINDOW": ('{"event":"diag","phone_id":"id-approved"}\n'
                                 '{"kind":"reconnect","phone_id":"id-approved"}'),
-            "FAKE_ATTEMPT_LOG": ('{"event":"err","detail":"link",'
-                                 '"code":"transport_unauthorized_peer",'
-                                 '"phone_id":"id-second","port":"1-2.3"}'),
+            "FAKE_ATTEMPT_LOG": self.attempt_log(),
         }
 
     def assert_budget_failure(self, code: int, doc: dict) -> None:
@@ -421,12 +446,12 @@ class RecoveryQaGates(unittest.TestCase):
         self.assertEqual(code, 3, doc)
         self.assertTrue(doc["scenarios"][0]["detail"].startswith("receiver_state_log_lost"), doc)
 
-    # #90 review 5 P2: a rejection whose content failed the row (here it names
-    # the approved phone's port) is confirmed even when the row also ran past
-    # its deadline and the attempt's log was delivered late.
+    # #90 review 5 P2: a rejection whose content failed the row (here the
+    # refusal names a port other than this attempt's own startup pseudonym) is
+    # confirmed even when the row also ran past its deadline and the attempt's
+    # log was delivered late.
     def test_confirmed_rejection_failure_past_the_deadline_survives_log_lag(self) -> None:
-        wrong_port = ('{"event":"err","detail":"link","code":"transport_unauthorized_peer",'
-                      '"phone_id":"id-second","port":"1-2.1"}')
+        wrong_port = self.attempt_log(startup=self.OTHER_PSEUDONYM)
         # The attempt's log is read in time; the clock then passes the deadline
         # before the row is recorded.
         env = self.passing_env() | {"FAKE_ADB_COUNT": "2", "FAKE_TERMINAL_MS": "6000",
@@ -435,7 +460,7 @@ class RecoveryQaGates(unittest.TestCase):
         code, doc = self.run_qa(["--only", "unknown_phone"], **env)
         self.assertEqual(code, 1, doc)
         self.assertEqual(doc["scenarios"][0]["status"], "FAILED", doc)
-        self.assertEqual(doc["scenarios"][0]["evidence"], "rejection+approved_port", doc)
+        self.assertEqual(doc["scenarios"][0]["evidence"], "rejection+other_port", doc)
         self.assertEqual(doc["scenarios"][0]["detail"], "recovery_exceeded_budget", doc)
         # While a passing rejection that arrived past the deadline is timed by
         # the late log, so it is inconclusive rather than a confirmed miss.
@@ -539,11 +564,9 @@ class RecoveryQaGates(unittest.TestCase):
     def test_confirmed_failure_is_not_downgraded_by_unrelated_loss(self) -> None:
         # Given: an unknown phone that reached active (directly observed) and an
         # unrelated dropped runtime record plus lost state records elsewhere.
-        attributed = ('{"event":"err","detail":"link","code":"transport_unauthorized_peer",'
-                      '"phone_id":"id-abc123","port":"1-2.3"}')
-        window = attributed + '\n{"event":"active","startup_ms":100}'
+        window = self.attempt_log() + '\n{"event":"active","startup_ms":100}'
         code, doc = self.run_qa(["--only", "unknown_phone"], FAKE_ADB_COUNT="2",
-                                FAKE_LOG_WINDOW=attributed, FAKE_ATTEMPT_LOG=window,
+                                FAKE_LOG_WINDOW=self.refusal(), FAKE_ATTEMPT_LOG=window,
                                 FAKE_LOG_AUDIT=self.audit(runtime_dropped=4, state_overflow=2))
         # Then: the confirmed FAILED survives, exit 1.
         self.assertEqual(code, 1, doc)
@@ -818,11 +841,10 @@ class RecoveryQaGates(unittest.TestCase):
         self.assertEqual(rows["unknown_phone"]["evidence"], "rejection_unobserved")
 
     def test_unknown_phone_with_observed_rejection_passes(self):
-        attributed = ('{"event":"err","detail":"link","code":"transport_unauthorized_peer",'
-                      '"phone_id":"id-abc123","port":"1-2.3"}')
+        attributed = self.refusal()
         code, doc = self.run_qa(["--only", "unknown_phone"],
                                 FAKE_ADB_COUNT="2", FAKE_LOG_WINDOW=attributed,
-                                FAKE_ATTEMPT_LOG=attributed)
+                                FAKE_ATTEMPT_LOG=self.attempt_log())
         self.assertEqual(code, 0, doc)
         self.assertEqual(doc["status"], "PASS")
         rows = {row["name"]: row for row in doc["scenarios"]}
@@ -867,52 +889,60 @@ class RecoveryQaGates(unittest.TestCase):
         rows = {row["name"]: row for row in doc["scenarios"]}
         self.assertEqual(rows["unknown_phone"]["evidence"], "rejection_unattributed")
 
-    def test_unknown_phone_rejection_on_approved_port_is_failed(self):
-        attributed = ('{"event":"err","detail":"link","code":"transport_unauthorized_peer",'
-                      '"phone_id":"id-abc123","port":"1-2.1"}')
+    def test_unknown_phone_rejection_with_other_port_pseudonym_is_failed(self):
+        # The refusal names a port other than the one this attempt was opened
+        # on: the same process would have logged the same pseudonym otherwise.
         code, doc = self.run_qa(["--only", "unknown_phone"],
-                                FAKE_ADB_COUNT="2", FAKE_LOG_WINDOW=attributed,
-                                FAKE_ATTEMPT_LOG=attributed)
+                                FAKE_ADB_COUNT="2", FAKE_LOG_WINDOW=self.refusal(),
+                                FAKE_ATTEMPT_LOG=self.attempt_log(startup=self.OTHER_PSEUDONYM))
         self.assertEqual(code, 1, doc)
         self.assertEqual(doc["status"], "FAILED")
         rows = {row["name"]: row for row in doc["scenarios"]}
         self.assertEqual(rows["unknown_phone"]["detail"],
-                         "rejection_attributed_to_approved_phone")
+                         "rejection_attributed_to_other_device")
+        self.assertEqual(rows["unknown_phone"]["evidence"], "rejection+other_port")
+
+    def test_unknown_phone_without_startup_pseudonym_is_blocked(self):
+        # A refusal that cannot be tied to this attempt's own startup record is
+        # not fail-closed evidence: the pairing of the two is what proves it.
+        code, doc = self.run_qa(["--only", "unknown_phone"],
+                                FAKE_ADB_COUNT="2", FAKE_LOG_WINDOW=self.refusal(),
+                                FAKE_ATTEMPT_LOG=self.refusal())
+        self.assertEqual(code, 3, doc)
+        self.assertEqual(doc["status"], "BLOCKED")
+        rows = {row["name"]: row for row in doc["scenarios"]}
+        self.assertEqual(rows["unknown_phone"]["detail"], "attempt_port_pseudonym_unobserved")
 
     def test_unknown_phone_drives_second_device_through_admission(self):
-        attributed = ('{"event":"err","detail":"link","code":"transport_unauthorized_peer",'
-                      '"phone_id":"id-abc123","port":"1-2.3"}')
         with tempfile.TemporaryDirectory() as directory:
             log = Path(directory) / "ssh.log"
             code, doc = self.run_qa(["--only", "unknown_phone"],
-                                    FAKE_ADB_COUNT="2", FAKE_LOG_WINDOW=attributed,
-                                    FAKE_ATTEMPT_LOG=attributed, FAKE_SSH_LOG=str(log))
+                                    FAKE_ADB_COUNT="2", FAKE_LOG_WINDOW=self.refusal(),
+                                    FAKE_ATTEMPT_LOG=self.attempt_log(), FAKE_SSH_LOG=str(log))
             self.assertEqual(code, 0, doc)
             logged = log.read_text(encoding="utf-8")
             attempts = [line for line in logged.splitlines()
                         if "aa-wired-receiver-attempt.log" in line and "--port" in line]
             self.assertTrue(attempts, logged)
+            # ADB device selection stays raw-port based and independent of the
+            # redacted log fields.
             self.assertIn("--port 1-2.3", attempts[0])
             self.assertNotIn("--port 1-2.1", attempts[0])
 
     def test_unknown_phone_requires_identity_port_differ_from_approved(self):
         same_serial = ("FAKEAPPROVED device usb:1-2.1 product:fake model:Fake device:fake\n"
                        "FAKEAPPROVED device usb:1-2.3 product:fake model:Fake device:fake")
-        attributed = ('{"event":"err","detail":"link","code":"transport_unauthorized_peer",'
-                      '"phone_id":"id-abc123","port":"1-2.3"}')
         code, doc = self.run_qa(["--only", "unknown_phone"],
                                 FAKE_ADB_LONG=same_serial,
-                                FAKE_LOG_WINDOW=attributed, FAKE_ATTEMPT_LOG=attributed)
+                                FAKE_LOG_WINDOW=self.refusal(), FAKE_ATTEMPT_LOG=self.attempt_log())
         self.assertEqual(code, 3, doc)
         self.assertEqual(doc["status"], "BLOCKED")
         self.assertIn("second_device_absent", doc["blocked_on"])
 
     def test_unknown_phone_activation_despite_rejection_is_failed(self):
-        attributed = ('{"event":"err","detail":"link","code":"transport_unauthorized_peer",'
-                      '"phone_id":"id-abc123","port":"1-2.3"}')
-        window = attributed + '\n{"event":"active","startup_ms":100}'
+        window = self.attempt_log() + '\n{"event":"active","startup_ms":100}'
         code, doc = self.run_qa(["--only", "unknown_phone"],
-                                FAKE_ADB_COUNT="2", FAKE_LOG_WINDOW=attributed,
+                                FAKE_ADB_COUNT="2", FAKE_LOG_WINDOW=self.refusal(),
                                 FAKE_ATTEMPT_LOG=window)
         self.assertEqual(code, 1, doc)
         self.assertEqual(doc["status"], "FAILED")
