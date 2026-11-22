@@ -80,7 +80,7 @@ Every handshake failure logs one line to the helper's stderr, then fails
 through the ordinary deny path:
 
 ```text
-system-helper: wireless_handshake_failed phase=await_info_request msg_id=99 msg=unknown reason=unknown_id detail="record header rejected"
+system-helper: wireless_handshake_failed phase=await_info_request msg_id=99 msg=unknown reason=unknown_id detail="too many ignored records"
 ```
 
 `phase` is `authorization`, `await_info_request`, `await_start_response`,
@@ -214,8 +214,8 @@ established bootstrap, completed handoff, or projection session.
 Every aborted bootstrap shuts its RFCOMM socket down (`shutdown(SHUT_RDWR)`),
 because BlueZ holds its own reference and a plain `close()` sends no DISC; the
 phone then sees an IO error and restarts its wireless setup. That covers denial,
-every failure, the bootstrap deadline (10 s, or 40 s once the Wi-Fi join
-extension applies), a window that lapses before the bootstrap
+every failure, the bootstrap deadline (10 s from accept, extended to 30 s after
+the `WifiInfoResponse` is sent), a window that lapses before the bootstrap
 ends (the bootstrap still runs to its own deadline), and the retirement of a
 completed hand-off, whether it failed before the receiver confirmed it or its
 session ended later. Completion itself shuts nothing down: the channel stays as
