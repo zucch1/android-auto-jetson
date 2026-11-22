@@ -606,6 +606,7 @@ class DeployHarnessTest(unittest.TestCase):
         result = self.adopt(self.pkg_v1)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("recovered current.env for installed version 1.0.0", result.stdout)
+        self.assertIn("receiver.sha256 is missing or does not match", result.stdout)
         self.assertIn(f"DEB_PATH={archive}\n", current.read_text())
         self.assertIn(f"DEB_SHA256={hashlib.sha256(original).hexdigest()}\n", current.read_text())
         saved = current.read_bytes(), current.stat().st_ino

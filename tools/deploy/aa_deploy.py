@@ -613,6 +613,11 @@ def build_adopt_script(state_dir: str, expected_sha: str) -> str:
             "$installed_version" "$archive" "$expected_sha" > "$temporary"
         mv -fT -- "$temporary" "$current_env"
         printf 'recovered current.env for installed version %s\n' "$installed_version"
+        installed_digest="$(sha256sum -- {shlex.quote(INSTALLED_RECEIVER)} 2>/dev/null | cut -d' ' -f1 || true)"
+        recorded_digest="$(head -c 65 -- {shlex.quote(RECEIVER_SHA256)} 2>/dev/null | tr -d '\n' || true)"
+        if [[ ! "$installed_digest" =~ ^[a-f0-9]{{64}}$ || "$installed_digest" != "$recorded_digest" ]]; then
+            printf 'adopt: WARNING {RECEIVER_SHA256} is missing or does not match {INSTALLED_RECEIVER}; aa-system-helper will refuse to start until you redeploy the identical package to refresh it (see docs/deploy.md)\n'
+        fi
     """))
 
 
@@ -1033,7 +1038,8 @@ def main(argv: list[str] | None = None) -> int:
             "set -euo pipefail\nmktemp -d /tmp/aa-deploy-stage.XXXXXX\n",
         )
         stage_dir = stage_dir_out.strip() if not args.dry_run else "/tmp/aa-deploy-stage.XXXXXX"
-        if not stage_dir:
+        # mktemp output; the test harness prefixes a fake root, so allow plain leading components.
+        if not re.fullmatch(r"(?:/[A-Za-z0-9_-][A-Za-z0-9._-]*)*/tmp/aa-deploy-stage\.[A-Za-z0-9]{6}", stage_dir):
             raise DeployError("failed to create remote staging directory")
         staged_deb = f"{stage_dir}/{PACKAGE_NAME}_{deb_info['Version']}_{EXPECTED_ARCH}.deb"
         runner.scp("copy .deb to target", args.deb.resolve(), staged_deb)
