@@ -31,4 +31,8 @@ if(NOT CMAKE_CROSSCOMPILING)
                 "${CMAKE_C_COMPILER}" "${CMAKE_AR}" --lintian)
     set_tests_properties(deb_package_layout deb_package_lintian PROPERTIES TIMEOUT 90)
     set_tests_properties(deb_package_lintian PROPERTIES SKIP_RETURN_CODE 77)
+    add_test(NAME deploy_ssh_harness
+        COMMAND "${Python3_EXECUTABLE}" -B -m unittest discover
+                -s "${CMAKE_SOURCE_DIR}/tests/deploy" -v)
+    set_tests_properties(deploy_ssh_harness PROPERTIES TIMEOUT 90)
 endif()
