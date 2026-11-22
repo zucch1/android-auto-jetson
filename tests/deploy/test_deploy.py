@@ -53,6 +53,7 @@ def repl(m: re.Match[str]) -> str:
     return root + val
 sys.stdout.write(pat.sub(repl, src))
 ' <<< "$raw_cmd")"
+cd "$root/home/zucchi"
 HOME="$root/home/zucchi" PATH="$FAKE_REMOTE_BIN:$PATH" bash -euo pipefail -s <<< "$cmd"
 """
 
@@ -88,6 +89,11 @@ exec "$@"
 
 FAKE_INSTALL = r"""#!/usr/bin/env bash
 set -euo pipefail
+if [ "${FAKE_METADATA_BACKUP_FAIL:-0}" = "1" ] &&
+    [[ "${@: -2:1}" == */deploy/current.env && "${@: -1}" == */runs/*/previous.env ]]; then
+    echo "fake-install: metadata backup failed" >&2
+    exit 1
+fi
 args=()
 while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -109,6 +115,8 @@ FAKE_REMOTE_PYTHON = r"""#!/usr/bin/python3
 import os
 import sys
 
+if sys.argv[1:3] == ["-I", "-c"] and sys.argv[4:] == ["/"]:
+    os.execv("/usr/bin/python3", ["python3", *sys.argv[1:4], os.environ["FAKE_TARGET_ROOT"]])
 if sys.argv[1:4] != ["-I", "-", "/"]:
     os.execv("/usr/bin/python3", ["python3", *sys.argv[1:]])
 sys.argv = ["-", os.environ["FAKE_TARGET_ROOT"], *sys.argv[4:]]
@@ -124,6 +132,25 @@ os.fstat = fake_fstat
 exec(compile(sys.stdin.read(), "<remote validator>", "exec"))
 """
 
+
+FAKE_FLOCK = r"""#!/usr/bin/env bash
+set -euo pipefail
+if [ "${FAKE_LOCK_TIMEOUT:-0}" = "1" ]; then
+    [ "$1 $2 $3 $4 $5" = "--close --timeout 120 --conflict-exit-code 75" ]
+    exit 75
+fi
+exec /usr/bin/flock "$@"
+"""
+
+FAKE_MV = r"""#!/usr/bin/env bash
+set -euo pipefail
+if [ "${FAKE_INTERRUPT_RECORD_PUBLISH:-0}" = "1" ] &&
+    [[ "${@: -1}" == */deploy/current.env ]]; then
+    echo "fake-mv: interrupted before publishing current.env" >&2
+    exit 1
+fi
+exec /usr/bin/mv "$@"
+"""
 
 FAKE_CP = r"""#!/usr/bin/env bash
 set -euo pipefail
@@ -149,6 +176,16 @@ FAKE_GIT = r"""#!/usr/bin/env bash
 set -euo pipefail
 printf 'git %s\n' "$*" >> "${FAKE_EVENT_LOG:?}"
 exec /usr/bin/git "$@"
+"""
+
+FAKE_STAT = r"""#!/usr/bin/env bash
+set -euo pipefail
+out="$(/usr/bin/stat "$@")"
+if [ -n "${FAKE_STAT_UID:-}" ] && [ "${1:-}" = "-c" ] && [[ "${2:-}" == %u* ]]; then
+    printf '%s%s\n' "$FAKE_STAT_UID" "${out#${out%% *}}"
+    exit 0
+fi
+printf '%s\n' "$out"
 """
 
 FAKE_DPKG = r"""#!/usr/bin/env bash
@@ -340,6 +377,9 @@ class DeployHarnessTest(unittest.TestCase):
         write_exec(self.remote_bin / "sudo", FAKE_SUDO)
         write_exec(self.remote_bin / "install", FAKE_INSTALL)
         write_exec(self.remote_bin / "chown", FAKE_CHOWN)
+        write_exec(self.remote_bin / "stat", FAKE_STAT)
+        write_exec(self.remote_bin / "flock", FAKE_FLOCK)
+        write_exec(self.remote_bin / "mv", FAKE_MV)
         write_exec(self.remote_bin / "python3", FAKE_REMOTE_PYTHON)
         write_exec(self.remote_bin / "cp", FAKE_CP)
         write_exec(self.remote_bin / "git", FAKE_GIT)
@@ -402,6 +442,7 @@ class DeployHarnessTest(unittest.TestCase):
             "FAKE_REMOTE_BIN": str(self.remote_bin),
             "FAKE_SSH_LOG": str(self.ssh_log),
             "FAKE_EVENT_LOG": str(self.event_log),
+            "FAKE_STAT_UID": "0",
             **(extra_env or {}),
         }
         return subprocess.run(
@@ -420,6 +461,10 @@ class DeployHarnessTest(unittest.TestCase):
     def rollback(self, **env: str) -> subprocess.CompletedProcess[str]:
         return self.run_deploy("zucchi@jetson", "--rollback", extra_env=env)
 
+    def adopt(self, deb: Path, **env: str) -> subprocess.CompletedProcess[str]:
+        digest = hashlib.sha256(deb.read_bytes()).hexdigest()
+        return self.run_deploy("zucchi@jetson", "--adopt-installed", digest, extra_env=env)
+
     def legacy_helper(self) -> tuple[Path, Path]:
         helper = self.target / "usr/libexec/aa-system-helper"
         unit = self.target / "etc/systemd/system/aa-system-helper.service"
@@ -436,12 +481,17 @@ class DeployHarnessTest(unittest.TestCase):
                 result = self.install()
                 self.assertNotEqual(result.returncode, 0, result.stdout)
                 self.assertIn("session.uid", result.stderr)
-        uid.chmod(0o644)
         for value in (b"0" * 123 + b"2002\n", b"4294967295"):
             with self.subTest(value=value):
                 uid.write_bytes(value)
                 result = self.install()
                 self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_session_uid_accepts_world_readable_file(self) -> None:
+        uid = self.target / "etc/android-auto-receiver/session.uid"
+        uid.chmod(0o644)
+        result = self.install()
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_preflight_rejects_writable_and_symlinked_etc(self) -> None:
         etc = self.target / "etc"
@@ -471,6 +521,16 @@ class DeployHarnessTest(unittest.TestCase):
         ap.write_bytes(b"v1\twlan0 US\r\njurisdiction-confirmed 0005277 00044\n")
         result = self.install()
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_ap_policy_rejects_interface_glob_even_with_a_match(self) -> None:
+        (self.target / "home/zucchi/wlan0").touch()
+        (self.target / "etc/android-auto-receiver/ap.conf").write_text(
+            "v1 wl* US jurisdiction-confirmed 5277 44\n",
+        )
+        result = self.install()
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("interface name invalid", result.stderr)
+        self.assertNotIn("wl*", result.stderr)
 
     def test_rebuilt_version_cannot_replace_current_or_previous_archive(self) -> None:
         rebuilt = make_deb(self.base / "rebuilt", "1.0.0", b"REBUILT\n")
@@ -503,6 +563,129 @@ class DeployHarnessTest(unittest.TestCase):
                     self.assertIn("deployment metadata", result.stderr)
         self.assertEqual((self.target / "usr/bin/aa-wireless-receiver").read_bytes(), b"ELF-RECEIVER-V1\n")
         self.assertFalse(any(line.startswith("apt-get remove") for line in self.event_log.read_text().splitlines()))
+
+    def test_adopt_recovers_after_install_interrupted_before_record_publish(self) -> None:
+        helper, unit = self.legacy_helper()
+        legacy_helper = helper.read_bytes()
+        result = self.install(FAKE_INTERRUPT_RECORD_PUBLISH="1")
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("interrupted before publishing", result.stderr)
+        state = self.target / "var/lib/android-auto-receiver/deploy"
+        current = state / "current.env"
+        previous = state / "previous.env"
+        self.assertFalse(current.exists())
+        self.assertFalse(previous.exists())
+        self.assertTrue(unit.exists())
+        backup, = state.glob("runs/*-deploy/legacy/legacy-helper")
+        self.assertEqual(backup.read_bytes(), legacy_helper)
+
+        result = self.install()
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("--adopt-installed", result.stderr)
+        result = self.rollback()
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("no previous deployment recorded", result.stderr)
+
+        archive = state / "packages" / self.pkg_v1.name
+        original = archive.read_bytes()
+        archive.unlink()
+        result = self.adopt(self.pkg_v1)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("missing or non-regular cached archive", result.stderr)
+        self.assertIn(self.pkg_v1.name, result.stderr)
+        self.assertFalse(current.exists())
+
+        archive.write_bytes(original + b"corrupt")
+        result = self.adopt(self.pkg_v1)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("cached archive SHA-256 mismatch", result.stderr)
+        self.assertFalse(current.exists())
+
+        archive.write_bytes(original)
+        before = self.event_log.read_text()
+        result = self.adopt(self.pkg_v1)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("recovered current.env for installed version 1.0.0", result.stdout)
+        self.assertIn(f"DEB_PATH={archive}\n", current.read_text())
+        self.assertIn(f"DEB_SHA256={hashlib.sha256(original).hexdigest()}\n", current.read_text())
+        saved = current.read_bytes(), current.stat().st_ino
+        result = self.adopt(self.pkg_v1)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("already records installed version 1.0.0", result.stdout)
+        self.assertEqual((current.read_bytes(), current.stat().st_ino), saved)
+        self.assertFalse(previous.exists())
+        self.assertEqual(backup.read_bytes(), legacy_helper)
+        self.assertTrue(unit.exists())
+        self.assertNotIn("apt-get", self.event_log.read_text()[len(before):])
+        result = self.install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(previous.exists())
+
+    def test_adopt_repairs_stale_record_after_external_install_and_preserves_rollback(self) -> None:
+        helper, _ = self.legacy_helper()
+        legacy_helper = helper.read_bytes()
+        result = self.install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        state = self.target / "var/lib/android-auto-receiver/deploy"
+        current = state / "current.env"
+        previous = state / "previous.env"
+        old_current, old_previous = current.read_bytes(), previous.read_bytes()
+
+        # Reproduce dpkg -i outside the deployment tool against the fake target.
+        subprocess.run(["dpkg-deb", "--extract", self.pkg_v2, self.target], check=True, capture_output=True)
+        status = self.target / "var/lib/dpkg/fake-packages.txt"
+        status.write_text(status.read_text().replace("android-auto-receiver\t1.0.0", "android-auto-receiver\t1.1.0"))
+        for result in (self.install(self.pkg_v2), self.rollback()):
+            self.assertNotEqual(result.returncode, 0, result.stdout)
+            self.assertIn("--adopt-installed", result.stderr)
+        archive = state / "packages" / self.pkg_v2.name
+
+        # Even a trusted digest for the wrong archive or a same-version rebuild
+        # cannot turn it into a rollback artifact for the installed payload.
+        archive.write_bytes(self.pkg_v1.read_bytes())
+        result = self.adopt(self.pkg_v1)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("cached archive metadata does not match", result.stderr)
+        rebuilt = make_deb(self.base / "rebuilt", "1.1.0", b"DIFFERENT PAYLOAD\n")
+        archive.write_bytes(rebuilt.read_bytes())
+        result = self.adopt(rebuilt)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("installed payload differs", result.stderr)
+        self.assertEqual(current.read_bytes(), old_current)
+        self.assertEqual(previous.read_bytes(), old_previous)
+
+        archive.write_bytes(self.pkg_v2.read_bytes())
+        result = self.adopt(self.pkg_v2)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("VERSION=1.1.0", current.read_text())
+        self.assertEqual(previous.read_bytes(), old_previous)
+        result = self.rollback()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("rolled_back_to=legacy", result.stdout)
+        self.assertEqual(helper.read_bytes(), legacy_helper)
+
+    def test_identical_redeploy_restores_pruned_archive_but_upgrade_refuses(self) -> None:
+        result = self.install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        state = self.target / "var/lib/android-auto-receiver/deploy"
+        previous = (state / "previous.env").read_bytes()
+        archive = state / "packages" / self.pkg_v1.name
+        archive.unlink()
+        result = self.install(self.pkg_v2)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("current deployment archive missing or corrupt", result.stderr)
+        result = self.install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(archive.read_bytes(), self.pkg_v1.read_bytes())
+        self.assertEqual((state / "previous.env").read_bytes(), previous)
+
+    def test_lock_timeout_reports_holder_check_and_cleans_staging(self) -> None:
+        result = self.install(FAKE_LOCK_TIMEOUT="1")
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("timed out after 120s", result.stderr)
+        self.assertIn(f"sudo fuser -v {self.target}/run/aa-deploy.lock", result.stderr)
+        self.assertEqual(list((self.target / "tmp").glob("aa-deploy-stage.*")), [])
+        self.assertFalse((self.target / "usr/bin/aa-wireless-receiver").exists())
 
     def test_failed_removal_preserves_both_clean_and_legacy_recovery(self) -> None:
         state = self.target / "var/lib/android-auto-receiver/deploy"
@@ -544,7 +727,7 @@ class DeployHarnessTest(unittest.TestCase):
         state = self.target / "var/lib/android-auto-receiver/deploy"
         recovery = state / "previous.env"
         old_format_backup = state / "rollback/legacy"
-        old_format_backup.mkdir()
+        old_format_backup.mkdir(exist_ok=True)
         old_format_backup.joinpath(unit.name).write_text("[Service]\nExecStart=/usr/libexec/aa-system-helper\n")
         recovery.write_text("PREV_MODE=legacy\n")
         result = self.rollback()
@@ -596,6 +779,21 @@ class DeployHarnessTest(unittest.TestCase):
         self.assertTrue(unit.exists())
         self.assertEqual(helper.read_bytes(), old_helper)
         self.assertFalse((self.target / "usr/bin/aa-wireless-receiver").exists())
+
+    def test_metadata_backup_failure_aborts_before_upgrade(self) -> None:
+        result = self.install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        state = self.target / "var/lib/android-auto-receiver/deploy"
+        records = state / "current.env", state / "previous.env"
+        old_records = [record.read_bytes() for record in records]
+        receiver = self.target / "usr/bin/aa-wireless-receiver"
+        before = self.event_log.read_text()
+        result = self.install(self.pkg_v2, FAKE_METADATA_BACKUP_FAIL="1")
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("metadata backup failed", result.stderr)
+        self.assertEqual([record.read_bytes() for record in records], old_records)
+        self.assertEqual(receiver.read_bytes(), b"ELF-RECEIVER-V1\n")
+        self.assertNotIn("apt-get install", self.event_log.read_text()[len(before):])
 
     def test_preflight_refusals_and_no_secret_leak(self) -> None:
         ap_conf = self.target / "etc/android-auto-receiver/ap.conf"

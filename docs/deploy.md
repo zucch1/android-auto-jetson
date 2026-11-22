@@ -9,7 +9,12 @@ development host to the target Jetson over SSH, replacing the historical ad-hoc
 
 Before running `aa-deploy.sh`, the operator must already have provisioned:
 
-1. Python 3 and passwordless `sudo -n` for the SSH user on the target.
+1. Python 3, `flock` (from util-linux), and passwordless `sudo -n` for the SSH
+   user on the target. The tool runs Python 3 as root for file and package
+   verification. Deploy, rollback, and adoption share `/run/aa-deploy.lock`.
+   If the tool times out after 120 seconds, run
+   `sudo fuser -v /run/aa-deploy.lock` on the target and retry once the holder
+   finishes.
 2. Root-owned, mode `0600` `/etc/android-auto-receiver/ap.conf` containing a valid
    `v1` line with `jurisdiction-confirmed` (see [networkmanager-ap.md](networkmanager-ap.md)).
    `aa-deploy.sh` validates the schema and jurisdiction match on the target without
@@ -52,7 +57,78 @@ Rollback uses a minimal preflight (target architecture, deploy state directory
 present, and no `~/MEASUREMENT_IN_PROGRESS` marker). If the pre-rollback
 infotainment snapshot fails or the directory is missing, rollback warns and
 proceeds. With a usable baseline it still checks the post-rollback snapshot.
-Apt or helper restart failures retain the rollback record for a retry.
+APT or helper restart failures retain the rollback record for a retry.
+Rollback is single-level. A successful rollback consumes the previous record.
+Keep the legacy backup directory referenced in `previous.env`, typically
+`runs/<id>-deploy/legacy` under the state directory, and any archive that a
+record references.
+
+## Recovering deployment state
+
+Use adoption if an interrupted install leaves `current.env` missing or a
+manual package install leaves it stale. Deploy and any rollback that needs
+to remove the package refuse inconsistent current metadata. A rollback to a
+recorded Debian archive can proceed using its own verified archive.
+
+On the development host, compute the SHA-256 from the trusted original
+`arm64` package for the installed version, or use its published digest.
+Set `target` to the original SSH destination and pass `--state-dir` if
+you used a custom state directory.
+
+```sh
+sha=$(sha256sum "$original_deb" | cut -d' ' -f1)
+tools/deploy/aa-deploy.sh "$target" --adopt-installed "$sha"
+```
+
+Adoption checks dpkg's installed version, the matching version-keyed archive in
+`packages/`, and the installed payload. It updates only `current.env`.
+If `previous.env` exists, review the recorded target before rolling back.
+If it is absent, rollback is unavailable until a later deploy records a previous
+version. Adoption preserves the backups and any unpublished `previous.env` in
+`runs/<id>-deploy/`. If the original migration stopped before removing legacy
+shadow files, review those files against the saved backup before resolving them
+manually. Then redeploy the identical package with `--confirm-jurisdiction` to
+refresh the receiver digest and service configuration.
+
+If the archive is missing or damaged, copy the trusted original package to the
+target. Run the following on the target, setting `source_deb` to that local copy
+and `sha` to the trusted digest from the development host. Use the same state
+directory as the original invocation if it passed `--state-dir`.
+
+```sh
+state=/var/lib/android-auto-receiver/deploy
+version=$(dpkg-query -W -f='${Version}' android-auto-receiver)
+archive="$state/packages/android-auto-receiver_${version}_arm64.deb"
+printf '%s  %s\n' "$sha" "$source_deb" | sha256sum --check --status &&
+  sudo flock --close --timeout 120 /run/aa-deploy.lock bash -ec '
+    install -d -m 0700 -o root -g root "$1" "$1/packages"
+    if [ -e "$2" ] || [ -L "$2" ]; then
+      saved=$(mktemp -d -- "$1/packages/recovery.XXXXXX")
+      mv -T -- "$2" "$saved/${2##*/}"
+    fi
+    install -m 0644 -o root -g root -- "$3" "$2"
+  ' bash "$state" "$archive" "$source_deb"
+```
+
+Retry adoption with the same trusted digest. If it reports altered or missing
+installed files, reinstall the verified original on the target with
+`sudo dpkg -i -- "$archive"`. Resolve any reported dependency or configuration
+errors and retry adoption. If dpkg reports an unfinished configuration, run
+`sudo dpkg --configure -a` and resolve any errors first. Perform manual
+package-manager recovery with other deploy operations stopped.
+
+If only the archive was pruned and `current.env` still records the installed
+version, redeploy the identical package to restore the missing cache and retain
+the previous record. An upgrade needs the current archive as a rollback
+artifact. If a rollback's previous archive is missing or corrupt, use the
+recorded `DEB_PATH` and `DEB_SHA256` from `previous.env` for the cache restore
+command above, then retry rollback.
+
+If dpkg already removed the package during rollback, retry `--rollback` to
+finish restoration before deploying again. If no usable previous record
+survives, complete any required legacy restoration from the saved run directory
+and move stale `current.env` or `previous.env` out of the state directory for
+reference before a fresh deploy.
 
 ## What `aa-deploy.sh` does
 
@@ -82,11 +158,13 @@ Apt or helper restart failures retain the rollback record for a retry.
 6. **Package install and rollback state preservation:** checks the installed
    package against `current.env` and verifies its cached archive before upgrading.
    An installed package with missing or inconsistent deployment metadata requires
-   operator recovery before deploy can proceed. Cached archives are immutable per
+   [adoption](#recovering-deployment-state) before deploy can proceed. Cached archives are immutable per
    Debian version. Build with a new version when the bytes change. Reinstalling the
    exact same package preserves `previous.env`.
 7. **Legacy ad-hoc migration:** backs up the artifacts below in the deploy run's
-   `legacy/` directory before invoking APT. Backup errors abort installation.
+   `legacy/` directory before invoking APT. Backup errors and symlinks at
+   the legacy paths abort installation. Record any symlink targets separately
+   and resolve the layout manually before migration.
    After installation succeeds, deploy publishes the rollback record and removes
    the shadowing config:
    - `/etc/udev/rules.d/70-android-auto-receiver.rules` (shadows the packaged
@@ -96,7 +174,10 @@ Apt or helper restart failures retain the rollback record for a retry.
      `ExecStart=/usr/libexec/aa-system-helper`, deploy also saves the original
      executable and rollback restores it before restoring the unit. Other units
      need one literal absolute `ExecStart` path and its executable must remain
-     available. Arrange manual recovery for custom unit layouts before migration.
+     available. Deploy refuses a missing or non-executable target. Custom
+     executables must survive package removal for rollback to work, so check
+     the incoming package's file list with `dpkg-deb --contents "$deb"` and
+     resolve overlaps before migration.
    - `/etc/dbus-1/system.d/org.custom.AndroidAutoSystemHelper.conf` (duplicates the
      packaged `/usr/share/dbus-1/system.d/org.custom.AndroidAutoSystemHelper.conf`).
      Operator per-user allow fragments

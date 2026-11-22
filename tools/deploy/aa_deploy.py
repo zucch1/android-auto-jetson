@@ -288,10 +288,9 @@ def build_preflight_script(
     """)
 
 
-def build_rollback_preflight_script(state_dir: str) -> str:
-    """Minimal preflight for --rollback: arch, state dir present, no measurement in progress."""
-    q_state = shlex.quote(state_dir)
-    return textwrap.dedent(f"""\
+def build_recovery_preflight_script(state_dir: str | None = None) -> str:
+    """Check architecture and measurement marker, plus the state dir for rollback."""
+    script = textwrap.dedent(f"""\
         set -euo pipefail
         if [ -e "$HOME/MEASUREMENT_IN_PROGRESS" ]; then
             echo "preflight: measurement in progress ($HOME/MEASUREMENT_IN_PROGRESS exists)" >&2
@@ -307,12 +306,16 @@ def build_rollback_preflight_script(state_dir: str) -> str:
             echo "preflight: unsupported kernel arch: $machine (expected {EXPECTED_UNAME_M})" >&2
             exit 1
         fi
-        if ! sudo -n test -d {q_state}; then
-            echo "preflight: deploy state directory missing:" {q_state} >&2
-            exit 1
-        fi
-        echo "rollback_preflight=ok"
     """)
+    if state_dir is not None:
+        q_state = shlex.quote(state_dir)
+        script += textwrap.dedent(f"""\
+            if ! sudo -n test -d {q_state}; then
+                echo "preflight: deploy state directory missing:" {q_state} >&2
+                exit 1
+            fi
+        """)
+    return script
 
 
 def build_infotainment_snapshot_script(infotainment_dir: str, *, optional: bool = False) -> str:
@@ -392,14 +395,24 @@ def build_depends_check_script(stage_dir: str, staged_deb: str, expected_sha: st
     """)
 
 
-# Serialize deploy and rollback even when callers choose different state directories.
-def locked_mutation(script: str) -> str:
+# Serialize mutations even when callers choose different state directories.
+def locked_mutation(script: str, *, stage_dir: str | None = None) -> str:
+    cleanup = ""
+    if stage_dir is not None:
+        cleanup = f"trap {shlex.quote('rm -rf -- ' + shlex.quote(stage_dir))} EXIT\n"
     return (
         'set -euo pipefail\n'
-        'sudo -n flock --close /run/aa-deploy.lock env AA_DEPLOY_OPERATOR_HOME="$HOME" '
-        "bash -s <<'AA_LOCKED_MUTATION'\n"
+        + cleanup
+        + 'rc=0\n'
+        'sudo -n flock --close --timeout 120 --conflict-exit-code 75 /run/aa-deploy.lock '
+        'env AA_DEPLOY_OPERATOR_HOME="$HOME" bash -s <<\'AA_LOCKED_MUTATION\' || rc=$?\n'
         + script
         + "AA_LOCKED_MUTATION\n"
+        'if [ "$rc" -eq 75 ]; then\n'
+        '    echo "timed out after 120s waiting for /run/aa-deploy.lock; '
+        'on the target, inspect the holder with sudo fuser -v /run/aa-deploy.lock and retry when it exits" >&2\n'
+        'fi\n'
+        'exit "$rc"\n'
     )
 
 
@@ -418,7 +431,7 @@ read_installed_version() {
         case "$status" in
             installed) [ -n "$installed_version" ] || fail "dpkg reported an empty installed version" ;;
             config-files|not-installed) installed_version="" ;;
-            *) fail "package is in dpkg state $status; repair it before deploying or rolling back" ;;
+            *) fail "package is in dpkg state $status; run sudo dpkg --configure -a on the target, resolve any dpkg errors, then retry" ;;
         esac
     else
         rc=$?
@@ -438,7 +451,7 @@ read_current_metadata() {
     if [ ! -f "$current_env" ] || [ "$(state_field "$current_env" PREV_MODE)" != deb ] ||
         [[ ! "$current_version" =~ ^[0-9A-Za-z.+~:-]+$ || ! "$current_sha" =~ ^[a-f0-9]{64}$ ]] ||
         [ -z "$current_deb" ] || [ "$current_version" != "$installed_version" ]; then
-        fail "missing or inconsistent deployment metadata at $current_env; recover the managed package state first"
+        fail "missing or inconsistent deployment metadata at $current_env; run aa-deploy.sh TARGET --adopt-installed SHA256 (see docs/deploy.md)"
     fi
 }
 
@@ -523,6 +536,86 @@ def mutation_script(state_dir: str, run_dir: str) -> str:
     )
 
 
+# Compare the archive payload to the target without extracting files as root.
+ADOPT_PAYLOAD_VERIFIER = r"""
+import hashlib
+import os
+from pathlib import Path, PurePosixPath
+import stat
+import sys
+import tarfile
+
+root = Path(sys.argv[1])
+try:
+    with tarfile.open(fileobj=sys.stdin.buffer, mode="r|") as payload:
+        for member in payload:
+            name = PurePosixPath(member.name)
+            if name.is_absolute() or ".." in name.parts:
+                sys.exit(f"adopt: unsafe archive path {member.name!r}")
+            path = root / name
+            if member.isdir():
+                matches = path.is_dir()
+            elif member.issym():
+                matches = path.is_symlink() and os.readlink(path) == member.linkname
+            elif member.isfile() and stat.S_ISREG(path.lstat().st_mode):
+                with path.open("rb") as installed, payload.extractfile(member) as archived:
+                    matches = hashlib.file_digest(installed, "sha256").digest() == (
+                        hashlib.file_digest(archived, "sha256").digest()
+                    )
+            else:
+                matches = False
+            if not matches:
+                sys.exit(f"adopt: installed payload differs at {member.name!r}")
+except (OSError, tarfile.TarError) as error:
+    sys.exit(f"adopt: could not verify installed payload: {error}")
+"""
+
+
+def build_adopt_script(state_dir: str, expected_sha: str) -> str:
+    return locked_mutation(mutation_script(state_dir, "") + textwrap.dedent(f"""\
+        expected_sha={shlex.quote(expected_sha)}
+        read_installed_version
+        [ -n "$installed_version" ] ||
+            fail "adopt: android-auto-receiver is not installed; deploy normally on a clean target, or follow the incomplete rollback procedure in docs/deploy.md if records remain"
+        [[ "$installed_version" =~ ^[0-9A-Za-z.+~:-]+$ ]] ||
+            fail "adopt: dpkg reported an invalid version; repair the package state before retrying"
+
+        archive="$state_dir/packages/{PACKAGE_NAME}_${{installed_version}}_{EXPECTED_ARCH}.deb"
+        recovery="restore the original {EXPECTED_ARCH} .deb for installed version $installed_version (SHA-256 $expected_sha) to $archive, then retry --adopt-installed $expected_sha; see docs/deploy.md for target commands"
+        [[ -f "$archive" && ! -L "$archive" ]] ||
+            fail "adopt: missing or non-regular cached archive at $archive; $recovery"
+        [ "$(sha256sum -- "$archive" | cut -d' ' -f1)" = "$expected_sha" ] ||
+            fail "adopt: cached archive SHA-256 mismatch at $archive; $recovery"
+        if [[ "$(dpkg-deb --field -- "$archive" Package)" != {PACKAGE_NAME} ||
+              "$(dpkg-deb --field -- "$archive" Version)" != "$installed_version" ||
+              "$(dpkg-deb --field -- "$archive" Architecture)" != {EXPECTED_ARCH} ]]; then
+            fail "adopt: cached archive metadata does not match the installed package; $recovery"
+        fi
+        if ! dpkg-deb --fsys-tarfile "$archive" |
+            python3 -I -c {shlex.quote(ADOPT_PAYLOAD_VERIFIER)} /; then
+            fail "adopt: restore the installed payload by reinstalling the verified archive with sudo dpkg -i -- '$archive' on the target, then retry --adopt-installed $expected_sha; see docs/deploy.md"
+        fi
+        read_installed_version
+        [ "$archive" = "$state_dir/packages/{PACKAGE_NAME}_${{installed_version}}_{EXPECTED_ARCH}.deb" ] ||
+            fail "adopt: installed version changed during verification; retry after package-manager activity ends"
+
+        if [[ -f "$current_env" && ! -L "$current_env" &&
+            "$(state_field "$current_env" PREV_MODE)" = deb &&
+            "$(state_field "$current_env" VERSION)" = "$installed_version" &&
+            "$(state_field "$current_env" DEB_PATH)" = "$archive" &&
+            "$(state_field "$current_env" DEB_SHA256)" = "$expected_sha" ]]; then
+            printf 'current.env already records installed version %s\n' "$installed_version"
+            exit 0
+        fi
+        temporary="$(mktemp -- "$state_dir/.current.env.XXXXXX")"
+        trap 'rm -f -- "$temporary"' EXIT
+        printf 'PREV_MODE=deb\nVERSION=%s\nDEB_PATH=%s\nDEB_SHA256=%s\n' \
+            "$installed_version" "$archive" "$expected_sha" > "$temporary"
+        mv -fT -- "$temporary" "$current_env"
+        printf 'recovered current.env for installed version %s\n' "$installed_version"
+    """))
+
+
 def build_install_script(
     state_dir: str,
     run_dir: str,
@@ -548,10 +641,14 @@ def build_install_script(
             if dpkg --compare-versions "$installed_version" eq "$version" && [ "$current_sha" != "$deb_sha" ]; then
                 fail "Debian version $version is already installed with different bytes; build with a new version"
             fi
-            [[ -f "$current_deb" && "$(sha256sum "$current_deb" | cut -d' ' -f1)" = "$current_sha" ]] ||
-                fail "current deployment archive missing or corrupt; recover it before upgrading"
+            if [[ "$current_deb" != "$stored_deb" || "$current_sha" != "$deb_sha" ||
+                -e "$current_deb" || -L "$current_deb" ]]; then
+                [[ -f "$current_deb" && ! -L "$current_deb" &&
+                    "$(sha256sum "$current_deb" | cut -d' ' -f1)" = "$current_sha" ]] ||
+                    fail "current deployment archive missing or corrupt at $current_deb; restore the exact archive (SHA-256 $current_sha) using docs/deploy.md, then retry"
+            fi
         elif [ -e "$current_env" ] || [ -e "$prev_env" ]; then
-            fail "inconsistent deployment metadata at $state_dir; finish recovery before deploying"
+            fail "inconsistent deployment metadata at $state_dir with no installed package; follow the incomplete rollback procedure in docs/deploy.md before deploying"
         fi
 
         # Version-keyed archives are immutable, including those used by an older rollback record.
@@ -645,7 +742,7 @@ def build_install_script(
         dpkg-query -W > "$run_dir/dpkg-query-after.txt"
         printf 'INSTALLED_VERSION=%s\nRECEIVER_SHA256=%s\nHELPER_RESTARTED=%s\n' \
             "$version" "$digest" "$should_restart"
-    """))
+    """), stage_dir=stage_dir)
 
 
 def build_rollback_script(state_dir: str, run_dir: str) -> str:
@@ -801,13 +898,18 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         description="Idempotent SSH install, upgrade, and rollback for android-auto-receiver.",
     )
     parser.add_argument("target", help="SSH target (e.g. zucchi@192.168.55.3)")
-    parser.add_argument("deb", nargs="?", type=Path, help="Path to local arm64 .deb (omit with --rollback)")
+    parser.add_argument("deb", nargs="?", type=Path, help="Path to local arm64 .deb (install/upgrade only)")
     parser.add_argument(
         "--confirm-jurisdiction",
         metavar="CC",
         help="Explicit two-letter uppercase regulatory jurisdiction matching operator ap.conf (required for install/upgrade)",
     )
-    parser.add_argument("--rollback", action="store_true", help="Roll back to the previous recorded package or legacy state")
+    action = parser.add_mutually_exclusive_group()
+    action.add_argument("--rollback", action="store_true", help="Roll back to the previous recorded package or legacy state")
+    action.add_argument(
+        "--adopt-installed", metavar="SHA256",
+        help="Recover current.env from the installed package and the cached .deb with this trusted SHA-256",
+    )
     parser.add_argument("--dry-run", action="store_true", help="Print every command without running it")
     parser.add_argument("--min-free-mb", type=int, default=DEFAULT_MIN_FREE_MB, help="Minimum free disk in MiB (default: 512)")
     parser.add_argument("--state-dir", default=DEFAULT_STATE_DIR, help=f"Remote state directory (default: {DEFAULT_STATE_DIR})")
@@ -822,9 +924,14 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     if args.rollback:
         if args.deb is not None:
             parser.error("do not pass a .deb path with --rollback")
+    elif args.adopt_installed is not None:
+        if args.deb is not None or args.confirm_jurisdiction is not None:
+            parser.error("--adopt-installed takes a SHA-256 only, with no .deb path or --confirm-jurisdiction")
+        if not SHA256_RE.fullmatch(args.adopt_installed):
+            parser.error("--adopt-installed needs a 64-character lowercase SHA-256")
     else:
         if args.deb is None:
-            parser.error("a .deb path is required unless --rollback is given")
+            parser.error("a .deb path is required for install/upgrade")
         if not args.confirm_jurisdiction:
             parser.error("--confirm-jurisdiction CC is required for install/upgrade")
 
@@ -846,11 +953,21 @@ def main(argv: list[str] | None = None) -> int:
     run_dir = f"{args.state_dir}/runs/{run_id}-{action}"
 
     try:
+        if args.adopt_installed is not None:
+            runner.ssh("adoption preflight checks", build_recovery_preflight_script())
+            output = runner.ssh(
+                "adopt installed package",
+                build_adopt_script(args.state_dir, args.adopt_installed),
+            )
+            if not args.dry_run:
+                print(output.strip())
+            return 0
+
         if args.rollback:
             # Minimal rollback preflight: arch, state dir present, no measurement in progress.
             runner.ssh(
                 "rollback preflight checks",
-                build_rollback_preflight_script(args.state_dir),
+                build_recovery_preflight_script(args.state_dir),
             )
             try:
                 info_before = runner.ssh(
