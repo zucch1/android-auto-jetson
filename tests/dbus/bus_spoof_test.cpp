@@ -150,6 +150,11 @@ TEST(BusSpoof, ForgedOnlyReplySprayFailsClosedTyped) {
 // The chain is 4-aligned at its u32 for the levels used below.
 [[nodiscard]] std::vector<std::uint8_t> nested_variant_bytes(int levels) {
     std::vector<std::uint8_t> bytes;
+    // Exact final size: three bytes per nested "v" header, then the innermost
+    // "v" header (3) and its u32 value (4). Sizing the buffer up front is also
+    // what keeps GCC 13 -O3 from reporting the inlined libstdc++ range insert
+    // as a -Wstringop-overflow write "into a region of size 0".
+    bytes.reserve(static_cast<std::size_t>(levels) * 3 + 7);
     for (int level = 0; level < levels; ++level) {
         bytes.insert(bytes.end(), {0x01, 0x76, 0x00});
     }
