@@ -244,6 +244,18 @@ def build_preflight_script(
                 echo "preflight: operator session.uid must be root-owned with no group/other permissions" >&2
                 exit 1
             fi
+            # Mirror src/helper/Identity.cpp IdentityPolicy::load: one optional trailing
+            # newline, then a non-empty decimal that fits uint32 (never printed).
+            suid_text="$(cat "$session_uid")"
+            case "$suid_text" in
+                ""|*[!0-9]*)
+                    echo "preflight: operator session.uid must hold a decimal UID" >&2
+                    exit 1 ;;
+            esac
+            if [ "${{#suid_text}}" -gt 10 ] || [ "$((10#$suid_text))" -gt 4294967295 ]; then
+                echo "preflight: operator session.uid is out of uint32 range" >&2
+                exit 1
+            fi
 
             # Mirror Files.cpp:97-122 (load_policy) without ever printing ap.conf contents.
             line_count=0
@@ -333,7 +345,7 @@ def build_rollback_preflight_script(state_dir: str) -> str:
             exit 1
         fi
         if ! sudo -n test -d {q_state}; then
-            echo "preflight: deploy state directory missing: {state_dir}" >&2
+            echo "preflight: deploy state directory missing:" {q_state} >&2
             exit 1
         fi
         echo "rollback_preflight=ok"
@@ -432,6 +444,7 @@ def build_install_script(
     deb_sha = deb_info["SHA256"]
     stored_deb = f"{state_dir}/packages/{PACKAGE_NAME}_{version}_{EXPECTED_ARCH}.deb"
     q_stored = shlex.quote(stored_deb)
+    q_incoming = shlex.quote(f"{state_dir}/packages/incoming-{deb_sha}.deb")
     return textwrap.dedent(f"""\
         set -euo pipefail
         # 0. Capture helper active/enabled state BEFORE any mutation (never enable anything new).
@@ -442,12 +455,27 @@ def build_install_script(
             should_restart=1
         fi
 
-        # 1. Store the verified .deb in the root-owned package cache and remove private staging dir.
-        sudo -n install -m 0644 -o root -g root {q_staged} {q_stored}
+        # 1. Copy the verified .deb into the root-owned cache under an incoming
+        #    name, re-verify the cached bytes, and install from that copy. The
+        #    version-keyed artifact (which a recorded rollback may point at) is
+        #    only replaced after a successful install, so a failed redeploy can
+        #    never corrupt the rollback artifact.
+        sudo -n install -m 0644 -o root -g root {q_staged} {q_incoming}
         rm -rf {q_stage}
+        cached_sha="$(sudo -n sha256sum {q_incoming} | cut -d' ' -f1)"
+        if [ "$cached_sha" != {shlex.quote(deb_sha)} ]; then
+            sudo -n rm -f {q_incoming}
+            echo "install: cached .deb sha256 mismatch" >&2
+            exit 1
+        fi
 
         # 2. Install the Debian package FIRST (legacy files stay intact if install fails).
-        sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y {q_stored}
+        if ! sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y {q_incoming}; then
+            sudo -n rm -f {q_incoming}
+            echo "install: apt-get install failed; previous package and legacy files untouched" >&2
+            exit 1
+        fi
+        sudo -n mv -f {q_incoming} {q_stored}
 
         # 3. Record previous deployment state and migrate legacy shadowing files AFTER install succeeds.
         migration_log=""

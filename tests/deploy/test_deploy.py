@@ -405,6 +405,14 @@ class DeployHarnessTest(unittest.TestCase):
         self.assertNotIn("wlan0", res.stdout + res.stderr)
         ap_conf.chmod(0o600)
 
+        # session.uid content must be a decimal UID (IdentityPolicy::load)
+        for bad in ("zucchi\n", "\n", "4294967296\n", "-1\n"):
+            session_uid.write_text(bad)
+            res = self.run_deploy("zucchi@jetson", str(self.pkg_v1), "--confirm-jurisdiction", "US")
+            self.assertNotEqual(res.returncode, 0, msg=bad)
+            self.assertIn("session.uid", res.stderr)
+        session_uid.write_text("2002\n")
+
         # Non-root-owned ap.conf refused (matches Files.cpp:46)
         res = self.run_deploy(
             "zucchi@jetson", str(self.pkg_v1), "--confirm-jurisdiction", "US",
@@ -526,6 +534,11 @@ class DeployHarnessTest(unittest.TestCase):
         self.assertEqual(legacy_udev.read_text(), "# legacy udev\n")
         self.assertEqual(legacy_unit.read_text(), "[Unit]\nDescription=legacy\n")
         self.assertEqual(legacy_dbus.read_text(), "<busconfig><!-- legacy --></busconfig>\n")
+        packages = self.target / "var/lib/android-auto-receiver/deploy/packages"
+        if packages.exists():
+            self.assertEqual(sorted(p.name for p in packages.glob("incoming-*")), [])
+            # A failed install never writes the version-keyed rollback artifact.
+            self.assertFalse((packages / "android-auto-receiver_1.0.0_arm64.deb").exists())
 
     def test_install_migration_digest_from_installed_and_no_enable_inactive_helper(self) -> None:
         # Pre-populate legacy ad-hoc install artifacts
