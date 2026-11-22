@@ -285,6 +285,25 @@ class IntegrationContractTests(unittest.TestCase):
             self.assertEqual(res.returncode, 1, msg=res.stdout + res.stderr)
             self.assertIn("INTEGRATION_CONTRACT_DBUS_POLICY_DRIFT", res.stdout)
 
+    def test_helper_dbus_policy_wildcard_deny_fails(self) -> None:
+        # own="*" matches every well-known name, so a later wildcard deny blocks
+        # the helper's root ownership; the checker must not skip it.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            stage_tree(root)
+            conf = root / "packaging/dbus/org.custom.AndroidAutoSystemHelper.conf"
+            conf.write_text(
+                conf.read_text(encoding="utf-8").replace(
+                    '    <allow own="org.custom.AndroidAutoSystemHelper"/>\n  </policy>',
+                    '    <allow own="org.custom.AndroidAutoSystemHelper"/>\n'
+                    '    <deny own="*"/>\n  </policy>',
+                ),
+                encoding="utf-8",
+            )
+            res = run_checker(root)
+            self.assertEqual(res.returncode, 1, msg=res.stdout + res.stderr)
+            self.assertIn("INTEGRATION_CONTRACT_DBUS_POLICY_DRIFT", res.stdout)
+
     def test_helper_dbus_policy_unsupported_rule_shape_fails(self) -> None:
         # Effective-rule modelling covers own/send_destination in the default and
         # root policies only; anything else fails closed instead of being ignored.

@@ -384,6 +384,12 @@ def check_dbus_policy_xml(conf_path: Path, bus_name: str) -> list[Violation]:
                 drift(f"rule must name exactly one of own/send_destination ({child.attrib})")
                 continue
             attribute = next(iter(child.attrib))
+            if "*" in child.get(attribute, ""):
+                # dbus-daemon treats own="*" (and send_destination="*") as matching
+                # every name, so a wildcard rule can supersede the named rules.
+                # It is outside the modelled shape: fail closed.
+                drift(f"unsupported wildcard rule in {scope} policy ({child.attrib})")
+                continue
             if child.get(attribute) != bus_name:
                 # Rules for other names do not affect this contract; ignore them.
                 continue
