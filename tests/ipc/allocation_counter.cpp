@@ -6,6 +6,8 @@
 #include <cstdlib>
 #include <new>
 
+#include <stdlib.h> // posix_memalign (POSIX)
+
 namespace {
 
 std::atomic<long long> allocations{0};
@@ -28,11 +30,20 @@ void count_allocation() noexcept { allocations.fetch_add(1, std::memory_order_re
 // allocation functions stay in place, and an over-aligned allocation would be
 // neither counted (weakening the "no retained storage" regression) nor a
 // matched pair with the operators below.
-[[nodiscard]] void* allocate_aligned(std::size_t size, std::align_val_t alignment) {
+// posix_memalign rejects alignments below sizeof(void*) with EINVAL, while
+// C++ permits any power of two; clamp so every valid std::align_val_t works.
+[[nodiscard]] void* aligned_or_null(std::size_t size, std::align_val_t alignment) noexcept {
     count_allocation();
     void* pointer = nullptr;
-    const auto align = static_cast<std::size_t>(alignment);
-    if (::posix_memalign(&pointer, align, size ? size : 1) != 0) throw std::bad_alloc();
+    const auto align = static_cast<std::size_t>(alignment) < sizeof(void*)
+                           ? sizeof(void*)
+                           : static_cast<std::size_t>(alignment);
+    return ::posix_memalign(&pointer, align, size ? size : 1) == 0 ? pointer : nullptr;
+}
+
+[[nodiscard]] void* allocate_aligned(std::size_t size, std::align_val_t alignment) {
+    void* pointer = aligned_or_null(size, alignment);
+    if (!pointer) throw std::bad_alloc();
     return pointer;
 }
 
@@ -65,12 +76,7 @@ void* operator new[](std::size_t size, std::align_val_t alignment) {
 void* operator new(std::size_t size, std::align_val_t alignment, const std::nothrow_t&) noexcept {
     // The nothrow contract applies to the aligned forms as well: report
     // failure instead of throwing.
-    count_allocation();
-    void* pointer = nullptr;
-    if (::posix_memalign(&pointer, static_cast<std::size_t>(alignment), size ? size : 1) != 0) {
-        return nullptr;
-    }
-    return pointer;
+    return aligned_or_null(size, alignment);
 }
 void* operator new[](std::size_t size, std::align_val_t alignment,
                      const std::nothrow_t& tag) noexcept {
