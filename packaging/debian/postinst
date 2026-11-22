@@ -1,0 +1,11 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
+set -eu
+
+if [ "$1" = configure ]; then
+    policy="${DPKG_ROOT:-}/usr/share/dbus-1/system.d/org.custom.AndroidAutoSystemHelper.conf"
+    if [ ! -s "$policy" ]; then
+        echo "android-auto-receiver: missing packaged system-helper D-Bus policy" >&2
+        exit 1
+    fi
+fi

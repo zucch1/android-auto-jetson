@@ -1,0 +1,17 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+[Unit]
+Description=Android Auto receiver in the user session
+Documentation=file:/usr/share/doc/android-auto-receiver/debian-package.md
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/aa-wireless-receiver --store-dir %S/android-auto-receiver --pairing-only
+StateDirectory=android-auto-receiver
+StateDirectoryMode=0700
+UMask=0077
+NoNewPrivileges=yes
+LimitCORE=0
+
+[Install]
+WantedBy=graphical-session.target

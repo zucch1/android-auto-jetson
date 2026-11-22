@@ -51,6 +51,8 @@ cmake --build --preset host-dev
 ctest --preset host-dev --output-on-failure
 ```
 
+See [Building the Debian package](docs/debian-package.md) for ARM64 packaging and inspection.
+
 ### Reproducing public CI checks locally
 
 The public CI workflow ([`.github/workflows/ci.yml`](.github/workflows/ci.yml), which is the authority for active CI job names and steps) executes independent checks, including the following:

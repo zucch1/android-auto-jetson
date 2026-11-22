@@ -30,6 +30,11 @@ endif()
 # Execute the actual dependency block extracted from patched effective AASDK.
 include(cmake/SysrootGate.cmake)
 enable_language(C CXX)
+option(AA_ENABLE_DEB_PACKAGE "Expose the Debian package staging component" OFF)
+if(AA_ENABLE_DEB_PACKAGE)
+    add_compile_options("-ffile-prefix-map=${CMAKE_SOURCE_DIR}=."
+                        "-ffile-prefix-map=${CMAKE_BINARY_DIR}=./build")
+endif()
 set(FETCHCONTENT_SOURCE_DIR_GOOGLETEST "${AA_DEPENDENCY_STAGE}/googletest" CACHE PATH "Verified source" FORCE)
 set(AASDK_TEST ON)
 include("${AA_DEPENDENCY_STAGE}/googletest-declaration.cmake")
@@ -228,4 +233,5 @@ endif()
 # aa_harden_project_targets()).
 include(cmake/DebugInfoSplit.cmake)
 aa_split_debug_info_project_targets()
+include(cmake/DebPackage.cmake)
 include(cmake/HostTestScheduling.cmake)
