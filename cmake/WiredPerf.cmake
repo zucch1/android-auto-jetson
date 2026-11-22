@@ -39,7 +39,7 @@ if(NOT CMAKE_CROSSCOMPILING)
         "${CMAKE_SOURCE_DIR}/tests/perf/test_review_regressions.py" log_integrity)
     add_test(NAME wired_perf_display_disconnect COMMAND "${Python3_EXECUTABLE}" -B
         "${CMAKE_SOURCE_DIR}/tests/perf/test_continuity_regressions.py" disconnected)
-    foreach(case frozen active_window collector_frozen)
+    foreach(case frozen active_window collector_frozen display_exit_after_complete)
         add_test(NAME wired_perf_${case} COMMAND "${Python3_EXECUTABLE}" -B
             "${CMAKE_SOURCE_DIR}/tests/perf/test_continuity_regressions.py" ${case})
     endforeach()

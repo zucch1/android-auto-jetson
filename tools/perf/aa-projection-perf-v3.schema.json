@@ -107,6 +107,12 @@
             "null"
           ]
         },
+        "display_exit_code": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
         "display_connected": {
           "type": [
             "boolean",

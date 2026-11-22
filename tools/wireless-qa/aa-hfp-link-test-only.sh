@@ -8,12 +8,12 @@
 #
 # usage: aa-hfp-link-test-only.sh connect|disconnect|status "<phone Bluetooth alias>"
 #
-# HFP is verified primarily from BlueZ's D-Bus state (GetManagedObjects): per-profile / service
-# state if available (Device1.ConnectedProfiles/ConnectedUUIDs, Service1/Profile1), otherwise
-# MediaTransport1 for an HFP UUID, or Device1.Connected=false for down. Device1.Connected=true
-# alone is NEVER proof of HFP: BlueZ 5.72 may answer ConnectProfile successfully after falling
-# back to an LE ATT link on a dual-mode phone (src/device.c). WirePlumber/PipeWire (pw-dump) is
-# kept as secondary information and fallback when BlueZ exposes no per-profile/transport state.
+# HFP is verified from bluetoothd's per-device service state transitions in the bluetooth unit
+# journal (`journalctl -u bluetooth -o cat`, emitted by `bluetoothd -d`:
+# `src/service.c:change_state() ... device <MAC> profile Hands-Free... state changed: ... -> ...`),
+# and `Device1.Connected=false` as down evidence. `Device1.Connected=true` alone is NEVER proof
+# of HFP: BlueZ 5.72 may answer ConnectProfile successfully after falling back to an LE ATT link
+# on a dual-mode phone (src/device.c). WirePlumber/PipeWire (`pw-dump`) is secondary info only.
 # Exit: 0 verified, 1 the action or its verification failed, 2 usage, 3 device not found.
 set -euo pipefail
 readonly HFP_AG=0000111f-0000-1000-8000-00805f9b34fb VERIFY_S=${AA_HFP_VERIFY_S:-15}
@@ -37,123 +37,57 @@ device=${matches[0]}
   { echo "aa-hfp-link-test-only: $quoted is not paired" >&2; exit 3; }
 address=${device##*/dev_}; address=${address//_/:}   # internal only, never printed
 
-# Primary check: BlueZ D-Bus state via ObjectManager.GetManagedObjects.
-# Prints "<status_code> <source>" where status_code is:
-#   0: HFP verified up (bluez-profile, bluez-service, or bluez-transport)
-#   1: HFP verified down (bluez-profile, bluez-service, or bluez-disconnected)
-#   2: BlueZ D-Bus state could not be read
-#   3: Device1.Connected is true, but BlueZ exposes no HFP profile/service/transport state
-bluez_hfp_state() {
-  local objects
-  if ! objects=$(busctl --json=short call org.bluez / org.freedesktop.DBus.ObjectManager GetManagedObjects 2>/dev/null); then
-    echo "2 bluez-unreadable"
-    return 0
+# Primary signal: bluetoothd -d per-device Hands-Free state transitions in the bluetooth journal.
+# Optional argument $1: `--since` timestamp (empty reads the current boot's bluetooth journal).
+# Prints "<code> <reason>" where code is:
+#   0: latest Hands-Free transition for this device is -> connected
+#   1: latest Hands-Free transition for this device is -> disconnected
+#   2: journalctl could not be read (treated as unknown, never down)
+#   3: unknown (no change_state lines, no Hands-Free transition for this device, or transient state)
+journal_hfp_state() {
+  local since=${1:-} logs
+  if [ -n "$since" ]; then
+    if ! logs=$(journalctl -u bluetooth -o cat --since "$since" 2>/dev/null); then
+      echo "2 journal-unreadable"
+      return 0
+    fi
+  else
+    if ! logs=$(journalctl -u bluetooth -o cat -b 2>/dev/null); then
+      echo "2 journal-unreadable"
+      return 0
+    fi
   fi
-  AA_HFP_DEVICE=$device python3 -I -c '
-import json, os, sys
+  AA_HFP_ADDRESS=$address python3 -I -c '
+import os, re, sys
 
-HFP_UUIDS = {
-    "0000111f-0000-1000-8000-00805f9b34fb",  # HFP Audio Gateway
-    "0000111e-0000-1000-8000-00805f9b34fb",  # HFP Hands-Free
-}
-device = os.environ["AA_HFP_DEVICE"]
+address = os.environ["AA_HFP_ADDRESS"].upper()
+pattern = re.compile(
+    r"change_state\(\).*?\bdevice\s+([0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){5})\s+"
+    r"profile\s+Hands-Free[^\n]*?\s+state changed:\s+\S+\s*->\s*([A-Za-z0-9_-]+)"
+)
+saw_change_state = False
+latest = None
+for line in sys.stdin:
+    if "change_state()" in line:
+        saw_change_state = True
+    m = pattern.search(line)
+    if m and m.group(1).upper() == address:
+        latest = m.group(2).lower()
 
-def unwrap(val):
-    if isinstance(val, dict) and "data" in val and "type" in val:
-        return val["data"]
-    return val
-
-try:
-    payload = json.loads(sys.stdin.read())
-except ValueError:
-    print("2 bluez-unreadable")
-    sys.exit(0)
-
-data = payload.get("data") if isinstance(payload, dict) else None
-objects = data[0] if isinstance(data, list) and data and isinstance(data[0], dict) else None
-if objects is None:
-    print("2 bluez-unreadable")
-    sys.exit(0)
-
-dev_ifaces = objects.get(device)
-if not isinstance(dev_ifaces, dict):
-    print("2 bluez-device-missing")
-    sys.exit(0)
-
-dev = dev_ifaces.get("org.bluez.Device1") or {}
-connected = unwrap(dev.get("Connected"))
-
-# 1a. Per-profile UUID list on Device1 if exposed by BlueZ.
-for prop in ("ConnectedProfiles", "ConnectedUUIDs"):
-    if prop in dev:
-        raw = unwrap(dev.get(prop))
-        if isinstance(raw, list):
-            uuids = {str(u).lower() for u in raw}
-            if uuids & HFP_UUIDS:
-                print("0 bluez-profile")
-            else:
-                print("1 bluez-profile")
-            sys.exit(0)
-
-# 1b. Per-service / profile objects under or referencing the device.
-service_down = False
-for path, ifaces in objects.items():
-    if not isinstance(ifaces, dict):
-        continue
-    for iface_name in ("org.bluez.Service1", "org.bluez.Profile1"):
-        svc = ifaces.get(iface_name)
-        if not isinstance(svc, dict):
-            continue
-        svc_dev = unwrap(svc.get("Device"))
-        if svc_dev != device and path != device and not path.startswith(device + "/"):
-            continue
-        uuid = str(unwrap(svc.get("UUID")) or "").lower()
-        if uuid not in HFP_UUIDS:
-            continue
-        svc_conn = unwrap(svc.get("Connected"))
-        if isinstance(svc_conn, bool):
-            if svc_conn:
-                print("0 bluez-service")
-                sys.exit(0)
-            service_down = True
-        svc_state = str(unwrap(svc.get("State")) or "").lower()
-        if svc_state == "connected":
-            print("0 bluez-service")
-            sys.exit(0)
-        if svc_state == "disconnected":
-            service_down = True
-if service_down:
-    print("1 bluez-service")
-    sys.exit(0)
-
-# 2. MediaTransport1 for an HFP UUID on this device.
-for path, ifaces in objects.items():
-    if not isinstance(ifaces, dict):
-        continue
-    mt = ifaces.get("org.bluez.MediaTransport1")
-    if not isinstance(mt, dict):
-        continue
-    mt_dev = unwrap(mt.get("Device"))
-    if mt_dev != device and not (not mt_dev and path.startswith(device + "/")):
-        continue
-    uuid = str(unwrap(mt.get("UUID")) or "").lower()
-    if uuid not in HFP_UUIDS:
-        continue
-    state = str(unwrap(mt.get("State")) or "").lower()
-    if state in ("", "idle", "pending", "active"):
-        print("0 bluez-transport")
-        sys.exit(0)
-
-# 3. Device1.Connected=false proves HFP is down; Connected=true alone is NOT HFP.
-if connected is False:
-    print("1 bluez-disconnected")
+if latest == "connected":
+    print("0 journal")
+elif latest == "disconnected":
+    print("1 journal")
+elif latest is not None:
+    print(f"3 journal-state-{latest}")
+elif not saw_change_state:
+    print("3 no-bluetoothd-change-state-lines")
 else:
-    print("3 bluez-no-profile-state")
-' <<<"$objects"
+    print("3 no-hfp-transition-for-device")
+' <<<"$logs"
 }
 
-# Secondary check: WirePlumber/PipeWire bluez5 graph (informational; fallback only when
-# BlueZ has Connected=true without per-profile/service/transport state).
+# Secondary informational check: WirePlumber/PipeWire bluez5 graph. Never overrides journal/BlueZ.
 pw_hfp_state() {
   local dump
   dump=$(pw-dump 2>/dev/null) || { echo "unreadable"; return 0; }
@@ -182,72 +116,61 @@ print("absent")
 ' <<<"$dump"
 }
 
-# Combines BlueZ (primary) and PipeWire (secondary). Sets globals:
-#   HFP_CODE (0=up, 1=down, 2=error, 3=unknown), HFP_SOURCE, HFP_PW.
-probe_hfp() {
-  local bz_code bz_src pw
-  read -r bz_code bz_src < <(bluez_hfp_state)
-  pw=$(pw_hfp_state)
-  HFP_PW=$pw
-  if [ "$bz_code" -eq 0 ] || [ "$bz_code" -eq 1 ] || [ "$bz_code" -eq 2 ]; then
-    HFP_CODE=$bz_code
-    HFP_SOURCE=$bz_src
-    return 0
-  fi
-  # BlueZ returned 3 (Connected=true, no per-profile/service/transport state):
-  # use PipeWire only as secondary confirmation if it sees the phone.
-  case "$pw" in
-    up)   HFP_CODE=0; HFP_SOURCE="pipewire" ;;
-    down) HFP_CODE=1; HFP_SOURCE="pipewire" ;;
-    *)    HFP_CODE=3; HFP_SOURCE=$bz_src ;;
-  esac
-}
-
-# Polls until probe_hfp yields one of the wanted status codes or the budget runs out.
-await_hfp() {
-  for _ in $(seq 1 "$VERIFY_S"); do
-    probe_hfp
-    [ "$HFP_CODE" -eq 2 ] && fail "cannot read BlueZ D-Bus state (GetManagedObjects) to verify HFP"
-    for want in "$@"; do [ "$HFP_CODE" -eq "$want" ] && return 0; done
-    sleep 1
-  done
-  return 1
-}
-link() { busctl get-property org.bluez "$device" org.bluez.Device1 Connected; }
+link() { busctl get-property org.bluez "$device" org.bluez.Device1 Connected 2>/dev/null || echo "unknown"; }
 
 case "$action" in
   status)
-    probe_hfp
-    case "$HFP_CODE" in
-      0) echo "HFP=up Connected=$(link) (source=$HFP_SOURCE pw=$HFP_PW)" ;;
-      1) echo "HFP=down Connected=$(link) (source=$HFP_SOURCE pw=$HFP_PW)" ;;
-      3) echo "HFP=unknown (no HFP profile/transport state in BlueZ; pw=$HFP_PW) Connected=$(link)" ;;
-      *) fail "cannot read BlueZ D-Bus state (GetManagedObjects)" ;;
-    esac ;;
+    conn=$(link)
+    pw=$(pw_hfp_state)
+    read -r j_code j_reason < <(journal_hfp_state "")
+    if [ "$conn" = "b false" ]; then
+      echo "HFP=down Connected=$conn (source=bluez-disconnected pw=$pw)"
+    elif [ "$j_code" -eq 0 ] && [ "$conn" = "b true" ]; then
+      echo "HFP=up Connected=$conn (source=$j_reason pw=$pw)"
+    elif [ "$j_code" -eq 1 ]; then
+      echo "HFP=down Connected=$conn (source=$j_reason pw=$pw)"
+    else
+      echo "HFP=unknown ($j_reason; pw=$pw) Connected=$conn"
+    fi ;;
   connect)
+    since=$(date '+%Y-%m-%d %H:%M:%S.%6N')
     if ! err=$(sudo -n timeout 25 busctl call org.bluez "$device" org.bluez.Device1 ConnectProfile s "$HFP_AG" 2>&1 >/dev/null); then
       # Only the D-Bus error name: BlueZ messages are not part of the redacted output.
       fail "ConnectProfile(HFP AG) failed: $(grep -oE 'org\.bluez\.Error\.[A-Za-z]+' <<<"$err" | head -1 || echo unknown)"
     fi
-    await_hfp 0 || fail "ConnectProfile returned but no HFP profile became active within ${VERIFY_S}s (Connected=$(link) pw=${HFP_PW:-unknown}); an LE-only link is not HFP"
-    echo "HFP=up Connected=$(link) (source=$HFP_SOURCE pw=$HFP_PW)" ;;
+    j_code=3; j_reason="no-hfp-transition-for-device"
+    for _ in $(seq 1 "$VERIFY_S"); do
+      read -r j_code j_reason < <(journal_hfp_state "$since")
+      if [ "$j_code" -eq 0 ]; then
+        echo "HFP=up Connected=$(link) (source=$j_reason pw=$(pw_hfp_state))"
+        exit 0
+      fi
+      sleep 1
+    done
+    fail "ConnectProfile returned but no HFP profile became active within ${VERIFY_S}s (Connected=$(link) journal=$j_reason pw=$(pw_hfp_state)); an LE-only link is not HFP" ;;
   disconnect)
-    # Absence only proves teardown against a baseline: HFP seen up first. Without one
-    # (no profile/service/transport state and no bluez5 device), only BlueZ's own
-    # NotConnected answer or Device1.Connected=false / profile-down proof counts.
-    probe_hfp
-    before=$HFP_CODE
-    [ "$before" -eq 2 ] && fail "cannot read BlueZ D-Bus state (GetManagedObjects) to verify HFP"
+    since=$(date '+%Y-%m-%d %H:%M:%S.%6N')
     if ! err=$(sudo -n timeout 25 busctl call org.bluez "$device" org.bluez.Device1 DisconnectProfile s "$HFP_AG" 2>&1 >/dev/null); then
       name=$(grep -oE 'org\.bluez\.Error\.[A-Za-z]+' <<<"$err" | head -1 || true)
       if [ "$name" = org.bluez.Error.NotConnected ]; then echo "HFP=down (BlueZ: not connected) Connected=$(link)"; exit 0; fi
       fail "DisconnectProfile(HFP AG) failed: ${name:-unknown}"
     fi
-    if [ "$before" -eq 0 ]; then
-      await_hfp 1 3 || fail "HFP still active ${VERIFY_S}s after DisconnectProfile"
-    else
-      # Not seen up first: explicit down proof (BlueZ profile/service/disconnected or PipeWire off) is required.
-      await_hfp 1 || fail "unverifiable: HFP was not visible in BlueZ D-Bus or PipeWire before DisconnectProfile"
+    j_code=3; j_reason="no-hfp-transition-for-device"
+    for _ in $(seq 1 "$VERIFY_S"); do
+      conn=$(link)
+      if [ "$conn" = "b false" ]; then
+        echo "HFP=down Connected=$conn (source=bluez-disconnected pw=$(pw_hfp_state))"
+        exit 0
+      fi
+      read -r j_code j_reason < <(journal_hfp_state "$since")
+      if [ "$j_code" -eq 1 ]; then
+        echo "HFP=down Connected=$conn (source=$j_reason pw=$(pw_hfp_state))"
+        exit 0
+      fi
+      sleep 1
+    done
+    if [ "$j_code" -eq 0 ]; then
+      fail "HFP still active ${VERIFY_S}s after DisconnectProfile"
     fi
-    echo "HFP=down Connected=$(link) (source=$HFP_SOURCE pw=$HFP_PW)" ;;
+    fail "unverifiable: no HFP disconnect transition in bluetooth journal ($j_reason) and Device1.Connected=$(link)" ;;
 esac

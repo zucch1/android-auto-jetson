@@ -1207,6 +1207,7 @@ def collect(args: argparse.Namespace, build: dict | None = None) -> dict:
     disp_file = None
     crashes = 0
     receiver_exit: int | None = None
+    display_exit: int | None = None
     early_exit = False
     stopped_by_us = False
     display_survived: bool | None = None
@@ -1578,6 +1579,8 @@ def collect(args: argparse.Namespace, build: dict | None = None) -> dict:
             events[key] = None
     if receiver is not None:
         receiver_exit = receiver.returncode
+    if display is not None:
+        display_exit = display.returncode
     if not stopped_by_us and receiver_exit is not None and receiver_exit != 0:
         crashes = 1
     if not stopped_by_us and not early_exit and receiver_exit is None:
@@ -1599,6 +1602,7 @@ def collect(args: argparse.Namespace, build: dict | None = None) -> dict:
         "receiver_exit_code": receiver_exit,
         "receiver_stopped_by_collector": stopped_by_us,
         "display_survived": display_survived,
+        "display_exit_code": display_exit,
         "display_connected": display_connected,
         "terminal_errors": parser.terminal_errors,
         "playback_slot_absences": dict(parser.playback_slot_absences),

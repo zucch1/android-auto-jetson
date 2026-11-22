@@ -242,10 +242,12 @@ trap 'exit 129' HUP
 receiver_pid="$(remote "nohup $(shq "$RECEIVER") --port ${PORT_Q} > ${REMOTE_QA_DIR_Q}/aa-wired-receiver.log 2>&1 & echo \$!")"
 # Open the FIFO read/write so startup does not wait for a separate writer and
 # the test-only channel stays open between bounded status/input requests.
-# Capture the display's real PID (for teardown) and its exit status in
-# aa-wired-display.exit so a non-zero exit after telemetry_complete never
-# passes (#174).
-display_pid="$(remote "mkfifo ${REMOTE_QA_DIR_Q}/aa-disp.in && { ( nohup $(shq "$DISPLAY") --test-only-autostart --test-only-control-stdin <>${REMOTE_QA_DIR_Q}/aa-disp.in > ${REMOTE_QA_DIR_Q}/aa-wired-display.log 2>&1 & dpid=\$!; printf '%s\n' \"\$dpid\" > ${REMOTE_QA_DIR_Q}/aa-wired-display.pid.tmp && mv ${REMOTE_QA_DIR_Q}/aa-wired-display.pid.tmp ${REMOTE_QA_DIR_Q}/aa-wired-display.pid; rc=0; wait \"\$dpid\" || rc=\$?; printf '%s\n' \"\$rc\" > ${REMOTE_QA_DIR_Q}/aa-wired-display.exit.tmp && mv ${REMOTE_QA_DIR_Q}/aa-wired-display.exit.tmp ${REMOTE_QA_DIR_Q}/aa-wired-display.exit ) </dev/null >/dev/null 2>&1 & for n in \$(seq 1 100); do [ -s ${REMOTE_QA_DIR_Q}/aa-wired-display.pid ] && break; sleep 0.05; done; cat ${REMOTE_QA_DIR_Q}/aa-wired-display.pid; }")"
+# Run the display under a small supervisor process whose PID we track for
+# teardown (#174 review): the supervisor owns the display child, forwards
+# SIGTERM to it (never signalling a reused numeric PID after an early crash),
+# waits for the child to finish draining and exit, and atomically publishes
+# aa-wired-display.exit BEFORE the supervisor itself exits.
+display_pid="$(remote "mkfifo ${REMOTE_QA_DIR_Q}/aa-disp.in && { ( child=''; stop_child() { [ -n \"\$child\" ] && kill -TERM \"\$child\" 2>/dev/null || true; }; trap stop_child TERM; nohup $(shq "$DISPLAY") --test-only-autostart --test-only-control-stdin <>${REMOTE_QA_DIR_Q}/aa-disp.in > ${REMOTE_QA_DIR_Q}/aa-wired-display.log 2>&1 & child=\$!; rc=0; while true; do rc=0; wait \"\$child\" && break || rc=\$?; kill -0 \"\$child\" 2>/dev/null || break; done; printf '%s\n' \"\$rc\" > ${REMOTE_QA_DIR_Q}/aa-wired-display.exit.tmp && mv ${REMOTE_QA_DIR_Q}/aa-wired-display.exit.tmp ${REMOTE_QA_DIR_Q}/aa-wired-display.exit ) </dev/null >/dev/null 2>&1 & echo \$!; }")"
 
 projection="false"
 session_active="false"; video="false"; audio="false"; input="false"
@@ -323,8 +325,8 @@ log_audit="$(printf '%s\n' "$log_stream" | python3 -I "$INTEGRITY_TOOL" generati
 # The display's telemetry log must end with its single completion record: its
 # SIGTERM path drains the writer first (#90 review 4). Exactly one line names
 # telemetry_complete, and it is the last record (#90 review 5). Also read the
-# display's exit code recorded by the launch wrapper (#174).
-display_last="$(remote "f=${REMOTE_QA_DIR_Q}/aa-wired-display.log; e=${REMOTE_QA_DIR_Q}/aa-wired-display.exit; for n in \$(seq 1 40); do [ -r \"\$e\" ] && break; sleep 0.05; done; echo '### exit'; [ -r \"\$e\" ] && cat \"\$e\" || echo ''; echo '### count'; if [ -r \"\$f\" ]; then grep -cF '\"event\":\"telemetry_complete\"' \"\$f\" || true; echo '### last'; grep '^{' \"\$f\" | tail -n 1; echo '### end'; fi" 2>/dev/null)" || display_last=""
+# display's exit code published by the supervisor before it exited (#174).
+display_last="$(remote "f=${REMOTE_QA_DIR_Q}/aa-wired-display.log; e=${REMOTE_QA_DIR_Q}/aa-wired-display.exit; echo '### exit'; [ -r \"\$e\" ] && cat \"\$e\" || echo ''; echo '### count'; if [ -r \"\$f\" ]; then grep -cF '\"event\":\"telemetry_complete\"' \"\$f\" || true; echo '### last'; grep '^{' \"\$f\" | tail -n 1; echo '### end'; fi" 2>/dev/null)" || display_last=""
 display_exit="$(sed -n '/^### exit$/{n;p;q}' <<< "$display_last" | tr -d '[:space:]')"
 display_complete_count="$(sed -n '/^### count$/{n;p;q}' <<< "$display_last" | tr -d '[:space:]')"
 display_complete=false
@@ -348,6 +350,12 @@ evidence_doubtful=false
 if ! log_flag complete || log_flag state_lost || log_flag media_lost || log_flag runtime_lost ||
         log_flag late_delivery; then
     evidence_doubtful=true
+fi
+# A confirmed non-zero display exit (early crash or shutdown failure) is always
+# FAILED, never BLOCKED on incomplete display/receiver evidence (#174 review).
+if [[ "$display_exit_nonzero" == true ]]; then
+    write_result "FAILED" "display_exit_${display_exit}" "$projection" "$video" "$audio" "$input" "$budget_ms"
+    exit 4
 fi
 if [[ "$projection" != "true" || "$session_active" != "true" || "$video" != "true" ||
       "$audio" != "true" || "$input" != "true" ]]; then

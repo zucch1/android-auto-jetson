@@ -628,7 +628,8 @@ PHONE = "TESTPHONE01"  # synthetic serial; no real phone identifiers in fixtures
 
 
 def record(finished: datetime = NOW - timedelta(hours=2), **changes) -> dict:
-    doc = {"schema": smoke.SCHEMA, "verdict": "PASS", "duration_s": 600, "video_profiles": None,
+    doc = {"schema": smoke.SCHEMA, "verdict": "PASS", "display_exit": 0, "duration_s": 600,
+           "video_profiles": None,
            "finished_utc": finished.isoformat(), "phone_serial": PHONE,
            "configuration": dict(smoke.DEFAULT_CONFIGURATION),
            "binaries": {"receiver": {"sha256": A}, "display": {"sha256": B}}}
@@ -651,6 +652,18 @@ class GateTests(unittest.TestCase):
 
     def test_fresh_pass_for_the_same_bytes_admits_the_soak(self) -> None:
         self.assertIsNone(self.check(record()))
+
+    def test_stored_pass_requires_zero_display_exit(self) -> None:
+        # #174 review: a pre-change PASS without display_exit, or with non-zero/non-int
+        # display_exit, must never open the soak gate.
+        pre_change = record()
+        pre_change.pop("display_exit")
+        self.assertEqual(self.check(pre_change), "drive_smoke_display_exit_missing")
+        for bad in (None, False, True, "0"):
+            with self.subTest(bad=bad):
+                self.assertEqual(self.check(record(display_exit=bad)),
+                                 "drive_smoke_display_exit_missing")
+        self.assertEqual(self.check(record(display_exit=3)), "drive_smoke_not_passed")
 
     def test_refusals_are_named(self) -> None:
         cases = {

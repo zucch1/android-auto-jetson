@@ -149,7 +149,7 @@ def stop_launcher_mid_stage(mode: str, ack_seconds: str = "30", **extra_env: str
         marks.mkdir()
         smoke_record = root / "smoke.json"
         smoke_record.write_text(json.dumps({
-            "schema": smoke.SCHEMA, "verdict": "PASS", "duration_s": 600, "video_profiles": None,
+            "schema": smoke.SCHEMA, "verdict": "PASS", "display_exit": 0, "duration_s": 600, "video_profiles": None,
             "finished_utc": datetime.now(timezone.utc).isoformat(), "phone_serial": PHONE,
             "configuration": dict(smoke.DEFAULT_CONFIGURATION),
             "binaries": {"receiver": {"sha256": A}, "display": {"sha256": B}}}))
@@ -266,7 +266,7 @@ def run_launcher_past_its_budget(mode: str, stop_budgets: bool = False, **extra_
             capture_output=True, text=True, check=True).stdout) + 15
         smoke_record = root / "smoke.json"
         smoke_record.write_text(json.dumps({
-            "schema": smoke.SCHEMA, "verdict": "PASS", "duration_s": 600, "video_profiles": None,
+            "schema": smoke.SCHEMA, "verdict": "PASS", "display_exit": 0, "duration_s": 600, "video_profiles": None,
             "finished_utc": datetime.now(timezone.utc).isoformat(), "phone_serial": PHONE,
             "configuration": dict(smoke.DEFAULT_CONFIGURATION),
             "binaries": {"receiver": {"sha256": A}, "display": {"sha256": B}}}))

@@ -512,6 +512,7 @@ def analyze(receiver: list[dict], display: list[dict], sidecar: list[dict] | Non
     seconds = (min(cutoff, stopped_ns or cutoff) - start_ns) / 1e9 if start_ns and cutoff else None
     return {
         "verdict": verdict,
+        "display_exit": display_exit if type(display_exit) is int else None,
         **({"blocked_on": blocked_on} if blocked_on else {}),
         **({"failure": failure} if failure else {}),
         "log_integrity": {"receiver": rec, "display": disp, "idr_unstamped": len(unstamped),
@@ -713,6 +714,11 @@ def check_record(record: dict | None, *, receiver_sha256: str, display_sha256: s
             return "drive_smoke_link_unproven", f"the wireless smoke's link record: {gap}"
     if record["verdict"] != "PASS":
         return "drive_smoke_not_passed", f"verdict {record['verdict']!r}"
+    display_exit = record.get("display_exit")
+    if type(display_exit) is not int:
+        return "drive_smoke_display_exit_missing", "the smoke result lacks integer display_exit evidence"
+    if display_exit != 0:
+        return "drive_smoke_not_passed", f"display_exit {display_exit}"
     for role, digest in (("receiver", receiver_sha256), ("display", display_sha256)):
         if binaries[role]["sha256"] != digest:
             return "drive_smoke_build_mismatch", f"{role} sha256 differs from the smoke's"

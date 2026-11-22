@@ -7761,8 +7761,7 @@ TEST(WiredReceiver, RuntimeDiagnosticsAndAudioReopenKeepTimingOnStalledStdout) {
     ASSERT_NE(bypass_end_at, std::string::npos);
     EXPECT_LT(diag_at, reopen1_at);
     EXPECT_LT(reopen1_at, bypass_begin_at);
-    EXPECT_LT(bypass_begin_at, bypass_end_at);
-    EXPECT_LT(reopen1_at, reopen2_at);
+    EXPECT_LT(bypass_begin_at, reopen2_at);
     EXPECT_LT(reopen2_at, bypass_end_at);
 }
 
@@ -8823,14 +8822,15 @@ TEST(WiredReceiver, StdoutLogAbandonedSinkNeverWritesACompletionRecord) {
 // #174: finish() abandoning a stalled sink with parked records reports
 // ETIMEDOUT, records queued + parked in undelivered(), and writes no log_complete.
 TEST(WiredReceiver, StdoutLogFinishAbandonsStalledSinkWithParkedRecords) {
-    auto *probe = new LogWriteProbe; // Intentionally leaked: the worker outlives this test.
-    LogWriteProbe::active = probe;
+    LogWriteProbe owned_probe;
+    LogWriteProbe::active = &owned_probe;
     std::atomic<bool> running{true};
     {
         aa::wired_receiver::StdoutLog log{running, LogWriteProbe::write,
                                           &aa::wired_receiver::StdoutLog::Clock::now, {},
                                           aa::wired_receiver::StdoutLog::default_finish_timeout, true};
         fill_log_queue(log);
+        ASSERT_TRUE(wait_probe_calls(owned_probe, 1));
         constexpr std::size_t parked_count = 3;
         for (std::size_t i = 0; i < parked_count; ++i) {
             EXPECT_FALSE(log.submit_pending("{\"event\":\"parked\",\"seq\":" + std::to_string(i) + "}"));
@@ -8839,12 +8839,13 @@ TEST(WiredReceiver, StdoutLogFinishAbandonsStalledSinkWithParkedRecords) {
         EXPECT_EQ(log.finish(std::chrono::milliseconds{100}).value(), ETIMEDOUT);
         EXPECT_TRUE(log.timed_out());
         EXPECT_EQ(log.undelivered(), aa::wired_receiver::StdoutLog::entry_capacity + parked_count);
+        // Release the sink and observe detached-worker exit before inspecting output or clearing the probe.
+        owned_probe.release();
+        EXPECT_TRUE(log.wait_for_worker_exit());
     }
-    probe->release();
-    std::this_thread::sleep_for(std::chrono::milliseconds{100});
     {
-        const std::lock_guard lock(probe->mutex);
-        EXPECT_EQ(probe->bytes.find("log_complete"), std::string::npos);
+        const std::lock_guard lock(owned_probe.mutex);
+        EXPECT_EQ(owned_probe.bytes.find("log_complete"), std::string::npos);
     }
     LogWriteProbe::active = nullptr;
 }

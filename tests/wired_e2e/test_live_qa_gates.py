@@ -779,6 +779,59 @@ class LiveQaGates(unittest.TestCase):
         self.assertEqual(doc["status"], "BLOCKED")
         self.assertEqual(doc["blocked_on"], "display_log_incomplete")
 
+    def test_early_display_crash_with_missing_video_and_log_is_failed_not_blocked(self) -> None:
+        # #174 review P3: a confirmed nonzero display exit must be FAILED, never
+        # BLOCKED on display_log_incomplete, even when video was never painted.
+        code, doc = self.run_qa(False, projection_timeout_ms=300,
+                                FAKE_OBS_VIDEO="0", FAKE_DISPLAY_EXIT="3",
+                                FAKE_NO_TELEMETRY_COMPLETE="1")
+        self.assertEqual(code, 4, doc)
+        self.assertEqual(doc["status"], "FAILED")
+        self.assertEqual(doc["blocked_on"], "display_exit_3")
+
+    def test_real_display_supervisor_traps_term_and_gates_exit_status(self) -> None:
+        # #174 review P3: supervisor owns the display child, forwards TERM so a
+        # healthy display exits 0, publishes exit status before exiting, and fails
+        # both an early crash (exit 3) and a shutdown exit 3 after telemetry_complete.
+        for label, disp_body, expect_code, expect_status, expect_reason in (
+            ("graceful_term_exit_0",
+             'trap \'kill "$!" 2>/dev/null; printf "%s\\n" "{\\"event\\":\\"telemetry_complete\\"}"; exit 0\' TERM\nsleep 60 & wait\n',
+             0, "PASS", ""),
+            ("shutdown_exit_3_after_complete",
+             'trap \'kill "$!" 2>/dev/null; printf "%s\\n" "{\\"event\\":\\"telemetry_complete\\"}"; exit 3\' TERM\nsleep 60 & wait\n',
+             4, "FAILED", "display_exit_3"),
+            ("early_crash_exit_3",
+             'exit 3\n',
+             4, "FAILED", "display_exit_3"),
+        ):
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
+                target = Path(directory)
+                recv = target / "recv"
+                recv.write_text('#!/usr/bin/env bash\nexec sleep 60\n', encoding="utf-8")
+                recv.chmod(0o755)
+                disp = target / "disp"
+                disp.write_text(
+                    '#!/usr/bin/env bash\nset -euo pipefail\n'
+                    'printf "%s\\n" "$$" > "${0}.actual-pid"\n'
+                    'touch "$FAKE_TARGET/control-ready"\n' + disp_body,
+                    encoding="utf-8",
+                )
+                disp.chmod(0o755)
+                try:
+                    code, doc = self.run_qa(
+                        False, projection_timeout_ms=PASS_BUDGET_MS, FAKE_PROCESSES="1",
+                        FAKE_TARGET=directory,
+                    )
+                    self.assertEqual(code, expect_code, doc)
+                    self.assertEqual(doc["status"], expect_status, doc)
+                    self.assertEqual(doc["blocked_on"], expect_reason, doc)
+                finally:
+                    for actual in target.glob("*.actual-pid"):
+                        try:
+                            os.kill(int(actual.read_text(encoding="utf-8")), signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:

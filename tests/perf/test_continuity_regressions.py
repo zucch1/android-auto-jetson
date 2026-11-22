@@ -86,7 +86,7 @@ def frozen() -> None:
     capture = json.loads((ROOT / "tests/perf/fixtures/wired_perf/nominal_capture.json").read_text())
     capture.update(measurement_origin="live", observed_duration_seconds=1800,
                    early_exit=False, receiver_exit_code=0, display_survived=True,
-                   display_connected=True)
+                   display_exit_code=0, display_connected=True)
     capture["events"].update(startup_ms=10, video_units=1, audio_chunks=1)
     capture["provenance"].update(source_digest="a" * 64, build_artifact_digest="b" * 64,
                                  configuration_digest="c" * 64,
@@ -174,6 +174,63 @@ def active_window(freeze_after: float | None = None) -> None:
 
 def collector_frozen() -> None:
     active_window(freeze_after=5)
+
+
+def display_exit_after_complete() -> None:
+    # #174 review P2: collector -> reporter regression with a real subprocess
+    # display that writes telemetry_complete on SIGTERM and exits 0 vs 3.
+    fake_receiver = ROOT / "tests/perf/fixtures/wired_perf/fake_receiver.py"
+    for exit_code in (0, 3):
+        with tempfile.TemporaryDirectory(prefix=f"perf-disp-exit-{exit_code}-") as tmp:
+            root = Path(tmp)
+            display = root / "fake-display"
+            display.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json, signal, sys, time\n"
+                "def stop(signum, frame):\n"
+                "    print(json.dumps({'event': 'telemetry_complete'}), flush=True)\n"
+                f"    sys.exit({exit_code})\n"
+                "signal.signal(signal.SIGTERM, stop)\n"
+                "print(json.dumps({'event': 'ready'}), flush=True)\n"
+                "while True:\n"
+                "    now = time.monotonic_ns()\n"
+                "    print(json.dumps({'event': 'video_presented', 'scheduled_ns': now, 'completed_ns': now + 1000000}), flush=True)\n"
+                "    time.sleep(0.1)\n",
+                encoding="utf-8",
+            )
+            display.chmod(0o755)
+            args = argparse.Namespace(
+                receiver=str(fake_receiver), display=str(display), port="1-2.1",
+                no_display=False, duration_seconds=2, interval=1,
+                store=None, video_socket=None, input_socket=None,
+                state_dir=str(root / "state"),
+                build_dir=None, allow_unoptimized_build=True,
+                phone_serial=None, transport="wired", phone_id=None,
+                ap_interface=None, ap_channel=None, startup_timeout_seconds=None,
+                workload="none", media_uri=None, media_type="audio/*",
+                media_component=None, geo_uri=None, run_file=None,
+                video_profiles=None,
+            )
+            with (patch.dict(os.environ, {"FAKE_RECEIVER_MEDIA_TIMING": "1"}),
+                  patch.object(collector, "_display_connected", return_value=True),
+                  patch.object(collector, "_thermal_zones", return_value=()),
+                  patch.object(collector, "_target_hardware_state", return_value={})):
+                capture = collector.collect(args)
+            assert capture["display_survived"] is True, capture
+            assert capture["display_exit_code"] == exit_code, capture
+            assert "display_log_incomplete" not in capture.get("invalid_telemetry", []), capture
+            doc = reporter.build_result(
+                json.loads(json.dumps(capture)), duration_requested="2s",
+                now="2026-11-21T00:00:00Z", capture_path=None, capture_sha256=None,
+            )
+            metrics = {v["metric"] for v in doc["violations"]}
+            if exit_code == 0:
+                assert "display_exit_code" not in metrics, doc
+                assert doc["run_status"]["display_exit_code"] == 0, doc
+            else:
+                assert doc["verdict"] == "FAIL", doc
+                assert "display_exit_code" in metrics, doc
+                assert doc["run_status"]["display_exit_code"] == 3, doc
 
 
 if __name__ == "__main__":
