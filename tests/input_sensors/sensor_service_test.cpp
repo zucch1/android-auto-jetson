@@ -206,7 +206,27 @@ TEST(InputSensorsSensor, OwnedDescriptorOutlivesCallerHeapDestruction) {
             {SensorChannel::speed},
             NightModePolicy::manual,
         });
+    // GCC 13.3 at -O3 mislabels the inlined copy of this descriptor - two
+    // one-element vectors of one-byte enums - reporting the libstdc++ element
+    // copy as out of bounds: "forming offset 1 is out of the bounds [0, 1]"
+    // (-Warray-bounds), and, once that is ignored, "writing between 2 and
+    // 9223372036854775807 bytes into a region of size 1"
+    // (-Wstringop-overflow). Both vectors copy exactly their own size, so
+    // nothing is out of bounds: the same statement compiles clean at -O2 and
+    // under Clang, and runs clean under AddressSanitizer. This is the known
+    // bogus inlined-libstdc++-copy family (GCC PR 110498, known to fail on
+    // 13.3.0; meta-bugs 56456 and 88443), so only this construction is
+    // exempted. Guarded because Clang has neither warning group and rejects
+    // unknown ones under -Werror.
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Warray-bounds"
+#pragma GCC diagnostic ignored "-Wstringop-overflow"
+#endif
     SensorService service(*heap_descriptor, phone);
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
     heap_descriptor.reset();
 
     // When: the service's descriptor and request path are exercised after the

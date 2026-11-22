@@ -1,36 +1,14 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+#include "allocation_counter.hpp"
 #include "transport.hpp"
 #include <gtest/gtest.h>
-#include <atomic>
-#include <cstdlib>
+#include <algorithm>
+#include <cstdint>
 #include <memory>
-#include <new>
 #include <vector>
 #include <sys/socket.h>
 
 using namespace aa::ipc;
-namespace {
-// Count heap allocations so the malformed-flood regression enforces bounded, non-retained
-// storage instead of only checking rejection counters. The counters/delete are harmless for
-// every other test in this binary.
-std::atomic<long long> allocations{0};
-long long allocation_count() { return allocations.load(std::memory_order_relaxed); }
-}
-void* operator new(std::size_t size) {
-    allocations.fetch_add(1, std::memory_order_relaxed);
-    void* pointer = std::malloc(size ? size : 1);
-    if (!pointer) throw std::bad_alloc();
-    return pointer;
-}
-void* operator new[](std::size_t size) { return ::operator new(size); }
-void* operator new(std::size_t size, const std::nothrow_t&) noexcept { return ::operator new(size); }
-void* operator new[](std::size_t size, const std::nothrow_t&) noexcept { return ::operator new(size); }
-void operator delete(void* pointer) noexcept { std::free(pointer); }
-void operator delete[](void* pointer) noexcept { std::free(pointer); }
-void operator delete(void* pointer, std::size_t) noexcept { std::free(pointer); }
-void operator delete[](void* pointer, std::size_t) noexcept { std::free(pointer); }
-void operator delete(void* pointer, const std::nothrow_t&) noexcept { std::free(pointer); }
-void operator delete[](void* pointer, const std::nothrow_t&) noexcept { std::free(pointer); }
 namespace {
 Packet make_packet(Header h) {
     Packet packet{}; encode(packet, h);
@@ -121,12 +99,15 @@ TEST(IpcFraming, RejectInconsistentFragmentsAndReplay) {
     EXPECT_EQ(feed(*receiver, {1, 1, 42, 0, 1, 4, 4, true}), Receive::rejected);
 }
 TEST(IpcFraming, MalformedFloodKeepsFixedStorage) {
+    // Enforce bounded, non-retained storage instead of only checking rejection
+    // counters: the replacement allocation functions (allocation_counter.cpp)
+    // count every allocation the flood could make.
     auto receiver = std::make_unique<Reassembler>();
     Packet packet{};
-    const auto before = allocation_count();
+    const auto before = ipctest::allocation_count();
     unsigned rejected = 0;
     for (unsigned i = 0; i < 10000; ++i) rejected += receiver->accept(packet) == Receive::rejected;
-    const auto allocated = allocation_count() - before;
+    const auto allocated = ipctest::allocation_count() - before;
     EXPECT_EQ(rejected, 10000);
     EXPECT_EQ(allocated, 0) << "malformed flood retained dynamic allocation";
     EXPECT_EQ(receiver->rejected, 10000); EXPECT_TRUE(receiver->frame().empty());
