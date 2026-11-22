@@ -7,7 +7,7 @@ from __future__ import annotations
 import hashlib
 import os
 from pathlib import Path
-import stat
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -20,18 +20,38 @@ set -euo pipefail
 if [ -n "${FAKE_SSH_LOG:-}" ]; then
     printf 'ssh %s\n' "$*" >> "$FAKE_SSH_LOG"
 fi
-cmd="${@: -1}"
 root="${FAKE_TARGET_ROOT:?}"
-# Rewrite target system paths into the hermetic fake target root.
-cmd="${cmd//\/etc\/os-release/$root\/etc\/os-release}"
-cmd="${cmd//\/etc\/android-auto-receiver/$root\/etc\/android-auto-receiver}"
-cmd="${cmd//\/etc\/udev\/rules.d/$root\/etc\/udev\/rules.d}"
-cmd="${cmd//\/etc\/systemd\/system/$root\/etc\/systemd\/system}"
-cmd="${cmd//\/etc\/dbus-1\/system.d/$root\/etc\/dbus-1\/system.d}"
-cmd="${cmd//\/usr\/bin\/aa-wireless-receiver/$root\/usr\/bin\/aa-wireless-receiver}"
-cmd="${cmd//\/var\/lib\/android-auto-receiver/$root\/var\/lib\/android-auto-receiver}"
-cmd="${cmd//\/tmp\/aa-deploy-/$root\/tmp\/aa-deploy-}"
-HOME="$root/home/zucchi" PATH="$FAKE_REMOTE_BIN:$PATH" bash -euc "$cmd"
+if [ "$#" -ge 2 ] && [ "${@: -2:1}" = "bash" ] && [ "${@: -1}" = "-s" ]; then
+    raw_cmd="$(cat)"
+else
+    raw_cmd="${@: -1}"
+fi
+# Single-pass, unambiguous path rewrite into the hermetic fake target root.
+# Matching an existing $root/... prefix first prevents double-rewriting even when
+# TMPDIR is unset or /tmp (so $root itself begins with /tmp/aa-deploy-test-...).
+cmd="$(python3 -c '
+import os, re, sys
+root = os.environ["FAKE_TARGET_ROOT"]
+src = sys.stdin.read()
+pat = re.compile(
+    re.escape(root) + r"[^\s\x27\";]*"
+    + r"|(?:/etc/os-release"
+    + r"|/etc/android-auto-receiver"
+    + r"|/etc/udev/rules\.d"
+    + r"|/etc/systemd/system"
+    + r"|/etc/dbus-1/system\.d"
+    + r"|/usr/bin/aa-wireless-receiver"
+    + r"|/var/lib/android-auto-receiver"
+    + r"|/tmp/aa-deploy-)"
+)
+def repl(m: re.Match[str]) -> str:
+    val = m.group(0)
+    if val.startswith(root):
+        return val
+    return root + val
+sys.stdout.write(pat.sub(repl, src))
+' <<< "$raw_cmd")"
+HOME="$root/home/zucchi" PATH="$FAKE_REMOTE_BIN:$PATH" bash -euo pipefail -s <<< "$cmd"
 """
 
 FAKE_SCP = r"""#!/usr/bin/env bash
@@ -43,9 +63,15 @@ root="${FAKE_TARGET_ROOT:?}"
 src="${@: -2:1}"
 dst="${@: -1}"
 remote_path="${dst#*:}"
-remote_path="${remote_path/\/tmp\/aa-deploy-/$root\/tmp\/aa-deploy-}"
+case "$remote_path" in
+    "$root"/*) ;;
+    /tmp/aa-deploy-*) remote_path="${root}${remote_path}" ;;
+esac
 mkdir -p "$(dirname -- "$remote_path")"
 cp -p "$src" "$remote_path"
+if [ "${FAKE_CORRUPT_SCP:-0}" = "1" ]; then
+    printf 'X' >> "$remote_path"
+fi
 """
 
 FAKE_SUDO = r"""#!/usr/bin/env bash
@@ -73,6 +99,16 @@ exec /usr/bin/install "${args[@]}"
 FAKE_CHOWN = r"""#!/usr/bin/env bash
 set -euo pipefail
 exit 0
+"""
+
+FAKE_STAT = r"""#!/usr/bin/env bash
+set -euo pipefail
+out="$(/usr/bin/stat "$@")"
+if [ -n "${FAKE_STAT_UID:-}" ] && [ "${1:-}" = "-c" ] && [[ "${2:-}" == %u* ]]; then
+    printf '%s%s\n' "$FAKE_STAT_UID" "${out#${out%% *}}"
+    exit 0
+fi
+printf '%s\n' "$out"
 """
 
 FAKE_DPKG = r"""#!/usr/bin/env bash
@@ -124,7 +160,7 @@ if ! find "$root/var/lib/android-auto-receiver/deploy/runs" -name 'dpkg-query-be
     echo "fake-apt-get: dpkg-query-before.txt missing before apt-get $*" >&2
     exit 97
 fi
-if [ "${1:-}" = "-s" ] && [ "${2:-}" = "install" ]; then
+if [ "${1:-}" = "-s" ]; then
     if [ "${FAKE_DEPENDS_FAIL:-0}" = "1" ]; then
         echo "E: Unable to correct problems, you have held broken packages." >&2
         exit 100
@@ -132,6 +168,10 @@ if [ "${1:-}" = "-s" ] && [ "${2:-}" = "install" ]; then
     exit 0
 fi
 if [ "${1:-}" = "install" ]; then
+    if [ "${FAKE_INSTALL_FAIL:-0}" = "1" ]; then
+        echo "E: Sub-process /usr/bin/dpkg returned an error code (1)" >&2
+        exit 100
+    fi
     deb="${@: -1}"
     ver="$(/usr/bin/dpkg-deb --field "$deb" Version)"
     /usr/bin/dpkg-deb --extract "$deb" "$root"
@@ -147,6 +187,9 @@ if [ "${1:-}" = "remove" ]; then
     grep -v '^android-auto-receiver[[:space:]]' "$status_file" > "$status_file.new" || true
     mv -f "$status_file.new" "$status_file"
     rm -f "$root/usr/bin/aa-wireless-receiver"
+    if [ "${FAKE_TAMPER_INFOTAINMENT:-0}" = "1" ]; then
+        printf 'tampered\n' >> "$root/home/zucchi/Desktop/infotainment/README.md"
+    fi
     exit 0
 fi
 echo "fake-apt-get: unexpected args: $*" >&2
@@ -239,6 +282,7 @@ class DeployHarnessTest(unittest.TestCase):
         write_exec(self.remote_bin / "sudo", FAKE_SUDO)
         write_exec(self.remote_bin / "install", FAKE_INSTALL)
         write_exec(self.remote_bin / "chown", FAKE_CHOWN)
+        write_exec(self.remote_bin / "stat", FAKE_STAT)
         write_exec(self.remote_bin / "dpkg", FAKE_DPKG)
         write_exec(self.remote_bin / "dpkg-query", FAKE_DPKG_QUERY)
         write_exec(self.remote_bin / "apt-get", FAKE_APT_GET)
@@ -260,6 +304,7 @@ class DeployHarnessTest(unittest.TestCase):
             "home/zucchi/Desktop/infotainment",
         ):
             (self.target / rel).mkdir(parents=True, exist_ok=True)
+        (self.target / "etc/android-auto-receiver").chmod(0o755)
 
         (self.target / "etc/os-release").write_text('ID=ubuntu\nVERSION_ID="24.04"\n')
         ap_conf = self.target / "etc/android-auto-receiver/ap.conf"
@@ -293,6 +338,7 @@ class DeployHarnessTest(unittest.TestCase):
             "FAKE_REMOTE_BIN": str(self.remote_bin),
             "FAKE_SSH_LOG": str(self.ssh_log),
             "FAKE_EVENT_LOG": str(self.event_log),
+            "FAKE_STAT_UID": "0",
             **(extra_env or {}),
         }
         return subprocess.run(
@@ -304,6 +350,9 @@ class DeployHarnessTest(unittest.TestCase):
         )
 
     def test_preflight_refusals_and_no_secret_leak(self) -> None:
+        ap_conf = self.target / "etc/android-auto-receiver/ap.conf"
+        session_uid = self.target / "etc/android-auto-receiver/session.uid"
+
         # Missing --confirm-jurisdiction
         res = self.run_deploy("zucchi@jetson", str(self.pkg_v1))
         self.assertNotEqual(res.returncode, 0)
@@ -317,13 +366,21 @@ class DeployHarnessTest(unittest.TestCase):
         self.assertIn("measurement in progress", res.stderr)
         marker.unlink()
 
-        # Wrong architecture
+        # Wrong dpkg architecture
         res = self.run_deploy(
             "zucchi@jetson", str(self.pkg_v1), "--confirm-jurisdiction", "US",
             extra_env={"FAKE_ARCH": "amd64"},
         )
         self.assertNotEqual(res.returncode, 0)
         self.assertIn("unsupported dpkg architecture", res.stderr)
+
+        # Wrong kernel architecture (uname -m)
+        res = self.run_deploy(
+            "zucchi@jetson", str(self.pkg_v1), "--confirm-jurisdiction", "US",
+            extra_env={"FAKE_UNAME_M": "x86_64"},
+        )
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("unsupported kernel arch", res.stderr)
 
         # Wrong OS release
         (self.target / "etc/os-release").write_text('ID=ubuntu\nVERSION_ID="22.04"\n')
@@ -340,8 +397,49 @@ class DeployHarnessTest(unittest.TestCase):
         self.assertNotEqual(res.returncode, 0)
         self.assertIn("insufficient free disk", res.stderr)
 
+        # ap.conf mode 0644 refused (matches Files.cpp:47)
+        ap_conf.chmod(0o644)
+        res = self.run_deploy("zucchi@jetson", str(self.pkg_v1), "--confirm-jurisdiction", "US")
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("mode too permissive", res.stderr)
+        self.assertNotIn("wlan0", res.stdout + res.stderr)
+        ap_conf.chmod(0o600)
+
+        # Non-root-owned ap.conf refused (matches Files.cpp:46)
+        res = self.run_deploy(
+            "zucchi@jetson", str(self.pkg_v1), "--confirm-jurisdiction", "US",
+            extra_env={"FAKE_STAT_UID": "1000"},
+        )
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("root-owned", res.stderr)
+
+        # Missing ap.conf and symlinked ap.conf
+        ap_conf.unlink()
+        res = self.run_deploy("zucchi@jetson", str(self.pkg_v1), "--confirm-jurisdiction", "US")
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("missing or non-regular operator ap.conf", res.stderr)
+        ap_conf.symlink_to(session_uid)
+        res = self.run_deploy("zucchi@jetson", str(self.pkg_v1), "--confirm-jurisdiction", "US")
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("missing or non-regular operator ap.conf", res.stderr)
+        ap_conf.unlink()
+        ap_conf.write_text("v1 wlan0 US jurisdiction-confirmed 5277 44\n")
+        ap_conf.chmod(0o600)
+
+        # Missing and symlinked session.uid
+        session_uid.unlink()
+        res = self.run_deploy("zucchi@jetson", str(self.pkg_v1), "--confirm-jurisdiction", "US")
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("missing or non-regular operator session.uid", res.stderr)
+        session_uid.symlink_to(ap_conf)
+        res = self.run_deploy("zucchi@jetson", str(self.pkg_v1), "--confirm-jurisdiction", "US")
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("missing or non-regular operator session.uid", res.stderr)
+        session_uid.unlink()
+        session_uid.write_text("2002\n")
+        session_uid.chmod(0o600)
+
         # Unconfirmed jurisdiction in ap.conf (and verify ap.conf contents never leak)
-        ap_conf = self.target / "etc/android-auto-receiver/ap.conf"
         ap_conf.write_text("v1 wlan0 US jurisdiction-unconfirmed 5277 44\n")
         res = self.run_deploy("zucchi@jetson", str(self.pkg_v1), "--confirm-jurisdiction", "US")
         self.assertNotEqual(res.returncode, 0)
@@ -349,13 +447,56 @@ class DeployHarnessTest(unittest.TestCase):
         self.assertNotIn("wlan0", res.stdout + res.stderr)
         self.assertNotIn("5277", res.stdout + res.stderr)
 
-        # Jurisdiction mismatch
-        ap_conf.write_text("v1 wlan0 DE jurisdiction-confirmed 5277 44\n")
+        # Jurisdiction mismatch (use distinctive code "ZZ" that cannot appear in generic error text)
+        ap_conf.write_text("v1 wlan0 ZZ jurisdiction-confirmed 5277 44\n")
         res = self.run_deploy("zucchi@jetson", str(self.pkg_v1), "--confirm-jurisdiction", "US")
         self.assertNotEqual(res.returncode, 0)
         self.assertIn("does not match", res.stderr)
-        self.assertNotIn("DE", res.stdout + res.stderr)
+        self.assertNotIn("ZZ", res.stdout + res.stderr)
+
+        # Country code "00" rejected (matches Files.cpp:106-107)
+        ap_conf.write_text("v1 wlan0 00 jurisdiction-confirmed 5277 44\n")
+        res = self.run_deploy("zucchi@jetson", str(self.pkg_v1), "--confirm-jurisdiction", "US")
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("country code", res.stderr)
+        self.assertNotIn("wlan0", res.stdout + res.stderr)
+
+        # Privileged port 80 rejected (matches Files.cpp:112 requiring 1024..65535)
+        ap_conf.write_text("v1 wlan0 US jurisdiction-confirmed 80 44\n")
+        res = self.run_deploy("zucchi@jetson", str(self.pkg_v1), "--confirm-jurisdiction", "US")
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("port out of range", res.stderr)
+        self.assertNotIn("wlan0", res.stdout + res.stderr)
+
+        # Invalid interface name (too long / bad char, matches Files.cpp:107-108)
+        ap_conf.write_text("v1 wlan0$bad US jurisdiction-confirmed 5277 44\n")
+        res = self.run_deploy("zucchi@jetson", str(self.pkg_v1), "--confirm-jurisdiction", "US")
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("interface name invalid", res.stderr)
+        self.assertNotIn("wlan0$bad", res.stdout + res.stderr)
+
+        # Invalid channel and multi-line ap.conf
+        ap_conf.write_text("v1 wlan0 US jurisdiction-confirmed 5277 52\n")
+        res = self.run_deploy("zucchi@jetson", str(self.pkg_v1), "--confirm-jurisdiction", "US")
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("channel invalid", res.stderr)
+
+        ap_conf.write_text("v1 wlan0 US jurisdiction-confirmed 5277 44\nextra\n")
+        res = self.run_deploy("zucchi@jetson", str(self.pkg_v1), "--confirm-jurisdiction", "US")
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("exactly one configuration line", res.stderr)
+
         ap_conf.write_text("v1 wlan0 US jurisdiction-confirmed 5277 44\n")
+        ap_conf.chmod(0o600)
+
+        # Staged .deb SHA-256 mismatch refused
+        res = self.run_deploy(
+            "zucchi@jetson", str(self.pkg_v1), "--confirm-jurisdiction", "US",
+            extra_env={"FAKE_CORRUPT_SCP": "1"},
+        )
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("staged .deb sha256 mismatch", res.stderr)
+        self.assertFalse((self.target / "usr/bin/aa-wireless-receiver").exists())
 
         # Unsatisfiable Depends: dpkg-query -W recorded before apt-get -s, and no install occurs
         res = self.run_deploy(
@@ -365,6 +506,26 @@ class DeployHarnessTest(unittest.TestCase):
         self.assertNotEqual(res.returncode, 0)
         self.assertIn("Depends not satisfiable", res.stderr)
         self.assertFalse((self.target / "usr/bin/aa-wireless-receiver").exists())
+
+    def test_failed_install_preserves_legacy_files(self) -> None:
+        legacy_udev = self.target / "etc/udev/rules.d/70-android-auto-receiver.rules"
+        legacy_unit = self.target / "etc/systemd/system/aa-system-helper.service"
+        legacy_dbus = self.target / "etc/dbus-1/system.d/org.custom.AndroidAutoSystemHelper.conf"
+        legacy_udev.write_text("# legacy udev\n")
+        legacy_unit.write_text("[Unit]\nDescription=legacy\n")
+        legacy_dbus.write_text("<busconfig><!-- legacy --></busconfig>\n")
+
+        res = self.run_deploy(
+            "zucchi@jetson", str(self.pkg_v1), "--confirm-jurisdiction", "US",
+            extra_env={"FAKE_INSTALL_FAIL": "1"},
+        )
+        self.assertNotEqual(res.returncode, 0)
+        self.assertTrue(legacy_udev.exists())
+        self.assertTrue(legacy_unit.exists())
+        self.assertTrue(legacy_dbus.exists())
+        self.assertEqual(legacy_udev.read_text(), "# legacy udev\n")
+        self.assertEqual(legacy_unit.read_text(), "[Unit]\nDescription=legacy\n")
+        self.assertEqual(legacy_dbus.read_text(), "<busconfig><!-- legacy --></busconfig>\n")
 
     def test_install_migration_digest_from_installed_and_no_enable_inactive_helper(self) -> None:
         # Pre-populate legacy ad-hoc install artifacts
@@ -416,16 +577,101 @@ class DeployHarnessTest(unittest.TestCase):
         self.assertFalse(any(e.startswith("systemctl enable") for e in events), events)
         self.assertFalse(any(e.startswith("systemctl start") for e in events), events)
 
-        # Rollback back to legacy restores legacy files and digest
+        # Rollback back to legacy restores byte-identical legacy files, digest, and preserves allow fragment
         rb = self.run_deploy(
             "zucchi@jetson", "--rollback",
             extra_env={"FAKE_HELPER_ACTIVE": "inactive", "FAKE_HELPER_ENABLED": "disabled"},
         )
         self.assertEqual(rb.returncode, 0, rb.stderr)
-        self.assertTrue(legacy_udev.exists())
-        self.assertTrue(legacy_unit.exists())
-        self.assertTrue(legacy_dbus.exists())
+        self.assertIn("rolled_back_to=legacy", rb.stdout)
+        self.assertEqual(legacy_udev.read_text(), "# legacy udev\n")
+        self.assertEqual(legacy_unit.read_text(), "[Unit]\nDescription=legacy\n")
+        self.assertEqual(legacy_dbus.read_text(), "<busconfig><!-- legacy --></busconfig>\n")
+        self.assertEqual(allow_frag.read_text(), "<busconfig><!-- keep --></busconfig>\n")
         self.assertEqual(legacy_sha.read_text(), "0" * 64 + "\n")
+
+    def test_enabled_but_inactive_helper_is_restarted_never_enabled(self) -> None:
+        res = self.run_deploy(
+            "zucchi@jetson", str(self.pkg_v1), "--confirm-jurisdiction", "US",
+            extra_env={"FAKE_HELPER_ACTIVE": "inactive", "FAKE_HELPER_ENABLED": "enabled"},
+        )
+        self.assertEqual(res.returncode, 0, res.stderr)
+        events = self.event_log.read_text().splitlines()
+        self.assertTrue(any(e == "systemctl restart aa-system-helper.service" for e in events), events)
+        self.assertFalse(any(e.startswith("systemctl enable") for e in events), events)
+        self.assertFalse(any(e.startswith("systemctl start") for e in events), events)
+
+    def test_clean_box_rollback_and_edge_cases(self) -> None:
+        # Clean-box install (no legacy files)
+        res = self.run_deploy("zucchi@jetson", str(self.pkg_v1), "--confirm-jurisdiction", "US")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        sha_file = self.target / "etc/android-auto-receiver/receiver.sha256"
+        prev_env = self.target / "var/lib/android-auto-receiver/deploy/previous.env"
+        self.assertTrue(sha_file.exists())
+        self.assertIn("PREV_MODE=none", prev_env.read_text())
+
+        # Rollback on clean box removes package and receiver.sha256, reports rolled_back_to=none, no receiver_sha256
+        rb = self.run_deploy("zucchi@jetson", "--rollback")
+        self.assertEqual(rb.returncode, 0, rb.stderr)
+        self.assertIn("rolled_back_to=none", rb.stdout)
+        self.assertNotIn("rolled_back_to=legacy", rb.stdout)
+        self.assertNotIn("receiver_sha256=", rb.stdout)
+        self.assertFalse(sha_file.exists())
+        self.assertFalse((self.target / "usr/bin/aa-wireless-receiver").exists())
+
+        # Second rollback refuses cleanly with no previous deployment recorded
+        rb2 = self.run_deploy("zucchi@jetson", "--rollback")
+        self.assertNotEqual(rb2.returncode, 0)
+        self.assertIn("no previous deployment recorded", rb2.stderr)
+
+    def test_rollback_not_blocked_by_missing_infotainment_or_install_preflight(self) -> None:
+        res1 = self.run_deploy("zucchi@jetson", str(self.pkg_v1), "--confirm-jurisdiction", "US")
+        self.assertEqual(res1.returncode, 0, res1.stderr)
+        res2 = self.run_deploy("zucchi@jetson", str(self.pkg_v2), "--confirm-jurisdiction", "US")
+        self.assertEqual(res2.returncode, 0, res2.stderr)
+
+        # Break install-only preflight conditions (ap.conf, disk, OS) AND remove infotainment dir
+        (self.target / "etc/android-auto-receiver/ap.conf").unlink()
+        (self.target / "etc/os-release").write_text('ID=ubuntu\nVERSION_ID="22.04"\n')
+        shutil.rmtree(self.target / "home/zucchi/Desktop/infotainment")
+
+        rb = self.run_deploy(
+            "zucchi@jetson", "--rollback",
+            extra_env={"FAKE_FREE_MB": "50"},
+        )
+        self.assertEqual(rb.returncode, 0, rb.stderr)
+        self.assertIn("warning: infotainment tree missing", rb.stderr)
+        self.assertIn("rolled_back_to=1.0.0", rb.stdout)
+        self.assertEqual((self.target / "usr/bin/aa-wireless-receiver").read_bytes(), b"ELF-RECEIVER-V1\n")
+
+    def test_rollback_detects_infotainment_tamper_when_present_and_corrupt_prev_deb(self) -> None:
+        res1 = self.run_deploy("zucchi@jetson", str(self.pkg_v1), "--confirm-jurisdiction", "US")
+        self.assertEqual(res1.returncode, 0, res1.stderr)
+        res2 = self.run_deploy("zucchi@jetson", str(self.pkg_v2), "--confirm-jurisdiction", "US")
+        self.assertEqual(res2.returncode, 0, res2.stderr)
+
+        # Corrupt previous .deb -> rollback refuses
+        prev_deb = self.target / "var/lib/android-auto-receiver/deploy/packages/android-auto-receiver_1.0.0_arm64.deb"
+        saved_bytes = prev_deb.read_bytes()
+        prev_deb.write_bytes(saved_bytes + b"corrupt")
+        rb_corrupt = self.run_deploy("zucchi@jetson", "--rollback")
+        self.assertNotEqual(rb_corrupt.returncode, 0)
+        self.assertIn("previous .deb sha256 mismatch", rb_corrupt.stderr)
+
+        # Missing previous .deb -> rollback refuses
+        prev_deb.unlink()
+        rb_missing = self.run_deploy("zucchi@jetson", "--rollback")
+        self.assertNotEqual(rb_missing.returncode, 0)
+        self.assertIn("recorded previous .deb missing", rb_missing.stderr)
+
+        # Restore previous .deb and verify infotainment tamper during rollback still fails
+        prev_deb.write_bytes(saved_bytes)
+        rb_tamper = self.run_deploy(
+            "zucchi@jetson", "--rollback",
+            extra_env={"FAKE_TAMPER_INFOTAINMENT": "1"},
+        )
+        self.assertNotEqual(rb_tamper.returncode, 0)
+        self.assertIn("infotainment tree modified", rb_tamper.stderr)
 
     def test_idempotence_upgrade_and_deb_rollback_with_active_helper(self) -> None:
         env = {"FAKE_HELPER_ACTIVE": "active", "FAKE_HELPER_ENABLED": "enabled"}
@@ -442,6 +688,8 @@ class DeployHarnessTest(unittest.TestCase):
 
         self.assertEqual(sha_file.read_text(), v2_digest + "\n")
         self.assertIn("VERSION=1.0.0", prev_env.read_text())
+        # Dead receiver.sha256.prev is no longer written
+        self.assertFalse((self.target / "var/lib/android-auto-receiver/deploy/rollback/receiver.sha256.prev").exists())
 
         # Idempotent reinstall of v2 produces no diff in package/digest and keeps previous.env at v1
         before_pkgs = pkgs_file.read_text()
@@ -472,12 +720,14 @@ class DeployHarnessTest(unittest.TestCase):
         self.assertNotEqual(res.returncode, 0)
         self.assertIn("infotainment tree modified", res.stderr)
 
-    def test_dry_run_prints_commands_without_running_ssh(self) -> None:
+    def test_dry_run_prints_real_restart_decision_without_running_ssh(self) -> None:
         res = self.run_deploy("zucchi@jetson", str(self.pkg_v1), "--confirm-jurisdiction", "US", "--dry-run")
         self.assertEqual(res.returncode, 0, res.stderr)
         self.assertIn("[dry-run] ssh", res.stdout)
         self.assertIn("[dry-run] scp", res.stdout)
         self.assertIn("apt-get install", res.stdout)
+        self.assertIn('if [ "$should_restart" = "1" ]', res.stdout)
+        self.assertNotIn('if [ 0 = "1" ]', res.stdout)
         self.assertFalse(self.ssh_log.exists())
         self.assertFalse(self.event_log.exists())
 
@@ -485,6 +735,8 @@ class DeployHarnessTest(unittest.TestCase):
         self.assertEqual(rb.returncode, 0, rb.stderr)
         self.assertIn("[dry-run] ssh", rb.stdout)
         self.assertIn("--allow-downgrades", rb.stdout)
+        self.assertIn('if [ "$effective_restart" = "1" ]', rb.stdout)
+        self.assertNotIn('if [ 0 = "1" ]', rb.stdout)
         self.assertFalse(self.ssh_log.exists())
 
 

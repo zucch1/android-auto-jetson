@@ -48,38 +48,49 @@ tools/deploy/aa-deploy.sh zucchi@192.168.55.3 --rollback
 ```
 
 Pass `--dry-run` with `--rollback` to inspect the rollback commands first.
-You may also pass `--confirm-jurisdiction CC` to cross-check `ap.conf` during rollback.
+Rollback uses a minimal preflight (target architecture, deploy state directory
+present, and no `~/MEASUREMENT_IN_PROGRESS` marker) so recovery is never blocked
+by install-only checks or a missing infotainment tree. If `~/Desktop/infotainment`
+is present, rollback still verifies it remains unchanged; if missing, it warns and
+proceeds.
 
 ## What `aa-deploy.sh` does
 
 1. **Local package validation:** verifies the `.deb` is `Package: android-auto-receiver`,
-   `Architecture: arm64`, with a non-empty `Version`, and computes its SHA-256.
+   `Architecture: arm64`, with a valid `Version`, and computes its SHA-256.
 2. **Remote preflight (fail-closed, read-only):**
    - Refuses if `~/MEASUREMENT_IN_PROGRESS` exists.
    - Verifies `dpkg --print-architecture` is `arm64`, `uname -m` is `aarch64`, and
      `/etc/os-release` is Ubuntu `24.04`.
    - Verifies free disk space on `/`, `/var`, and the state directory parent is at
      least `--min-free-mb` (default `512` MiB).
-   - Verifies `/etc/android-auto-receiver/ap.conf` (with `jurisdiction-confirmed`
-     matching `--confirm-jurisdiction`) and `/etc/android-auto-receiver/session.uid`
-     exist as regular, non-symlink files without printing any file contents.
+   - Verifies `/etc/android-auto-receiver`, `ap.conf`, and `session.uid` ownership,
+     permissions, and schema — mirroring `src/helper/nm/Files.cpp` (root-owned,
+     mode `0600`, valid interface, country code != `00` matching
+     `--confirm-jurisdiction`, `jurisdiction-confirmed`, port `1024..65535`, allowed
+     channel) — without ever printing file contents.
 3. **Infotainment pre-snapshot (read-only):** records `git -C ~/Desktop/infotainment rev-parse HEAD`,
    a SHA-256 of `git status --porcelain`, and a deterministic SHA-256 of every
-   non-`.git` file in `~/Desktop/infotainment`. The script never writes to that tree.
+   non-`.git` regular file in `~/Desktop/infotainment`.
 4. **Package-set recording before package-manager activity:** creates a root-owned
    timestamped run directory under `/var/lib/android-auto-receiver/deploy/runs/` and
    saves `dpkg-query -W` to `dpkg-query-before.txt` before running any `apt-get` or
    `dpkg` operation.
-5. **Transfer and dependency check:** copies the `.deb` via `scp`, verifies its
-   SHA-256 on the target, and checks `Depends` satisfiability with `apt-get -s install`
+5. **Private staging, transfer, and dependency check:** creates a private `0700`
+   `mktemp` directory on the target, copies the `.deb` via `scp`, verifies its
+   SHA-256 on the target, and checks `Depends` satisfiability with `apt-get -s -y install`
    before mutating anything.
-6. **Rollback state preservation:** stores the `.deb` in
-   `/var/lib/android-auto-receiver/deploy/packages/`. When moving to a different
-   `.deb`, copies `current.env` to `previous.env` and backs up `receiver.sha256`.
-   Reinstalling the exact same `.deb` is idempotent and does **not** overwrite
-   `previous.env`.
-7. **Legacy ad-hoc config migration:** detects and handles artifacts from the
-   earlier `~/aa-build/deploy-*.sh` and `tools/usb-policy/install.sh` workflow:
+6. **Package install and rollback state preservation:** stores the `.deb` in
+   `/var/lib/android-auto-receiver/deploy/packages/` and installs it with
+   `apt-get install -y` **before** removing any legacy files (so a failed install
+   leaves legacy config intact). After install succeeds, when moving to a different
+   `.deb`, copies `current.env` to `previous.env` (deb rollback recomputes
+   `receiver.sha256` from the restored binary). Reinstalling the exact same `.deb`
+   is idempotent and does **not** overwrite `previous.env`. On a first packaged
+   install, records `PREV_MODE=legacy` if legacy files were present or `PREV_MODE=none`
+   on a clean box.
+7. **Legacy ad-hoc config migration (post-install):** detects and handles artifacts
+   from the earlier `~/aa-build/deploy-*.sh` and `tools/usb-policy/install.sh` workflow:
    - `/etc/udev/rules.d/70-android-auto-receiver.rules` (shadows the packaged
      `/usr/lib/udev/rules.d/70-android-auto-receiver.rules`): backed up to
      `/var/lib/android-auto-receiver/deploy/rollback/legacy/` and removed.
@@ -93,8 +104,7 @@ You may also pass `--confirm-jurisdiction CC` to cross-check `ap.conf` during ro
    - `~/aa-build/bin/aa-*`: detected and logged in `migration.log` as superseded by
      `/usr/bin/aa-*`. `receiver.sha256` is switched to `/usr/bin/aa-wireless-receiver`;
      the operator may remove `~/aa-build/bin` after qualification (#191) completes.
-8. **Package install and receiver digest:** installs the `.deb` with
-   `apt-get install -y`, computes the SHA-256 of the **installed**
+8. **Receiver digest:** computes the SHA-256 of the **installed**
    `/usr/bin/aa-wireless-receiver`, and atomically writes the 64-hex digest (with
    trailing LF, mode `0600`, `root:root`) to `/etc/android-auto-receiver/receiver.sha256`.
 9. **Service reload and conditional restart:** runs `systemctl daemon-reload` and
@@ -102,7 +112,7 @@ You may also pass `--confirm-jurisdiction CC` to cross-check `ap.conf` during ro
    before the deploy. Never enables or starts an inactive/disabled unit.
 10. **Post-deploy verification:** records `dpkg-query -W` to `dpkg-query-after.txt`
     and re-hashes `~/Desktop/infotainment`, failing if `HEAD`, `git status --porcelain`,
-    or the file-tree hash changed.
+    or the non-`.git` regular file-tree hash changed.
 
 ## Automated host tests
 
