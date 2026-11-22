@@ -25,8 +25,6 @@ DEFAULT_STATE_DIR = "/var/lib/android-auto-receiver/deploy"
 DEFAULT_INFOTAINMENT_DIR = "$HOME/Desktop/infotainment"
 INSTALLED_RECEIVER = "/usr/bin/aa-wireless-receiver"
 ETC_DIR = "/etc/android-auto-receiver"
-AP_CONF = f"{ETC_DIR}/ap.conf"
-SESSION_UID = f"{ETC_DIR}/session.uid"
 RECEIVER_SHA256 = f"{ETC_DIR}/receiver.sha256"
 HELPER_UNIT = "aa-system-helper.service"
 LEGACY_UDEV_RULE = "/etc/udev/rules.d/70-android-auto-receiver.rules"
@@ -150,6 +148,98 @@ def remote_path_expr(path: str) -> str:
     return shlex.quote(path)
 
 
+# Runs on the target as root. Mirror the production readers in Identity.cpp
+# (protected_file, IdentityPolicy::load) and nm/Files.cpp (directory, read_into,
+# load_policy). receiver.sha256 is generated separately from the installed binary.
+OPERATOR_CONFIG_VALIDATOR = r"""
+import os
+import re
+import stat
+import sys
+from contextlib import ExitStack
+
+root, jurisdiction = sys.argv[1:]
+
+def refuse(reason):
+    sys.exit("preflight: " + reason)
+
+def open_checked(stack, name, flags, reason, *, dir_fd=None):
+    try:
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | flags, dir_fd=dir_fd)
+        stack.callback(os.close, fd)
+        return fd, os.fstat(fd)
+    except OSError:
+        refuse(reason)
+
+def read_config(name, limit, mode_mask, *, single_link=False):
+    with ExitStack() as stack:
+        fd, st = open_checked(
+            stack, name, os.O_NONBLOCK, f"missing or non-regular operator {name}", dir_fd=directory,
+        )
+        if not stat.S_ISREG(st.st_mode):
+            refuse(f"missing or non-regular operator {name}")
+        if st.st_uid != 0 or st.st_mode & mode_mask:
+            refuse(f"operator {name} ownership or mode too permissive (must be root-owned and protected)")
+        if single_link and st.st_nlink != 1:
+            refuse(f"operator {name} must not be hard-linked")
+        if single_link and st.st_size > limit:
+            refuse(f"operator {name} exceeds {limit} bytes")
+        try:
+            if single_link:
+                data = os.read(fd, limit + 1)
+                if len(data) != st.st_size:
+                    refuse(f"operator {name} size changed while reading")
+            else:
+                with os.fdopen(fd, "rb", closefd=False) as stream:
+                    data = stream.read(limit + 1)
+        except OSError:
+            refuse(f"could not read operator {name}")
+        if len(data) > limit:
+            refuse(f"operator {name} exceeds {limit} bytes")
+        return data
+
+with ExitStack() as stack:
+    directory, _ = open_checked(stack, root, os.O_DIRECTORY, "could not open target root")
+    for component in ("etc", "android-auto-receiver"):
+        directory, st = open_checked(
+            stack, component, os.O_DIRECTORY, "missing or non-directory operator config dir",
+            dir_fd=directory,
+        )
+        if st.st_uid != 0 or st.st_mode & 0o022:
+            refuse("operator config dir must be root-owned and not group/other-writable")
+    ap = read_config("ap.conf", 512, 0o077, single_link=True)
+    uid = read_config("session.uid", 128, 0o022).removesuffix(b"\n")
+
+if not re.fullmatch(rb"[0-9]+", uid):
+    refuse("operator session.uid must hold a decimal UID")
+if int(uid) > 0xffffffff:
+    refuse("operator session.uid is out of uint32 range")
+
+fields = ap.split()
+if len(fields) not in (5, 6):
+    refuse("ap.conf schema invalid (expected 5 or 6 fields)")
+version, interface, country, confirmed, port, *channel = fields
+if version != b"v1":
+    refuse("ap.conf schema version invalid")
+if not re.fullmatch(rb"[A-Za-z0-9_-]{1,15}", interface):
+    refuse("ap.conf interface name invalid")
+if not re.fullmatch(rb"[A-Z]{2}", country):
+    refuse("ap.conf country code malformed")
+if country != jurisdiction.encode("ascii"):
+    refuse("--confirm-jurisdiction does not match operator ap.conf")
+if confirmed != b"jurisdiction-confirmed":
+    refuse("ap.conf does not have jurisdiction-confirmed")
+if not re.fullmatch(rb"[0-9]+", port):
+    refuse("ap.conf port invalid")
+if not 1024 <= int(port) <= 65535:
+    refuse("ap.conf port out of range (expected 1024..65535)")
+if channel and (
+    not re.fullmatch(rb"[0-9]+", channel[0]) or int(channel[0]) not in (36, 40, 44, 48)
+):
+    refuse("ap.conf channel invalid (expected 36, 40, 44 or 48)")
+"""
+
+
 def build_preflight_script(
     jurisdiction: str | None,
     min_free_mb: int,
@@ -191,136 +281,9 @@ def build_preflight_script(
                 exit 1
             fi
         done
-        # Validate ap.conf and session.uid without ever printing file contents.
-        # Rules mirror src/helper/nm/Files.cpp:21-51 (directory/read_into) and :97-122 (load_policy).
-        sudo -n bash -c '
-            set -euo pipefail
-            export LC_ALL=C
-            etc_dir=$1
-            ap_conf=$2
-            session_uid=$3
-            expected_cc=$4
-
-            # Mirror Files.cpp:21-41 (directory): real root-owned dir, not group/other-writable.
-            if [ ! -d "$etc_dir" ] || [ -L "$etc_dir" ]; then
-                echo "preflight: missing or non-directory operator config dir" >&2
-                exit 1
-            fi
-            read -r dir_uid dir_mode < <(stat -c "%u %a" "$etc_dir")
-            if [ "$dir_uid" -ne 0 ] || [ $((8#$dir_mode & 8#022)) -ne 0 ]; then
-                echo "preflight: operator config dir ownership or mode invalid (must be root-owned and not group/other-writable)" >&2
-                exit 1
-            fi
-
-            # Mirror Files.cpp:43-51 (read_into): regular non-symlink, root-owned, mode & 0077 == 0, nlink == 1, size <= 512.
-            if [ ! -f "$ap_conf" ] || [ -L "$ap_conf" ]; then
-                echo "preflight: missing or non-regular operator ap.conf" >&2
-                exit 1
-            fi
-            read -r ap_uid ap_mode ap_nlink ap_size < <(stat -c "%u %a %h %s" "$ap_conf")
-            if [ "$ap_uid" -ne 0 ]; then
-                echo "preflight: operator ap.conf must be root-owned" >&2
-                exit 1
-            fi
-            if [ $((8#$ap_mode & 8#077)) -ne 0 ]; then
-                echo "preflight: operator ap.conf mode too permissive (must have no group/other permissions)" >&2
-                exit 1
-            fi
-            if [ "$ap_nlink" -ne 1 ]; then
-                echo "preflight: operator ap.conf must not be hard-linked" >&2
-                exit 1
-            fi
-            if [ "$ap_size" -gt 512 ]; then
-                echo "preflight: operator ap.conf exceeds 512 bytes" >&2
-                exit 1
-            fi
-
-            if [ ! -f "$session_uid" ] || [ -L "$session_uid" ]; then
-                echo "preflight: missing or non-regular operator session.uid" >&2
-                exit 1
-            fi
-            read -r suid_uid suid_mode < <(stat -c "%u %a" "$session_uid")
-            if [ "$suid_uid" -ne 0 ] || [ $((8#$suid_mode & 8#077)) -ne 0 ]; then
-                echo "preflight: operator session.uid must be root-owned with no group/other permissions" >&2
-                exit 1
-            fi
-            # Mirror src/helper/Identity.cpp IdentityPolicy::load: one optional trailing
-            # newline, then a non-empty decimal that fits uint32 (never printed).
-            suid_text="$(cat "$session_uid")"
-            case "$suid_text" in
-                ""|*[!0-9]*)
-                    echo "preflight: operator session.uid must hold a decimal UID" >&2
-                    exit 1 ;;
-            esac
-            if [ "${{#suid_text}}" -gt 10 ] || [ "$((10#$suid_text))" -gt 4294967295 ]; then
-                echo "preflight: operator session.uid is out of uint32 range" >&2
-                exit 1
-            fi
-
-            # Mirror Files.cpp:97-122 (load_policy) without ever printing ap.conf contents.
-            line_count=0
-            valid_line=""
-            while IFS= read -r raw || [ -n "$raw" ]; do
-                [ -z "$raw" ] && continue
-                line_count=$((line_count + 1))
-                valid_line="$raw"
-            done < "$ap_conf"
-            if [ "$line_count" -ne 1 ]; then
-                echo "preflight: ap.conf must contain exactly one configuration line" >&2
-                exit 1
-            fi
-            set -- $valid_line
-            if [ "$#" -ne 5 ] && [ "$#" -ne 6 ]; then
-                echo "preflight: ap.conf schema invalid (expected 5 or 6 fields)" >&2
-                exit 1
-            fi
-            # Files.cpp:105: version == "v1"
-            if [ "$1" != "v1" ]; then
-                echo "preflight: ap.conf schema version invalid" >&2
-                exit 1
-            fi
-            # Files.cpp:107-108: interface non-empty, <= 15 chars, [A-Za-z0-9_-]
-            if [ -z "$2" ] || [ "${{#2}}" -gt 15 ]; then
-                echo "preflight: ap.conf interface name invalid" >&2
-                exit 1
-            fi
-            case "$2" in
-                *[!A-Za-z0-9_-]*) echo "preflight: ap.conf interface name invalid" >&2; exit 1 ;;
-            esac
-            # Files.cpp:105-107: country is 2 uppercase ASCII letters and != "00"
-            if [ "$3" = "00" ]; then
-                echo "preflight: ap.conf country code 00 is rejected" >&2
-                exit 1
-            fi
-            case "$3" in
-                [A-Z][A-Z]) ;;
-                *) echo "preflight: ap.conf country code malformed" >&2; exit 1 ;;
-            esac
-            if [ -n "$expected_cc" ] && [ "$3" != "$expected_cc" ]; then
-                echo "preflight: --confirm-jurisdiction does not match operator ap.conf" >&2
-                exit 1
-            fi
-            # Files.cpp:105: confirmed == "jurisdiction-confirmed"
-            if [ "$4" != "jurisdiction-confirmed" ]; then
-                echo "preflight: ap.conf does not have jurisdiction-confirmed" >&2
-                exit 1
-            fi
-            # Files.cpp:111-112: port is unsigned decimal in 1024..65535
-            case "$5" in
-                ""|*[!0-9]*) echo "preflight: ap.conf port invalid" >&2; exit 1 ;;
-            esac
-            if [ $((10#$5)) -lt 1024 ] || [ $((10#$5)) -gt 65535 ]; then
-                echo "preflight: ap.conf port out of range (expected 1024..65535)" >&2
-                exit 1
-            fi
-            # Files.cpp:114-119: optional channel in ap_channel_allowed (36, 40, 44, 48)
-            if [ "$#" -eq 6 ]; then
-                case "$6" in
-                    36|40|44|48) ;;
-                    *) echo "preflight: ap.conf channel invalid (expected 36, 40, 44 or 48)" >&2; exit 1 ;;
-                esac
-            fi
-        ' _ {shlex.quote(ETC_DIR)} {shlex.quote(AP_CONF)} {shlex.quote(SESSION_UID)} {q_jur}
+        sudo -n python3 -I - / {q_jur} <<'AA_OPERATOR_CONFIG'
+    """) + OPERATOR_CONFIG_VALIDATOR + textwrap.dedent("""\
+        AA_OPERATOR_CONFIG
         echo "preflight=ok"
     """)
 
@@ -373,7 +336,7 @@ def build_infotainment_snapshot_script(infotainment_dir: str, *, optional: bool 
         dir={dir_expr}
     """) + missing_dir_block + textwrap.dedent("""\
         head_sha="$(git -C "$dir" rev-parse HEAD)"
-        status_sha="$(git -C "$dir" status --porcelain | sha256sum | cut -d' ' -f1)"
+        status_sha="$(git --no-optional-locks -C "$dir" status --porcelain | sha256sum | cut -d' ' -f1)"
         tree_sha="$(
             cd "$dir" &&
             find . -path './.git' -prune -o -type f -print0 |
@@ -429,6 +392,137 @@ def build_depends_check_script(stage_dir: str, staged_deb: str, expected_sha: st
     """)
 
 
+# Serialize deploy and rollback even when callers choose different state directories.
+def locked_mutation(script: str) -> str:
+    return (
+        'set -euo pipefail\n'
+        'sudo -n flock --close /run/aa-deploy.lock env AA_DEPLOY_OPERATOR_HOME="$HOME" '
+        "bash -s <<'AA_LOCKED_MUTATION'\n"
+        + script
+        + "AA_LOCKED_MUTATION\n"
+    )
+
+
+DEPLOY_STATE_FUNCTIONS = r"""
+fail() { echo "$*" >&2; exit 1; }
+
+state_field() {
+    awk -v key="$2=" 'index($0, key) == 1 { print substr($0, length(key) + 1); exit }' "$1"
+}
+
+read_installed_version() {
+    local record status rc
+    installed_version=""
+    if record="$(dpkg-query -W -f='${db:Status-Status} ${Version}\n' android-auto-receiver 2>/dev/null)"; then
+        read -r status installed_version <<< "$record"
+        case "$status" in
+            installed) [ -n "$installed_version" ] || fail "dpkg reported an empty installed version" ;;
+            config-files|not-installed) installed_version="" ;;
+            *) fail "package is in dpkg state $status; repair it before deploying or rolling back" ;;
+        esac
+    else
+        rc=$?
+        [[ "$rc" -eq 1 && -z "$record" ]] || fail "could not read installed package status"
+    fi
+}
+
+read_current_metadata() {
+    current_version=""
+    current_sha=""
+    current_deb=""
+    if [ -f "$current_env" ]; then
+        current_version="$(state_field "$current_env" VERSION)"
+        current_sha="$(state_field "$current_env" DEB_SHA256)"
+        current_deb="$(state_field "$current_env" DEB_PATH)"
+    fi
+    if [ ! -f "$current_env" ] || [ "$(state_field "$current_env" PREV_MODE)" != deb ] ||
+        [[ ! "$current_version" =~ ^[0-9A-Za-z.+~:-]+$ || ! "$current_sha" =~ ^[a-f0-9]{64}$ ]] ||
+        [ -z "$current_deb" ] || [ "$current_version" != "$installed_version" ]; then
+        fail "missing or inconsistent deployment metadata at $current_env; recover the managed package state first"
+    fi
+}
+
+helper_needs_restart() {
+    local active enabled
+    active="$(systemctl is-active aa-system-helper.service 2>/dev/null || true)"
+    enabled="$(systemctl is-enabled aa-system-helper.service 2>/dev/null || true)"
+    should_restart=0
+    if [ "$active" = active ] || [ "$enabled" = enabled ]; then
+        should_restart=1
+    fi
+}
+
+write_receiver_digest() {
+    local temporary
+    [[ -f "$receiver" && ! -L "$receiver" ]] || fail "deployed receiver is missing at $receiver"
+    digest="$(sha256sum "$receiver" | cut -d' ' -f1)"
+    [[ "$digest" =~ ^[a-f0-9]{64}$ ]] || fail "could not compute the deployed receiver digest"
+    temporary="$(mktemp -- "$etc_sha.XXXXXX")"
+    printf '%s\n' "$digest" > "$temporary"
+    chown root:root "$temporary"
+    mv -fT -- "$temporary" "$etc_sha"
+}
+"""
+
+# Accept a single literal absolute ExecStart in [Service], the layout needed
+# for the reference unit and ad-hoc units pointing into ~/aa-build/bin.
+LEGACY_UNIT_EXECUTABLE = r"""
+import re
+import sys
+from pathlib import Path
+
+root, filename = sys.argv[1:]
+try:
+    lines = Path(filename).read_text().split("\n")
+except (OSError, UnicodeError):
+    sys.exit("could not read saved legacy helper unit")
+
+section = ""
+commands = []
+for line in lines:
+    line = line.strip()
+    if not line or line.startswith(("#", ";")):
+        continue
+    if line.endswith("\\"):
+        sys.exit("legacy helper unit has unsupported line continuations; recover it manually")
+    if line.startswith("["):
+        section = line
+    key, _, value = line.partition("=")
+    if section == "[Service]" and key.rstrip() == "ExecStart":
+        commands.append(value.strip())
+if len(commands) != 1 or not re.fullmatch(r"/[a-zA-Z0-9_./-]+", commands[0]):
+    sys.exit("legacy helper unit needs one literal absolute ExecStart path; recover it manually")
+if any(part in ("", ".", "..") for part in commands[0][1:].split("/")):
+    sys.exit("legacy helper ExecStart path is not canonical; recover it manually")
+print(root.rstrip("/") + commands[0])
+"""
+
+
+def mutation_script(state_dir: str, run_dir: str) -> str:
+    return textwrap.dedent(f"""\
+        set -euo pipefail
+        export LC_ALL=C
+        umask 077
+        state_dir={shlex.quote(state_dir)}
+        run_dir={shlex.quote(run_dir)}
+        receiver={shlex.quote(INSTALLED_RECEIVER)}
+        etc_sha={shlex.quote(RECEIVER_SHA256)}
+        legacy_udev={shlex.quote(LEGACY_UDEV_RULE)}
+        legacy_unit={shlex.quote(LEGACY_HELPER_UNIT)}
+        legacy_dbus={shlex.quote(LEGACY_DBUS_POLICY)}
+        packaged_helper=/usr/libexec/aa-system-helper
+        current_env="$state_dir/current.env"
+        prev_env="$state_dir/previous.env"
+        restart_pending="$state_dir/rollback/restart-pending"
+        legacy_files=("$legacy_udev" "$legacy_unit" "$legacy_dbus" "$etc_sha")
+    """) + DEPLOY_STATE_FUNCTIONS + (
+        "legacy_executable() {\n"
+        "    python3 -I - / \"$1\" <<'AA_LEGACY_UNIT'\n"
+        + LEGACY_UNIT_EXECUTABLE
+        + "AA_LEGACY_UNIT\n}\n"
+    )
+
+
 def build_install_script(
     state_dir: str,
     run_dir: str,
@@ -436,268 +530,239 @@ def build_install_script(
     staged_deb: str,
     deb_info: dict[str, str],
 ) -> str:
-    q_state = shlex.quote(state_dir)
-    q_run = shlex.quote(run_dir)
-    q_stage = shlex.quote(stage_dir)
-    q_staged = shlex.quote(staged_deb)
     version = deb_info["Version"]
     deb_sha = deb_info["SHA256"]
     stored_deb = f"{state_dir}/packages/{PACKAGE_NAME}_{version}_{EXPECTED_ARCH}.deb"
-    q_stored = shlex.quote(stored_deb)
-    q_incoming = shlex.quote(f"{state_dir}/packages/incoming-{deb_sha}.deb")
-    return textwrap.dedent(f"""\
-        set -euo pipefail
-        # 0. Capture helper active/enabled state BEFORE any mutation (never enable anything new).
-        helper_active="$(systemctl is-active {shlex.quote(HELPER_UNIT)} 2>/dev/null || true)"
-        helper_enabled="$(systemctl is-enabled {shlex.quote(HELPER_UNIT)} 2>/dev/null || true)"
-        should_restart=0
-        if [ "$helper_active" = "active" ] || [ "$helper_enabled" = "enabled" ]; then
-            should_restart=1
+    return locked_mutation(mutation_script(state_dir, run_dir) + textwrap.dedent(f"""\
+        version={shlex.quote(version)}
+        deb_sha={shlex.quote(deb_sha)}
+        stored_deb={shlex.quote(stored_deb)}
+        incoming_deb={shlex.quote(f"{state_dir}/packages/incoming-{deb_sha}.deb")}
+        stage_dir={shlex.quote(stage_dir)}
+        trap 'rm -rf -- "$stage_dir"; rm -f -- "$incoming_deb"' EXIT
+
+        helper_needs_restart
+        read_installed_version
+        if [ -n "$installed_version" ]; then
+            read_current_metadata
+            if dpkg --compare-versions "$installed_version" eq "$version" && [ "$current_sha" != "$deb_sha" ]; then
+                fail "Debian version $version is already installed with different bytes; build with a new version"
+            fi
+            [[ -f "$current_deb" && "$(sha256sum "$current_deb" | cut -d' ' -f1)" = "$current_sha" ]] ||
+                fail "current deployment archive missing or corrupt; recover it before upgrading"
+        elif [ -e "$current_env" ] || [ -e "$prev_env" ]; then
+            fail "inconsistent deployment metadata at $state_dir; finish recovery before deploying"
         fi
 
-        # 1. Copy the verified .deb into the root-owned cache under an incoming
-        #    name, re-verify the cached bytes, and install from that copy. The
-        #    version-keyed artifact (which a recorded rollback may point at) is
-        #    only replaced after a successful install, so a failed redeploy can
-        #    never corrupt the rollback artifact.
-        sudo -n install -m 0644 -o root -g root {q_staged} {q_incoming}
-        rm -rf {q_stage}
-        cached_sha="$(sudo -n sha256sum {q_incoming} | cut -d' ' -f1)"
-        if [ "$cached_sha" != {shlex.quote(deb_sha)} ]; then
-            sudo -n rm -f {q_incoming}
-            echo "install: cached .deb sha256 mismatch" >&2
-            exit 1
+        # Version-keyed archives are immutable, including those used by an older rollback record.
+        if [ -e "$stored_deb" ] || [ -L "$stored_deb" ]; then
+            [[ -f "$stored_deb" && ! -L "$stored_deb" &&
+                "$(sha256sum "$stored_deb" | cut -d' ' -f1)" = "$deb_sha" ]] ||
+                fail "Debian version $version is already cached with different bytes; build with a new version"
         fi
 
-        # 2. Install the Debian package FIRST (legacy files stay intact if install fails).
-        if ! sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y {q_incoming}; then
-            sudo -n rm -f {q_incoming}
-            echo "install: apt-get install failed; previous package and legacy files untouched" >&2
-            exit 1
-        fi
-        sudo -n mv -f {q_incoming} {q_stored}
-
-        # 3. Record previous deployment state and migrate legacy shadowing files AFTER install succeeds.
-        migration_log=""
-        if [ -d "$HOME/aa-build/bin" ]; then
-            for legacy_bin in aa-wireless-receiver aa-wired-receiver aa-wired-enrol aa-dummy-display; do
-                if [ -x "$HOME/aa-build/bin/$legacy_bin" ]; then
-                    migration_log="${{migration_log}}legacy_bin_detected=$HOME/aa-build/bin/$legacy_bin (superseded by /usr/bin/$legacy_bin)\n"
+        # Prepare all backups before APT can overwrite legacy payloads. Publish them
+        # after install succeeds, before removing shadowing files or restarting.
+        new_previous="$run_dir/previous.env"
+        legacy_dir="$run_dir/legacy"
+        if [ -n "$installed_version" ]; then
+            if [ "$current_sha" != "$deb_sha" ]; then
+                install -m 0600 -- "$current_env" "$new_previous"
+            fi
+        else
+            for src in "${{legacy_files[@]}}"; do
+                if [ -e "$src" ] || [ -L "$src" ]; then
+                    [[ -f "$src" && ! -L "$src" ]] ||
+                        fail "legacy path must be a regular file before migration: $src"
+                    mkdir -p -- "$legacy_dir"
+                    cp -p -- "$src" "$legacy_dir/"
                 fi
             done
-        fi
-        udev_migrated=0
-        while IFS= read -r line; do
-            [ -n "$line" ] || continue
-            if [ "$line" = "migrated={LEGACY_UDEV_RULE}" ]; then
-                udev_migrated=1
-            fi
-            printf '%s\n' "$line" | sudo -n tee -a {q_run}/migration.log >/dev/null
-        done < <(sudo -n bash -c '
-            set -euo pipefail
-            state_dir=$1
-            new_sha=$2
-            etc_sha=$3
-            legacy_udev=$4
-            legacy_unit=$5
-            legacy_dbus=$6
-            legacy_dir="$state_dir/rollback/legacy"
-
-            if [ -f "$state_dir/current.env" ]; then
-                cur_sha="$(grep -E "^DEB_SHA256=" "$state_dir/current.env" | head -n1 | cut -d= -f2- || true)"
-                if [ "$cur_sha" != "$new_sha" ]; then
-                    cp -p "$state_dir/current.env" "$state_dir/previous.env"
-                    chmod 0600 "$state_dir/previous.env"
+            if [ -f "$legacy_dir/${{legacy_unit##*/}}" ]; then
+                legacy_exec="$(legacy_executable "$legacy_unit")"
+                [[ -f "$legacy_exec" && -x "$legacy_exec" ]] ||
+                    fail "legacy helper executable missing or not executable; restore it before deploying"
+                if [ "$legacy_exec" -ef "$packaged_helper" ]; then
+                    [[ "$legacy_exec" = "$packaged_helper" && ! -L "$packaged_helper" ]] ||
+                        fail "legacy helper aliases the packaged helper path; migrate it manually"
+                    cp -p -- "$packaged_helper" "$legacy_dir/legacy-helper"
                 fi
+            fi
+            if [ -d "$legacy_dir" ]; then
+                printf 'PREV_MODE=legacy\nLEGACY_DIR=%s\n' "$legacy_dir" > "$new_previous"
             else
-                has_legacy=0
-                for f in "$legacy_udev" "$legacy_unit" "$legacy_dbus" "$etc_sha"; do
-                    if [ -f "$f" ] && [ ! -L "$f" ]; then
-                        has_legacy=1
-                        break
-                    fi
-                done
-                if [ "$has_legacy" -eq 1 ]; then
-                    install -d -m 0700 -o root -g root "$legacy_dir"
-                    printf "PREV_MODE=legacy\n" > "$state_dir/previous.env"
-                    chmod 0600 "$state_dir/previous.env"
-                    if [ -f "$etc_sha" ] && [ ! -L "$etc_sha" ] && [ ! -f "$legacy_dir/receiver.sha256" ]; then
-                        cp -p "$etc_sha" "$legacy_dir/receiver.sha256"
-                        chmod 0600 "$legacy_dir/receiver.sha256"
-                    fi
-                else
-                    printf "PREV_MODE=none\n" > "$state_dir/previous.env"
-                    chmod 0600 "$state_dir/previous.env"
-                fi
+                printf 'PREV_MODE=none\n' > "$new_previous"
             fi
-
-            migrate_file() {{
-                src=$1
-                dst_name=$2
-                if [ -f "$src" ] && [ ! -L "$src" ]; then
-                    install -d -m 0700 -o root -g root "$legacy_dir"
-                    if [ ! -f "$legacy_dir/$dst_name" ]; then
-                        cp -p "$src" "$legacy_dir/$dst_name"
-                    fi
-                    rm -f "$src"
-                    printf "migrated=%s\n" "$src"
-                fi
-            }}
-            migrate_file "$legacy_udev" 70-android-auto-receiver.rules
-            migrate_file "$legacy_unit" aa-system-helper.service
-            migrate_file "$legacy_dbus" org.custom.AndroidAutoSystemHelper.conf
-        ' _ {q_state} {shlex.quote(deb_sha)} {shlex.quote(RECEIVER_SHA256)} {shlex.quote(LEGACY_UDEV_RULE)} {shlex.quote(LEGACY_HELPER_UNIT)} {shlex.quote(LEGACY_DBUS_POLICY)})
-        if [ -n "$migration_log" ]; then
-            printf '%b' "$migration_log" | sudo -n tee -a {q_run}/migration.log >/dev/null
-        fi
-        if [ "$udev_migrated" -eq 1 ] && command -v udevadm >/dev/null 2>&1; then
-            sudo -n udevadm control --reload || true
         fi
 
-        # 4. Recompute receiver digest from the INSTALLED receiver path.
-        if [ ! -f {shlex.quote(INSTALLED_RECEIVER)} ] || [ -L {shlex.quote(INSTALLED_RECEIVER)} ]; then
-            echo "deploy: installed receiver missing at {INSTALLED_RECEIVER}" >&2
-            exit 1
+        install -m 0644 -o root -g root {shlex.quote(staged_deb)} "$incoming_deb"
+        [ "$(sha256sum "$incoming_deb" | cut -d' ' -f1)" = "$deb_sha" ] ||
+            fail "install: cached .deb sha256 mismatch"
+        if ! env DEBIAN_FRONTEND=noninteractive apt-get install -y "$incoming_deb"; then
+            fail "install: apt-get install failed; deploy backups retained in $run_dir"
         fi
-        digest="$(sha256sum {shlex.quote(INSTALLED_RECEIVER)} | cut -d' ' -f1)"
-        printf '%s\n' "$digest" | sudo -n tee {shlex.quote(RECEIVER_SHA256)}.new >/dev/null
-        sudo -n chmod 0600 {shlex.quote(RECEIVER_SHA256)}.new
-        sudo -n chown root:root {shlex.quote(RECEIVER_SHA256)}.new
-        sudo -n mv -f {shlex.quote(RECEIVER_SHA256)}.new {shlex.quote(RECEIVER_SHA256)}
+        read_installed_version
+        [ "$installed_version" = "$version" ] ||
+            fail "install: expected Debian version $version after APT; deploy backups retained in $run_dir"
+        if [ ! -e "$stored_deb" ]; then
+            mv -T -- "$incoming_deb" "$stored_deb"
+        fi
 
-        # 5. Reload systemd; restart helper ONLY if it was already active or enabled. Never enable anything new.
-        sudo -n systemctl daemon-reload
+        # Record the installed package before post-install work that may need rollback.
+        printf 'PREV_MODE=deb\nVERSION=%s\nDEB_PATH=%s\nDEB_SHA256=%s\n' \
+            "$version" "$stored_deb" "$deb_sha" > "$run_dir/current.env"
+        mv -fT -- "$run_dir/current.env" "$current_env"
+        if [ -f "$new_previous" ]; then
+            mv -fT -- "$new_previous" "$prev_env"
+            rm -f -- "$restart_pending"
+        fi
+
+        for legacy_bin in aa-wireless-receiver aa-wired-receiver aa-wired-enrol aa-dummy-display; do
+            if [ -x "$AA_DEPLOY_OPERATOR_HOME/aa-build/bin/$legacy_bin" ]; then
+                printf 'legacy_bin_detected=%s/aa-build/bin/%s (superseded by /usr/bin/%s)\n' \
+                    "$AA_DEPLOY_OPERATOR_HOME" "$legacy_bin" "$legacy_bin" >> "$run_dir/migration.log"
+            fi
+        done
+        for src in "$legacy_udev" "$legacy_unit" "$legacy_dbus"; do
+            if [ -f "$legacy_dir/${{src##*/}}" ]; then
+                rm -f -- "$src"
+                printf 'migrated=%s\n' "$src" >> "$run_dir/migration.log"
+            fi
+        done
+        if [ -f "$legacy_dir/${{legacy_udev##*/}}" ] && command -v udevadm >/dev/null 2>&1; then
+            udevadm control --reload || true
+        fi
+
+        write_receiver_digest
+        cat -- "$current_env" > "$run_dir/current.env"
+        printf 'RECEIVER_SHA256=%s\n' "$digest" >> "$run_dir/current.env"
+        mv -fT -- "$run_dir/current.env" "$current_env"
+        systemctl daemon-reload
         if [ "$should_restart" = "1" ]; then
-            sudo -n systemctl restart {shlex.quote(HELPER_UNIT)}
+            systemctl restart {shlex.quote(HELPER_UNIT)}
         fi
 
-        # 6. Record post-install package set and current deployment metadata.
-        dpkg-query -W | sudo -n tee {q_run}/dpkg-query-after.txt >/dev/null
-        sudo -n chmod 0600 {q_run}/dpkg-query-after.txt
-        sudo -n bash -c '
-            set -euo pipefail
-            state_dir=$1
-            printf "PREV_MODE=deb\nVERSION=%s\nDEB_PATH=%s\nDEB_SHA256=%s\nRECEIVER_SHA256=%s\n" \
-                "$2" "$3" "$4" "$5" > "$state_dir/current.env.new"
-            chmod 0600 "$state_dir/current.env.new"
-            mv -f "$state_dir/current.env.new" "$state_dir/current.env"
-        ' _ {q_state} {shlex.quote(version)} {q_stored} {shlex.quote(deb_sha)} "$digest"
-
+        dpkg-query -W > "$run_dir/dpkg-query-after.txt"
         printf 'INSTALLED_VERSION=%s\nRECEIVER_SHA256=%s\nHELPER_RESTARTED=%s\n' \
-            {shlex.quote(version)} "$digest" "$should_restart"
-    """)
+            "$version" "$digest" "$should_restart"
+    """))
 
 
-def build_rollback_script(
-    state_dir: str,
-    run_dir: str,
-) -> str:
-    q_state = shlex.quote(state_dir)
-    q_run = shlex.quote(run_dir)
-    return textwrap.dedent(f"""\
-        set -euo pipefail
-        # Capture helper active/enabled state BEFORE rollback (never enable anything new).
-        helper_active="$(systemctl is-active {shlex.quote(HELPER_UNIT)} 2>/dev/null || true)"
-        helper_enabled="$(systemctl is-enabled {shlex.quote(HELPER_UNIT)} 2>/dev/null || true)"
-        should_restart=0
-        if [ "$helper_active" = "active" ] || [ "$helper_enabled" = "enabled" ]; then
-            should_restart=1
-        fi
-
-        prev_env={q_state}/previous.env
-        if ! sudo -n test -f "$prev_env"; then
-            echo "rollback: no previous deployment recorded at $prev_env" >&2
-            exit 1
-        fi
-        prev_mode="$(sudo -n grep -E '^PREV_MODE=' "$prev_env" | head -n1 | cut -d= -f2- || true)"
+def build_rollback_script(state_dir: str, run_dir: str) -> str:
+    return locked_mutation(mutation_script(state_dir, run_dir) + textwrap.dedent(f"""\
+        [ -f "$prev_env" ] || fail "rollback: no previous deployment recorded at $prev_env"
+        prev_mode="$(state_field "$prev_env" PREV_MODE)"
+        helper_needs_restart
+        read_installed_version
         digest=""
         effective_restart="$should_restart"
-        if [ "$prev_mode" = "deb" ]; then
-            prev_ver="$(sudo -n grep -E '^VERSION=' "$prev_env" | head -n1 | cut -d= -f2-)"
-            prev_deb="$(sudo -n grep -E '^DEB_PATH=' "$prev_env" | head -n1 | cut -d= -f2-)"
-            prev_sha="$(sudo -n grep -E '^DEB_SHA256=' "$prev_env" | head -n1 | cut -d= -f2-)"
-            if [ -z "$prev_deb" ] || ! sudo -n test -f "$prev_deb"; then
-                echo "rollback: recorded previous .deb missing: $prev_deb" >&2
-                exit 1
-            fi
-            actual_sha="$(sudo -n sha256sum "$prev_deb" | cut -d' ' -f1)"
-            if [ "$actual_sha" != "$prev_sha" ]; then
-                echo "rollback: previous .deb sha256 mismatch" >&2
-                exit 1
-            fi
-            sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y --allow-downgrades "$prev_deb"
-            digest="$(sha256sum {shlex.quote(INSTALLED_RECEIVER)} | cut -d' ' -f1)"
-            printf '%s\n' "$digest" | sudo -n tee {shlex.quote(RECEIVER_SHA256)}.new >/dev/null
-            sudo -n chmod 0600 {shlex.quote(RECEIVER_SHA256)}.new
-            sudo -n chown root:root {shlex.quote(RECEIVER_SHA256)}.new
-            sudo -n mv -f {shlex.quote(RECEIVER_SHA256)}.new {shlex.quote(RECEIVER_SHA256)}
-            sudo -n cp -p "$prev_env" {q_state}/current.env
-            sudo -n chmod 0600 {q_state}/current.env
-            sudo -n rm -f "$prev_env"
-            rolled_to="$prev_ver"
-        elif [ "$prev_mode" = "legacy" ]; then
-            sudo -n env DEBIAN_FRONTEND=noninteractive apt-get remove -y {shlex.quote(PACKAGE_NAME)} || true
-            sudo -n bash -c '
-                set -euo pipefail
-                state_dir=$1
-                legacy_dir="$state_dir/rollback/legacy"
-                restore_file() {{
-                    src="$legacy_dir/$1"
-                    dst=$2
-                    if [ -f "$src" ]; then
-                        cp -p "$src" "$dst"
-                        chown root:root "$dst"
-                    fi
-                }}
-                restore_file 70-android-auto-receiver.rules {shlex.quote(LEGACY_UDEV_RULE)}
-                restore_file aa-system-helper.service {shlex.quote(LEGACY_HELPER_UNIT)}
-                restore_file org.custom.AndroidAutoSystemHelper.conf {shlex.quote(LEGACY_DBUS_POLICY)}
-                if [ -f "$legacy_dir/receiver.sha256" ]; then
-                    cp -p "$legacy_dir/receiver.sha256" {shlex.quote(RECEIVER_SHA256)}
-                    chmod 0600 {shlex.quote(RECEIVER_SHA256)}
-                    chown root:root {shlex.quote(RECEIVER_SHA256)}
-                else
-                    rm -f {shlex.quote(RECEIVER_SHA256)}
+        if [ -f "$restart_pending" ]; then
+            effective_restart=1
+        fi
+        case "$prev_mode" in
+            deb)
+                prev_ver="$(state_field "$prev_env" VERSION)"
+                prev_deb="$(state_field "$prev_env" DEB_PATH)"
+                prev_sha="$(state_field "$prev_env" DEB_SHA256)"
+                [[ -n "$prev_deb" && -f "$prev_deb" ]] ||
+                    fail "rollback: recorded previous .deb missing: $prev_deb"
+                [ "$(sha256sum "$prev_deb" | cut -d' ' -f1)" = "$prev_sha" ] ||
+                    fail "rollback: previous .deb sha256 mismatch"
+                if [ "$effective_restart" = 1 ]; then touch -- "$restart_pending"; fi
+                env DEBIAN_FRONTEND=noninteractive apt-get install -y --allow-downgrades "$prev_deb"
+                read_installed_version
+                [[ -n "$prev_ver" && "$installed_version" = "$prev_ver" ]] ||
+                    fail "rollback: previous Debian version was not installed; recovery state retained"
+                write_receiver_digest
+                rolled_to="$prev_ver"
+                ;;
+            legacy|none)
+                # Require current metadata before removing any installed package.
+                # If an earlier rollback completed removal, resume restoration.
+                if [ -n "$installed_version" ]; then
+                    read_current_metadata
                 fi
-                rm -f "$state_dir/current.env" "$state_dir/previous.env"
-            ' _ {q_state}
-            if command -v udevadm >/dev/null 2>&1; then
-                sudo -n udevadm control --reload || true
-            fi
-            if sudo -n test -f {shlex.quote(RECEIVER_SHA256)}; then
-                digest="$(sudo -n cat {shlex.quote(RECEIVER_SHA256)} | tr -d '\n' || true)"
-            fi
-            rolled_to="legacy"
-        elif [ "$prev_mode" = "none" ]; then
-            sudo -n env DEBIAN_FRONTEND=noninteractive apt-get remove -y {shlex.quote(PACKAGE_NAME)} || true
-            sudo -n bash -c '
-                set -euo pipefail
-                state_dir=$1
-                rm -f {shlex.quote(RECEIVER_SHA256)} "$state_dir/current.env" "$state_dir/previous.env"
-            ' _ {q_state}
-            if command -v udevadm >/dev/null 2>&1; then
-                sudo -n udevadm control --reload || true
-            fi
-            digest=""
-            effective_restart=0
-            rolled_to="none"
-        else
-            echo "rollback: unknown previous mode: $prev_mode" >&2
-            exit 1
-        fi
+                legacy_dir=""
+                saved_unit=""
+                if [ "$prev_mode" = legacy ]; then
+                    legacy_dir="$(state_field "$prev_env" LEGACY_DIR)"
+                    legacy_dir="${{legacy_dir:-$state_dir/rollback/legacy}}"
+                    [ -d "$legacy_dir" ] || fail "rollback: recorded legacy backup directory missing"
+                    saved_unit="$legacy_dir/${{legacy_unit##*/}}"
+                    if [ -f "$saved_unit" ]; then
+                        legacy_exec="$(legacy_executable "$saved_unit")"
+                        if [ "$legacy_exec" = "$packaged_helper" ]; then
+                            [[ -f "$legacy_dir/legacy-helper" && -x "$legacy_dir/legacy-helper" ]] ||
+                                fail "rollback: saved legacy helper executable missing; recover it before rollback"
+                        else
+                            [[ -f "$legacy_exec" && -x "$legacy_exec" && ! "$legacy_exec" -ef "$packaged_helper" ]] ||
+                                fail "rollback: legacy helper executable missing or aliases the packaged helper"
+                        fi
+                    fi
+                fi
 
-        sudo -n systemctl daemon-reload
+                if [ "$effective_restart" = 1 ] && [ "$prev_mode" = legacy ]; then
+                    touch -- "$restart_pending"
+                fi
+                if [ -n "$installed_version" ]; then
+                    env DEBIAN_FRONTEND=noninteractive apt-get remove -y {shlex.quote(PACKAGE_NAME)} ||
+                        fail "rollback: package removal failed; recovery state retained"
+                    read_installed_version
+                    [ -z "$installed_version" ] ||
+                        fail "rollback: package removal failed; package still installed and recovery state retained"
+                fi
+
+                if [ -n "$saved_unit" ] && [ -f "$saved_unit" ]; then
+                    if [ "$legacy_exec" = "$packaged_helper" ]; then
+                        helper_dir="${{packaged_helper%/*}}"
+                        if [ ! -d "$helper_dir" ]; then install -d -m 0755 -- "$helper_dir"; fi
+                        cp -p --remove-destination -- "$legacy_dir/legacy-helper" "$legacy_exec"
+                    fi
+                    [[ -f "$legacy_exec" && -x "$legacy_exec" ]] ||
+                        fail "rollback: legacy helper executable unavailable after package removal"
+                else
+                    effective_restart=0
+                fi
+
+                for dst in "${{legacy_files[@]}}"; do
+                    if [ -n "$legacy_dir" ] && [ -f "$legacy_dir/${{dst##*/}}" ]; then
+                        cp -p --remove-destination -- "$legacy_dir/${{dst##*/}}" "$dst"
+                        chown root:root "$dst"
+                    elif [ "$dst" = "$etc_sha" ]; then
+                        rm -f -- "$dst"
+                    fi
+                done
+                if [ -f "$etc_sha" ]; then
+                    saved_digest="$(cat -- "$etc_sha")"
+                    if [[ "$saved_digest" =~ ^[a-f0-9]{{64}}$ ]]; then digest="$saved_digest"; fi
+                fi
+                if command -v udevadm >/dev/null 2>&1; then
+                    udevadm control --reload || true
+                fi
+                rolled_to="$prev_mode"
+                ;;
+            *) fail "rollback: unknown previous mode: $prev_mode" ;;
+        esac
+
+        systemctl daemon-reload
         if [ "$effective_restart" = "1" ]; then
-            sudo -n systemctl restart {shlex.quote(HELPER_UNIT)}
+            systemctl restart {shlex.quote(HELPER_UNIT)}
         fi
+        dpkg-query -W > "$run_dir/dpkg-query-after.txt"
 
-        dpkg-query -W | sudo -n tee {q_run}/dpkg-query-after.txt >/dev/null
-        sudo -n chmod 0600 {q_run}/dpkg-query-after.txt
+        if [ "$prev_mode" = deb ]; then
+            install -m 0600 -- "$prev_env" "$run_dir/current.env"
+            mv -fT -- "$run_dir/current.env" "$current_env"
+        fi
+        if [ "$prev_mode" != deb ]; then
+            rm -f -- "$current_env"
+        fi
+        rm -f -- "$restart_pending" "$prev_env"
         printf 'ROLLED_BACK_TO=%s\nHELPER_RESTARTED=%s\n' "$rolled_to" "$effective_restart"
         if [ -n "$digest" ]; then
             printf 'RECEIVER_SHA256=%s\n' "$digest"
         fi
-    """)
+    """))
 
 
 def verify_infotainment_unchanged(
@@ -706,25 +771,28 @@ def verify_infotainment_unchanged(
     run_dir: str,
     before_text: str,
 ) -> None:
-    after_text = runner.ssh(
-        "post-deploy infotainment tree snapshot",
-        build_infotainment_snapshot_script(infotainment_dir),
-    )
-    runner.ssh(
-        "record post-deploy infotainment snapshot",
-        f"set -euo pipefail\nprintf '%s' {shlex.quote(after_text)} | "
-        f"sudo -n tee {shlex.quote(run_dir)}/infotainment-after.txt >/dev/null\n"
-        f"sudo -n chmod 0600 {shlex.quote(run_dir)}/infotainment-after.txt\n",
-    )
-    if runner.dry_run:
-        return
-    before_kv = parse_kv(before_text)
-    after_kv = parse_kv(after_text)
-    if before_kv != after_kv:
-        raise DeployError(
-            "infotainment tree modified during deployment: "
-            f"before={before_kv} after={after_kv}"
+    try:
+        after_text = runner.ssh(
+            "post-deploy infotainment tree snapshot",
+            build_infotainment_snapshot_script(infotainment_dir),
         )
+        runner.ssh(
+            "record post-deploy infotainment snapshot",
+            f"set -euo pipefail\nprintf '%s' {shlex.quote(after_text)} | "
+            f"sudo -n tee {shlex.quote(run_dir)}/infotainment-after.txt >/dev/null\n"
+            f"sudo -n chmod 0600 {shlex.quote(run_dir)}/infotainment-after.txt\n",
+        )
+        if runner.dry_run:
+            return
+        before_kv = parse_kv(before_text)
+        after_kv = parse_kv(after_text)
+        if before_kv != after_kv:
+            raise DeployError(
+                "infotainment tree modified during deployment: "
+                f"before={before_kv} after={after_kv}"
+            )
+    except DeployError as error:
+        raise DeployError(f"package and configuration changes completed. {error}") from error
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
@@ -784,13 +852,16 @@ def main(argv: list[str] | None = None) -> int:
                 "rollback preflight checks",
                 build_rollback_preflight_script(args.state_dir),
             )
-            info_before = runner.ssh(
-                "pre-rollback infotainment tree snapshot (optional)",
-                build_infotainment_snapshot_script(args.infotainment_dir, optional=True),
-            )
-            info_before_kv = parse_kv(info_before)
-            infotainment_present = info_before_kv.get("INFOTAINMENT_STATUS") == "present"
-            if not args.dry_run and not infotainment_present:
+            try:
+                info_before = runner.ssh(
+                    "pre-rollback infotainment tree snapshot (optional)",
+                    build_infotainment_snapshot_script(args.infotainment_dir, optional=True),
+                )
+            except DeployError as error:
+                print(f"aa-deploy: warning: infotainment snapshot failed: {error}", file=sys.stderr)
+                info_before = "INFOTAINMENT_STATUS=unavailable\n"
+            infotainment_status = parse_kv(info_before).get("INFOTAINMENT_STATUS")
+            if infotainment_status == "missing":
                 print(
                     "aa-deploy: warning: infotainment tree missing or not a git repository; "
                     "continuing rollback without infotainment invariance check",
@@ -804,7 +875,7 @@ def main(argv: list[str] | None = None) -> int:
                 "rollback to previous package/config",
                 build_rollback_script(args.state_dir, run_dir),
             )
-            if args.dry_run or infotainment_present:
+            if args.dry_run or infotainment_status == "present":
                 verify_infotainment_unchanged(runner, args.infotainment_dir, run_dir, info_before)
             if not args.dry_run:
                 rb_kv = parse_kv(rb_out)

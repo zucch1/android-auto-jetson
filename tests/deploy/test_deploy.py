@@ -41,6 +41,8 @@ pat = re.compile(
     + r"|/etc/systemd/system"
     + r"|/etc/dbus-1/system\.d"
     + r"|/usr/bin/aa-wireless-receiver"
+    + r"|/usr/libexec/aa-system-helper"
+    + r"|/run/aa-deploy.lock"
     + r"|/var/lib/android-auto-receiver"
     + r"|/tmp/aa-deploy-)"
 )
@@ -101,14 +103,52 @@ set -euo pipefail
 exit 0
 """
 
-FAKE_STAT = r"""#!/usr/bin/env bash
+# Run the actual remote validator with the fake target as its root and inject
+# ownership only. File descriptors, modes, links, and bytes remain real.
+FAKE_REMOTE_PYTHON = r"""#!/usr/bin/python3
+import os
+import sys
+
+if sys.argv[1:4] != ["-I", "-", "/"]:
+    os.execv("/usr/bin/python3", ["python3", *sys.argv[1:]])
+sys.argv = ["-", os.environ["FAKE_TARGET_ROOT"], *sys.argv[4:]]
+real_fstat = os.fstat
+
+def fake_fstat(fd):
+    result = list(real_fstat(fd))
+    path = os.readlink(f"/proc/self/fd/{fd}")
+    result[4] = int(os.environ.get("FAKE_AP_UID", "0")) if path.endswith("/ap.conf") else 0
+    return os.stat_result(result)
+
+os.fstat = fake_fstat
+exec(compile(sys.stdin.read(), "<remote validator>", "exec"))
+"""
+
+
+FAKE_CP = r"""#!/usr/bin/env bash
 set -euo pipefail
-out="$(/usr/bin/stat "$@")"
-if [ -n "${FAKE_STAT_UID:-}" ] && [ "${1:-}" = "-c" ] && [[ "${2:-}" == %u* ]]; then
-    printf '%s%s\n' "$FAKE_STAT_UID" "${out#${out%% *}}"
-    exit 0
+if [ "${FAKE_LEGACY_BACKUP_FAIL:-0}" = "1" ] && [[ "$*" == *'/etc/udev/rules.d/'* ]]; then
+    echo "fake-cp: legacy backup failed" >&2
+    exit 1
 fi
-printf '%s\n' "$out"
+exec /usr/bin/cp "$@"
+"""
+
+FAKE_SHA256SUM = r"""#!/usr/bin/env bash
+set -euo pipefail
+for arg; do
+    if [[ "$arg" == *'/unreadable-fixture' ]]; then
+        echo "sha256sum: unreadable-fixture: Permission denied" >&2
+        exit 1
+    fi
+done
+exec /usr/bin/sha256sum "$@"
+"""
+
+FAKE_GIT = r"""#!/usr/bin/env bash
+set -euo pipefail
+printf 'git %s\n' "$*" >> "${FAKE_EVENT_LOG:?}"
+exec /usr/bin/git "$@"
 """
 
 FAKE_DPKG = r"""#!/usr/bin/env bash
@@ -144,6 +184,10 @@ fi
 if [ "${1:-}" = "-W" ] && [ "$#" -eq 1 ]; then
     cat "$status_file"
     exit 0
+fi
+if [ "${1:-}" = "-W" ] && [ "${@: -1}" = "android-auto-receiver" ]; then
+    awk '$1 == "android-auto-receiver" {print "installed", $2; found=1} END {exit !found}' "$status_file"
+    exit $?
 fi
 exec /usr/bin/dpkg-query "$@"
 """
@@ -184,9 +228,17 @@ if [ "${1:-}" = "install" ]; then
     exit 0
 fi
 if [ "${1:-}" = "remove" ]; then
+    if [ "${FAKE_REMOVE_FAIL:-0}" = "1" ]; then
+        echo "fake-apt-get: removal failed" >&2
+        exit 100
+    fi
+    if [ "${FAKE_REMOVE_NOOP:-0}" = "1" ]; then
+        exit 0
+    fi
     grep -v '^android-auto-receiver[[:space:]]' "$status_file" > "$status_file.new" || true
     mv -f "$status_file.new" "$status_file"
-    rm -f "$root/usr/bin/aa-wireless-receiver"
+    rm -f "$root/usr/bin/aa-wireless-receiver" "$root/usr/libexec/aa-system-helper"
+    rmdir --ignore-fail-on-non-empty "$root/usr/libexec"
     if [ "${FAKE_TAMPER_INFOTAINMENT:-0}" = "1" ]; then
         printf 'tampered\n' >> "$root/home/zucchi/Desktop/infotainment/README.md"
     fi
@@ -217,6 +269,10 @@ case "${1:-}" in
         [ "$state" = "enabled" ] && exit 0 || exit 1
         ;;
     daemon-reload|restart)
+        if [ "$1" = restart ] && [ "${FAKE_RESTART_FAIL:-0}" = "1" ]; then
+            echo "fake-systemctl: restart failed" >&2
+            exit 1
+        fi
         exit 0
         ;;
     *)
@@ -244,6 +300,8 @@ def make_deb(directory: Path, version: str, receiver_payload: bytes, arch: str =
     pkg_dir = directory / f"pkg-{version}"
     (pkg_dir / "DEBIAN").mkdir(parents=True)
     (pkg_dir / "usr/bin").mkdir(parents=True)
+    (pkg_dir / "usr/libexec").mkdir(parents=True)
+    write_exec(pkg_dir / "usr/libexec/aa-system-helper", "#!/bin/sh\n# packaged helper\n")
     (pkg_dir / "usr/lib/systemd/system").mkdir(parents=True)
     (pkg_dir / "usr/lib/udev/rules.d").mkdir(parents=True)
     (pkg_dir / "usr/share/dbus-1/system.d").mkdir(parents=True)
@@ -282,7 +340,10 @@ class DeployHarnessTest(unittest.TestCase):
         write_exec(self.remote_bin / "sudo", FAKE_SUDO)
         write_exec(self.remote_bin / "install", FAKE_INSTALL)
         write_exec(self.remote_bin / "chown", FAKE_CHOWN)
-        write_exec(self.remote_bin / "stat", FAKE_STAT)
+        write_exec(self.remote_bin / "python3", FAKE_REMOTE_PYTHON)
+        write_exec(self.remote_bin / "cp", FAKE_CP)
+        write_exec(self.remote_bin / "git", FAKE_GIT)
+        write_exec(self.remote_bin / "sha256sum", FAKE_SHA256SUM)
         write_exec(self.remote_bin / "dpkg", FAKE_DPKG)
         write_exec(self.remote_bin / "dpkg-query", FAKE_DPKG_QUERY)
         write_exec(self.remote_bin / "apt-get", FAKE_APT_GET)
@@ -298,12 +359,15 @@ class DeployHarnessTest(unittest.TestCase):
             "etc/systemd/system",
             "etc/dbus-1/system.d",
             "usr/bin",
+            "usr/libexec",
+            "run",
             "var/lib/dpkg",
             "var/lib/android-auto-receiver",
             "tmp",
             "home/zucchi/Desktop/infotainment",
         ):
             (self.target / rel).mkdir(parents=True, exist_ok=True)
+        (self.target / "etc").chmod(0o755)
         (self.target / "etc/android-auto-receiver").chmod(0o755)
 
         (self.target / "etc/os-release").write_text('ID=ubuntu\nVERSION_ID="24.04"\n')
@@ -338,7 +402,6 @@ class DeployHarnessTest(unittest.TestCase):
             "FAKE_REMOTE_BIN": str(self.remote_bin),
             "FAKE_SSH_LOG": str(self.ssh_log),
             "FAKE_EVENT_LOG": str(self.event_log),
-            "FAKE_STAT_UID": "0",
             **(extra_env or {}),
         }
         return subprocess.run(
@@ -348,6 +411,191 @@ class DeployHarnessTest(unittest.TestCase):
             env=env,
             check=False,
         )
+
+    def install(self, deb: Path | None = None, **env: str) -> subprocess.CompletedProcess[str]:
+        return self.run_deploy(
+            "zucchi@jetson", str(deb or self.pkg_v1), "--confirm-jurisdiction", "US", extra_env=env,
+        )
+
+    def rollback(self, **env: str) -> subprocess.CompletedProcess[str]:
+        return self.run_deploy("zucchi@jetson", "--rollback", extra_env=env)
+
+    def legacy_helper(self) -> tuple[Path, Path]:
+        helper = self.target / "usr/libexec/aa-system-helper"
+        unit = self.target / "etc/systemd/system/aa-system-helper.service"
+        helper.parent.mkdir(exist_ok=True)
+        write_exec(helper, "#!/bin/sh\n# legacy helper\n")
+        unit.write_text("[Service]\nExecStart=/usr/libexec/aa-system-helper\n")
+        return helper, unit
+
+    def test_session_uid_is_validated_byte_for_byte(self) -> None:
+        uid = self.target / "etc/android-auto-receiver/session.uid"
+        for value in (b"2002\n\n", b"20\x0002\n", b"2002" + b"\n" * 125):
+            with self.subTest(value=value):
+                uid.write_bytes(value)
+                result = self.install()
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn("session.uid", result.stderr)
+        uid.chmod(0o644)
+        for value in (b"0" * 123 + b"2002\n", b"4294967295"):
+            with self.subTest(value=value):
+                uid.write_bytes(value)
+                result = self.install()
+                self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_preflight_rejects_writable_and_symlinked_etc(self) -> None:
+        etc = self.target / "etc"
+        etc.chmod(0o775)
+        result = self.install()
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("config dir", result.stderr)
+        etc.chmod(0o755)
+        etc.rename(self.target / "etc-real")
+        etc.symlink_to("etc-real")
+        result = self.install()
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("config dir", result.stderr)
+
+    def test_ap_policy_validates_raw_tokens_and_bounded_port(self) -> None:
+        ap = self.target / "etc/android-auto-receiver/ap.conf"
+        for value in (
+            b"v1 wl\x00an0 US jurisdiction-confirmed 5277 44\n",
+            b"v1 wlan0 US jurisdiction-confirmed 18446744073709556893 44\n",
+        ):
+            with self.subTest(value=value):
+                ap.write_bytes(value)
+                result = self.install()
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn("ap.conf", result.stderr)
+                self.assertNotIn("18446744073709556893", result.stderr)
+        ap.write_bytes(b"v1\twlan0 US\r\njurisdiction-confirmed 0005277 00044\n")
+        result = self.install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_rebuilt_version_cannot_replace_current_or_previous_archive(self) -> None:
+        rebuilt = make_deb(self.base / "rebuilt", "1.0.0", b"REBUILT\n")
+        result = self.install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        archive = self.target / "var/lib/android-auto-receiver/deploy/packages" / self.pkg_v1.name
+        for current in (self.pkg_v1, self.pkg_v2):
+            result = self.install(current)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            result = self.install(rebuilt)
+            self.assertNotEqual(result.returncode, 0, result.stdout)
+            self.assertIn("different bytes", result.stderr)
+            self.assertEqual(archive.read_bytes(), self.pkg_v1.read_bytes())
+        result = self.rollback()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("rolled_back_to=1.0.0", result.stdout)
+
+    def test_missing_or_inconsistent_metadata_refuses_deploy_and_removal(self) -> None:
+        result = self.install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        current = self.target / "var/lib/android-auto-receiver/deploy/current.env"
+        saved = current.read_bytes()
+        for metadata in (None, saved.replace(b"VERSION=1.0.0", b"VERSION=9.0.0")):
+            with self.subTest(metadata=metadata):
+                current.unlink(missing_ok=True)
+                if metadata is not None:
+                    current.write_bytes(metadata)
+                for result in (self.install(self.pkg_v2), self.rollback()):
+                    self.assertNotEqual(result.returncode, 0, result.stdout)
+                    self.assertIn("deployment metadata", result.stderr)
+        self.assertEqual((self.target / "usr/bin/aa-wireless-receiver").read_bytes(), b"ELF-RECEIVER-V1\n")
+        self.assertFalse(any(line.startswith("apt-get remove") for line in self.event_log.read_text().splitlines()))
+
+    def test_failed_removal_preserves_both_clean_and_legacy_recovery(self) -> None:
+        state = self.target / "var/lib/android-auto-receiver/deploy"
+        digest = self.target / "etc/android-auto-receiver/receiver.sha256"
+        for mode in ("none", "legacy"):
+            with self.subTest(mode=mode):
+                if mode == "legacy":
+                    self.legacy_helper()
+                result = self.install()
+                self.assertEqual(result.returncode, 0, result.stderr)
+                files = (state / "current.env", state / "previous.env", digest)
+                before = [path.read_bytes() for path in files]
+                for failure in ("FAKE_REMOVE_FAIL", "FAKE_REMOVE_NOOP"):
+                    result = self.rollback(**{failure: "1"})
+                    self.assertNotEqual(result.returncode, 0, result.stdout)
+                    self.assertIn("removal failed", result.stderr)
+                    self.assertEqual([path.read_bytes() for path in files], before)
+                result = self.rollback()
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn(f"rolled_back_to={mode}", result.stdout)
+
+    def test_legacy_rollback_restores_packaged_overlapping_helper(self) -> None:
+        helper, unit = self.legacy_helper()
+        old_helper = helper.read_bytes()
+        old_unit = unit.read_bytes()
+        result = self.install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotEqual(helper.read_bytes(), old_helper)
+        result = self.rollback(FAKE_HELPER_ENABLED="enabled")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(os.access(helper, os.X_OK))
+        self.assertEqual(helper.read_bytes(), old_helper)
+        self.assertEqual(unit.read_bytes(), old_unit)
+
+    def test_rollback_refuses_legacy_unit_without_its_saved_executable(self) -> None:
+        helper, unit = self.legacy_helper()
+        result = self.install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        state = self.target / "var/lib/android-auto-receiver/deploy"
+        recovery = state / "previous.env"
+        old_format_backup = state / "rollback/legacy"
+        old_format_backup.mkdir()
+        old_format_backup.joinpath(unit.name).write_text("[Service]\nExecStart=/usr/libexec/aa-system-helper\n")
+        recovery.write_text("PREV_MODE=legacy\n")
+        result = self.rollback()
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("saved legacy helper executable missing", result.stderr)
+        self.assertTrue(helper.exists())
+        self.assertTrue(recovery.exists())
+        self.assertFalse(unit.exists())
+        self.assertFalse(any(line.startswith("apt-get remove") for line in self.event_log.read_text().splitlines()))
+
+    def test_restart_failure_keeps_rollback_record_for_retry(self) -> None:
+        helper, unit = self.legacy_helper()
+        result = self.install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        recovery = self.target / "var/lib/android-auto-receiver/deploy/previous.env"
+        expected = recovery.read_bytes()
+        result = self.rollback(FAKE_HELPER_ACTIVE="active", FAKE_RESTART_FAIL="1")
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("restart failed", result.stderr)
+        self.assertEqual(recovery.read_bytes(), expected)
+        self.assertTrue(helper.exists())
+        self.assertTrue(unit.exists())
+        result = self.rollback()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("helper_restarted=1", result.stdout)
+        self.assertFalse(recovery.exists())
+
+    def test_rollback_warns_if_infotainment_snapshot_cannot_read_file(self) -> None:
+        result = self.install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        unreadable = self.target / "home/zucchi/Desktop/infotainment/unreadable-fixture"
+        unreadable.touch(mode=0)
+        result = self.install(self.pkg_v2)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        result = self.rollback()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("warning: infotainment snapshot failed", result.stderr)
+        self.assertIn("rolled_back_to=none", result.stdout)
+
+    def test_legacy_backup_failure_aborts_before_package_install(self) -> None:
+        helper, unit = self.legacy_helper()
+        old_helper = helper.read_bytes()
+        rule = self.target / "etc/udev/rules.d/70-android-auto-receiver.rules"
+        rule.write_text("# legacy rule\n")
+        result = self.install(FAKE_LEGACY_BACKUP_FAIL="1")
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("legacy backup failed", result.stderr)
+        self.assertEqual(rule.read_text(), "# legacy rule\n")
+        self.assertTrue(unit.exists())
+        self.assertEqual(helper.read_bytes(), old_helper)
+        self.assertFalse((self.target / "usr/bin/aa-wireless-receiver").exists())
 
     def test_preflight_refusals_and_no_secret_leak(self) -> None:
         ap_conf = self.target / "etc/android-auto-receiver/ap.conf"
@@ -416,7 +664,7 @@ class DeployHarnessTest(unittest.TestCase):
         # Non-root-owned ap.conf refused (matches Files.cpp:46)
         res = self.run_deploy(
             "zucchi@jetson", str(self.pkg_v1), "--confirm-jurisdiction", "US",
-            extra_env={"FAKE_STAT_UID": "1000"},
+            extra_env={"FAKE_AP_UID": "1000"},
         )
         self.assertNotEqual(res.returncode, 0)
         self.assertIn("root-owned", res.stderr)
@@ -492,7 +740,7 @@ class DeployHarnessTest(unittest.TestCase):
         ap_conf.write_text("v1 wlan0 US jurisdiction-confirmed 5277 44\nextra\n")
         res = self.run_deploy("zucchi@jetson", str(self.pkg_v1), "--confirm-jurisdiction", "US")
         self.assertNotEqual(res.returncode, 0)
-        self.assertIn("exactly one configuration line", res.stderr)
+        self.assertIn("schema invalid", res.stderr)
 
         ap_conf.write_text("v1 wlan0 US jurisdiction-confirmed 5277 44\n")
         ap_conf.chmod(0o600)
@@ -517,10 +765,9 @@ class DeployHarnessTest(unittest.TestCase):
 
     def test_failed_install_preserves_legacy_files(self) -> None:
         legacy_udev = self.target / "etc/udev/rules.d/70-android-auto-receiver.rules"
-        legacy_unit = self.target / "etc/systemd/system/aa-system-helper.service"
+        _, legacy_unit = self.legacy_helper()
         legacy_dbus = self.target / "etc/dbus-1/system.d/org.custom.AndroidAutoSystemHelper.conf"
         legacy_udev.write_text("# legacy udev\n")
-        legacy_unit.write_text("[Unit]\nDescription=legacy\n")
         legacy_dbus.write_text("<busconfig><!-- legacy --></busconfig>\n")
 
         res = self.run_deploy(
@@ -532,7 +779,7 @@ class DeployHarnessTest(unittest.TestCase):
         self.assertTrue(legacy_unit.exists())
         self.assertTrue(legacy_dbus.exists())
         self.assertEqual(legacy_udev.read_text(), "# legacy udev\n")
-        self.assertEqual(legacy_unit.read_text(), "[Unit]\nDescription=legacy\n")
+        self.assertEqual(legacy_unit.read_text(), "[Service]\nExecStart=/usr/libexec/aa-system-helper\n")
         self.assertEqual(legacy_dbus.read_text(), "<busconfig><!-- legacy --></busconfig>\n")
         packages = self.target / "var/lib/android-auto-receiver/deploy/packages"
         if packages.exists():
@@ -549,8 +796,7 @@ class DeployHarnessTest(unittest.TestCase):
         legacy_recv.chmod(0o755)
         legacy_udev = self.target / "etc/udev/rules.d/70-android-auto-receiver.rules"
         legacy_udev.write_text("# legacy udev\n")
-        legacy_unit = self.target / "etc/systemd/system/aa-system-helper.service"
-        legacy_unit.write_text("[Unit]\nDescription=legacy\n")
+        _, legacy_unit = self.legacy_helper()
         legacy_dbus = self.target / "etc/dbus-1/system.d/org.custom.AndroidAutoSystemHelper.conf"
         legacy_dbus.write_text("<busconfig><!-- legacy --></busconfig>\n")
         allow_frag = self.target / "etc/dbus-1/system.d/org.custom.AndroidAutoSystemHelper.receiver-2002.conf"
@@ -598,7 +844,7 @@ class DeployHarnessTest(unittest.TestCase):
         self.assertEqual(rb.returncode, 0, rb.stderr)
         self.assertIn("rolled_back_to=legacy", rb.stdout)
         self.assertEqual(legacy_udev.read_text(), "# legacy udev\n")
-        self.assertEqual(legacy_unit.read_text(), "[Unit]\nDescription=legacy\n")
+        self.assertEqual(legacy_unit.read_text(), "[Service]\nExecStart=/usr/libexec/aa-system-helper\n")
         self.assertEqual(legacy_dbus.read_text(), "<busconfig><!-- legacy --></busconfig>\n")
         self.assertEqual(allow_frag.read_text(), "<busconfig><!-- keep --></busconfig>\n")
         self.assertEqual(legacy_sha.read_text(), "0" * 64 + "\n")
@@ -732,6 +978,15 @@ class DeployHarnessTest(unittest.TestCase):
         )
         self.assertNotEqual(res.returncode, 0)
         self.assertIn("infotainment tree modified", res.stderr)
+        self.assertIn("package and configuration changes completed", res.stderr)
+        self.assertTrue((self.target / "var/lib/android-auto-receiver/deploy/previous.env").exists())
+
+    def test_infotainment_snapshots_disable_git_index_refresh(self) -> None:
+        result = self.install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        statuses = [line for line in self.event_log.read_text().splitlines() if " status --porcelain" in line]
+        self.assertEqual(len(statuses), 2)
+        self.assertTrue(all(line.startswith("git --no-optional-locks ") for line in statuses), statuses)
 
     def test_dry_run_prints_real_restart_decision_without_running_ssh(self) -> None:
         res = self.run_deploy("zucchi@jetson", str(self.pkg_v1), "--confirm-jurisdiction", "US", "--dry-run")

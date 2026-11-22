@@ -9,7 +9,7 @@ development host to the target Jetson over SSH, replacing the historical ad-hoc
 
 Before running `aa-deploy.sh`, the operator must already have provisioned:
 
-1. Passwordless `sudo -n` for the SSH user on the target.
+1. Python 3 and passwordless `sudo -n` for the SSH user on the target.
 2. Root-owned, mode `0600` `/etc/android-auto-receiver/ap.conf` containing a valid
    `v1` line with `jurisdiction-confirmed` (see [networkmanager-ap.md](networkmanager-ap.md)).
    `aa-deploy.sh` validates the schema and jurisdiction match on the target without
@@ -49,10 +49,10 @@ tools/deploy/aa-deploy.sh zucchi@192.168.55.3 --rollback
 
 Pass `--dry-run` with `--rollback` to inspect the rollback commands first.
 Rollback uses a minimal preflight (target architecture, deploy state directory
-present, and no `~/MEASUREMENT_IN_PROGRESS` marker) so recovery is never blocked
-by install-only checks or a missing infotainment tree. If `~/Desktop/infotainment`
-is present, rollback still verifies it remains unchanged; if missing, it warns and
-proceeds.
+present, and no `~/MEASUREMENT_IN_PROGRESS` marker). If the pre-rollback
+infotainment snapshot fails or the directory is missing, rollback warns and
+proceeds. With a usable baseline it still checks the post-rollback snapshot.
+Apt or helper restart failures retain the rollback record for a retry.
 
 ## What `aa-deploy.sh` does
 
@@ -64,13 +64,12 @@ proceeds.
      `/etc/os-release` is Ubuntu `24.04`.
    - Verifies free disk space on `/`, `/var`, and the state directory parent is at
      least `--min-free-mb` (default `512` MiB).
-   - Verifies `/etc/android-auto-receiver`, `ap.conf`, and `session.uid` ownership,
-     permissions, and schema — mirroring `src/helper/nm/Files.cpp` (root-owned,
-     mode `0600`, valid interface, country code != `00` matching
-     `--confirm-jurisdiction`, `jurisdiction-confirmed`, port `1024..65535`, allowed
-     channel) — without ever printing file contents.
+   - Opens `/etc` and `/etc/android-auto-receiver` component by component and
+     applies the helper's ownership and permission checks. Validates `ap.conf`
+     and `session.uid` against the helper's file and byte-level parsing rules.
+     `ap.conf` must also match `--confirm-jurisdiction`. Diagnostics omit file contents.
 3. **Infotainment pre-snapshot (read-only):** records `git -C ~/Desktop/infotainment rev-parse HEAD`,
-   a SHA-256 of `git status --porcelain`, and a deterministic SHA-256 of every
+   a SHA-256 of `git --no-optional-locks status --porcelain`, and a deterministic SHA-256 of every
    non-`.git` regular file in `~/Desktop/infotainment`.
 4. **Package-set recording before package-manager activity:** creates a root-owned
    timestamped run directory under `/var/lib/android-auto-receiver/deploy/runs/` and
@@ -80,30 +79,33 @@ proceeds.
    `mktemp` directory on the target, copies the `.deb` via `scp`, verifies its
    SHA-256 on the target, and checks `Depends` satisfiability with `apt-get -s -y install`
    before mutating anything.
-6. **Package install and rollback state preservation:** stores the `.deb` in
-   `/var/lib/android-auto-receiver/deploy/packages/` and installs it with
-   `apt-get install -y` **before** removing any legacy files (so a failed install
-   leaves legacy config intact). After install succeeds, when moving to a different
-   `.deb`, copies `current.env` to `previous.env` (deb rollback recomputes
-   `receiver.sha256` from the restored binary). Reinstalling the exact same `.deb`
-   is idempotent and does **not** overwrite `previous.env`. On a first packaged
-   install, records `PREV_MODE=legacy` if legacy files were present or `PREV_MODE=none`
-   on a clean box.
-7. **Legacy ad-hoc config migration (post-install):** detects and handles artifacts
-   from the earlier `~/aa-build/deploy-*.sh` and `tools/usb-policy/install.sh` workflow:
+6. **Package install and rollback state preservation:** checks the installed
+   package against `current.env` and verifies its cached archive before upgrading.
+   An installed package with missing or inconsistent deployment metadata requires
+   operator recovery before deploy can proceed. Cached archives are immutable per
+   Debian version. Build with a new version when the bytes change. Reinstalling the
+   exact same package preserves `previous.env`.
+7. **Legacy ad-hoc migration:** backs up the artifacts below in the deploy run's
+   `legacy/` directory before invoking APT. Backup errors abort installation.
+   After installation succeeds, deploy publishes the rollback record and removes
+   the shadowing config:
    - `/etc/udev/rules.d/70-android-auto-receiver.rules` (shadows the packaged
-     `/usr/lib/udev/rules.d/70-android-auto-receiver.rules`): backed up to
-     `/var/lib/android-auto-receiver/deploy/rollback/legacy/` and removed.
+     `/usr/lib/udev/rules.d/70-android-auto-receiver.rules`).
    - `/etc/systemd/system/aa-system-helper.service` (shadows the packaged
-     `/usr/lib/systemd/system/aa-system-helper.service`): backed up and removed.
+     `/usr/lib/systemd/system/aa-system-helper.service`). For a unit with
+     `ExecStart=/usr/libexec/aa-system-helper`, deploy also saves the original
+     executable and rollback restores it before restoring the unit. Other units
+     need one literal absolute `ExecStart` path and its executable must remain
+     available. Arrange manual recovery for custom unit layouts before migration.
    - `/etc/dbus-1/system.d/org.custom.AndroidAutoSystemHelper.conf` (duplicates the
-     packaged `/usr/share/dbus-1/system.d/org.custom.AndroidAutoSystemHelper.conf`):
-     backed up and removed. Operator per-user allow fragments
+     packaged `/usr/share/dbus-1/system.d/org.custom.AndroidAutoSystemHelper.conf`).
+     Operator per-user allow fragments
      (`/etc/dbus-1/system.d/org.custom.AndroidAutoSystemHelper.receiver-*.conf`) are
      never touched.
-   - `~/aa-build/bin/aa-*`: detected and logged in `migration.log` as superseded by
-     `/usr/bin/aa-*`. `receiver.sha256` is switched to `/usr/bin/aa-wireless-receiver`;
-     the operator may remove `~/aa-build/bin` after qualification (#191) completes.
+   - The legacy `receiver.sha256`. After rollback, point the session launcher
+     back to the legacy receiver if needed. Keep the original `~/aa-build/bin`
+     executables and their launcher configuration until rollback is no longer
+     needed. Deploy logs detected legacy binaries in `migration.log`.
 8. **Receiver digest:** computes the SHA-256 of the **installed**
    `/usr/bin/aa-wireless-receiver`, and atomically writes the 64-hex digest (with
    trailing LF, mode `0600`, `root:root`) to `/etc/android-auto-receiver/receiver.sha256`.
@@ -112,7 +114,8 @@ proceeds.
    before the deploy. Never enables or starts an inactive/disabled unit.
 10. **Post-deploy verification:** records `dpkg-query -W` to `dpkg-query-after.txt`
     and re-hashes `~/Desktop/infotainment`, failing if `HEAD`, `git status --porcelain`,
-    or the non-`.git` regular file-tree hash changed.
+    or the non-`.git` regular file-tree hash changed. The error reports that
+    package and configuration changes have already completed.
 
 ## Automated host tests
 
