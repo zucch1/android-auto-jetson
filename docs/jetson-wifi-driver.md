@@ -80,13 +80,18 @@ Disable `rtl8822ce-regd-shim.service` and `rtl8822ce-regd-watchdog.service`
 for OS mode; both were enabled before this rebuild. Leave `wifi-regdom.service`
 enabled to set the global US domain at boot.
 
-The active destination is:
-`/lib/modules/6.8.12-1021-tegra/updates/drivers/net/wireless/realtek/rtl8822ce/rtl8822ce.ko`.
-Install the verified candidate there with mode 0644, then `sudo depmod -a` (after a kernel
-upgrade, name the target kernel explicitly: `sudo depmod -a <kver>`).
-To roll back, restore `rtl8822ce.ko.orig` to that path, run `depmod -a`, remove only `/etc/modprobe.d/rtl8822ce-issue73.conf`, leave the original
-`rtl8822ce.conf` untouched, and re-enable both shim/watchdog units, and run the detached
-trial script with the backup as both candidate and original, mode `vendor`.
+The install path depends on the kernel. Set `K` to the target kernel. After a reboot this is the
+running kernel, `K=$(uname -r)`, which is `6.8.12-1029-tegra` since the R39.2.2 upgrade:
+`/lib/modules/$K/updates/drivers/net/wireless/realtek/rtl8822ce/rtl8822ce.ko`.
+Install the verified candidate there with mode 0644, then run `sudo depmod -a $K`.
+The original R39.2.1 install used `K=6.8.12-1021-tegra`. That tree is historical: the upgrade
+removed its module, so don't install to it or roll back into it.
+To roll back on kernel `$K`, restore `rtl8822ce.ko.orig` from the same `$K` directory (the stock
+module for that kernel), then run `sudo depmod -a $K`. Remove only
+`/etc/modprobe.d/rtl8822ce-issue73.conf` and leave the original `rtl8822ce.conf` untouched. Re-enable
+both shim/watchdog units, but only once a shim built for `$K` exists under `/lib/modules/$K/extra/`
+(see [R39.2.2 rebuild](#r3922-rebuild-2026-11-21)). Then run the detached trial script with the
+backup as both candidate and original, mode `vendor`.
 Check Renzo and interface-bound ping. Returning to the new driver uses mode `os`
 and reinstalls the verified candidate and its DFS exclusions.
 
