@@ -161,10 +161,14 @@ case "$action" in
     j_code=3; j_reason="no-hfp-transition-for-device"
     for _ in $(seq 1 "$VERIFY_S"); do
       read -r j_code j_reason < <(journal_hfp_state "$cursor")
-      if [ "$j_code" -eq 0 ]; then
-        echo "HFP=up Connected=$(link) (source=$j_reason pw=$(pw_hfp_state))"
+      # A post-cursor `-> connected` record proves the transition happened, not that the link is
+      # still up: also require the live bearer (#198 review), else keep waiting and fail closed.
+      conn=$(link)
+      if [ "$j_code" -eq 0 ] && [ "$conn" = "b true" ]; then
+        echo "HFP=up Connected=$conn (source=$j_reason pw=$(pw_hfp_state))"
         exit 0
       fi
+      [ "$j_code" -eq 0 ] && j_reason="journal-connected-but-bearer-$conn"
       sleep 1
     done
     fail "ConnectProfile returned but no HFP profile became active within ${VERIFY_S}s (Connected=$(link) journal=$j_reason pw=$(pw_hfp_state)); an LE-only link is not HFP" ;;
