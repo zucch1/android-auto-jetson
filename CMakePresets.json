@@ -9,12 +9,13 @@
       "binaryDir": "${sourceDir}/build/${presetName}",
       "cacheVariables": {
         "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
-        "AA_ENABLE_ASAN": "OFF"
+        "AA_ENABLE_ASAN": "OFF",
+        "AA_ENABLE_TEST_HELPER_BUS": "OFF"
       }
     },
-    {"name": "host-dev", "inherits": "host-base", "cacheVariables": {"CMAKE_BUILD_TYPE": "Debug"}},
+    {"name": "host-dev", "inherits": "host-base", "cacheVariables": {"CMAKE_BUILD_TYPE": "Debug", "AA_ENABLE_TEST_HELPER_BUS": "ON"}},
     {"name": "host-release", "inherits": "host-base", "cacheVariables": {"CMAKE_BUILD_TYPE": "Release"}},
-    {"name": "host-asan", "inherits": "host-base", "cacheVariables": {"CMAKE_BUILD_TYPE": "Debug", "AA_ENABLE_ASAN": "ON"}},
+    {"name": "host-asan", "inherits": "host-base", "cacheVariables": {"CMAKE_BUILD_TYPE": "Debug", "AA_ENABLE_ASAN": "ON", "AA_ENABLE_TEST_HELPER_BUS": "ON"}},
     {
       "name": "jetson-aarch64",
       "displayName": "Jetson aarch64 cross-build (task 5): --sysroot toolchain + pre-compile hash gate",
@@ -23,6 +24,7 @@
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
         "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "AA_ENABLE_TEST_HELPER_BUS": "OFF",
         "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/toolchains/jetson-aarch64.cmake",
         "AA_SYSROOT_ROOTFS": "$env{AA_SYSROOT_ROOTFS}",
         "AA_SYSROOT_MANIFEST": "$env{AA_SYSROOT_MANIFEST}",
