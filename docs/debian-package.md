@@ -65,15 +65,30 @@ The receiver unit is installed in `/usr/lib/systemd/user`. Its reference
 command starts the wireless receiver in pairing-only mode and uses the
 user manager's state directory. The unit restarts on failure after two
 seconds and allows up to five starts within 60 seconds. Invalid command-line
-arguments exit with status 2 and suppress restart. The helper is
-a separate system unit.
+arguments exit with status 2 and suppress restart.
+
+Once enabled, the receiver starts with the systemd user manager's
+`default.target`, including on Xfce. It uses the user session D-Bus and the
+provisioned system helper. It runs without a display. An SSH or other
+non-graphical login can start the user manager, and enabling linger starts it
+at boot and keeps it running after logout. The packaged pairing-only command
+serves enrolment and control without starting an AP or projection. A wireless
+projection override waits for a consumer before starting either.
+
 Package configuration checks that the shipped default-deny helper policy
 is present and reloads udev so the packaged USB rule applies without a reboot.
-Both services require explicit operator activation; the maintainer scripts
-never enable or start a unit. On removal, `prerm` stops an already-running
-`aa-system-helper.service` before its default-deny policy is removed, and
-`postrm` reloads udev. An upgrade leaves a running helper alone: restart it
-after refreshing the receiver digest.
+The package ships no systemd presets or enablement symlinks for either service.
+The maintainer scripts leave activation to the operator. After provisioning
+and starting the system helper, run
+`systemctl --user enable --now aa-receiver.service` as the intended receiver
+user. If that user already enabled the unit when it used
+`graphical-session.target`, run `systemctl --user reenable aa-receiver.service`
+to replace the old enablement link, then
+`systemctl --user start aa-receiver.service` to start it in the current session.
+
+On removal, `prerm` stops a running `aa-system-helper.service` before its
+default-deny policy is removed, and `postrm` reloads udev. After an upgrade,
+restart the helper once you have refreshed the receiver digest.
 
 [System helper provisioning](system-helper.md#explicit-fail-closed-provisioning-not-installed-by-this-task)
 covers the session UID, receiver executable digest, and per-user D-Bus

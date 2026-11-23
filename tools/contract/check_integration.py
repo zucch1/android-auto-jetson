@@ -785,8 +785,10 @@ def check_contract(root: Path) -> list[Violation]:
             if line.startswith("- **Packaged user unit (")
             for token in BACKTICK_RE.findall(line)
         ]
+        if "PartOf" in unit.get("Unit", {}):
+            fail("INTEGRATION_CONTRACT_UNIT_DRIFT",
+                 f"{RECEIVER_SERVICE_REL} [Unit] must omit PartOf=")
         for section, key in (
-            ("Unit", "PartOf"),
             ("Unit", "StartLimitIntervalSec"),
             ("Unit", "StartLimitBurst"),
             ("Service", "LimitCORE"),

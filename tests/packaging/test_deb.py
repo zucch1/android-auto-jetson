@@ -92,6 +92,8 @@ def inspect(package, owner, arch):
         assert archive.extractfile(actual[POLICY]).read() == (ROOT / "packaging/dbus" / Path(POLICY).name).read_bytes()
         receiver_unit = ConfigParser(interpolation=None)
         receiver_unit.read_string(archive.extractfile(actual[USER_UNIT]).read().decode())
+        assert receiver_unit["Install"]["WantedBy"] == "default.target"
+        assert "PartOf" not in receiver_unit["Unit"]
         assert receiver_unit["Service"]["Restart"] == "on-failure"
         assert receiver_unit["Service"].getint("RestartSec") == 2
         assert receiver_unit["Service"].getint("RestartPreventExitStatus") == 2
