@@ -137,6 +137,10 @@ Both enrolment flows keep all user-facing prompts in infotainment. Neither flow 
 | `StateChanged` | `st` | Mirrors `GetState`: `projection_state`, `consumer_id`. |
 | `DiagnosticEvent` | `sst` | Low-rate structured diagnostic: `severity` (`"info"`, `"warning"`, `"error"`), `event`, numeric `subject_id`. Never carries identifiers or secrets. |
 
+The wired receiver allows 30 seconds by default from link loss to active projection.
+`--reconnect-ms` overrides this window (1–120000 ms). If the window expires,
+the wired lifecycle reports `failed` and the receiver exits.
+
 ### Receiver Properties
 
 | Property | Type | Access | Value |

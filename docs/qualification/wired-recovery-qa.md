@@ -60,13 +60,13 @@ tools/wired-qa/run-wired-recovery-qa.sh \
 The receiver allows 30 seconds from link loss to active projection by default.
 Set `aa-wired-receiver --reconnect-ms N` (1–120000 ms) to change that window.
 It retries while the selected device is absent. If the device is already in
-AOA mode on replug or receiver restart, it issues a targeted USB reset and
-waits for phone-mode enumeration within the current link-open deadline
-(15 seconds on startup). The libusb reset call is synchronous. The AOA IDs
-and accessory strings alone cannot
-identify the approved phone. Admission requires a fresh phone-mode snapshot,
+a supported AOA mode on replug or receiver restart, it attempts one targeted
+USB reset per loss or startup. The re-enumeration wait uses one-second slices
+during recovery and has a 15-second startup deadline. The libusb reset call
+is synchronous. The AOA IDs and accessory strings alone cannot identify the
+approved phone. Admission requires a fresh phone-mode snapshot,
 AOA switch and lookup of the full wired identity. If the phone never returns
-to phone mode, the attempt expires without projection.
+to phone mode, the window expires without projection.
 
 The harness exits non-zero with a `BLOCKED` or `FAILED` result (`blocked_on`)
 whenever a prerequisite is unmet or a scenario does not recover within the wired

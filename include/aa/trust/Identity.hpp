@@ -142,6 +142,10 @@ enum class WiredKeyClass { not_wired, serial_bound, port_only, malformed };
 // Field-level validation (printable ASCII, usable material). Fail closed.
 [[nodiscard]] core::Result<std::string> validated_key(const TransportIdentity& identity);
 
+// Live wired admission and enrolment require phone-mode IDs. Store decoding uses
+// validated_key so a legacy accessory-mode entry can still be loaded and forgotten.
+[[nodiscard]] core::Result<std::string> validated_wired_phone_key(const WiredIdentity& identity);
+
 // Pseudonymized label for logs/diagnostics (task-19 redaction boundary): never
 // contains the raw serial, Bluetooth address or port context.
 [[nodiscard]] std::string redacted_label(const TransportIdentity& identity);

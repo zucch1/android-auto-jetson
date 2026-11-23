@@ -233,6 +233,44 @@ TEST(UsbAoaWorld, PersistentAccessoryModeNeverReachesAdmission) {
     EXPECT_FALSE(contains(log, "libusb_claim_interface"));
 }
 
+TEST(UsbAoaWorld, FailedStartupResetReturnsTypedError) {
+    set_scenario("reset-fails");
+    const auto link = tr::connect_usb_aoa(tr::UsbDeviceSelector{"1-2.1"}, {}, admit_all());
+    ASSERT_FALSE(link.has_value());
+    EXPECT_EQ(link.error().code(), ErrorCode::transport_io);
+    EXPECT_EQ(count_of(read_log(), "libusb_reset_device"), 1);
+}
+
+TEST(UsbAoaWorld, UnsupportedAccessoryModeIsNeitherResetNorSwitched) {
+    set_scenario("unsupported-accessory");
+    const auto link = tr::connect_usb_aoa(tr::UsbDeviceSelector{"1-2.1"}, {}, admit_all());
+    ASSERT_FALSE(link.has_value());
+    EXPECT_EQ(link.error().code(), ErrorCode::transport_unavailable);
+    const auto log = read_log();
+    EXPECT_FALSE(contains(log, "libusb_reset_device"));
+    EXPECT_FALSE(contains(log, "libusb_control_transfer"));
+}
+
+TEST(UsbAoaWorld, NextSliceClaimsAccessoryUsingTheCompletedSwitch) {
+    set_scenario("delayed-accessory");
+    const tr::UsbDeviceSelector selector{"1-2.1"};
+    tr::AoaRecovery recovery;
+    const aa::core::Deadline first{
+        aa::core::Deadline::Clock::now() + std::chrono::milliseconds{200}, {}};
+    const auto retry = tr::connect_usb_aoa(selector, {}, admit_all(), first, nullptr, &recovery);
+    ASSERT_FALSE(retry.has_value());
+    EXPECT_EQ(retry.error().code(), ErrorCode::timeout);
+
+    const auto link = tr::connect_usb_aoa(selector, {}, admit_all(), {}, nullptr, &recovery);
+    ASSERT_TRUE(link.has_value());
+    EXPECT_EQ(link.value().identity.usb_vendor_id, "04e8");
+    EXPECT_EQ(link.value().identity.usb_serial, "TEST-SERIAL-001");
+    EXPECT_TRUE(link.value().switch_report.started);
+    const auto log = read_log();
+    EXPECT_EQ(count_of(log, "libusb_control_transfer:53:0"), 1);
+    EXPECT_FALSE(contains(log, "libusb_reset_device"));
+}
+
 TEST(UsbAoaWorld, ExpiredCallerDeadlinePreventsAccessoryClaim) {
     set_scenario("happy");
     auto factory = ua::make_libusb_link_factory();

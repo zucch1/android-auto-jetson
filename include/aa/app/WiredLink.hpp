@@ -38,7 +38,7 @@ struct WiredLink final {
 };
 
 // The session-side identity key for a captured wired identity:
-// PhoneIdentity{trust::validated_key(TransportIdentity{identity})}. This is the
+// PhoneIdentity{trust::validated_wired_phone_key(identity)}. This is the
 // key ApprovedPhoneStore::lookup matches, so the admission decision made inside
 // connect_usb_aoa and the session's phone_discovered event name the SAME
 // record. Fails invalid_argument when the identity carries no usable material.
@@ -56,6 +56,7 @@ wired_phone_identity(const trust::WiredIdentity &identity);
                                                       const transport::AoaAccessoryInfo &info,
                                                       const trust::TrustStore &store,
                                                       const core::Deadline &deadline = {},
-                                                      trust::WiredIdentity *attempted_identity = nullptr);
+                                                      trust::WiredIdentity *attempted_identity = nullptr,
+                                                      transport::AoaRecovery *recovery = nullptr);
 
 } // namespace aa::app

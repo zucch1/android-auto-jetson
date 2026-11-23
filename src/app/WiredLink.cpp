@@ -8,7 +8,7 @@
 namespace aa::app {
 
 core::Result<trust::PhoneIdentity> wired_phone_identity(const trust::WiredIdentity &identity) {
-    const auto key = trust::validated_key(trust::TransportIdentity{identity});
+    const auto key = trust::validated_wired_phone_key(identity);
     if (!key) {
         return key.error();
     }
@@ -19,12 +19,13 @@ core::Result<WiredLink> open_wired_link(const transport::UsbDeviceSelector &sele
                                         const transport::AoaAccessoryInfo &info,
                                         const trust::TrustStore &store,
                                         const core::Deadline &deadline,
-                                        trust::WiredIdentity *attempted_identity) {
+                                        trust::WiredIdentity *attempted_identity,
+                                        transport::AoaRecovery *recovery) {
     // Admission is the store's decision (admit_via); nothing is auto-approved.
     core::DeadlineCancellation bounded{deadline};
     auto link = transport::connect_usb_aoa(selector, info, transport::admit_via(store),
                                           core::Deadline{deadline.until, bounded.token()},
-                                          attempted_identity);
+                                          attempted_identity, recovery);
     if (auto checked = deadline.check(); !checked) {
         return checked.error();
     }

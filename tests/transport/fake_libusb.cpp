@@ -9,7 +9,8 @@
 //   AA_FAKE_LIBUSB_SCENARIO  absent (default) | happy | stall |
 //                            claim-fail-pre | claim-fail-always | replacement |
 //                            stuck-accessory | recovery-swap
-//                            unknown-accessory | persistent-accessory
+//                            unknown-accessory | persistent-accessory | reset-fails
+//                            unsupported-accessory | delayed-accessory
 //   AA_FAKE_LIBUSB_LOG       call-log file path (appended), one call per line
 //
 // Device model: one device on port path "1-2.1" (bus 1). Phone mode is
@@ -74,6 +75,11 @@ enum class Scenario {
     stuck_accessory,
     unknown_accessory,
     persistent_accessory,
+    persistent_accessory_new_address,
+    reset_fails,
+    unsupported_accessory,
+    delayed_accessory,
+    accessory_ready,
     recovery_swap
 };
 
@@ -108,6 +114,21 @@ enum class Scenario {
     }
     if (text == "persistent-accessory") {
         return Scenario::persistent_accessory;
+    }
+    if (text == "persistent-accessory-new-address") {
+        return Scenario::persistent_accessory_new_address;
+    }
+    if (text == "reset-fails") {
+        return Scenario::reset_fails;
+    }
+    if (text == "unsupported-accessory") {
+        return Scenario::unsupported_accessory;
+    }
+    if (text == "delayed-accessory") {
+        return Scenario::delayed_accessory;
+    }
+    if (text == "accessory-ready") {
+        return Scenario::accessory_ready;
     }
     if (text == "recovery-swap") {
         return Scenario::recovery_swap;
@@ -223,6 +244,10 @@ int control_transfer_typed(ua::LibusbDeviceHandle *handle, BmRequestType bm_requ
     }
     if (request_type == ua::kUsbTypeVendor && request == 53) {
         g_mode = Mode::accessory;
+        if (scenario() == Scenario::delayed_accessory) {
+            g_enumerations_until_present = 5;
+            become_scenario("accessory-ready");
+        }
         return 0;
     }
     return ua::kLibusbErrorNotFound;
@@ -237,7 +262,10 @@ int libusb_init(ua::LibusbContext **ctx) {
     log_line("libusb_init");
     const auto current = scenario();
     g_mode = (current == Scenario::stuck_accessory || current == Scenario::unknown_accessory ||
-              current == Scenario::persistent_accessory || current == Scenario::recovery_swap)
+              current == Scenario::persistent_accessory ||
+              current == Scenario::persistent_accessory_new_address ||
+              current == Scenario::reset_fails || current == Scenario::unsupported_accessory ||
+              current == Scenario::accessory_ready || current == Scenario::recovery_swap)
                  ? Mode::accessory
                  : Mode::phone;
     std::memset(g_slots, 0, sizeof(g_slots));
@@ -296,7 +324,7 @@ int libusb_get_device_descriptor(ua::LibusbDevice *dev, ua::LibusbDeviceDescript
         desc->idProduct = 0x5678;
     } else if (g_mode == Mode::accessory) {
         desc->idVendor = 0x18D1;
-        desc->idProduct = 0x2D00;
+        desc->idProduct = scenario() == Scenario::unsupported_accessory ? 0x2D02 : 0x2D00;
     } else {
         desc->idVendor = 0x04E8;
         desc->idProduct = 0x6860;
@@ -311,7 +339,7 @@ std::uint8_t libusb_get_bus_number(ua::LibusbDevice *dev) {
 
 std::uint8_t libusb_get_device_address(ua::LibusbDevice *dev) {
     (void)dev;
-    return 7;
+    return scenario() == Scenario::persistent_accessory_new_address ? 8 : 7;
 }
 
 int libusb_get_port_numbers(ua::LibusbDevice *dev, std::uint8_t *ports, int ports_length) {
@@ -515,7 +543,13 @@ int libusb_reset_device(ua::LibusbDeviceHandle *handle) {
     (void)handle;
     log_line("libusb_reset_device");
     std::lock_guard lock(g_mutex);
+    if (scenario() == Scenario::reset_fails) {
+        constexpr int kLibusbErrorOther = -99;
+        return kLibusbErrorOther;
+    }
     if (scenario() == Scenario::persistent_accessory) {
+        g_enumerations_until_present = 1;
+        become_scenario("persistent-accessory-new-address");
         return ua::kLibusbSuccess;
     }
     // A software reset re-enumerates the device in its default (phone) mode.

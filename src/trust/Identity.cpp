@@ -59,6 +59,13 @@ void append_field(std::string& out, std::string_view field) {
     return serial.find_first_not_of(" \t\n\r\f\v") == std::string_view::npos;
 }
 
+[[nodiscard]] bool accessory_mode_id(const WiredIdentity& wired) {
+    const std::string_view pid = wired.usb_product_id;
+    return (wired.usb_vendor_id == "18d1" || wired.usb_vendor_id == "18D1") &&
+           pid.size() == 4 && pid[0] == '2' && (pid[1] == 'd' || pid[1] == 'D') &&
+           pid[2] == '0' && pid[3] >= '0' && pid[3] <= '5';
+}
+
 [[nodiscard]] bool wired_has_material(const WiredIdentity& wired) {
     if (!blank_serial(wired.usb_serial) || !blank_serial(wired.aoa_serial)) {
         return true;
@@ -237,6 +244,13 @@ core::Result<std::string> validated_key(const TransportIdentity& identity) {
         return Error{ErrorCode::invalid_argument};
     }
     return identity_key(identity);
+}
+
+core::Result<std::string> validated_wired_phone_key(const WiredIdentity& identity) {
+    if (accessory_mode_id(identity)) {
+        return Error{ErrorCode::invalid_argument};
+    }
+    return validated_key(TransportIdentity{identity});
 }
 
 std::string redacted_label(const TransportIdentity& identity) {

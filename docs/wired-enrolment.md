@@ -63,7 +63,10 @@ outstanding request without writing anything.
   durable (step 7) logs `wired_enrolment_not_durable` and exits 1. After a
   durable approval, start the receiver again for a fresh admission check.
   The receiver resets a phone still in accessory mode and checks its
-  phone-mode identity. A serial-backed approval works on any selected port.
+  phone-mode identity within the 15-second startup open window. A serial-backed
+  approval works on any selected port. After a live link loss, the receiver allows
+  30 seconds by default to return to active projection. Use `--reconnect-ms` to
+  configure that window (1–120000 ms).
 - With no approval inside the window (or `--duration-ms`), it logs
   `wired_enrolment_closed` and exits 3, as without the flag.
 - If admission succeeds, enrolment closes before the session starts. Pairing

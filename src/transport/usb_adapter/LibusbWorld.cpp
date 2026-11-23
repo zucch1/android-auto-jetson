@@ -24,13 +24,20 @@ namespace {
 
 inline constexpr std::uint16_t kGoogleVendorId = 0x18D1;
 inline constexpr std::uint16_t kAccessoryProductId = 0x2D00;
-inline constexpr std::uint16_t kAccessoryAudioProductId = 0x2D01;
+inline constexpr std::uint16_t kAccessoryAdbProductId = 0x2D01;
 inline constexpr int kStringFetchLength = 255;
 inline constexpr auto kReenumPollInterval = std::chrono::milliseconds(100);
 
 [[nodiscard]] bool is_aoa_device(const UsbDeviceSnapshot &snapshot) {
     return snapshot.vendor_id == kGoogleVendorId && snapshot.product_id >= 0x2D00 &&
            snapshot.product_id <= 0x2D05;
+}
+
+// Keep supported accessory IDs in sync with 70-android-auto-receiver.rules.
+[[nodiscard]] bool is_supported_accessory(const UsbDeviceSnapshot &snapshot) {
+    return snapshot.vendor_id == kGoogleVendorId &&
+           (snapshot.product_id == kAccessoryProductId ||
+            snapshot.product_id == kAccessoryAdbProductId);
 }
 
 void wait_for_reenumeration(const core::Deadline &budget) {
@@ -165,17 +172,30 @@ class Enumeration final {
     return true;
 }
 
-[[nodiscard]] core::Result<void> reset_device(const LibusbApi &api, LibusbDevice *device) {
+[[nodiscard]] core::Result<void> reset_device(const LibusbApi &api, LibusbDevice *device,
+                                              AoaRecovery *recovery = nullptr) {
+    const auto report = [&](std::string_view status) {
+        if (recovery && recovery->reset_status) {
+            recovery->reset_status(status);
+        }
+    };
     LibusbDeviceHandle *raw = nullptr;
     const int opened = api.open(device, &raw);
     if (opened != kLibusbSuccess) {
-        return map_libusb_error(opened);
+        const auto error = map_libusb_error(opened);
+        report(to_string(error.code()));
+        return error;
     }
     LibusbHandle handle(&api, raw);
+    report("issued");
+    // libusb's kernel port reset is synchronous and cannot be cancelled.
     const int reset = api.reset_device(handle.get());
     if (reset != kLibusbSuccess) {
-        return map_libusb_error(reset);
+        const auto error = map_libusb_error(reset);
+        report(to_string(error.code()));
+        return error;
     }
+    report("ok");
     return {};
 }
 
@@ -361,7 +381,8 @@ class LibusbLinkFactory final : public AoaLinkFactory {
         if (!validated) {
             return validated.error();
         }
-        bool recovering = false;
+        AoaRecovery local_recovery;
+        auto &recovery = recovery_ ? *recovery_ : local_recovery;
         for (;;) {
             if (auto checked = deadline_.check(); !checked) {
                 return checked.error();
@@ -385,7 +406,10 @@ class LibusbLinkFactory final : public AoaLinkFactory {
                 LibusbControlChannel channel(session_.api(), std::move(handle.value()), deadline_);
                 return run_aoa_switch(channel, info, switch_report);
             }
-            if (!recovering) {
+            if (found != candidates.end() && !is_supported_accessory(found->snapshot)) {
+                return Error{ErrorCode::transport_unavailable};
+            }
+            if (!recovery.reset_attempted) {
                 if (found == candidates.end()) {
                     return Error{ErrorCode::transport_unavailable};
                 }
@@ -395,14 +419,14 @@ class LibusbLinkFactory final : public AoaLinkFactory {
                 if (auto checked = deadline_.check(); !checked) {
                     return checked.error();
                 }
-                const auto reset = reset_device(session_.api(), found->device);
+                recovery.reset_attempted = true;
+                const auto reset = reset_device(session_.api(), found->device, &recovery);
                 if (!reset && reset.error().code() != ErrorCode::transport_closed &&
                     reset.error().code() != ErrorCode::transport_unavailable) {
                     return reset.error();
                 }
                 // A disconnect during the reset can invalidate the handle.
                 // Re-enumerate to determine whether the device changed modes.
-                recovering = true;
                 continue;
             }
             wait_for_reenumeration(deadline_);
@@ -433,10 +457,8 @@ class LibusbLinkFactory final : public AoaLinkFactory {
             }
             const Candidate *found = nullptr;
             for (const auto &candidate : enumeration.candidates()) {
-                const bool accessory = candidate.snapshot.vendor_id == kGoogleVendorId &&
-                                       (candidate.snapshot.product_id == kAccessoryProductId ||
-                                        candidate.snapshot.product_id == kAccessoryAudioProductId);
-                if (accessory && candidate.port_path == selector.port_context) {
+                if (is_supported_accessory(candidate.snapshot) &&
+                    candidate.port_path == selector.port_context) {
                     found = &candidate;
                     break;
                 }

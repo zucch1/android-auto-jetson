@@ -141,6 +141,22 @@ void log_sink_selected(const aa::audio::SinkReport &selected, std::string_view o
 
 void on_signal(int) { g_running.store(false); }
 
+// The handler only publishes the shutdown flag. A normal thread wakes USB waits,
+// even if the D-Bus dispatcher is inside a synchronous ForgetPhone call.
+std::jthread cancel_open_on_shutdown(aa::core::CancellationSource &source) {
+    return std::jthread([&source](const std::stop_token &stop) {
+        std::mutex mutex;
+        std::condition_variable_any cv;
+        std::unique_lock lock(mutex);
+        while (g_running.load() && !stop.stop_requested()) {
+            cv.wait_for(lock, stop, std::chrono::milliseconds{25}, [] { return false; });
+        }
+        if (!g_running.load()) {
+            source.request_stop();
+        }
+    });
+}
+
 using aa::audio::AudioDispatchObservation;
 using aa::audio::AudioFailureOrigin;
 using aa::audio::AudioRejectionSnapshot;
@@ -656,8 +672,12 @@ int receiver_main(int argc, char **argv) {
     aa::transport::UsbDeviceSelector selector{};
     selector.port_context = port;
     aa::transport::AoaAccessoryInfo accessory{};
-    log_line("{\"event\":\"connecting\",\"port\":\"" +
-             aa::diagnostics::redact_identifier(port) + "\"}");
+    const auto redacted_port = aa::diagnostics::redact_identifier(port);
+    log_line("{\"event\":\"connecting\",\"port\":\"" + redacted_port + "\"}");
+    const auto log_reset = [&](std::string_view status) {
+        log_line_nonblocking("{\"event\":\"diag\",\"detail\":\"aoa_reset\",\"port\":\"" +
+                             redacted_port + "\",\"status\":\"" + std::string{status} + "\"}");
+    };
 
     // Per-link cipher (P1-B/P1-C): the initial attach AND every reconnect build
     // a FRESH cipher bound to the identity the TrustStore admitted for THIS
@@ -684,7 +704,19 @@ int receiver_main(int argc, char **argv) {
         "{\"event\":\"err\",\"detail\":\"link\",\"code\":\"phone_serial_mismatch\"}";
 
     aa::trust::WiredIdentity attempted_identity{};
-    auto first_link = aa::app::open_wired_link(selector, accessory, store, {}, &attempted_identity);
+    auto first_link = [&] {
+        aa::core::CancellationSource startup_stop;
+        auto watch_shutdown = cancel_open_on_shutdown(startup_stop);
+        aa::core::Deadline startup_budget;
+        startup_budget.cancellation = startup_stop.get_token();
+        aa::transport::AoaRecovery startup_recovery;
+        startup_recovery.reset_status = log_reset;
+        return aa::app::open_wired_link(selector, accessory, store, startup_budget,
+                                        &attempted_identity, &startup_recovery);
+    }();
+    if (!g_running.load()) {
+        return 0;
+    }
     if (!first_link.has_value()) {
         // ADDITIVE attribution at admission rejection (item 2): the link-error
         // record names the rejected attempt's identity+port. The identity is
@@ -753,6 +785,8 @@ int receiver_main(int argc, char **argv) {
     std::mutex gate_mutex;
     std::condition_variable gate_cv;
     aa::core::CancellationSource reconnect_stop;
+    aa::transport::AoaRecovery recovery;
+    recovery.reset_status = log_reset;
     bool runtime_failed = false;
 
     auto service_control = [&] {
@@ -855,9 +889,13 @@ int receiver_main(int argc, char **argv) {
         }
         video_outlet.reset();
         const auto session_budget = session.io_deadline();
-        const std::stop_callback cancel_reconnect{session_budget.cancellation,
-                                                  [&] { reconnect_stop.request_stop(); }};
-        const aa::core::Deadline budget{session_budget.until, reconnect_stop.get_token()};
+        aa::core::CancellationSource open_stop;
+        const std::stop_callback cancel_on_session_stop{session_budget.cancellation,
+                                                        [&] { open_stop.request_stop(); }};
+        const std::stop_callback cancel_on_dispatcher_stop{reconnect_stop.get_token(),
+                                                           [&] { open_stop.request_stop(); }};
+        auto watch_shutdown = cancel_open_on_shutdown(open_stop);
+        const aa::core::Deadline budget{session_budget.until, open_stop.get_token()};
         while (g_running.load()) {
             if (service_control()) {
                 return aa::Error{aa::ErrorCode::cancelled};
@@ -866,7 +904,11 @@ int receiver_main(int argc, char **argv) {
                 session.tick();
                 return checked.error();
             }
-            auto relink = aa::app::open_wired_link(selector, accessory, store, budget);
+            const aa::core::Deadline slice{
+                std::min(budget.until, aa::core::Deadline::Clock::now() + std::chrono::seconds{1}),
+                budget.cancellation};
+            auto relink = aa::app::open_wired_link(selector, accessory, store, slice,
+                                                  nullptr, &recovery);
             if (!g_running.load() || service_control()) {
                 return aa::Error{aa::ErrorCode::cancelled};
             }
@@ -1057,7 +1099,9 @@ int receiver_main(int argc, char **argv) {
                 }
                 if (session.state() == aa::session::State::negotiating &&
                     session.channel_opens() > 0) {
-                    (void)session.apply(aa::session::Event::negotiation_succeeded);
+                    if (session.apply(aa::session::Event::negotiation_succeeded)) {
+                        recovery.reset_attempted = false;
+                    }
                 }
                 if (session.state() == aa::session::State::active && active_ms.load() < 0) {
                     const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
