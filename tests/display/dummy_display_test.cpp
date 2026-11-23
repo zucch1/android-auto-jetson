@@ -2617,6 +2617,7 @@ TEST(DummyDisplayStopRecovery, LostRegistrationReconcilesToUnavailableAndClearsI
         EXPECT_EQ(failed.error().code(), ErrorCode::session_illegal_transition);
         EXPECT_EQ(fixture->display().state(), DisplayState::unavailable);
         EXPECT_EQ(fixture->display().consumer(), aa::core::ConsumerId{});
+        EXPECT_FALSE(fixture->display().helper_started());
         EXPECT_EQ(fixture->closes, 1);
     }
 }

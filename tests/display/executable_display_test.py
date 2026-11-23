@@ -11,6 +11,9 @@ Cases:
   absent  (F5): receiver-absent runs (with and without the autostart flag)
                 assert no helper process/request and no AP/network change
                 via PATH-shim recorder + route snapshot sentinels.
+  reattach (#214): a display launched before the receiver survives a restart,
+                reports unavailable, and retries rejected registrations at
+                most once per second before autostarting on the new receiver.
   stalled (gate r3 F1): an UNPACED 401-key burst against a same-UID input
                 endpoint that accepts but never reads must never starve the
                 GUI - a fresh status reply and F6 stop completion must both
@@ -274,6 +277,42 @@ def case_replay(args):
         assert status["awaiting_idr"] is False, status
         assert display.stop() == 0
         assert receiver.stop(False) == 0
+
+
+def case_reattach(args):
+    with tempfile.TemporaryDirectory(prefix="aa-restart-") as runtime, ExitStack() as children:
+        video = os.path.join(runtime, "android-auto-receiver", "video.sock")
+        input_sock = os.path.join(runtime, "android-auto-receiver", "input.sock")
+        display = start_display(args, video, input_sock, True, os.environ.copy(),
+                                decoder_backend="software")
+        children.callback(display.stop)
+        initial = display.await_status(lambda s: s["state"] == "unavailable", timeout=10)
+        assert initial["helper_started"] is False, initial
+
+        receiver, _, _ = start_receiver(args, runtime)
+        children.callback(receiver.stop, False)
+        first = display.await_status(lambda s: s["frames_presented"] == 90, timeout=30)
+        assert first["state"] == "projecting" and first["helper_started"], first
+
+        assert receiver.stop(False) == 0
+        lost = display.await_status(lambda s: s["state"] == "unavailable"
+                                    and s["frames_presented"] == 90, timeout=10)
+        assert lost["helper_started"] is False and lost["frames_presented"] == 90, lost
+
+        replacement, _, _ = start_receiver(args, runtime, mode="reject-first-registrations")
+        children.callback(replacement.stop, False)
+        resumed = display.await_status(lambda s: s["frames_presented"] == 180, timeout=30)
+        assert resumed["state"] == "projecting" and resumed["helper_started"], resumed
+        with replacement.lock:
+            calls = [e for e in replacement.events if e.get("event") == "call"]
+        attach_calls = [e for e in calls if e["member"] in
+                        ("RegisterConsumer", "SetDisplayViewport", "StartProjection")]
+        assert [e["member"] for e in attach_calls] == ["RegisterConsumer"] * 3 + [
+            "SetDisplayViewport", "StartProjection"], attach_calls
+        attempts = [e["monotonic_ns"] for e in attach_calls[:3]]
+        assert all(b - a >= 1_000_000_000 for a, b in zip(attempts, attempts[1:])), attempts
+        assert display.stop() == 0
+        assert replacement.stop(False) == 0
 
 
 def case_flow(args):
@@ -699,13 +738,13 @@ def main():
     parser.add_argument("--case", required=True,
                         choices=("replay", "flow", "absent", "stalled", "stopfail",
                                  "stopreject", "diagnostics-bootstrap", "diagnostics-factory",
-                                 "diagnostics-connect", "sigterm"))
+                                 "diagnostics-connect", "sigterm", "reattach"))
     args = parser.parse_args()
     {"replay": case_replay, "flow": case_flow, "absent": case_absent,
      "stalled": case_stalled, "stopfail": case_stopfail,
      "stopreject": case_stopreject, "diagnostics-bootstrap": case_diagnostics,
      "diagnostics-factory": case_diagnostics, "diagnostics-connect": case_diagnostics,
-     "sigterm": case_sigterm}[args.case](args)
+     "sigterm": case_sigterm, "reattach": case_reattach}[args.case](args)
     print(f"PASS: {args.case}")
     return 0
 

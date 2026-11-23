@@ -70,6 +70,7 @@ struct DisplayController::Impl final {
     DecodeSessionFactory decode_sessions;
     FrameTarget& frames;
     DisplayConfig config{};
+    std::optional<ipc::BusName> receiver{};
     protocol::VideoProfile active_caps{};
     DisplayState state{DisplayState::unavailable};
     core::ConsumerId consumer{};
@@ -165,6 +166,14 @@ struct DisplayController::Impl final {
         eof = false;
     }
 
+    void clear_registration() noexcept {
+        release_media();
+        receiver.reset();
+        consumer = core::ConsumerId{};
+        helper_started = false;
+        state = DisplayState::unavailable;
+    }
+
     // Failed-stop reconciliation: exactly ONE GetState exchange, run ONLY
     // after a failed stop (never per pump/tick). The snapshot decides the
     // state per the decision table and releases or retains the media to
@@ -180,9 +189,7 @@ struct DisplayController::Impl final {
         }
         if (snapshot.value().consumer == core::ConsumerId{} ||
             snapshot.value().consumer != consumer) {
-            release_media();
-            consumer = core::ConsumerId{};
-            state = DisplayState::unavailable;
+            clear_registration();
             return;
         }
         if (snapshot.value().projection == ipc::ProjectionState::stopped) {
@@ -211,7 +218,7 @@ struct DisplayController::Impl final {
 core::Result<DisplayController> DisplayController::attach(Deps deps, DisplayConfig config) {
     auto impl = std::make_unique<Impl>(Impl{deps.control, std::move(deps.decode_sessions),
                                             deps.frames, std::move(config)});
-    const auto owner = impl->control.receiver_owner();
+    auto owner = impl->control.receiver_owner();
     if (!owner.has_value()) {
         return owner.error();
     }
@@ -228,6 +235,7 @@ core::Result<DisplayController> DisplayController::attach(Deps deps, DisplayConf
         return viewport_set.error();
     }
     impl->consumer = registered.value();
+    impl->receiver = std::move(owner.value().value());
     impl->state = DisplayState::idle;
     return DisplayController(std::move(impl));
 }
@@ -245,6 +253,10 @@ DisplayState DisplayController::state() const noexcept {
 
 core::ConsumerId DisplayController::consumer() const noexcept {
     return impl_ ? impl_->consumer : core::ConsumerId{};
+}
+
+bool DisplayController::attached_to(const ipc::BusName& receiver) const noexcept {
+    return impl_ && impl_->state != DisplayState::unavailable && impl_->receiver == receiver;
 }
 
 std::uint64_t DisplayController::frames_presented() const noexcept {
@@ -410,6 +422,12 @@ core::Result<std::size_t> DisplayController::pump(Milliseconds wait) {
     return frames.value();
 }
 
+void DisplayController::receiver_lost() noexcept {
+    if (impl_) {
+        impl_->clear_registration();
+    }
+}
+
 void DisplayController::shutdown() noexcept {
     if (!impl_) {
         return;
@@ -420,17 +438,10 @@ void DisplayController::shutdown() noexcept {
         // never via a temporary idle, and teardown runs no reconciliation.
         static_cast<void>(impl_->control.stop_projection());
         static_cast<void>(impl_->control.unregister_consumer());
-        impl_->release_media();
-        impl_->state = DisplayState::unavailable;
-        impl_->consumer = core::ConsumerId{};
-        return;
-    }
-    impl_->release_media();
-    if (impl_->state == DisplayState::idle) {
+    } else if (impl_->state == DisplayState::idle) {
         static_cast<void>(impl_->control.unregister_consumer());
-        impl_->state = DisplayState::unavailable;
-        impl_->consumer = core::ConsumerId{};
     }
+    receiver_lost();
 }
 
 core::Result<DisplayController> attach_test_only_autostart(const TestOnlyAutostart& gate,

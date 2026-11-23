@@ -90,34 +90,34 @@ public:
           diagnostics_(diagnostics) {}
 
     void on_start_projection() override {
-        if (!controller_.has_value()) {
-            return;
-        }
-        report("StartProjection", controller_->start_projection(video_));
+        report("StartProjection", controller_ ? controller_->start_projection(video_)
+                                               : unavailable());
     }
 
     void on_stop_projection() override {
-        if (!controller_.has_value()) {
-            return;
-        }
-        report("StopProjection", controller_->stop_projection());
+        report("StopProjection", controller_ ? controller_->stop_projection() : unavailable());
     }
 
 private:
+    static aa::core::Result<void> unavailable() {
+        return aa::Error{aa::ErrorCode::session_illegal_transition};
+    }
+
     // Captures the result, refreshes the state text and reports a typed
     // failure ("<state>: <Operation> failed (<code>)") on stderr and through
     // the widget error setter; a successful recovery clears the error while
     // the success-state text stays owned by set_status(). The stderr line is
     // queued on its own writer: this runs on the GUI thread.
     void report(const char* operation, const aa::core::Result<void>& result) {
-        widget_.set_status(controller_->state());
+        const auto display_state = controller_ ? controller_->state() : DisplayState::unavailable;
+        widget_.set_status(display_state);
         if (result.has_value()) {
             widget_.set_error(std::string_view{});
             return;
         }
         errors_.report(std::strcmp(operation, "StartProjection") == 0 ? "start" : "stop",
                        result.error().code());
-        const auto state = aa::display::to_string(controller_->state());
+        const auto state = aa::display::to_string(display_state);
         const auto code = aa::to_string(result.error().code());
         std::string message{};
         message.reserve(state.size() + code.size() + 32);
@@ -134,38 +134,32 @@ private:
     aa::display::TelemetryWriter& diagnostics_;
 };
 
-std::optional<aa::display::DisplayController> g_controller{};
-aa::ipc::InputSender* g_sender{nullptr};
-aa::display::qt_adapter::ProjectionWidget* g_widget{nullptr};
-
-aa::display::testcontrol::Status probe_status() {
+aa::display::testcontrol::Status probe_status(
+    const std::optional<aa::display::DisplayController>& controller,
+    aa::display::qt_adapter::ProjectionWidget& widget, const aa::ipc::InputSender& sender,
+    std::uint64_t previous_frames) {
     aa::display::testcontrol::Status status{};
-    if (!g_controller.has_value() || g_widget == nullptr) {
-        return status;
+    status.frames_presented = previous_frames;
+    status.frames_painted = widget.frames_painted();
+    if (controller.has_value()) {
+        status.state = controller->state();
+        status.frames_presented += controller->frames_presented();
+        status.helper_started = controller->helper_started();
+        const auto& decode = controller->decode_report();
+        status.frames_lost_retention = decode.frames_lost_retention;
+        status.frames_lost_capacity = decode.frames_lost_capacity;
+        status.frames_lost_eos = decode.frames_lost_eos;
+        status.frames_lost_close = decode.frames_lost_close;
+        status.frames_discarded_awaiting_idr = decode.frames_discarded_awaiting_idr;
+        status.awaiting_idr = decode.awaiting_idr;
     }
-    status.state = g_controller->state();
-    status.frames_presented = g_controller->frames_presented();
-    status.frames_painted = g_widget->frames_painted();
-    status.helper_started = g_controller->helper_started();
-    const auto& decode = g_controller->decode_report();
-    status.frames_lost_retention = decode.frames_lost_retention;
-    status.frames_lost_capacity = decode.frames_lost_capacity;
-    status.frames_lost_eos = decode.frames_lost_eos;
-    status.frames_lost_close = decode.frames_lost_close;
-    status.frames_discarded_awaiting_idr = decode.frames_discarded_awaiting_idr;
-    status.awaiting_idr = decode.awaiting_idr;
-    if (g_sender != nullptr) {
-        status.input_sent = g_sender->sent();
-        status.input_dropped = g_sender->dropped();
-        const auto failure = g_sender->last_failure();
-        if (failure.has_value()) {
-            const auto name = aa::to_string(failure.value());
-            status.input_last_error.assign(name.data(), name.size());
-        }
+    status.input_sent = sender.sent();
+    status.input_dropped = sender.dropped();
+    if (const auto failure = sender.last_failure()) {
+        status.input_last_error = aa::to_string(*failure);
     }
-    const auto error = g_widget->error_text().toStdString();
-    status.last_error = error;
-    const QPixmap probe = g_widget->grab();
+    status.last_error = widget.error_text().toStdString();
+    const QPixmap probe = widget.grab();
     status.render_ok = !probe.isNull();
     status.render_width = probe.width();
     status.render_height = probe.height();
@@ -265,7 +259,6 @@ int display_main(int argc, char** argv) {
     const auto quit_on_signal = aa::display::signal_quit::install();
     aa::ipc::InputSender sender{};
     sender.attach(aa::ipc::InputSocketPath{input_socket}, aa::ipc::current_uid());
-    g_sender = &sender;
 
     aa::display::DisplayConfig config{};
     config.consumer_name = aa::ipc::BusName{"org.custom.DummyDisplay1"};
@@ -302,53 +295,101 @@ int display_main(int argc, char** argv) {
 
     aa::display::qt_adapter::ProjectionWidget widget(sender, config.caps);
     widget.set_input_viewport(static_cast<std::uint16_t>(config.viewport.width),static_cast<std::uint16_t>(config.viewport.height));
-    g_widget = &widget;
     widget.set_telemetry_writer(&telemetry);
     widget.set_status(DisplayState::unavailable);
 
     aa::display::DecodeLossTelemetry decode_loss;
-    auto client = aa::ipc::ControlBusClient::connect();
-    if (client.has_value()) {
-        aa::display::TestOnlyAutostart gate{};
-        gate.marker = test_autostart ? aa::display::TestOnlyAutostart::kMarker : std::string_view{};
-        gate.video_socket = aa::ipc::VideoSocketPath{video_socket};
-        auto factory = [errors, decoder_backend, &decode_loss, &telemetry,
-                        inner = aa::display::helper_decode_sessions()](
-                           const aa::consumer::DecodeConfig& decode_config)
-            -> aa::core::Result<std::unique_ptr<aa::display::DecodeSession>> {
-            errors->begin_attempt();
-            auto effective_config = decode_config;
-            effective_config.backend = decoder_backend;
-            auto opened = inner(effective_config);
-            if (!opened.has_value()) {
-                return opened;
-            }
-            for (auto& line : decode_loss.begin_session()) {
-                static_cast<void>(telemetry.enqueue(std::move(line)));
-            }
-            return std::unique_ptr<aa::display::DecodeSession>(
-                std::make_unique<aa::display::LossReportingDecodeSession>(
-                    std::move(opened.value()), decode_loss,
-                    [&telemetry](std::string line) {
-                        static_cast<void>(telemetry.enqueue(std::move(line)));
-                    }));
-        };
-        aa::display::DisplayController::Deps deps{client.value(), std::move(factory), widget};
-        auto attached = test_autostart
-                            ? aa::display::attach_test_only_autostart(gate, deps, config)
-                            : aa::display::DisplayController::attach(std::move(deps), config);
-        if (attached.has_value()) {
-            widget.set_status(attached.value().state());
-            g_controller.emplace(std::move(attached.value()));
-        } else {
-            errors->report(test_autostart ? "autostart" : "attach", attached.error().code());
+    auto factory = [errors, decoder_backend, &decode_loss, &telemetry,
+                    inner = aa::display::helper_decode_sessions()](
+                       const aa::consumer::DecodeConfig& decode_config)
+        -> aa::core::Result<std::unique_ptr<aa::display::DecodeSession>> {
+        errors->begin_attempt();
+        auto effective_config = decode_config;
+        effective_config.backend = decoder_backend;
+        auto opened = inner(effective_config);
+        if (!opened.has_value()) {
+            return opened;
         }
-    } else {
-        errors->report("attach", client.error().code());
-    }
+        for (auto& line : decode_loss.begin_session()) {
+            static_cast<void>(telemetry.enqueue(std::move(line)));
+        }
+        return std::unique_ptr<aa::display::DecodeSession>(
+            std::make_unique<aa::display::LossReportingDecodeSession>(
+                std::move(opened.value()), decode_loss,
+                [&telemetry](std::string line) {
+                    static_cast<void>(telemetry.enqueue(std::move(line)));
+                }));
+    };
 
-    ControlWiring controls{g_controller, aa::ipc::VideoSocketPath{video_socket}, widget, *errors,
-                           diagnostics};
+    const aa::ipc::VideoSocketPath video_path{video_socket};
+    const aa::display::TestOnlyAutostart gate{aa::display::TestOnlyAutostart::kMarker, video_path};
+    std::optional<aa::ipc::ControlBusClient> watcher;
+    std::optional<aa::ipc::ControlBusClient> client;
+    std::optional<aa::display::DisplayController> controller;
+    std::uint64_t previous_frames = 0;
+    const auto poll_receiver = [&] {
+        if (!watcher.has_value()) {
+            auto connected = aa::ipc::ControlBusClient::connect();
+            if (!connected.has_value()) {
+                errors->report("attach", connected.error().code());
+                return;
+            }
+            watcher.emplace(std::move(connected.value()));
+        }
+        // Keep the owner's unique name on the controller's client pinned for
+        // the lifetime of the registration, including during control calls.
+        const auto owner = watcher->receiver_owner();
+        if (controller.has_value()) {
+            if (owner && owner.value() && controller->attached_to(*owner.value())) {
+                return;
+            }
+            previous_frames += controller->frames_presented();
+            controller->receiver_lost();
+            controller.reset();
+            client.reset();
+            widget.set_status(DisplayState::unavailable);
+            widget.set_error({});
+            return;
+        }
+        if (!owner || !owner.value()) {
+            return;
+        }
+        auto connected = aa::ipc::ControlBusClient::connect();
+        if (!connected.has_value()) {
+            errors->report("attach", connected.error().code());
+            return;
+        }
+        client.emplace(std::move(connected.value()));
+        aa::display::DisplayController::Deps deps{*client, factory, widget};
+        auto attached = test_autostart
+                            ? aa::display::attach_test_only_autostart(gate, std::move(deps), config)
+                            : aa::display::DisplayController::attach(std::move(deps), config);
+        if (!attached.has_value()) {
+            errors->report(test_autostart ? "autostart" : "attach", attached.error().code());
+            client.reset();
+            return;
+        }
+        if (attached.value().state() == DisplayState::unavailable) {
+            // The receiver vanished between the poll and the attach lookup.
+            return;
+        }
+        controller.emplace(std::move(attached.value()));
+        widget.set_status(controller->state());
+        widget.set_error({});
+    };
+    // Rearm after each poll so a delayed GUI tick cannot bunch up attempts.
+    QTimer receiver_timer;
+    receiver_timer.setTimerType(Qt::PreciseTimer);
+    receiver_timer.setSingleShot(true);
+    receiver_timer.setInterval(std::chrono::seconds{1});
+    QObject::connect(&receiver_timer, &QTimer::timeout, [&] {
+        poll_receiver();
+        receiver_timer.start();
+    });
+    poll_receiver();
+    receiver_timer.start();
+
+    ControlWiring controls{controller, video_path, widget, *errors, diagnostics};
     widget.set_projection_control(&controls);
 
     // Pump timer must outlive app.exec(): declared at main scope, not inside
@@ -357,7 +398,7 @@ int display_main(int argc, char** argv) {
     auto pump_timer = std::make_unique<QTimer>();
     aa::display::pump::configure(*pump_timer);
     QObject::connect(pump_timer.get(), &QTimer::timeout,
-                     [errors, &telemetry, &widget, &decode_loss,
+                     [errors, &telemetry, &widget, &decode_loss, &controller,
                       telemetry_reported = false]() mutable {
         // A full queue or failed write loses measurement events: show it once.
         // Only on screen: a stream write here could block on the same stdout
@@ -366,8 +407,8 @@ int display_main(int argc, char** argv) {
             telemetry_reported = true;
             widget.set_error("telemetry failure: events undelivered");
         }
-        if (g_controller.has_value()) {
-            const auto pumped = g_controller->pump(aa::core::Milliseconds{0});
+        if (controller.has_value()) {
+            const auto pumped = controller->pump(aa::core::Milliseconds{0});
             if (!pumped.has_value()) {
                 const auto code = pumped.error().code();
                 if (code != aa::ErrorCode::timeout &&
@@ -376,33 +417,33 @@ int display_main(int argc, char** argv) {
                     errors->report("pump", code);
                 }
             }
-            for (auto& line : decode_loss.observe(g_controller->decode_report(),
+            for (auto& line : decode_loss.observe(controller->decode_report(),
                                                   std::chrono::steady_clock::now())) {
                 static_cast<void>(telemetry.enqueue(std::move(line)));
             }
         }
     });
-    if (g_controller.has_value()) {
-        pump_timer->start();
-    }
+    pump_timer->start();
 
     std::unique_ptr<aa::display::testcontrol::Channel> control{};
     if (test_control_stdin) {
-        control = std::make_unique<aa::display::testcontrol::Channel>(widget, probe_status,
-                                                                      &telemetry);
+        control = std::make_unique<aa::display::testcontrol::Channel>(
+            widget, [&] { return probe_status(controller, widget, sender, previous_frames); },
+            &telemetry);
     }
 
     widget.show();
     int outcome = app.exec();
+    receiver_timer.stop();
     pump_timer->stop();
-    if (g_controller.has_value()) {
+    if (controller.has_value()) {
         // Totals coalesced by the rate limit must not die with the session.
-        for (auto& line : decode_loss.observe(g_controller->decode_report(),
+        for (auto& line : decode_loss.observe(controller->decode_report(),
                                               std::chrono::steady_clock::now(), true)) {
             static_cast<void>(telemetry.enqueue(std::move(line)));
         }
-        g_controller->shutdown();
-        g_controller.reset();
+        controller->shutdown();
+        controller.reset();
     }
     widget.set_telemetry_writer(nullptr);
     errors->attach(nullptr);
