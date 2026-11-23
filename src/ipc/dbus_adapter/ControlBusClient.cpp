@@ -631,27 +631,4 @@ const BusName& ControlBusClient::unique_name() const noexcept {
     return impl_ ? impl_->connection->unique_name() : empty;
 }
 
-[[nodiscard]] core::Result<std::map<std::string, std::string>> parse_string_map(
-    Cursor& cursor, std::size_t end) {
-    if (!cursor.align(8)) {
-        return Error{ErrorCode::ipc_malformed_request};
-    }
-    std::map<std::string, std::string> entries;
-    while (cursor.position() < end) {
-        if (!cursor.align(8)) {
-            return Error{ErrorCode::ipc_malformed_request};
-        }
-        auto key = cursor.read_string();
-        auto value = cursor.read_string();
-        if (!key.has_value() || !value.has_value() || entries.size() >= 16) {
-            return Error{ErrorCode::ipc_malformed_request};
-        }
-        entries.insert_or_assign(std::move(key.value()), std::move(value.value()));
-    }
-    if (cursor.position() != end) {
-        return Error{ErrorCode::ipc_malformed_request};
-    }
-    return entries;
-}
-
 } // namespace aa::ipc

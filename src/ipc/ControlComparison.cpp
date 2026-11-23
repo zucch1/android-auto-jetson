@@ -101,16 +101,25 @@ void ControlService::advance_enrolment() {
         return;
     }
     // A non-durable (703) approval is retracted: the store forget and the tracked revocation, then
-    // reconciliation. If the retraction cannot be written either, the approval remains in the store
-    // and reconciliation keeps the helper consistent with it.
-    bool retracted = false;
-    if (phone) (void)revoke_phone(active, phone, &retracted, request);
-    if (!retracted && open_pairing_ && open_pairing_->request == request) {
+    // reconciliation. Local retraction durability is tracked separately from helper cleanup:
+    // confirmed durable removal reports "retracted", an unconfirmed directory sync reports
+    // "not_durable", and a pre-replacement write failure reports "retraction_failed" after retiring
+    // the helper source through the tracked cleanup path so reconciliation keeps the helper
+    // consistent with the retained approval.
+    auto retraction = StoreRetraction::failed;
+    if (phone) (void)revoke_phone(active, phone, &retraction, request);
+    if (retraction == StoreRetraction::failed && open_pairing_ && open_pairing_->request == request) {
+        const auto peer = open_pairing_->peer;
+        retire_failed_pairing(active.consumer, request, peer);
         open_pairing_.reset();
         (void)gate_.cancel({active.consumer, active.name}, request);
         events_.emit(PairingClosed{request});
     }
-    finalize_pairing_outcome(request, retracted ? "retracted" : "retraction_failed");
+    const std::string_view outcome =
+        retraction == StoreRetraction::durable ? "retracted"
+        : retraction == StoreRetraction::not_durable ? "not_durable"
+                                                     : "retraction_failed";
+    finalize_pairing_outcome(request, outcome);
     request_reconcile();
 }
 

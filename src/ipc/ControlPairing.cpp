@@ -218,12 +218,14 @@ core::Result<void> ControlService::forget_phone(const BusName& caller, core::Pho
     return revoke_phone(active.value(), phone);
 }
 core::Result<void> ControlService::revoke_phone(const Registered& active, core::PhoneId phone,
-                                                bool* store_retracted,
+                                                StoreRetraction* store_retraction,
                                                 core::PairingRequestId retracting_request) {
-    if (store_retracted) *store_retracted = false;
+    if (store_retraction) *store_retraction = StoreRetraction::failed;
     for (auto it = revocations_.begin(); it != revocations_.end(); ++it) {
         if (it->snapshot.phone != phone) continue;
-        if (store_retracted) *store_retracted = true;
+        if (store_retraction) {
+            *store_retraction = it->not_durable ? StoreRetraction::not_durable : StoreRetraction::durable;
+        }
         const auto retried = attempt_revocation(*it);
         const bool not_durable = it->not_durable;
         if (!it->progress.complete()) request_reconcile();
@@ -234,7 +236,9 @@ core::Result<void> ControlService::revoke_phone(const Registered& active, core::
     const auto forgotten = phones_.forget(phone);
     const bool landed = forgotten || forgotten.error().code() == ErrorCode::trust_store_not_durable;
     if (!landed) return forgotten.error();
-    if (store_retracted) *store_retracted = true;
+    if (store_retraction) {
+        *store_retraction = forgotten.has_value() ? StoreRetraction::durable : StoreRetraction::not_durable;
+    }
     const auto snapshot = phones_.take_revocation_v1();
     const auto peer = snapshot ? helper::revocation_peer(*snapshot) : std::nullopt;
     auto closed = phones_.take_invalidated_pairings();

@@ -304,8 +304,11 @@ private:
     // durable (optional out): false when the approval landed only as a committed-but-not-durable
     // store result (703).
     core::Result<void> persist_pairing(const Registered&, core::PairingRequestId, bool* durable = nullptr);
+    enum class StoreRetraction { failed, not_durable, durable };
+
     // Revokes an approved phone: store forget plus tracked external revocation (ForgetPhone's core).
-    core::Result<void> revoke_phone(const Registered&, core::PhoneId, bool* store_retracted = nullptr,
+    core::Result<void> revoke_phone(const Registered&, core::PhoneId,
+                                    StoreRetraction* store_retraction = nullptr,
                                     core::PairingRequestId retracting_request = {});
     void record_pairing_pending(core::PairingRequestId request, core::ConsumerId consumer);
     void finalize_pairing_outcome(core::PairingRequestId request, std::string_view outcome);

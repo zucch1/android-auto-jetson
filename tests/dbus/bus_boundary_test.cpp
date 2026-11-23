@@ -666,9 +666,8 @@ TEST(BusBoundary, ListPhonesAndPairingOutcomeRoundTripOverRealSessionBus) {
         {static_cast<std::uint32_t>(::getuid())}, {ids, phones});
     ASSERT_TRUE(service.has_value());
 
-    std::atomic<bool> running{true};
-    std::jthread server_thread([&] {
-        while (running.load()) {
+    std::jthread server_thread([&](std::stop_token stop) {
+        while (!stop.stop_requested()) {
             const auto step = service.value().cycle(aa::core::Milliseconds{10});
             if (!step.has_value()) {
                 break;
@@ -724,7 +723,7 @@ TEST(BusBoundary, ListPhonesAndPairingOutcomeRoundTripOverRealSessionBus) {
     EXPECT_TRUE(saw_completed);
 
     ASSERT_TRUE(client.value().unregister_consumer().has_value());
-    running.store(false);
+    server_thread.request_stop();
     server_thread.join();
     service.value().close();
 }
