@@ -32,15 +32,29 @@ foreach(test IN LISTS host_tests)
     # retirement suite drives the same ComposedSurface (NM double, mock BlueZ, ~1 s bounds).
     # aa_wireless_composed only excludes other holders of that lock; these need
     # an idle host, so they also run alone.
-    # BusClient::confirmed()'s 1000 ms budget also bounds the NM AP private-bus suite and the
-    # composed admission e2e (both timed out under parallel load); the security suite asserts the
-    # 500 ms / 1 s helper deadlines under slow, failing BlueZ removals (#118). The two-bus
-    # acceptance suite drives the same confirmed() budget through real dbus-daemons, where the
-    # helper re-hashes the receiver executable on every authenticated call (a Debug fixture under
-    # parallel load exhausted it), and it measures receiver-loss cleanup under a 4 s flood.
-    if(test MATCHES "^(system_helper_retirement_budget_|wireless_e2e_retirement_|system_helper_bluez_lifecycle_)" OR
+    # BusClient::confirmed()'s 1000 ms budget also bounds the NM AP private-bus, lifecycle,
+    # composed, and helper matrix suites; the security suite asserts the 500 ms / 1 s helper
+    # deadlines under slow, failing BlueZ removals (#118); the two-bus acceptance suite drives
+    # confirmed() through real dbus-daemons and measures receiver-loss cleanup under a 4 s flood;
+    # and wireless_recovery_* (excluding the pure-Python QA gate tests) assert 500-1000 ms
+    # wall-clock bounds and R08's [9000,9500)/[10000,11000) windows (#177). Even with #176's
+    # split DWARF reducing per-call helper hashing, these suites keep real wall-clock budgets
+    # and already serialize against each other via aa_wireless_composed, so RUN_SERIAL protects
+    # them from unrelated parallel CPU load at minimal runtime cost.
+    if(test MATCHES "^(system_helper_retirement_budget_|wireless_e2e_retirement_|system_helper_bluez_lifecycle_|system_helper_lifecycle_)" OR
+       test MATCHES "^wireless_e2e_composed_" OR
+       (test MATCHES "^wireless_recovery_" AND NOT test MATCHES "_qa_gates$") OR
        test MATCHES "^(system_helper_bluez_runtime|wireless_e2e_helper_bluez|system_helper_composed_runtime|wireless_e2e_helper_composition|system_helper_enrolment_retirement)$" OR
-       test MATCHES "^(system_helper_nm_ap_private_bus|wireless_e2e_composed_admission|system_helper_security|system_helper_private_bus)$")
+       test MATCHES "^wireless_e2e_helper_(snapshot|CompletedLifecycle|CompletedLoss|CompletedApLoss|FailedReplacement|authority|bootstrap)$" OR
+       test MATCHES "^(system_helper_nm_ap_private_bus|system_helper_security|system_helper_private_bus)$")
+        set_tests_properties("${test}" PROPERTIES RUN_SERIAL TRUE)
+    endif()
+    # host-asan intentionally keeps DWARF inline (not split) so ASan stack traces stay
+    # symbolized even without llvm-symbolizer (#177). Serialize the remaining helper-hashing
+    # suites under ASan so parallel load cannot push unsplit ASan executable SHA-256 hashing
+    # past the 500 ms helper identity deadline.
+    if(AA_ENABLE_ASAN AND
+       test MATCHES "^(system_helper_delivery_policy|system_helper_bond_restart|wireless_receiver_helper_startup)$")
         set_tests_properties("${test}" PROPERTIES RUN_SERIAL TRUE)
     endif()
     # Target-safety guards watch every ancestor of their /tmp/opencode fixtures
