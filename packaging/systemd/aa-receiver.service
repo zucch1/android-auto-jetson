@@ -16,6 +16,7 @@ NoNewPrivileges=yes
 LimitCORE=0
 Restart=on-failure
 RestartSec=2
+RestartPreventExitStatus=2
 
 [Install]
 WantedBy=graphical-session.target

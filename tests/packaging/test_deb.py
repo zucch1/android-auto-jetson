@@ -94,6 +94,7 @@ def inspect(package, owner, arch):
         receiver_unit.read_string(archive.extractfile(actual[USER_UNIT]).read().decode())
         assert receiver_unit["Service"]["Restart"] == "on-failure"
         assert receiver_unit["Service"].getint("RestartSec") == 2
+        assert receiver_unit["Service"].getint("RestartPreventExitStatus") == 2
         assert receiver_unit["Unit"].getint("StartLimitIntervalSec") == 60
         assert receiver_unit["Unit"].getint("StartLimitBurst") == 5
 

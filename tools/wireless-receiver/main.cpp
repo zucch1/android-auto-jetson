@@ -64,7 +64,8 @@ int receiver_main(int argc, char **argv) {
         if (status)
             break;
         const auto error = status.error().code();
-        if (error == ErrorCode::helper_unavailable && Runtime::Clock::now() + delay < retry_until) {
+        if (error == ErrorCode::helper_unavailable && helper.value()->connected() &&
+            Runtime::Clock::now() + delay < retry_until) {
             std::this_thread::sleep_for(delay);
             continue;
         }

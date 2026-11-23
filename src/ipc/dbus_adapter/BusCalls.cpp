@@ -30,6 +30,7 @@ core::Result<std::uint32_t> BusConnection::send_message(MessageType type,
     const core::SecretScope wipe_bytes{bytes, sensitive};
     const auto sent = bus_io::write_full(fd_, bytes, deadline_.value_or(bus_io::deadline()));
     if (!sent.has_value()) {
+        if (sent.error().code() == ErrorCode::transport_closed) close_connection();
         return sent.error();
     }
     return serial;

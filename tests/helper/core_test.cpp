@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include <aa/helper/SystemHelper.hpp>
 #include <gtest/gtest.h>
+#include <vector>
 
 namespace aa::helper {
 namespace {
@@ -8,14 +9,18 @@ class Identities final : public IdentityLookup {
 public:
     ReceiverIdentity identity{":1.2", 1000, 123, 456, std::string(64, 'a')};
     bool dead{false};
-    bool first_disconnected{};
+    bool first_disconnected{}, reject_replacement{}, owner_check_failed{};
+    std::vector<std::string> owner_checks;
     core::Result<ReceiverIdentity> resolve(const std::string& name) override {
-        if (dead || (first_disconnected && name == ":1.2")) return Error{ErrorCode::helper_rejected};
+        if (dead || (first_disconnected && name == ":1.2") ||
+            (reject_replacement && name == ":1.3")) return Error{ErrorCode::helper_rejected};
         auto result = identity;
         result.unique_name = name;
         return result;
     }
     core::Result<bool> name_has_owner(const std::string& name) override {
+        owner_checks.push_back(name);
+        if (owner_check_failed) return Error{ErrorCode::transport_io};
         return !dead && !(first_disconnected && name == ":1.2");
     }
 };
@@ -102,6 +107,7 @@ TEST_F(HelperCore, ReplacementCanProbeImmediatelyAfterDisconnectBeforeTick) {
     ids.first_disconnected = true;
     const auto status = helper.execute(":1.3", {Action::ap_status, 0, 0}, now);
     ASSERT_TRUE(status) << (status ? "" : status.error().message());
+    EXPECT_EQ(ids.owner_checks, (std::vector<std::string>{":1.2"}));
     EXPECT_EQ(effects.cleanups, 1);
     EXPECT_EQ(helper.pending(), 0U);
     EXPECT_FALSE(helper.execute(":1.2", {Action::ap_status, 0, 0}, now));
@@ -112,10 +118,54 @@ TEST_F(HelperCore, VerifiedStartupProbeCanRetryWhileThePreviousNameStillExists) 
     const auto status = helper.execute(":1.3", {Action::ap_status, 0, 0}, now);
     ASSERT_FALSE(status);
     EXPECT_EQ(status.error().code(), ErrorCode::helper_unavailable);
+    EXPECT_EQ(ids.owner_checks, (std::vector<std::string>{":1.2"}));
     EXPECT_EQ(effects.cleanups, 0);
     EXPECT_EQ(effects.calls, 0);
     EXPECT_EQ(helper.pending(), 1U);
     EXPECT_TRUE(helper.execute(":1.2", {Action::acquire_ap, 36, owner.value()}, now));
+}
+TEST_F(HelperCore, FailedOwnerCheckPreservesBindingAndGrant) {
+    const auto owner = issue(); ASSERT_TRUE(owner);
+    ids.owner_check_failed = true;
+    const auto status = helper.execute(":1.3", {Action::ap_status, 0, 0}, now);
+    ASSERT_FALSE(status);
+    EXPECT_EQ(status.error().code(), ErrorCode::helper_unavailable);
+    EXPECT_EQ(ids.owner_checks, (std::vector<std::string>{":1.2"}));
+    EXPECT_EQ(effects.cleanups, 0);
+    EXPECT_EQ(effects.calls, 0);
+    EXPECT_TRUE(helper.execute(":1.2", {Action::acquire_ap, 36, owner.value()}, now));
+}
+TEST_F(HelperCore, UnverifiedProbeCannotCheckOrEvictBoundReceiver) {
+    ASSERT_TRUE(issue());
+    ids.reject_replacement = true;
+    for (const bool disconnected : {false, true}) {
+        ids.first_disconnected = disconnected;
+        const auto status = helper.execute(":1.3", {Action::ap_status, 0, 0}, now);
+        ASSERT_FALSE(status);
+        EXPECT_EQ(status.error().code(), ErrorCode::helper_rejected);
+    }
+    EXPECT_TRUE(ids.owner_checks.empty());
+    EXPECT_EQ(effects.cleanups, 0);
+    EXPECT_EQ(effects.calls, 0);
+    EXPECT_EQ(helper.pending(), 1U);
+}
+TEST_F(HelperCore, VerifiedReplacementMustUseExactStartupProbeWhileBound) {
+    ASSERT_TRUE(issue());
+    ids.first_disconnected = true;
+    const auto grant = helper.issue(":1.3", {2, 2}, Action::acquire_ap, 36, now);
+    ASSERT_FALSE(grant);
+    EXPECT_EQ(grant.error().code(), ErrorCode::helper_rejected);
+    for (const Invocation command : {Invocation{Action::release_ap, 0, 0},
+                                     Invocation{Action::ap_status, 1, 0},
+                                     Invocation{Action::ap_status, 0, 1}}) {
+        const auto result = helper.execute(":1.3", command, now);
+        ASSERT_FALSE(result);
+        EXPECT_EQ(result.error().code(), ErrorCode::helper_rejected);
+    }
+    EXPECT_TRUE(ids.owner_checks.empty());
+    EXPECT_EQ(effects.cleanups, 0);
+    EXPECT_EQ(effects.calls, 0);
+    EXPECT_EQ(helper.pending(), 1U);
 }
 TEST_F(HelperCore, BackendFailureConsumesGrantAndBusLossCleansInternally) {
     auto grant = issue(); ASSERT_TRUE(grant);

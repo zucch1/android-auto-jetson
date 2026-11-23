@@ -20,7 +20,8 @@ class RecordingBackend final : public Backend {
 public:
     explicit RecordingBackend(const char* path) : path_(path) {}
     core::Result<State> apply(Action action, std::uint32_t) override {
-        if (action == Action::release_ap && std::getenv("AA_HELPER_HOLD_RELEASE")) {
+        if ((action == Action::release_ap && std::getenv("AA_HELPER_HOLD_RELEASE")) ||
+            (action == Action::ap_status && std::getenv("AA_HELPER_HOLD_STATUS"))) {
             std::cout << "entered\n" << std::flush;
             ::pollfd input{STDIN_FILENO, POLLIN, 0};
             std::string release;

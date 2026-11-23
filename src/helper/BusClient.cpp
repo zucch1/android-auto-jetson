@@ -173,6 +173,10 @@ RevocationAttempt BusClient::forgotten_v1(const RevocationV1& snapshot, const Re
     }
     return report;
 }
+bool BusClient::connected() const {
+    const std::lock_guard lock{impl_->mutex};
+    return impl_->bus.native_handle() >= 0;
+}
 core::Result<State> BusClient::status(Action action) {
     const auto until = Clock::now() + std::chrono::milliseconds(1000);
     if (action != Action::ap_status && action != Action::usb_status && action != Action::modem_status)

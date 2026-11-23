@@ -113,7 +113,7 @@ core::Result<ParsedMessage> BusConnection::read_message(bool sensitive) {
     if (!got_head.has_value()) {
         // An idle timeout has not consumed anything and the next frame remains
         // intact. A partial fixed header, however, has no recoverable boundary.
-        if (head_bytes != 0) {
+        if (head_bytes != 0 || got_head.error().code() == ErrorCode::transport_closed) {
             close_connection();
         }
         return got_head.error();

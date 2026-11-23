@@ -54,7 +54,7 @@ inline int remaining(Deadline until) {
             if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
                 continue;
             }
-            return Error{ErrorCode::transport_io};
+            return Error{errno == ECONNRESET ? ErrorCode::transport_closed : ErrorCode::transport_io};
         }
         if (count == 0) {
             return Error{ErrorCode::transport_closed};
@@ -86,7 +86,8 @@ inline int remaining(Deadline until) {
             if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
                 continue;
             }
-            return Error{ErrorCode::transport_io};
+            return Error{errno == EPIPE || errno == ECONNRESET ? ErrorCode::transport_closed
+                                                               : ErrorCode::transport_io};
         }
         sent += static_cast<std::size_t>(count);
     }
