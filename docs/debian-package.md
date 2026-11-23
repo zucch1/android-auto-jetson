@@ -83,5 +83,6 @@ is complete. The historical standalone USB-policy installer may have left a
 rule under `/etc/udev/rules.d` with the same name. Check that override during
 deployment because udev gives it precedence over the packaged rule.
 
-Jetson install, upgrade, and rollback are tracked in [#190](https://github.com/zucch1/android-auto-jetson/issues/190).
+Jetson install, upgrade, and rollback are documented in [deploy.md](deploy.md)
+(tracked in [#190](https://github.com/zucch1/android-auto-jetson/issues/190)).
 Installed-system qualification is tracked in [#191](https://github.com/zucch1/android-auto-jetson/issues/191).
