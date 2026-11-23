@@ -182,11 +182,20 @@ private:
         return index == 0 ? Reservation{38400, 38400} : Reservation{6400, 38400};
     }
     static std::optional<std::size_t> audio_index(protocol::ChannelRole role);
+    // Lossless playout (#228) queues up to 8 times the stop-and-wait capacity
+    // (1.6 s of PCM per role) at the same advertised window. The credit is
+    // then granted on receipt while the buffer is deep or the sink blocks for
+    // up to about a second, so the phone never has to hold audio back (its
+    // capture buffer is 341 ms). The stall bypass, which drops audio, needs a
+    // full queue and a single write blocked for kStallBypassAfterNs
+    // (maybe_bypass_locked): a deep buffer alone never looks like a stall.
+    static constexpr std::size_t kLosslessCapacityScale = 8;
+    static_assert(kLosslessCapacityScale <= AudioCreditPolicy::kMaxWindow);
     // Capacity of one role under the credit window (AudioCreditPolicy).
-    [[nodiscard]] std::size_t role_slot_cap() const noexcept { return kRoleSlots * credit_window_; }
+    [[nodiscard]] std::size_t role_slot_cap() const noexcept { return kRoleSlots * capacity_scale_; }
     [[nodiscard]] Reservation role_capacity(std::size_t index) const noexcept {
         const auto base = capacity(index);
-        return {base.bytes * credit_window_, base.units * credit_window_};
+        return {base.bytes * capacity_scale_, base.units * capacity_scale_};
     }
     // The phone holds the whole window again after a channel reset: all N
     // permits are reserved (stop-and-wait keeps its single implicit permit).
@@ -275,7 +284,10 @@ private:
     // Catch-up (#155) totals over the worker's life, across reopens and sessions.
     std::uint64_t catch_up_events_lifetime_{};
     std::uint64_t catch_up_frames_lifetime_{};
+    std::uint64_t overflow_frames_lifetime_{};
     const std::uint32_t credit_window_;
+    const bool lossless_;
+    const std::size_t capacity_scale_;
     std::array<std::uint64_t, 4> unacked_{};
     std::uint64_t max_unacked_held_{};
     std::uint64_t playout_underruns_logged_{};
@@ -295,6 +307,7 @@ private:
     const std::int64_t playout_depth_ns_;
     void clear_playout_writes();
     std::optional<core::Nanoseconds> step_started_;
+    core::Nanoseconds step_entered_{}; // step_started_ on the real monotonic clock
     std::optional<core::Nanoseconds> bypass_since_;
     std::uint64_t bypass_epoch_{1};
     std::uint64_t bypass_dropped_{};

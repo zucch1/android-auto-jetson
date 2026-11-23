@@ -32,6 +32,11 @@ struct AudioRenderWorker::SettlementDiagnostics {
         std::uint64_t events_lifetime;
         std::uint64_t frames_lifetime;
     };
+    struct Overflow {
+        std::uint64_t frames;
+        std::uint64_t frames_lifetime;
+        core::Nanoseconds depth;
+    };
     struct Playout {
         PlayoutEvent event;
         // Underruns or anchors (start + resume) over the worker's life,
@@ -56,6 +61,7 @@ struct AudioRenderWorker::SettlementDiagnostics {
     std::optional<IdleSkip> skipped;
     std::optional<IdleResume> resumed;
     std::optional<CatchUp> caught_up;
+    std::optional<Overflow> overflowed;
     std::vector<Playout> playout;
 
     explicit SettlementDiagnostics(const AudioTelemetryCallbacks& callbacks) noexcept
@@ -92,6 +98,14 @@ struct AudioRenderWorker::SettlementDiagnostics {
             telemetry.log_media("audio_catch_up",
                 audio_catch_up_json(caught_up->frames, caught_up->total, caught_up->rate,
                                     caught_up->events_lifetime, caught_up->frames_lifetime));
+        }
+        if (overflowed) {
+            // Lossless playout hit its emergency bound: real audio was cut.
+            telemetry.log_media("audio_playout_overflow",
+                "{\"event\":\"audio_playout_overflow\",\"frames\":" +
+                std::to_string(overflowed->frames) + ",\"frames_lifetime\":" +
+                std::to_string(overflowed->frames_lifetime) + ",\"depth_ms\":" +
+                format_ms(overflowed->depth) + "}");
         }
         for (const auto& entry : playout) {
             const auto& event = entry.event;
@@ -156,6 +170,9 @@ AudioRenderWorker::AudioRenderWorker(RouterConfig config,
       idle_clock_(std::move(idle_clock)),
       ack_release_timeout_(std::max(std::chrono::milliseconds{1}, ack_release_timeout)),
       credit_window_(std::clamp<std::uint32_t>(credit.window, 1, AudioCreditPolicy::kMaxWindow)),
+      lossless_(config.playout.enabled && config.playout.lossless),
+      capacity_scale_(lossless_ ? std::max<std::size_t>(credit_window_, kLosslessCapacityScale)
+                                : credit_window_),
       playout_depth_ns_(config.playout.enabled ? config.playout.depth.count : 0) {
     for (std::size_t index = 0; index < credits_.size(); ++index) { seed_credits_locked(index); }
     // Started last: every member above is initialized before run() reads it.
@@ -783,6 +800,7 @@ void AudioRenderWorker::latch(Error error, AudioFailureOrigin origin,
 
 void AudioRenderWorker::maybe_bypass_locked(core::Nanoseconds now) {
     if (bypass_since_ || !in_flight_ || stopping_ || failure_) { return; }
+    if (lossless_ && now.count - step_entered_.count < kStallBypassAfterNs) { return; }
     for (const auto& pending : deferred_) {
         if (!pending.empty() && now.count - pending.front().since.count >= kStallBypassAfterNs) {
             enter_bypass_locked("credit_wait");
@@ -958,6 +976,7 @@ void AudioRenderWorker::run(RouterConfig config, const OpenRouter& open) {
         MediaTimingContext context;
         context.sink_reopens = sink_reopens;
         if (config.playout.enabled) { context.playout_target = config.playout.depth; }
+        context.lossless = lossless_;
         context.credit_window = credit_window_;
         context.max_unacked_held = max_unacked;
         return context;
@@ -969,11 +988,23 @@ void AudioRenderWorker::run(RouterConfig config, const OpenRouter& open) {
                              media_timing_json(stats, timing_context(max_unacked_held())));
     };
     std::uint64_t chunks = 0;
+    // Lossless playout: the router asked to be called again at this time.
+    std::optional<core::Nanoseconds> held_until;
     for (;;) {
         std::unique_lock lock(mutex_);
         cv_.wait(lock, [&] {
             return stopping_ || !queued_.empty() || applied_session_epoch_ != session_epoch_;
         });
+        if (held_until) {
+            // A new chunk, a stop or a session change ends the hold early.
+            const auto now = config.clock ? config.clock() : monotonic_now();
+            cv_.wait_for(lock, std::chrono::nanoseconds{held_until->count - now.count}, [&] {
+                return stopping_ || applied_session_epoch_ != session_epoch_
+                    || std::any_of(queued_.begin(), queued_.end(),
+                                   [](const Job& job) { return !job.dequeued_at; });
+            });
+            held_until.reset();
+        }
         if (stopping_) { break; }
         if (applied_session_epoch_ != session_epoch_) {
             applied_session_epoch_ = session_epoch_;
@@ -1026,13 +1057,16 @@ void AudioRenderWorker::run(RouterConfig config, const OpenRouter& open) {
         step_completion_.reset();
         in_flight_ = true;
         step_started_ = idle_clock_();
+        step_entered_ = monotonic_now();
         const auto before = local_router.report().stats.frames_written;
         const auto idle_before = local_router.report().stats.frames_idle_skipped;
         const auto caught_up_before = local_router.report().stats.frames_caught_up;
+        const auto overflowed_before = local_router.report().stats.frames_overflowed;
         lock.unlock();
         const auto step_started = monotonic_now();
         const auto result = local_router.render_step();
         const auto returned_at = monotonic_now();
+        held_until = result ? result.value().wait_until : std::nullopt;
         SettlementDiagnostics diagnostics{telemetry_};
         lock.lock();
         const bool same_epoch = (step_epoch == session_epoch_);
@@ -1077,6 +1111,13 @@ void AudioRenderWorker::run(RouterConfig config, const OpenRouter& open) {
             diagnostics.caught_up = SettlementDiagnostics::CatchUp{
                 frames, stats.frames_caught_up, config.output_format.sample_rate_hz,
                 catch_up_events_lifetime_, catch_up_frames_lifetime_};
+        }
+        // Lossless playout's emergency bound (always counted, like the above).
+        if (stats.frames_overflowed > overflowed_before) {
+            overflow_frames_lifetime_ += stats.frames_overflowed - overflowed_before;
+            diagnostics.overflowed = SettlementDiagnostics::Overflow{
+                stats.frames_overflowed - overflowed_before, overflow_frames_lifetime_,
+                stats.playout_depth};
         }
         if (same_epoch) {
             if (idle_resume_id_) {

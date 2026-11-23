@@ -270,6 +270,25 @@ std::vector<std::string> split_lines(const std::string& text) {
     return lines;
 }
 
+// #228: lossless playout is wired's default only; wireless keeps the #182
+// playout clock, drift rules and credit accounting.
+TEST(WirelessAudioWorker, WirelessConfigKeepsTheBoundedDriftRules) {
+    const auto config = wr::audio_config(audio::SinkBackend::pulse);
+    EXPECT_TRUE(config.playout.enabled);
+    EXPECT_FALSE(config.playout.lossless);
+    EXPECT_EQ(config.playout.depth, audio::kWirelessPlayoutDepth);
+    EXPECT_TRUE(config.live_pcm_drift.enabled);
+    EXPECT_EQ(config.live_pcm_drift.catch_up_watermark, aa::core::Nanoseconds{0});
+    // Its media_timing record has no lossless field.
+    audio::MediaTimingContext context;
+    context.playout_target = config.playout.depth;
+    EXPECT_EQ(audio::media_timing_json({}, context).find("frames_compressed"), std::string::npos);
+    context.lossless = true;
+    EXPECT_NE(audio::media_timing_json({}, context).find("\"frames_compressed\":0,\"frames_stretched\":0,"
+                                                         "\"playout_overflows\":0,\"frames_overflowed\":0"),
+              std::string::npos);
+}
+
 TEST(WirelessAudioWorker, StalledSinkDoesNotBlockSessionThreadOrIngress) {
     auto gate = std::make_shared<SinkGate>();
     gate->block_write_index = 1;

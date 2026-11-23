@@ -12,6 +12,7 @@
 #include <aa/audio/AudioRouter.hpp>
 
 #include "AudioSinkFactory.hpp"
+#include "RateCorrection.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -55,6 +56,31 @@ constexpr std::int64_t kPlayoutReanchorGroupNs = 10'000'000;
 constexpr std::int64_t kPlayoutBackwardCapNs = 200'000'000;
 // Arrivals closer than this belong to one burst (max_arrival_burst).
 constexpr std::int64_t kArrivalBurstNs = 10'000'000;
+
+// Lossless playout (PlayoutPolicy::lossless).
+// Rate correction: nothing within the dead band above the target depth, then
+// proportional (a 20 ms excess reaches 0.5%), then up to 1% while the excess
+// is between 100 and 200 ms or more. Below half the depth the buffer refills
+// at up to 0.5%.
+constexpr double kRateDeadBandMs = 10.0;
+constexpr double kRatePpmPerMs = 250.0;
+constexpr double kRatePpm = 5'000.0;
+constexpr double kDeepExcessMs = 100.0;
+constexpr double kDeepRatePpmPerMs = 50.0;
+// The rate itself moves by at most this much per second (0.1% per A26 chunk).
+constexpr double kRateSlewPpmPerSecond = 25'000.0;
+// Carry of correction that short runs could not take, in frames.
+constexpr double kMaxRateCarryFrames = 64.0;
+// A frame another playing role may still contribute to is mixed no earlier
+// than this before its slot (half the depth when that is smaller). Wired
+// arrival scheduling wrote a median 15 ms ahead of the slot with the sink on
+// time (presented == scheduled at p99 in the 1800 s A26 runs of 2026-11-17), so
+// 20 ms is enough.
+constexpr std::int64_t kHoldLeadNs = 20'000'000;
+// How much is mixed at a time once such a role is late.
+constexpr std::int64_t kHoldQuantumNs = 10'000'000;
+// A role silent this long no longer holds the others.
+constexpr std::int64_t kHoldExpectNs = 1'000'000'000;
 
 [[nodiscard]] std::optional<Role> role_of(protocol::ChannelRole channel) {
     switch (channel) {
@@ -106,6 +132,13 @@ struct PlayoutPlan final {
     std::uint64_t start_frame{};
     // steady: the back-to-back slot the plan was made against.
     std::uint64_t slot_frame{};
+    // Lossless steady: frames the run was shortened (negative) or lengthened
+    // by to correct the playback rate; no sample is dropped or inserted.
+    std::int64_t warped_frames{};
+    // Lossless steady: trim_frames keeps the backlog under the emergency bound.
+    bool overflow{false};
+    // Lossless anchor: only the decoder held the role back; it still owes.
+    bool decoder_held{false};
 };
 
 // One decoded run pending on the mix timeline. submitted_at_ns is stamped at
@@ -136,6 +169,8 @@ struct Run final {
     std::optional<PlayoutPlan> playout{};
     // Playout offset this run was committed with (WriteCompletion).
     std::int64_t playout_offset_ns{};
+    // Decoded frames before any rate correction.
+    std::uint64_t decoded_frames{};
 };
 
 // One run placed on the sample timeline at an effective (non-overlapping)
@@ -398,6 +433,13 @@ struct AudioRouter::Impl final {
         std::optional<std::int64_t> recovering_since{};
         // Latest committed arrival (backward-jump check).
         std::optional<std::int64_t> last_arrival{};
+        // Lossless: current rate correction (ppm; positive drains) and its
+        // fraction of a frame not yet applied.
+        double rate_ppm{};
+        double rate_carry{};
+        // Lossless: output of already committed parents the decoder still
+        // holds (a resampler split), in output frames.
+        std::uint64_t decoder_owed{};
     };
     // Re-anchors, resumes and underruns since the last take_playout_events().
     std::vector<PlayoutEvent> playout_events{};
@@ -410,6 +452,61 @@ struct AudioRouter::Impl final {
     LivePcmDriftCorrector playout_drift{};
 
     [[nodiscard]] bool playout_enabled() const noexcept { return config.playout.enabled; }
+    [[nodiscard]] bool lossless() const noexcept {
+        return config.playout.enabled && config.playout.lossless;
+    }
+    // pump()/flush(): everything pending is written, nothing is held.
+    bool draining{};
+    // Newest arrival submitted on any role.
+    std::int64_t newest_arrival{INT64_MIN};
+
+    [[nodiscard]] std::int64_t now_ns() const {
+        return config.clock ? config.clock().count : steady_now_ns();
+    }
+
+    // Frames of committed parents the decoder still owes once `run` is
+    // committed. A re-anchored role (or a decoder that has caught up) owes
+    // nothing older.
+    [[nodiscard]] static std::uint64_t owed_after(std::uint64_t owed, const Run& run) noexcept {
+        const auto due = owed > UINT64_MAX - run.content_frames ? UINT64_MAX : owed + run.content_frames;
+        return due > run.decoded_frames ? due - run.decoded_frames : 0;
+    }
+
+    // Wanted playback-rate correction (ppm; positive drains, negative
+    // refills) for a role whose window floor is `floor_ns` deep.
+    [[nodiscard]] double wanted_rate_ppm(std::int64_t floor_ns) const noexcept {
+        const double depth_ms = static_cast<double>(config.playout.depth.count) / 1e6;
+        const double floor_ms = static_cast<double>(floor_ns) / 1e6;
+        const double excess_ms = floor_ms - depth_ms;
+        if (excess_ms > kRateDeadBandMs) {
+            return std::min(kRatePpm, (excess_ms - kRateDeadBandMs) * kRatePpmPerMs)
+                + std::clamp((excess_ms - kDeepExcessMs) * kDeepRatePpmPerMs, 0.0, kRatePpm);
+        }
+        // Spent down to half the depth a jitter spike costs nothing.
+        const double deficit_ms = depth_ms / 2.0 - floor_ms;
+        return deficit_ms > 0.0 ? -std::min(kRatePpm, deficit_ms * kRatePpmPerMs) : 0.0;
+    }
+
+    // Lossless steady run, about to head its role: warps the decoded PCM by
+    // the role's rate correction. Never drops or inserts a sample.
+    void apply_rate(std::size_t role, Run& run, PlayoutPlan& plan) {
+        auto& state = playout[role];
+        const auto floor = window_floor(role, run.timestamp.count, plan.depth_ns);
+        const double wanted = floor.sustained ? wanted_rate_ppm(floor.low) : 0.0;
+        const double slew = kRateSlewPpmPerSecond * static_cast<double>(run.frames)
+            / static_cast<double>(config.output_format.sample_rate_hz);
+        state.rate_ppm += std::clamp(wanted - state.rate_ppm, -slew, slew);
+        state.rate_carry = std::clamp(
+            state.rate_carry + static_cast<double>(run.frames) * state.rate_ppm / 1e6,
+            -kMaxRateCarryFrames, kMaxRateCarryFrames);
+        const auto limit = detail::max_warp_frames(run.frames);
+        const auto removed = std::clamp(static_cast<std::int64_t>(state.rate_carry), -limit, limit);
+        if (removed == 0) { return; }
+        run.pcm = detail::warp_frames(run.pcm, config.output_format.channels, -removed);
+        run.frames = static_cast<std::uint64_t>(static_cast<std::int64_t>(run.frames) - removed);
+        plan.warped_frames = -removed;
+        state.rate_carry -= static_cast<double>(removed);
+    }
 
     // End (output clock) and end offset of the last reported write
     // (WriteCompletion): the reported offset is slewed from it.
@@ -474,8 +571,11 @@ struct AudioRouter::Impl final {
     // Playout decision for an unplaced run whose back-to-back slot is
     // `slot_frame`. False when a time cannot be represented (schedule
     // rejection, like every other conversion failure).
+    // `own_frame` is the role's own content end (its committed end plus what the
+    // decoder still owes); the slot is never before the shared cursor.
     [[nodiscard]] bool plan_playout(std::size_t role, const Run& run, std::uint64_t slot_frame,
-                                    std::int64_t base_ns, bool anchored, PlayoutPlan& plan) const {
+                                    std::uint64_t own_frame, std::int64_t base_ns, bool anchored,
+                                    PlayoutPlan& plan) const {
         const std::int64_t arrival = run.timestamp.count;
         const std::int64_t depth = config.playout.depth.count;
         std::int64_t slot_ns = 0;
@@ -486,14 +586,32 @@ struct AudioRouter::Impl final {
             plan.backward = true;
             return true;
         }
-        if (!anchored || slot_ns < arrival) {
+        // Lossless: a role starves when its own stream ran out, also while
+        // another role kept the shared cursor ahead of the arrival. A stream
+        // that only the decoder held back (a resampler split) did not: it goes
+        // on at its own content slot (at most `depth` after the arrival, so the
+        // hole is never gap silence), not as an underrun.
+        auto due_ns = slot_ns;
+        if (lossless() && anchored) {
+            std::int64_t own_ns = 0;
+            if (!frame_time(own_frame, base_ns, own_ns)) { return false; }
+            if (slot_ns < arrival && own_ns >= arrival) {
+                if (arrival > INT64_MAX - depth) { return false; }
+                plan.target_ns = std::min(own_ns, arrival + depth);
+                plan.depth_ns = plan.target_ns - arrival;
+                plan.decoder_held = true;
+                return true;
+            }
+            if (slot_ns >= arrival) { due_ns = std::min(due_ns, own_ns); }
+        }
+        if (!anchored || due_ns < arrival) {
             // A stream that resumes more than kPlayoutResumeAfter after its
             // slot paused (no stop message) rather than starved: a fresh
             // anchor, not an underrun.
-            const bool underrun = anchored && arrival - slot_ns <= kPlayoutResumeAfterNs;
+            const bool underrun = anchored && arrival - due_ns <= kPlayoutResumeAfterNs;
             plan.mode = underrun ? PlayoutPlan::Mode::underrun : PlayoutPlan::Mode::anchor;
             plan.resume = anchored && !underrun;
-            plan.late_ns = std::max<std::int64_t>(0, arrival - slot_ns);
+            plan.late_ns = std::max<std::int64_t>(0, arrival - due_ns);
             if (arrival > INT64_MAX - depth) { return false; }
             plan.target_ns = arrival + depth;
             plan.depth_ns = std::max(plan.target_ns, slot_ns) - arrival;
@@ -501,6 +619,19 @@ struct AudioRouter::Impl final {
         }
         plan.mode = PlayoutPlan::Mode::steady;
         plan.depth_ns = slot_ns - arrival;
+        if (lossless()) {
+            // The depth is free to grow and is drained by apply_rate(); only
+            // a backlog beyond the emergency bound is cut.
+            plan.start_frame = slot_frame;
+            plan.slot_frame = slot_frame;
+            const auto bound = config.playout.emergency_backlog.count;
+            if (plan.depth_ns > bound) {
+                plan.trim_frames = std::min(
+                    run.frames, ns_to_frames(core::Nanoseconds{plan.depth_ns - bound}));
+                plan.overflow = plan.trim_frames != 0;
+            }
+            return true;
+        }
         // Drift acts on sustained error of the buffer the latest arrival had
         // (DeepSeek F1, N2, windows 10/11). A group's chunks share one arrival
         // and are staggered by slot, so single depths spread by the group;
@@ -562,11 +693,25 @@ struct AudioRouter::Impl final {
             // or a cursor another role moved on) shifts every later depth (N7).
             const auto shifted = entry.applied_pad_frames;
             const auto pad = std::min(shifted, plan.pad_frames);
-            const auto adjust = frames_to_ns(shifted).count - frames_to_ns(entry.head_trim_frames).count;
+            const auto warped = plan.warped_frames >= 0
+                ? frames_to_ns(static_cast<std::uint64_t>(plan.warped_frames)).count
+                : -frames_to_ns(static_cast<std::uint64_t>(-plan.warped_frames)).count;
+            const auto adjust = frames_to_ns(shifted).count
+                - frames_to_ns(entry.head_trim_frames).count + warped;
             for (auto& [at, value] : state.depths) { value += adjust; }
             state.depths.emplace_back(run.timestamp.count, plan.depth_ns + adjust);
             stats.frames_padded += pad;
             if (plan.shed) { stats.frames_shed += entry.head_trim_frames; }
+            if (plan.overflow) {
+                ++stats.playout_overflows;
+                stats.frames_overflowed += entry.head_trim_frames;
+            }
+            if (plan.warped_frames < 0) {
+                stats.frames_compressed += static_cast<std::uint64_t>(-plan.warped_frames);
+            } else {
+                stats.frames_stretched += static_cast<std::uint64_t>(plan.warped_frames);
+            }
+            state.decoder_owed = owed_after(state.decoder_owed, run);
             stats.playout_depth_min = stats.playout_depth_min
                 ? std::min(*stats.playout_depth_min, core::Nanoseconds{plan.depth_ns})
                 : core::Nanoseconds{plan.depth_ns};
@@ -575,6 +720,9 @@ struct AudioRouter::Impl final {
                 : core::Nanoseconds{plan.depth_ns};
         } else {
             state.depths.clear();
+            state.rate_ppm = 0.0;
+            state.rate_carry = 0.0;
+            state.decoder_owed = owed_after(plan.decoder_held ? state.decoder_owed : 0, run);
             const auto depth = start_ns - run.timestamp.count;
             state.depths.emplace_back(run.timestamp.count, depth);
             PlayoutEvent event{PlayoutEvent::Kind::start, core::Nanoseconds{plan.late_ns},
@@ -638,7 +786,29 @@ struct AudioRouter::Impl final {
         for (const auto& other : playout) {
             if (other.anchored) { offset = std::max(offset, other.offset_ns); }
         }
+        if (const auto media = media_offset(start_ns)) { offset = *media; }
         stats.playout_offset = core::Nanoseconds{offset};
+    }
+
+    // Lossless: the offset of the media stream, the one video is in sync with,
+    // while it plays at output time `at_ns`. A prompt placed behind it (a
+    // resampler split) must not pull the video hold away from the music.
+    [[nodiscard]] std::optional<std::int64_t> media_offset(std::int64_t at_ns) const noexcept {
+        const auto& media = playout[role_index(Role::media)];
+        if (!lossless() || !media.anchored || !media.last_arrival
+            || at_ns - *media.last_arrival - media.offset_ns > kHoldExpectNs) { return std::nullopt; }
+        return media.offset_ns;
+    }
+
+    // Lossless: true when another role that is playing has not delivered its
+    // next chunk yet, so a frame mixed now would leave it behind.
+    [[nodiscard]] bool awaiting_role(std::int64_t at_ns) const noexcept {
+        for (std::size_t role = 0; role < kRoleCount; ++role) {
+            const auto& state = playout[role];
+            if (state.anchored && pending[role].empty() && state.last_arrival
+                && at_ns - *state.last_arrival < kHoldExpectNs) { return true; }
+        }
+        return false;
     }
 
     struct ElapsedRange final {
@@ -840,7 +1010,8 @@ core::Result<AudioRouter> open_router_with(
         // R8: without the drift policy the playout clock would follow the
         // phone's clock without bound; playout requires it.
         if (config.playout.depth.count <= 0 || config.playout.depth > kMaxPlayoutDepth
-            || config.playout.window.count <= 0 || !config.live_pcm_drift.enabled) {
+            || config.playout.window.count <= 0 || !config.live_pcm_drift.enabled
+            || (config.playout.lossless && config.playout.emergency_backlog < kMinEmergencyBacklog)) {
             return core::Result<AudioRouter>{Error{ErrorCode::invalid_argument}};
         }
         // Playout keeps its trims bounded: never a catch-up.
@@ -1009,6 +1180,7 @@ core::Result<void> AudioRouter::submit(const protocol::MessageView& message,
         static_cast<std::uint64_t>(impl_->config.output_format.channels) * sizeof(std::int16_t);
     run.frames = frame_bytes == 0 ? 0 : run.pcm.size() / frame_bytes;
     run.content_frames = run.frames;
+    run.decoded_frames = run.frames;
     if (chunk.codec == Codec::pcm) {
         const auto& input = chunk.input_format;
         const std::uint64_t input_frame_bytes =
@@ -1032,6 +1204,7 @@ core::Result<void> AudioRouter::submit(const protocol::MessageView& message,
     }
 
     impl_->report.stats.frames_decoded += run.frames;
+    impl_->newest_arrival = std::max(impl_->newest_arrival, run.timestamp.count);
     {
         // Chunks arriving together on one channel: how many the phone had in
         // flight at once (its credit use; our acks go out on receipt).
@@ -1049,10 +1222,14 @@ core::Result<void> AudioRouter::submit(const protocol::MessageView& message,
 
 core::Result<void> AudioRouter::pump() {
     if (impl_ && impl_->incremental) {
+        impl_->draining = true;
         for (;;) {
             auto step = render_step();
-            if (!step) { return step.error(); }
-            if (!step.value().pending) { return {}; }
+            if (!step || !step.value().pending) {
+                impl_->draining = false;
+                if (!step) { return step.error(); }
+                return {};
+            }
         }
     }
     if (!impl_ || impl_->closed) {
@@ -1487,6 +1664,7 @@ void AudioRouter::reset_session_timeline() {
         ++impl_->generations[i];
     }
     impl_->timeline_base.reset();
+    impl_->newest_arrival = INT64_MIN;
     impl_->last_reported.reset();
     impl_->report.stats.playout_reported_offset = {};
     impl_->playback_cursor_frames = 0;
@@ -1576,6 +1754,7 @@ core::Result<RenderStep> AudioRouter::render_step() {
         auto role_end = impl_->role_end_frames[role];
         auto role_source_frontier = impl_->role_source_frontier_frames[role];
         bool anchored = impl_->playout[role].anchored;
+        auto decoder_owed = impl_->playout[role].decoder_owed;
         for (auto& run : impl_->pending[role]) {
             diagnostic.offending = run.header;
             diagnostic.preflighted = run.preflighted;
@@ -1598,14 +1777,21 @@ core::Result<RenderStep> AudioRouter::render_step() {
                 PlayoutPlan plan;
                 if (run.playout) {
                     plan = *run.playout;
-                } else if (!impl_->plan_playout(role, run, slot_frame, base->count, anchored, plan)) {
+                } else if (!impl_->plan_playout(role, run, slot_frame, role_end + decoder_owed,
+                                                base->count, anchored, plan)) {
                     diagnostic.time_conversion_frame = slot_frame;
                     fail(RenderFailureReason::placement_time_conversion);
                     valid = false;
                     break;
                 } else if (&run == &impl_->pending[role].front()) {
+                    if (impl_->lossless() && plan.mode == PlayoutPlan::Mode::steady
+                        && !plan.backward && !plan.overflow) {
+                        impl_->apply_rate(role, run, plan);
+                    }
                     run.playout = plan;
                 }
+                const bool continues = plan.mode == PlayoutPlan::Mode::steady || plan.decoder_held;
+                decoder_owed = Impl::owed_after(continues ? decoder_owed : 0, run);
                 if (plan.backward) {
                     diagnostic.start.reset();
                     fail(RenderFailureReason::late);
@@ -1702,7 +1888,7 @@ core::Result<RenderStep> AudioRouter::render_step() {
     std::stable_sort(planned.begin(), planned.end(), [](const auto& left, const auto& right) {
         return left.start_frame < right.start_frame;
     });
-    const auto now_ns = steady_now_ns();
+    const auto now_ns = impl_->now_ns();
     diagnostic.now_ns = now_ns;
     std::int64_t cursor_ns = 0;
     if (valid && impl_->frame_time(cursor, base->count, cursor_ns)) {
@@ -1815,6 +2001,28 @@ core::Result<RenderStep> AudioRouter::render_step() {
         any = true;
     }
     if (!any) { return result; }
+    // Stamps are receipt times on this clock, so the newest one has passed.
+    const auto known_ns = std::max(now_ns, impl_->newest_arrival);
+    if (impl_->lossless() && !impl_->draining && impl_->awaiting_role(known_ns)) {
+        // A frame written now is gone for the role that still owes its next
+        // chunk: rendering ahead without it used to push that role's whole
+        // stream behind its arrival (a prompt over media, #228). Wait for it
+        // until shortly before the frame is due.
+        std::int64_t due_ns = 0;
+        const auto lead = std::min(kHoldLeadNs, impl_->config.playout.depth.count / 2);
+        if (!impl_->frame_time(cursor, base->count, due_ns)) {
+            diagnostic.time_conversion_frame = cursor;
+            fail(RenderFailureReason::output_start_time_conversion);
+            return Error{ErrorCode::invalid_argument};
+        }
+        if (due_ns - lead > known_ns) {
+            result.wait_until = core::Nanoseconds{due_ns - lead};
+            return result;
+        }
+        const auto ahead = impl_->ns_to_frames(
+            core::Nanoseconds{known_ns - (due_ns - lead) + kHoldQuantumNs});
+        end = std::min(end, cursor + std::max<std::uint64_t>(1, std::min(ahead, quantum)));
+    }
     const bool silence_only = std::none_of(heads.begin(), heads.end(), [&](const auto& head) {
         return head && head->start_frame <= cursor;
     });
@@ -1908,6 +2116,7 @@ core::Result<RenderStep> AudioRouter::render_step() {
         playout_offset_ns = std::max(playout_offset_ns, run.playout_offset_ns);
         result.contributors.push_back(run.header);
     }
+    if (const auto media = impl_->media_offset(scheduled_ns)) { playout_offset_ns = *media; }
     // Materialize before detaching: cancel_pending can now free EVERY parent
     // remainder while this single, bounded mixed piece is inside sink->write.
     std::vector<std::byte> output;

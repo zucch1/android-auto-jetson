@@ -81,10 +81,9 @@ private:
 // #155: wireless catch-up is configurable and defaults to off (0). With
 // receiver-arrival timestamps, a normal wireless TCP coalesced burst (e.g.
 // 3 x 50 ms chunks within 5 ms) reaches >90 ms placement phase without a sink
-// stall and would be trimmed by the wired 90 ms phase watermark. Wired keeps
-// the 90 ms default in audio::pcm_router_config(); wireless stays off unless
-// explicitly configured (e.g. --audio-catch-up-watermark-ms), and only on the
-// legacy arrival model (--audio-playout-ms 0).
+// stall and would be trimmed by the former wired 90 ms phase watermark. Both receivers
+// keep it off unless explicitly configured (--audio-catch-up-watermark-ms), and
+// only on the legacy arrival model (--audio-playout-ms 0).
 //
 // Credit window + playout (owner decision 2026-11-20): wireless audio plays on
 // a steady playout clock `playout_depth` (default 120 ms) behind the arrival
@@ -95,7 +94,10 @@ private:
     audio::SinkBackend backend = audio::SinkBackend::pulse,
     core::Nanoseconds catch_up_watermark = core::Nanoseconds{0},
     core::Nanoseconds playout_depth = audio::kWirelessPlayoutDepth) {
-    return audio::pcm_router_config(backend, audio_telemetry(), playout_depth, catch_up_watermark);
+    auto config = audio::pcm_router_config(backend, audio_telemetry(), playout_depth, catch_up_watermark);
+    // Wireless keeps the #182 drift rules; lossless playout is wired's (#228).
+    config.playout.lossless = false;
+    return config;
 }
 
 // Video presentation delay (credit window + playout, 2026-11-20): with a fixed

@@ -32,6 +32,11 @@ if(TARGET PkgConfig::AA_AUDIO_GST)
     target_link_libraries(aa_audio_worker PRIVATE PkgConfig::AA_AUDIO_GST)
 endif()
 
+# The audio pipeline tests run the receivers' production pcm_router_config().
+if(TARGET aa_audio_pipeline_test)
+    target_link_libraries(aa_audio_pipeline_test PRIVATE aa_audio_worker)
+endif()
+
 if(TARGET aa_sysroot_hash_gate)
     add_dependencies(aa_audio_worker aa_sysroot_hash_gate)
 endif()

@@ -135,7 +135,12 @@ struct RenderStep final {
     // role was cancelled during it. Delivery accounting only, never a credit;
     // whole-parent drift trims are not deliveries.
     std::vector<protocol::MessageHeader> delivered{};
+    // More can be rendered now.
     bool pending{};
+    // Lossless playout: nothing was rendered because a playing role has not
+    // delivered its next chunk yet; call again at this time (RouterConfig::
+    // clock), or earlier once a chunk was submitted or a role cancelled.
+    std::optional<core::Nanoseconds> wait_until{};
 };
 
 // One backend write, not device delivery. Optional stamps mean unobserved,
@@ -180,9 +185,10 @@ struct SinkWriteProgress final {
 // trims bounded head frames from over-watermark runs, advancing the timeline
 // by the RETAINED frames only. Trimmed audio is dropped, never resynthesized;
 // timestamps are never rebased to "now". The shared pcm_router_config() enables
-// live-PCM drift correction for both wired and wireless receivers (#163);
-// catch_up_watermark defaults to 90 ms for wired and is configurable (default
-// off, 0) for wireless pending an owner decision on TCP coalescing.
+// the policy for both receivers (#163) with catch_up_watermark off (0); a
+// nonzero watermark applies to the arrival model only (--audio-playout-ms 0).
+// Wired's lossless playout (PlayoutPolicy::lossless) corrects the rate instead
+// and takes none of these trims.
 //
 // Catch-up (#154, opt-in): a sink stall withholds credit, and the phone then
 // delivers its backlog in a burst stamped at arrival. Sequentialized after
@@ -250,7 +256,8 @@ private:
     std::uint64_t rate_{};
 };
 
-// Wireless playout (owner decision 2026-11-20, "credit window + playout"). The
+// Playout clock (owner decision 2026-11-20, "credit window + playout"; wired
+// since #228, with the lossless rules at the end). The
 // arrival model places each chunk at its receipt stamp, so on Wi-Fi every
 // round-trip spike becomes a gap (silence) and the burst after it is trimmed or
 // judged late. With playout enabled, render_step() schedules each role's
@@ -293,11 +300,37 @@ private:
 //   monotonic clock) running backwards by more than 200 ms fail closed
 //   `late`, as on the arrival model.
 // - playout requires LivePcmDriftPolicy::enabled (open fails otherwise).
-// Wired keeps the arrival model (disabled).
+//
+// `lossless` (wired default, #228, owner decision 2026-11-23: wired audio must
+// not drop sound, latency is the accepted cost) replaces the drift rules above:
+// - no drift trim, no shed and no drift pad: every decoded sample is played.
+//   A burst simply deepens the buffer; the depth and the offset grow with it;
+// - rate correction: while the window's floor is more than 10 ms above `depth`
+//   the role plays slightly fast, below half of `depth` slightly slow
+//   (frames_compressed / frames_stretched: frames the resampled run became
+//   shorter or longer by). Proportional, at most 0.5% (under 9 cents), up to
+//   1% only while the excess is over 100 ms; the rate moves by at most 0.1%
+//   per A26 chunk. A 300 ms excess is back under 15 ms in about 45 s;
+// - silence is written only on an anchor, a resume or an underrun. A role
+//   underruns when its own stream (its end plus what a resampler split still
+//   owes) ran out before the arrival, even while another role plays; a stream
+//   the split alone held back goes on at its own content slot (an anchor);
+// - the roles share one output cursor, so a frame is not mixed before its slot
+//   is 20 ms away while a role that plays (heard from in the last second) has
+//   not delivered its next chunk: a 200 ms prompt no longer runs the cursor
+//   ahead of 42.67 ms media chunks (RenderStep::wait_until);
+// - the offset the writes report is media's while media plays;
+// - emergency bound: a chunk placed more than `emergency_backlog` after its
+//   arrival loses the part beyond it (playout_overflows, frames_overflowed,
+//   logged as audio_playout_overflow). It bounds memory and delay. Neither a
+//   phone bursting its 341 ms capture buffer nor a full render worker queue
+//   (1.6 s) reaches the 2 s default.
 struct PlayoutPolicy final {
     bool enabled{false};
     core::Nanoseconds depth{core::Nanoseconds{120'000'000}};
     core::Nanoseconds window{core::Nanoseconds{4'000'000'000LL}};
+    bool lossless{false};
+    core::Nanoseconds emergency_backlog{core::Nanoseconds{2'000'000'000LL}};
 
     [[nodiscard]] friend constexpr bool operator==(const PlayoutPolicy&,
                                                    const PlayoutPolicy&) noexcept = default;
@@ -309,14 +342,17 @@ struct PlayoutPolicy final {
 // 120 ms (a round trip spike to ~250 ms) and keeps the pulsesink ring (200 ms)
 // able to take a whole 42.67 ms chunk ahead of it without blocking the worker.
 inline constexpr core::Nanoseconds kWirelessPlayoutDepth{120'000'000};
-// Wired (#228): USB/AOA has far less jitter than Wi-Fi (a few ms vs 10-120 ms)
-// and keeps stop-and-wait (max_unacked 1). 60 ms (half the wireless buffer)
-// puts the drift pad floor (depth / 4) at 15 ms, leaving 45 ms of zero-pad,
-// zero-underrun margin - more than one full 42.67 ms A26 media chunk - while
-// keeping 60 + 42.67 = 102.67 ms well inside the 200 ms pulsesink ring and
-// keeping the shed threshold (min(depth + 230 ms, 350 ms) = 290 ms) above a
-// 200 ms guidance resampler split.
+// Wired (#228): measured on 47 wired A26 runs (5.8 h, 488,000 media chunks,
+// 2026-11-15..17). Lateness accumulated within 2 s while the receiver's own sink
+// kept up: p99 43 ms over 397 episodes, above 60 ms in 3 (60.6, 61.3 and
+// 69.5 ms, all on the 2026-11-15 builds; at most 43.3 ms after). 60 ms covers
+// that and leaves 60 + 42.67 = 102.67 ms inside the 200 ms pulsesink ring. The
+// larger gaps (up to 204.7 ms) followed the receiver's own sink stalls
+// withholding the credit; the lossless queue, not the depth, covers those.
+// Table in docs/qualification/wired-perf-runbook.md.
 inline constexpr core::Nanoseconds kWiredPlayoutDepth{60'000'000};
+// Smallest PlayoutPolicy::emergency_backlog the router accepts.
+inline constexpr core::Nanoseconds kMinEmergencyBacklog{1'000'000'000};
 // Wireless audio credit window (AudioCreditPolicy, max_unacked): 4 x 42.67 ms
 // A26 media chunks = 170 ms of credit, more than the 150 ms round-trip spike
 // the replay tests cover and twice window 9's 83 ms spike second.
@@ -349,17 +385,22 @@ struct RouterConfig final {
     // remote and prove the degraded typed path against the real element.
     std::string sink_remote{};
     std::function<void(const WriteCompletion&)> on_write_completed{};
-    // Live-PCM drift correction (opt-in; default lossless/unchanged). Enabled
-    // by the shared pcm_router_config() (wired enables 90 ms catch-up by
-    // default; wireless keeps catch-up configurable and off by default).
+    // Live-PCM drift correction. Off in a bare RouterConfig; the receivers'
+    // pcm_router_config() enables it with catch-up off (a catch-up watermark
+    // is an arrival-model opt-in, --audio-playout-ms 0). Lossless playout
+    // requires it enabled but never trims with it.
     LivePcmDriftPolicy live_pcm_drift{};
     std::function<void(const SinkWriteProgress&)> on_sink_write_progress{};
     // render_step() interval bound. Keep the qualified 50 ms batching value.
     // Production uses pulsesink; native pipewiresink is refused on PipeWire
     // 1.0.5 / Ubuntu noble due to missing rate control and long-run degradation (#80).
     core::Nanoseconds render_quantum{core::Nanoseconds{50'000'000}};
-    // Wireless playout clock (default off: the wired arrival model).
+    // Playout clock. Off (the arrival model) in a bare RouterConfig;
+    // pcm_router_config() turns it on for both receivers: wired 60 ms and
+    // lossless, wireless 120 ms with the drift rules.
     PlayoutPolicy playout{};
+    // Clock of the arrival stamps (empty: the steady clock). Tests inject it.
+    std::function<core::Nanoseconds()> clock{};
 };
 
 enum class RouterState : std::uint8_t { active, degraded };
@@ -438,6 +479,13 @@ struct RouterStats final {
     // Subset of frames_trimmed: a deep post-drought backlog shed at 30% of
     // each chunk to stay under the video hold cap.
     std::uint64_t frames_shed{};
+    // Lossless playout: frames a rate correction shortened or lengthened the
+    // decoded runs by (input + stretched = retained + trimmed + compressed +
+    // pending), and the emergency-bound losses (subset of frames_trimmed).
+    std::uint64_t frames_compressed{};
+    std::uint64_t frames_stretched{};
+    std::uint64_t playout_overflows{};
+    std::uint64_t frames_overflowed{};
     // Committed offset above the shedding threshold, even when the buffer
     // minimum prevents additional shedding.
     std::uint64_t playout_shed_residual_chunks{};
