@@ -74,6 +74,8 @@ def check_text_values(text: str) -> None:
 def check_json_values(value: JSON) -> None:
     if isinstance(value, dict):
         for key, item in value.items():
+            # Keys are decoded text too: scan them for raw material the same way.
+            check_text_values(key)
             if SENSITIVE_KEY.search(key):
                 require(SAFE_VALUE.fullmatch(json.dumps(item, ensure_ascii=False)) is not None,
                         'PRIVACY_SENSITIVE_VALUE')
