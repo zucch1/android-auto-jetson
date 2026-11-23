@@ -53,9 +53,8 @@ public:
 };
 
 // Display lifecycle as the dummy consumer shows it: no receiver -> unavailable
-// (a shown state in which nothing is started; also the terminal state after a
-// lost registration), registered -> idle, projecting -> projecting, and a
-// failed StopProjection whose inactivity could NOT be confirmed -> stop_failed.
+// (a shown state in which nothing is started), registered -> idle,
+// projecting -> projecting, and unconfirmed StopProjection -> stop_failed.
 // stop_failed is a shown, recoverable state: the projection may still be
 // active remotely, so a new start is prohibited (no second remote
 // StartProjection) while a stop retry is allowed; recovery re-runs the stop
@@ -154,6 +153,8 @@ public:
 
     [[nodiscard]] DisplayState state() const noexcept;
     [[nodiscard]] core::ConsumerId consumer() const noexcept;
+    // Matches the unique bus name used by the active registration.
+    [[nodiscard]] bool attached_to(const ipc::BusName& receiver) const noexcept;
     [[nodiscard]] std::uint64_t frames_presented() const noexcept;
     [[nodiscard]] bool helper_started() const noexcept;
     // Zero report when no decode session is active. The reference is valid
@@ -190,6 +191,10 @@ public:
     // Allowed in projecting and (media retained) stop_failed under the SAME
     // video/session preconditions; pump never creates a decoder or session.
     [[nodiscard]] core::Result<std::size_t> pump(core::Milliseconds wait);
+
+    // Discard the local session after the receiver loses the contract name.
+    // The caller can then destroy the client to release its consumer name.
+    void receiver_lost() noexcept;
 
     // Contract teardown (StopProjection + UnregisterConsumer, best effort)
     // plus helper/channel release; idempotent.

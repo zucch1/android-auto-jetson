@@ -55,6 +55,8 @@ public:
     // org.freedesktop.DBus.AddMatch: subscribes this connection to the given
     // match rule (standard daemon interface, required to receive signals).
     [[nodiscard]] core::Result<void> add_match(std::string_view rule);
+    // An empty value means the daemon explicitly reported NameHasNoOwner.
+    [[nodiscard]] core::Result<std::optional<BusName>> find_name_owner(const BusName& name);
     [[nodiscard]] core::Result<BusName> get_name_owner(const BusName& name);
     [[nodiscard]] core::Result<bool> name_has_owner(const BusName& name);
     [[nodiscard]] core::Result<std::uint32_t> get_connection_unix_uid(const BusName& name);

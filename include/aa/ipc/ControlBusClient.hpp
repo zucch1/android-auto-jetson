@@ -42,9 +42,11 @@ public:
         std::string outcome{};
     };
 
-    // Connects to the session bus (DBUS_SESSION_BUS_ADDRESS) and subscribes
-    // to the contract's signals.
-    [[nodiscard]] static core::Result<ControlBusClient> connect();
+    enum class Signals { subscribe, ignore };
+
+    // Connects to the session bus (DBUS_SESSION_BUS_ADDRESS). Clients that
+    // only make method calls can skip the contract signal subscription.
+    [[nodiscard]] static core::Result<ControlBusClient> connect(Signals signals = Signals::subscribe);
 
     ~ControlBusClient();
     ControlBusClient(const ControlBusClient&) = delete;
@@ -53,8 +55,13 @@ public:
     ControlBusClient& operator=(ControlBusClient&& other) noexcept;
 
     // The receiver's daemon-stamped unique name; nullopt when no receiver
-    // currently owns the contract name (the display shows "unavailable").
+    // currently owns the contract name. Daemon and transport failures return
+    // typed errors.
     [[nodiscard]] core::Result<std::optional<BusName>> receiver_owner();
+
+    // Nonblocking check for a closed socket or a peer hangup, even with
+    // unread replies. Unique names can be reused after a bus restart.
+    [[nodiscard]] bool disconnected() const noexcept;
 
     [[nodiscard]] core::Result<core::ConsumerId> register_consumer(const BusName& consumer_name);
     [[nodiscard]] core::Result<void> unregister_consumer();

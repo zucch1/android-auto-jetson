@@ -312,6 +312,8 @@ Infotainment's C++ AA adapter should link `libaareceiver-consumer` (`include/aa/
 
 Reference consumers shipped in-tree (`aa-dummy-display` and `aa-wired-enrol`) are test and bring-up tools only; infotainment's UI is the production consumer.
 
+`aa-dummy-display` polls the session bus for the receiver's unique owner. When that owner disappears or changes, the display shows `unavailable` and closes its video socket and decode session. When the receiver is available, the display registers and sets its viewport again, with at least one second between attempts. With `--test-only-autostart` it then requests projection again. Otherwise it waits for F5.
+
 ---
 
 ## 5. Autostart Ownership

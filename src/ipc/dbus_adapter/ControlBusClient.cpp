@@ -224,17 +224,19 @@ struct ControlBusClient::Impl final {
     }
 };
 
-core::Result<ControlBusClient> ControlBusClient::connect() {
+core::Result<ControlBusClient> ControlBusClient::connect(Signals signals) {
     auto connection = BusConnection::connect_session();
     if (!connection.has_value()) {
         return connection.error();
     }
     auto impl = std::make_unique<Impl>();
     impl->connection = std::move(connection.value());
-    const auto matched = impl->connection->add_match(
-        std::string_view{"type='signal',interface='org.custom.AndroidAutoReceiver1'"});
-    if (!matched.has_value()) {
-        return matched.error();
+    if (signals == Signals::subscribe) {
+        const auto matched = impl->connection->add_match(
+            std::string_view{"type='signal',interface='org.custom.AndroidAutoReceiver1'"});
+        if (!matched.has_value()) {
+            return matched.error();
+        }
     }
     return ControlBusClient(std::move(impl));
 }
@@ -250,13 +252,20 @@ core::Result<std::optional<BusName>> ControlBusClient::receiver_owner() {
     if (!impl_) {
         return Error{ErrorCode::transport_closed};
     }
-    auto owner = impl_->connection->get_name_owner(BusName{std::string{kContractBusName}});
-    if (!owner.has_value()) {
-        impl_->owner_cache.reset();
-        return std::optional<BusName>{};
+    auto owner = impl_->connection->find_name_owner(BusName{std::string{kContractBusName}});
+    if (owner) {
+        impl_->owner_cache = owner.value();
     }
-    impl_->owner_cache = owner.value();
-    return std::optional<BusName>{owner.value()};
+    return owner;
+}
+
+bool ControlBusClient::disconnected() const noexcept {
+    const int fd = impl_ ? impl_->connection->native_handle() : -1;
+    if (fd < 0) {
+        return true;
+    }
+    ::pollfd socket{fd, 0, 0};
+    return ::poll(&socket, 1, 0) > 0 && (socket.revents & (POLLHUP | POLLERR | POLLNVAL)) != 0;
 }
 
 core::Result<core::ConsumerId> ControlBusClient::register_consumer(const BusName& consumer_name) {

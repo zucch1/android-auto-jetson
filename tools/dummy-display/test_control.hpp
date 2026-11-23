@@ -26,6 +26,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <fcntl.h>
+#include <functional>
 #include <string>
 #include <string_view>
 #include <unistd.h>
@@ -56,13 +57,13 @@ struct Status final {
 
 class Channel final {
 public:
-    using StatusProbe = Status (*)();
+    using StatusProbe = std::function<Status()>;
 
     // Replies go through `writer` when given, so a stalled stdout never
     // blocks the GUI event loop that dispatches these commands.
     Channel(qt_adapter::ProjectionWidget& widget, StatusProbe probe,
             TelemetryWriter* writer = nullptr)
-        : widget_(widget), probe_(probe), writer_(writer) {
+        : widget_(widget), probe_(std::move(probe)), writer_(writer) {
         const int flags = ::fcntl(0, F_GETFL, 0);
         if (flags >= 0) {
             static_cast<void>(::fcntl(0, F_SETFL, flags | O_NONBLOCK));
@@ -141,7 +142,7 @@ private:
     }
 
     std::string status_json() const {
-        const Status s = probe_ == nullptr ? Status{} : probe_();
+        const Status s = probe_ ? probe_() : Status{};
         const auto state = to_string(s.state);
         std::string out = "{\"event\":\"status\",\"state\":\"";
         out.append(state);
@@ -289,7 +290,7 @@ private:
     }
 
     qt_adapter::ProjectionWidget& widget_;
-    StatusProbe probe_{nullptr};
+    StatusProbe probe_{};
     TelemetryWriter* writer_{nullptr};
     QTimer poll_{};
     std::string buffer_{};
