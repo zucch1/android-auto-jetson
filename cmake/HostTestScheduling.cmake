@@ -41,6 +41,12 @@ foreach(test IN LISTS host_tests)
     # split DWARF reducing per-call helper hashing, these suites keep real wall-clock budgets
     # and already serialize against each other via aa_wireless_composed, so RUN_SERIAL protects
     # them from unrelated parallel CPU load at minimal runtime cost.
+    # Both the system_helper_* and wireless_e2e_helper_* aliases of the same binaries/filters
+    # (snapshot/nm_ap_private_bus, lifecycle, authority/unit, bootstrap, plus the pre-existing
+    # retirement/bluez/composition pairs) are kept RUN_SERIAL: ctest --preset host-dev runs
+    # both registrations, so leaving either alias parallel would expose the same 250-1000 ms
+    # wall-clock budgets to parallel load. The duplicate registrations themselves are retained
+    # so `ctest -R wireless_e2e` and `ctest -R system_helper` each remain self-contained.
     if(test MATCHES "^(system_helper_retirement_budget_|wireless_e2e_retirement_|system_helper_bluez_lifecycle_|system_helper_lifecycle_)" OR
        test MATCHES "^wireless_e2e_composed_" OR
        (test MATCHES "^wireless_recovery_" AND NOT test MATCHES "_qa_gates$") OR

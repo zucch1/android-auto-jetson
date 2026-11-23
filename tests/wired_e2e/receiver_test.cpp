@@ -6256,6 +6256,7 @@ TEST(WiredReceiver, WorkerGuidanceStallBurstInProductionFormatCatchesUp) {
     const auto report = audio.final_report();
     ASSERT_TRUE(report);
     EXPECT_FALSE(report->render_failure);
+    EXPECT_EQ(report->stats.chunks_submitted, 17U);
     // Logged at the 48 kHz output rate, never the 16 kHz input rate.
     const std::regex catch_up{
         R"(\{"event":"audio_catch_up","frames":([0-9]+),"frames_total":([0-9]+),"rate":48000,"events_lifetime":([0-9]+),"frames_lifetime":([0-9]+)(?:,"emit_ns":[0-9]+)?\})"};

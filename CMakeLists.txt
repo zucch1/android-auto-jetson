@@ -263,18 +263,22 @@ if(NOT CMAKE_CROSSCOMPILING)
     set(_aa_expect_split 0)
     set(_aa_expect_inline_dwarf 0)
     if(CMAKE_BUILD_TYPE MATCHES "^(Debug|RelWithDebInfo)$")
-        if(AA_SPLIT_DEBUG_INFO AND NOT AA_ENABLE_ASAN AND CMAKE_OBJCOPY)
+        if(NOT AA_ENABLE_ASAN)
+            # Require the default host-dev/RelWithDebInfo split unconditionally
+            # so flipping AA_SPLIT_DEBUG_INFO's default or missing objcopy fails
+            # loudly instead of turning CI green.
             set(_aa_expect_split 1)
         else()
             set(_aa_expect_inline_dwarf 1)
         endif()
     endif()
-    add_test(NAME build_debug_info_split COMMAND "${Python3_EXECUTABLE}" -B
+    add_test(NAME build_debug_info_split COMMAND "${Python3_EXECUTABLE}" -B -E
         "${CMAKE_SOURCE_DIR}/tests/build/debug_info_split.py"
         --cmake-module "${CMAKE_SOURCE_DIR}/cmake/DebugInfoSplit.cmake"
         --binary "$<TARGET_FILE:aa_host_smoke>"
         --expect-split "${_aa_expect_split}"
         --expect-inline-dwarf "${_aa_expect_inline_dwarf}"
+        --objcopy "${CMAKE_OBJCOPY}"
         --cmake "${CMAKE_COMMAND}"
         --generator "${CMAKE_GENERATOR}")
     set_tests_properties(build_debug_info_split PROPERTIES TIMEOUT 120)
