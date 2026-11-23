@@ -51,12 +51,13 @@ def capture(seconds: int, provenance: dict[str, JSON]) -> dict[str, JSON]:
     }
 
 
-def capture_v3(seconds: int, provenance: dict[str, JSON]) -> dict[str, JSON]:
-    """The v2 evidence as a v3 moving-map capture: 30 fps signed pairs and full audio."""
+def capture_v3(seconds: int, provenance: dict[str, JSON], *,
+               pair_interval_ns: int = 33_333_333) -> dict[str, JSON]:
+    """The v2 evidence as a v3 moving-map capture with signed pairs and full audio."""
     raw = capture(seconds, provenance)
     raw['schema'] = 'aa-projection-perf-capture/3'
     end = 1_000_000_000 + seconds * 1_000_000_000
-    times = list(range(0, end + 1, 33_333_333))
+    times = list(range(0, end + 1, pair_interval_ns))
     raw['av_series'] = {'pair_t_ns': times, 'pair_skew_ns': [12_000_000] * len(times),
                         'audio_intervals_ns': [[0, end + 1_000_000_000]]}
     drags = list(range(500_000_000, end + 5_000_000_000, 1_500_000_000))

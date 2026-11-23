@@ -8,25 +8,11 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 from pathlib import Path
 
 from check_privacy import scan
-from common import Document, EvidenceError, load, package_file, require
-from results import performance, projection, provenance, recovery
-
-
-RETIRED_NAME_TAGS = ('.interrupted.', '.disqualified.')
-RETIRED_FIELDS = frozenset({'interrupted'})
-
-
-def artifact(root: Path, ref: Document) -> Path:
-    ref.keys({'path', 'sha256'})
-    path = package_file(root, ref.text('path'))
-    require(hashlib.sha256(path.read_bytes()).hexdigest() == ref.text('sha256'),
-            'ARTIFACT_SHA256_MISMATCH')
-    require(path.stat().st_size > 0, 'EMPTY_ARTIFACT')
-    return path
+from common import EvidenceError, artifact, load, package_file, require
+from results import check_performance_runs, load_performance, performance, projection, provenance, recovery
 
 
 def check(manifest: Path) -> None:
@@ -41,8 +27,7 @@ def check(manifest: Path) -> None:
         ('phone', {'model', 'android_version', 'android_auto_version'}),
         ('usb_topology', {'controller', 'port', 'hub', 'cable'}),
     ):
-        child = doc.child(section)
-        child.keys(fields)
+        child = doc.child(section, fields=fields)
         for field in fields:
             child.text(field)
     limitations = doc.array('limitations')
@@ -60,26 +45,11 @@ def check(manifest: Path) -> None:
         result.equal('port', doc.child('usb_topology').text('port'))
     projection(projection_result)
     recovery(recovery_result)
-    for name, seconds in (('perf_30m', 1800), ('soak_2h', 7200)):
-        # A stage the soak chain retired (interrupted or disqualified) never
-        # qualifies, whatever the manifest says: by name and by its own marker.
-        require(not any(tag in paths[name].name for tag in RETIRED_NAME_TAGS), 'RETIRED_RESULT')
-        result = load(paths[name])
-        require(not RETIRED_FIELDS & set(result.values), 'RETIRED_RESULT')
-        performance(result, seconds)
-        require(result.child('provenance').values == doc.child('provenance').values,
-                'PROVENANCE_MISMATCH')
-        if 'thermal_scope' in result.child('measurement_coverage').values:
-            model = result.child('measurement_coverage').child('thermal_scope').child('policy').text('model')
-            require(model == doc.child('target').text('model'), 'THERMAL_POLICY_TARGET_MISMATCH')
-    short = load(paths['perf_30m'])
-    long = load(paths['soak_2h'])
-    require(short.text('generated_at_utc') != long.text('generated_at_utc'),
-            'PERF_RUNS_MUST_BE_DISTINCT')
-    policies = [result.child('measurement_coverage').child('thermal_scope').child('policy').values
-                if 'thermal_scope' in result.child('measurement_coverage').values else None
-                for result in (short, long)]
-    require(policies[0] == policies[1], 'THERMAL_POLICY_RUN_MISMATCH')
+    short = load_performance(paths['perf_30m'])
+    long = load_performance(paths['soak_2h'])
+    performance(short, 1800)
+    performance(long, 7200)
+    check_performance_runs(short, long, doc)
 
 
 def main() -> int:
