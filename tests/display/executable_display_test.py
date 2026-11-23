@@ -11,6 +11,13 @@ Cases:
   absent  (F5): receiver-absent runs (with and without the autostart flag)
                 assert no helper process/request and no AP/network change
                 via PATH-shim recorder + route snapshot sentinels.
+  reattach (#214): a display launched before the receiver survives a restart,
+                reports unavailable, and retries rejected registrations at
+                most once per second before autostarting on the new receiver.
+  owner-swap: the bus hands the name directly to a queued replacement. The
+                interactive display reattaches and waits for F5.
+  owner-signal-burst: a broadcast burst leaves the live projection intact.
+  owner-bus-restart: the display reconnects after the session bus is replaced.
   stalled (gate r3 F1): an UNPACED 401-key burst against a same-UID input
                 endpoint that accepts but never reads must never starve the
                 GUI - a fresh status reply and F6 stop completion must both
@@ -143,14 +150,14 @@ def make_path_shim(directory):
     return record
 
 
-def start_receiver(args, runtime, mode=None):
+def start_receiver(args, runtime, mode=None, env=None):
     video = os.path.join(runtime, "android-auto-receiver", "video.sock")
     input_sock = os.path.join(runtime, "android-auto-receiver", "input.sock")
     argv = [args.receiver, "--video-socket", video, "--input-socket", input_sock,
             "--fixture", args.fixture]
     if mode is not None:
         argv += ["--mode", mode]
-    proc = Driver(argv)
+    proc = Driver(argv, env=env)
     try:
         proc.await_event("ready")
     except AssertionError:
@@ -274,6 +281,151 @@ def case_replay(args):
         assert status["awaiting_idr"] is False, status
         assert display.stop() == 0
         assert receiver.stop(False) == 0
+
+
+def case_reattach(args):
+    with tempfile.TemporaryDirectory(prefix="aa-restart-") as runtime, ExitStack() as children:
+        video = os.path.join(runtime, "android-auto-receiver", "video.sock")
+        input_sock = os.path.join(runtime, "android-auto-receiver", "input.sock")
+        display = start_display(args, video, input_sock, True, os.environ.copy(),
+                                decoder_backend="software")
+        children.callback(display.stop)
+        initial = display.await_status(lambda s: s["state"] == "unavailable", timeout=10)
+        assert initial["helper_started"] is False, initial
+
+        receiver, _, _ = start_receiver(args, runtime)
+        children.callback(receiver.stop, False)
+        first = display.await_status(lambda s: s["frames_presented"] == 90, timeout=30)
+        assert first["state"] == "projecting" and first["helper_started"], first
+
+        assert receiver.stop(False) == 0
+        lost = display.await_status(lambda s: s["state"] == "unavailable"
+                                    and s["frames_presented"] == 90, timeout=10)
+        assert lost["helper_started"] is False and lost["frames_presented"] == 90, lost
+
+        replacement, _, _ = start_receiver(args, runtime, mode="reject-first-registrations")
+        children.callback(replacement.stop, False)
+        resumed = display.await_status(lambda s: s["frames_presented"] == 180, timeout=30)
+        assert resumed["state"] == "projecting" and resumed["helper_started"], resumed
+        replacement.await_output(lambda e: e.get("event") == "call"
+                                 and e.get("member") == "StartProjection", timeout=10)
+        with replacement.lock:
+            calls = [e for e in replacement.events if e.get("event") == "call"]
+        attach_calls = [e for e in calls if e["member"] in
+                        ("RegisterConsumer", "SetDisplayViewport", "StartProjection")]
+        assert [e["member"] for e in attach_calls] == ["RegisterConsumer"] * 3 + [
+            "SetDisplayViewport", "StartProjection"], attach_calls
+        attempts = [e["monotonic_ns"] for e in attach_calls[:3]]
+        assert all(b - a >= 1_000_000_000 for a, b in zip(attempts, attempts[1:])), attempts
+        assert display.stop() == 0
+        assert replacement.stop(False) == 0
+
+
+def case_owner_swap(args):
+    with tempfile.TemporaryDirectory(prefix="aa-swap-") as runtime, ExitStack() as children:
+        old_runtime = os.path.join(runtime, "old")
+        os.mkdir(old_runtime, 0o700)
+        receiver, _, _ = start_receiver(args, old_runtime)
+        children.callback(receiver.stop, False)
+        # The receiver fixture checks that its RequestName reply is IN_QUEUE.
+        # The daemon then hands the name directly from the old owner to it.
+        replacement, video, input_sock = start_receiver(args, runtime, mode="queue-for-owner")
+        children.callback(replacement.stop, False)
+        display = start_display(args, video, input_sock, False, os.environ.copy())
+        children.callback(display.stop)
+        display.await_status(lambda s: s["state"] == "idle", timeout=10)
+        receiver.await_output(lambda e: e.get("event") == "state" and e["consumer"] != 0,
+                              timeout=10)
+
+        assert receiver.stop(False) == 0
+        replacement.await_output(lambda e: e.get("member") == "SetDisplayViewport", timeout=10)
+        idle = display.await_status(lambda s: s["state"] == "idle", timeout=10)
+        assert idle["helper_started"] is False and idle["frames_presented"] == 0, idle
+        with replacement.lock:
+            calls = [e["member"] for e in replacement.events if e.get("event") == "call"]
+        assert calls == ["RegisterConsumer", "SetDisplayViewport"], calls
+
+        display.send("start")
+        replacement.await_output(lambda e: e.get("member") == "StartProjection", timeout=10)
+        resumed = display.await_status(lambda s: s["frames_presented"] == 90, timeout=20)
+        assert resumed["state"] == "projecting" and resumed["helper_started"], resumed
+        assert display.stop() == 0
+        assert replacement.stop(False) == 0
+
+
+def case_owner_signal_burst(args):
+    with tempfile.TemporaryDirectory(prefix="aa-burst-") as runtime, ExitStack() as children:
+        receiver, video, input_sock = start_receiver(args, runtime)
+        children.callback(receiver.stop, False)
+        display = start_display(args, video, input_sock, True, os.environ.copy())
+        children.callback(display.stop)
+        display.await_status(lambda s: s["state"] == "projecting", timeout=10)
+        # Ensure the entire burst is queued before the next display poll.
+        display.proc.send_signal(signal.SIGSTOP)
+        try:
+            for _ in range(48):
+                subprocess.run(["dbus-send", "--session", "--type=signal", "/org/custom/AndroidAutoReceiver",
+                                "org.custom.AndroidAutoReceiver1.DiagnosticEvent",
+                                "string:info", "string:burst", "uint64:0"], check=True, timeout=5)
+        finally:
+            display.proc.send_signal(signal.SIGCONT)
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline:
+            display.send("status")
+            status = display.await_event("status", timeout=5)
+            assert status["state"] == "projecting" and status["helper_started"], status
+        assert display.stop() == 0
+        assert receiver.stop(False) == 0
+
+
+def start_private_bus(address, children):
+    bus = subprocess.Popen(["dbus-daemon", "--session", "--nofork", f"--address={address}",
+                            "--print-address=1"], stdout=subprocess.PIPE, text=True)
+    children.callback(bus.stdout.close)
+    children.callback(stop_private_bus, bus)
+    assert select.select([bus.stdout], [], [], 5)[0], "private bus did not start"
+    assert bus.stdout.readline().startswith(address), "private bus did not bind the test address"
+    return bus
+
+
+def stop_private_bus(bus):
+    if bus.poll() is None:
+        bus.terminate()
+        try:
+            bus.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            bus.kill()
+            bus.wait(timeout=5)
+
+
+def case_owner_bus_restart(args):
+    with tempfile.TemporaryDirectory(prefix="aa-bus-") as runtime, ExitStack() as children:
+        address = f"unix:path={runtime}/bus"
+        env = dict(os.environ, DBUS_SESSION_BUS_ADDRESS=address)
+        bus = start_private_bus(address, children)
+        receiver, video, input_sock = start_receiver(args, runtime, env=env)
+        children.callback(receiver.stop, False)
+        display = start_display(args, video, input_sock, True, env, decoder_backend="software")
+        children.callback(display.stop)
+        display.await_status(lambda s: s["frames_presented"] == 90, timeout=20)
+
+        stop_private_bus(bus)
+        assert receiver.stop(False) == 0
+        lost = display.await_status(lambda s: s["state"] == "unavailable", timeout=10)
+        assert lost["helper_started"] is False and lost["frames_presented"] == 90, lost
+        display.await_output(lambda e: e.get("event") == "display_error"
+                             and e.get("stage") == "watch_receiver"
+                             and e.get("code") == "transport_closed", timeout=5)
+
+        # Reuse the socket address and receiver startup order. A new daemon
+        # can assign the same unique name to the new receiver.
+        start_private_bus(address, children)
+        replacement, _, _ = start_receiver(args, runtime, env=env)
+        children.callback(replacement.stop, False)
+        resumed = display.await_status(lambda s: s["frames_presented"] == 180, timeout=30)
+        assert resumed["state"] == "projecting" and resumed["helper_started"], resumed
+        assert display.stop() == 0
+        assert replacement.stop(False) == 0
 
 
 def case_flow(args):
@@ -699,13 +851,16 @@ def main():
     parser.add_argument("--case", required=True,
                         choices=("replay", "flow", "absent", "stalled", "stopfail",
                                  "stopreject", "diagnostics-bootstrap", "diagnostics-factory",
-                                 "diagnostics-connect", "sigterm"))
+                                 "diagnostics-connect", "sigterm", "reattach",
+                                 "owner-swap", "owner-signal-burst", "owner-bus-restart"))
     args = parser.parse_args()
     {"replay": case_replay, "flow": case_flow, "absent": case_absent,
      "stalled": case_stalled, "stopfail": case_stopfail,
      "stopreject": case_stopreject, "diagnostics-bootstrap": case_diagnostics,
      "diagnostics-factory": case_diagnostics, "diagnostics-connect": case_diagnostics,
-     "sigterm": case_sigterm}[args.case](args)
+     "sigterm": case_sigterm, "reattach": case_reattach,
+     "owner-swap": case_owner_swap, "owner-signal-burst": case_owner_signal_burst,
+     "owner-bus-restart": case_owner_bus_restart}[args.case](args)
     print(f"PASS: {args.case}")
     return 0
 

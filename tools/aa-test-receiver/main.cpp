@@ -29,6 +29,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <variant>
 #include <vector>
@@ -166,27 +167,21 @@ void serve_input(aa::ipc::InputServer& server) {
 }
 
 // TEST-ONLY scripted contract receiver (executable gate, PR #36 fix round):
-// the `reject-first-stop` mode of this binary - a raw BusConnection owning the
+// a raw BusConnection owning the
 // REAL contract name on the private dbus-run-session bus, answering the wire
-// contract via read_message()/send_reply() exactly like the
-// DummyDisplayStopRecovery controller tests do. ONE scripted scenario: the
-// FIRST StopProjection is REJECTED with a typed error while GetState keeps
-// reporting the SAME consumer still projecting; the stop retry is ACCEPTED
-// and GetState then reports stopped. Every contract call is logged so the
-// executable test can prove exactly what did (and did not) reach the
-// receiver - no production mock seam exists or is added.
+// contract via read_message()/send_reply() like the controller tests do.
+// It can reject the first stop or the first two registrations, then accept
+// the retry. Contract calls are logged for the executable tests.
 class ScriptedContract final {
 public:
-    static std::unique_ptr<ScriptedContract> start() {
-        auto scripted = std::unique_ptr<ScriptedContract>(new ScriptedContract());
+    static std::unique_ptr<ScriptedContract> start(std::string_view mode) {
+        auto scripted = std::unique_ptr<ScriptedContract>(new ScriptedContract(mode));
         auto connected = aa::ipc::dbus_adapter::BusConnection::connect_session();
         if (!connected.has_value()) {
             return nullptr;
         }
         scripted->connection_.emplace(std::move(connected.value()));
-        const auto owned = scripted->connection_->request_name(
-            aa::ipc::BusName{std::string{aa::ipc::kContractBusName}});
-        if (!owned.has_value()) {
+        if (!scripted->request_contract_name()) {
             return nullptr;
         }
         scripted->worker_ = std::thread([ptr = scripted.get()] { ptr->run(); });
@@ -212,7 +207,32 @@ public:
     [[nodiscard]] std::size_t stop_calls() const { return stops_.load(); }
 
 private:
-    ScriptedContract() = default;
+    explicit ScriptedContract(std::string_view mode) : mode_(mode) {}
+
+    bool request_contract_name() {
+        namespace bus = aa::ipc::dbus_adapter;
+        const aa::ipc::BusName name{std::string{aa::ipc::kContractBusName}};
+        if (mode_ != "queue-for-owner") {
+            return connection_->request_name(name).has_value();
+        }
+        // Queue behind the current receiver. The daemon transfers the name
+        // directly to this connection when the current owner releases it.
+        const aa::ipc::BusName daemon{"org.freedesktop.DBus"};
+        bus::MessageWriter request;
+        request.destination(daemon.value).interface_name(daemon.value).path("/org/freedesktop/DBus")
+            .member("RequestName").body_signature("su").put_string(name.value).put_u32(0);
+        const auto serial = connection_->send_message(bus::MessageType::method_call, request);
+        if (!serial) {
+            return false;
+        }
+        const auto reply = connection_->await_reply(serial.value(), daemon);
+        if (!reply) {
+            return false;
+        }
+        constexpr std::uint32_t kInQueue = 2;
+        const auto outcome = bus::reply_u32(reply.value());
+        return outcome && outcome.value() == kInQueue;
+    }
 
     void handle(const aa::ipc::dbus_adapter::ParsedMessage& message) {
         namespace bus = aa::ipc::dbus_adapter;
@@ -220,7 +240,15 @@ private:
         const std::string member = message.member;
         if (member == "RegisterConsumer") {
             out.body = std::uint64_t{1};
-            log_line("{\"event\":\"call\",\"member\":\"RegisterConsumer\"}");
+            if (mode_ == "reject-first-registrations" && ++registrations_ <= 2) {
+                out.is_error = true;
+                out.error_name = "org.custom.AndroidAutoReceiver1.Error.ConsumerRejected";
+                out.body = std::string{"scripted registration rejection"};
+            }
+            const auto now = std::chrono::steady_clock::now().time_since_epoch();
+            const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(now).count();
+            log_line("{\"event\":\"call\",\"member\":\"RegisterConsumer\",\"monotonic_ns\":" +
+                     std::to_string(ns) + "}");
         } else if (member == "GetState") {
             // The stateful script: the same consumer (1) reports "projecting"
             // while the rejected stop leaves inactivity unconfirmed, and
@@ -239,7 +267,7 @@ private:
             log_line("{\"event\":\"state\",\"projection\":\"projecting\",\"consumer\":1}");
         } else if (member == "StopProjection") {
             ++stops_;
-            if (stops_.load() == 1) {
+            if (mode_ == "reject-first-stop" && stops_.load() == 1) {
                 // REJECT the first stop with the typed error reply (the
                 // DummyDisplayStopRecovery (a) shape).
                 out.is_error = true;
@@ -297,6 +325,8 @@ private:
         return out;
     }
 
+    std::string mode_;
+    unsigned registrations_{0};
     std::optional<aa::ipc::dbus_adapter::BusConnection> connection_{};
     std::atomic<bool> running_{true};
     std::atomic<bool> projecting_{false};
@@ -310,11 +340,11 @@ private:
 int main(int argc, char** argv) {
     static const char* const kUsage =
         "usage: aa-test-receiver --video-socket P --input-socket P --fixture P"
-        " [--mode reject-first-stop]\n";
+        " [--mode reject-first-stop|reject-first-registrations|queue-for-owner]\n";
     std::string video_socket;
     std::string input_socket;
     std::string fixture;
-    bool scripted_mode = false;
+    std::string_view scripted_mode;
     for (int index = 1; index < argc; ++index) {
         if (std::strcmp(argv[index], "--video-socket") == 0 && index + 1 < argc) {
             video_socket = argv[++index];
@@ -323,14 +353,12 @@ int main(int argc, char** argv) {
         } else if (std::strcmp(argv[index], "--fixture") == 0 && index + 1 < argc) {
             fixture = argv[++index];
         } else if (std::strcmp(argv[index], "--mode") == 0 && index + 1 < argc) {
-            // TEST-ONLY scripted-receiver MODE (executable gate, PR #36 fix
-            // round): reject-first-stop replaces the real ControlBusService
-            // with the scripted contract receiver below.
-            if (std::strcmp(argv[++index], "reject-first-stop") != 0) {
+            scripted_mode = argv[++index];
+            if (scripted_mode != "reject-first-stop" && scripted_mode != "reject-first-registrations" &&
+                scripted_mode != "queue-for-owner") {
                 std::fputs(kUsage, stderr);
                 return 2;
             }
-            scripted_mode = true;
         } else {
             std::fputs(kUsage, stderr);
             return 2;
@@ -352,8 +380,8 @@ int main(int argc, char** argv) {
     RejectPhones phones;
     std::unique_ptr<ScriptedContract> scripted{};
     std::optional<aa::ipc::ControlBusService> service{};
-    if (scripted_mode) {
-        scripted = ScriptedContract::start();
+    if (!scripted_mode.empty()) {
+        scripted = ScriptedContract::start(scripted_mode);
         if (scripted == nullptr) {
             std::fputs("{\"event\":\"err\",\"detail\":\"dbus\"}\n", stdout);
             return 1;
@@ -379,9 +407,9 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    log_line(scripted_mode ? "{\"event\":\"ready\",\"units\":" + std::to_string(units.size()) +
-                                 ",\"mode\":\"reject-first-stop\"}"
-                           : "{\"event\":\"ready\",\"units\":" + std::to_string(units.size()) + "}");
+    const std::string mode_field = scripted_mode.empty()
+        ? std::string{} : ",\"mode\":\"" + std::string{scripted_mode} + "\"";
+    log_line("{\"event\":\"ready\",\"units\":" + std::to_string(units.size()) + mode_field + "}");
 
     ::signal(SIGINT, on_signal);
     ::signal(SIGTERM, on_signal);
@@ -390,7 +418,7 @@ int main(int argc, char** argv) {
     std::thread input_thread(serve_input, std::ref(input.value()));
 
     std::uint64_t dispatched_total = 0;
-    if (scripted_mode) {
+    if (scripted) {
         // The scripted contract answers from its own worker thread; the main
         // loop only waits for the shutdown signal.
         while (running.load()) {
@@ -422,10 +450,10 @@ int main(int argc, char** argv) {
     running.store(false);
     video_thread.join();
     input_thread.join();
-    if (scripted_mode) {
-        log_line("{\"event\":\"stopping\",\"mode\":\"reject-first-stop\",\"starts\":" +
+    if (scripted) {
+        log_line("{\"event\":\"stopping\",\"starts\":" +
                  std::to_string(scripted->start_calls()) +
-                 ",\"stops\":" + std::to_string(scripted->stop_calls()) + "}");
+                 ",\"stops\":" + std::to_string(scripted->stop_calls()) + mode_field + "}");
     } else {
         log_line("{\"event\":\"stopping\",\"dispatched\":" + std::to_string(dispatched_total) +
                  ",\"idle_refreshes\":" + std::to_string(service.value().idle_refreshes()) +
@@ -434,7 +462,7 @@ int main(int argc, char** argv) {
     }
     input.value().close();
     video.value().close();
-    if (scripted_mode) {
+    if (scripted) {
         scripted.reset();
     } else {
         service.value().close();

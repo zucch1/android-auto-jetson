@@ -4,6 +4,7 @@
 #include "BusIo.hpp"
 
 #include <string_view>
+#include <utility>
 
 namespace aa::ipc::dbus_adapter {
 
@@ -189,7 +190,7 @@ core::Result<void> BusConnection::add_match(std::string_view rule) {
     return {};
 }
 
-core::Result<BusName> BusConnection::get_name_owner(const BusName& name) {
+core::Result<std::optional<BusName>> BusConnection::find_name_owner(const BusName& name) {
     MessageWriter body;
     body.put_string(name.value);
     const auto reply = call("GetNameOwner", "s", body);
@@ -197,13 +198,27 @@ core::Result<BusName> BusConnection::get_name_owner(const BusName& name) {
         return reply.error();
     }
     if (reply.value().type == MessageType::error_reply) {
-        return Error{ErrorCode::ipc_peer_unauthorized};
+        if (reply.value().error_name == "org.freedesktop.DBus.Error.NameHasNoOwner") {
+            return std::optional<BusName>{};
+        }
+        return Error{ErrorCode::transport_io};
     }
     auto owner = reply_string(reply.value());
     if (!owner.has_value()) {
         return owner.error();
     }
-    return BusName{owner.value()};
+    return std::optional<BusName>{BusName{std::move(owner.value())}};
+}
+
+core::Result<BusName> BusConnection::get_name_owner(const BusName& name) {
+    auto owner = find_name_owner(name);
+    if (!owner) {
+        return owner.error();
+    }
+    if (!owner.value()) {
+        return Error{ErrorCode::ipc_peer_unauthorized};
+    }
+    return std::move(*owner.value());
 }
 
 core::Result<bool> BusConnection::name_has_owner(const BusName& name) {
