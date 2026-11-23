@@ -181,9 +181,7 @@ public:
             return nullptr;
         }
         scripted->connection_.emplace(std::move(connected.value()));
-        const auto owned = scripted->connection_->request_name(
-            aa::ipc::BusName{std::string{aa::ipc::kContractBusName}});
-        if (!owned.has_value()) {
+        if (!scripted->request_contract_name()) {
             return nullptr;
         }
         scripted->worker_ = std::thread([ptr = scripted.get()] { ptr->run(); });
@@ -210,6 +208,31 @@ public:
 
 private:
     explicit ScriptedContract(std::string_view mode) : mode_(mode) {}
+
+    bool request_contract_name() {
+        namespace bus = aa::ipc::dbus_adapter;
+        const aa::ipc::BusName name{std::string{aa::ipc::kContractBusName}};
+        if (mode_ != "queue-for-owner") {
+            return connection_->request_name(name).has_value();
+        }
+        // Queue behind the current receiver. The daemon transfers the name
+        // directly to this connection when the current owner releases it.
+        const aa::ipc::BusName daemon{"org.freedesktop.DBus"};
+        bus::MessageWriter request;
+        request.destination(daemon.value).interface_name(daemon.value).path("/org/freedesktop/DBus")
+            .member("RequestName").body_signature("su").put_string(name.value).put_u32(0);
+        const auto serial = connection_->send_message(bus::MessageType::method_call, request);
+        if (!serial) {
+            return false;
+        }
+        const auto reply = connection_->await_reply(serial.value(), daemon);
+        if (!reply) {
+            return false;
+        }
+        constexpr std::uint32_t kInQueue = 2;
+        const auto outcome = bus::reply_u32(reply.value());
+        return outcome && outcome.value() == kInQueue;
+    }
 
     void handle(const aa::ipc::dbus_adapter::ParsedMessage& message) {
         namespace bus = aa::ipc::dbus_adapter;
@@ -302,7 +325,7 @@ private:
         return out;
     }
 
-    std::string_view mode_;
+    std::string mode_;
     unsigned registrations_{0};
     std::optional<aa::ipc::dbus_adapter::BusConnection> connection_{};
     std::atomic<bool> running_{true};
@@ -317,7 +340,7 @@ private:
 int main(int argc, char** argv) {
     static const char* const kUsage =
         "usage: aa-test-receiver --video-socket P --input-socket P --fixture P"
-        " [--mode reject-first-stop|reject-first-registrations]\n";
+        " [--mode reject-first-stop|reject-first-registrations|queue-for-owner]\n";
     std::string video_socket;
     std::string input_socket;
     std::string fixture;
@@ -331,7 +354,8 @@ int main(int argc, char** argv) {
             fixture = argv[++index];
         } else if (std::strcmp(argv[index], "--mode") == 0 && index + 1 < argc) {
             scripted_mode = argv[++index];
-            if (scripted_mode != "reject-first-stop" && scripted_mode != "reject-first-registrations") {
+            if (scripted_mode != "reject-first-stop" && scripted_mode != "reject-first-registrations" &&
+                scripted_mode != "queue-for-owner") {
                 std::fputs(kUsage, stderr);
                 return 2;
             }

@@ -240,7 +240,8 @@ if(NOT CMAKE_CROSSCOMPILING)
     set_tests_properties(dummy_display_isolation_failure PROPERTIES
         ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 120)
     foreach(case replay flow absent stalled stopfail stopreject
-            diagnostics-bootstrap diagnostics-factory diagnostics-connect sigterm reattach)
+            diagnostics-bootstrap diagnostics-factory diagnostics-connect sigterm reattach
+            owner-swap owner-signal-burst owner-bus-restart)
         add_test(NAME dummy_display_exec_${case} COMMAND "${AA_DBUS_RUN_SESSION}" --
             "${Python3_EXECUTABLE}" -B
             "${CMAKE_SOURCE_DIR}/tests/display/executable_display_test.py"

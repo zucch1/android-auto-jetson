@@ -323,15 +323,31 @@ int display_main(int argc, char** argv) {
 
     const aa::ipc::VideoSocketPath video_path{video_socket};
     const aa::display::TestOnlyAutostart gate{aa::display::TestOnlyAutostart::kMarker, video_path};
-    std::optional<aa::ipc::ControlBusClient> watcher;
-    std::optional<aa::ipc::ControlBusClient> client;
+    using aa::ipc::ControlBusClient;
+    std::optional<ControlBusClient> watcher;
+    std::unique_ptr<ControlBusClient> client;
     std::optional<aa::display::DisplayController> controller;
+    QTimer pump_timer;
+    aa::display::pump::configure(pump_timer);
     std::uint64_t previous_frames = 0;
+    const auto detach = [&] {
+        pump_timer.stop();
+        previous_frames += controller->frames_presented();
+        controller->receiver_lost();
+        controller.reset();
+        client.reset();
+        widget.set_status(DisplayState::unavailable);
+        widget.set_error({});
+    };
     const auto poll_receiver = [&] {
+        const bool client_disconnected = client && client->disconnected();
+        if (client_disconnected) {
+            detach();
+        }
         if (!watcher.has_value()) {
-            auto connected = aa::ipc::ControlBusClient::connect();
+            auto connected = ControlBusClient::connect(ControlBusClient::Signals::ignore);
             if (!connected.has_value()) {
-                errors->report("attach", connected.error().code());
+                errors->report("watch_receiver", connected.error().code());
                 return;
             }
             watcher.emplace(std::move(connected.value()));
@@ -339,43 +355,44 @@ int display_main(int argc, char** argv) {
         // Keep the owner's unique name on the controller's client pinned for
         // the lifetime of the registration, including during control calls.
         const auto owner = watcher->receiver_owner();
-        if (controller.has_value()) {
-            if (owner && owner.value() && controller->attached_to(*owner.value())) {
-                return;
+        if (!owner) {
+            errors->report("watch_receiver", owner.error().code());
+            watcher.reset();
+            return;
+        }
+        if (controller) {
+            if (!owner.value() || !controller->attached_to(*owner.value())) {
+                detach();
             }
-            previous_frames += controller->frames_presented();
-            controller->receiver_lost();
-            controller.reset();
-            client.reset();
-            widget.set_status(DisplayState::unavailable);
-            widget.set_error({});
             return;
         }
-        if (!owner || !owner.value()) {
+        if (client_disconnected || !owner.value()) {
             return;
         }
-        auto connected = aa::ipc::ControlBusClient::connect();
+        auto connected = ControlBusClient::connect(ControlBusClient::Signals::ignore);
         if (!connected.has_value()) {
             errors->report("attach", connected.error().code());
             return;
         }
-        client.emplace(std::move(connected.value()));
-        aa::display::DisplayController::Deps deps{*client, factory, widget};
+        auto candidate = std::make_unique<ControlBusClient>(std::move(connected.value()));
+        aa::display::DisplayController::Deps deps{*candidate, factory, widget};
         auto attached = test_autostart
                             ? aa::display::attach_test_only_autostart(gate, std::move(deps), config)
                             : aa::display::DisplayController::attach(std::move(deps), config);
         if (!attached.has_value()) {
             errors->report(test_autostart ? "autostart" : "attach", attached.error().code());
-            client.reset();
             return;
         }
         if (attached.value().state() == DisplayState::unavailable) {
             // The receiver vanished between the poll and the attach lookup.
             return;
         }
+        client = std::move(candidate);
         controller.emplace(std::move(attached.value()));
+        errors->begin_attempt();
         widget.set_status(controller->state());
         widget.set_error({});
+        pump_timer.start();
     };
     // Rearm after each poll so a delayed GUI tick cannot bunch up attempts.
     QTimer receiver_timer;
@@ -386,18 +403,10 @@ int display_main(int argc, char** argv) {
         poll_receiver();
         receiver_timer.start();
     });
-    poll_receiver();
-    receiver_timer.start();
-
     ControlWiring controls{controller, video_path, widget, *errors, diagnostics};
     widget.set_projection_control(&controls);
 
-    // Pump timer must outlive app.exec(): declared at main scope, not inside
-    // the attach block (task 24 F1 - a timer destroyed before the event loop
-    // starts never pumps video into the helper or presents frames).
-    auto pump_timer = std::make_unique<QTimer>();
-    aa::display::pump::configure(*pump_timer);
-    QObject::connect(pump_timer.get(), &QTimer::timeout,
+    QObject::connect(&pump_timer, &QTimer::timeout,
                      [errors, &telemetry, &widget, &decode_loss, &controller,
                       telemetry_reported = false]() mutable {
         // A full queue or failed write loses measurement events: show it once.
@@ -423,7 +432,8 @@ int display_main(int argc, char** argv) {
             }
         }
     });
-    pump_timer->start();
+    poll_receiver();
+    receiver_timer.start();
 
     std::unique_ptr<aa::display::testcontrol::Channel> control{};
     if (test_control_stdin) {
@@ -435,7 +445,7 @@ int display_main(int argc, char** argv) {
     widget.show();
     int outcome = app.exec();
     receiver_timer.stop();
-    pump_timer->stop();
+    pump_timer.stop();
     if (controller.has_value()) {
         // Totals coalesced by the rate limit must not die with the session.
         for (auto& line : decode_loss.observe(controller->decode_report(),

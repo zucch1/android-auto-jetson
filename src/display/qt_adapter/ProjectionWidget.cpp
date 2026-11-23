@@ -97,7 +97,7 @@ namespace {
 [[nodiscard]] QString state_hint(DisplayState state) {
     switch (state) {
     case DisplayState::unavailable:
-        return QStringLiteral("Receiver not found on the session bus. Start the receiver, then relaunch.");
+        return QStringLiteral("Receiver unavailable on the session bus. Waiting to reconnect…");
     case DisplayState::idle: return QStringLiteral("Press F5 to start projection");
     case DisplayState::projecting: return QStringLiteral("Waiting for video from the phone… (F6 stops)");
     case DisplayState::stop_failed: return QStringLiteral("Stop was not confirmed. Press F6 to retry.");
