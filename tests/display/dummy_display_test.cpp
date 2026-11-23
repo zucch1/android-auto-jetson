@@ -44,6 +44,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -1316,6 +1317,7 @@ TEST(DummyDisplayContractAbsent, ReceiverAbsentShowsUnavailableWithoutStartingHe
     // helper, no video channel, and (the display has no helper/NetworkManager
     // code path at all) no AP.
     EXPECT_EQ(controller.value().state(), DisplayState::unavailable);
+    EXPECT_FALSE(controller.value().attached_to(BusName{":1.99"}));
     EXPECT_FALSE(started.has_value());
     EXPECT_EQ(started.error().code(), ErrorCode::session_illegal_transition);
     EXPECT_EQ(helper_opens, 0);
@@ -2617,6 +2619,7 @@ TEST(DummyDisplayStopRecovery, LostRegistrationReconcilesToUnavailableAndClearsI
         EXPECT_EQ(failed.error().code(), ErrorCode::session_illegal_transition);
         EXPECT_EQ(fixture->display().state(), DisplayState::unavailable);
         EXPECT_EQ(fixture->display().consumer(), aa::core::ConsumerId{});
+        EXPECT_FALSE(fixture->display().helper_started());
         EXPECT_EQ(fixture->closes, 1);
     }
 }
@@ -2953,6 +2956,55 @@ std::unique_ptr<ControlBusClient> connected_client() {
 }
 
 } // namespace
+
+TEST(DummyDisplayRegistration, ReceiverLossReleasesMediaWithoutRemoteTeardown) {
+    auto receiver = ScriptedReceiver::start({});
+    ASSERT_NE(receiver, nullptr);
+    auto client = ControlBusClient::connect();
+    ASSERT_TRUE(client);
+    const auto owner = client.value().receiver_owner();
+    ASSERT_TRUE(owner && owner.value());
+
+    BackpressureDecoderState decoder;
+    RecordingFrameTarget frames;
+    auto attached = DisplayController::attach(
+        DisplayController::Deps{client.value(), backpressure_factory(decoder), frames},
+        test_config("ReceiverLost"));
+    ASSERT_TRUE(attached);
+    auto& display = attached.value();
+    EXPECT_TRUE(display.attached_to(*owner.value()));
+    EXPECT_FALSE(display.attached_to(BusName{owner.value()->value + "0"}));
+    EXPECT_NE(display.consumer(), aa::core::ConsumerId{});
+
+    OwnedRuntime runtime;
+    ASSERT_FALSE(runtime.path().empty());
+    const auto socket = aa::ipc::video_socket_path_in(runtime.path());
+    auto server = aa::ipc::VideoServer::listen(socket, aa::ipc::VideoServerOptions{{}, aa::ipc::current_uid()});
+    ASSERT_TRUE(server);
+    auto accept = std::async(std::launch::async, [&] {
+        return server.value().accept_consumer(Milliseconds{5000});
+    });
+    ASSERT_TRUE(display.start_projection(socket));
+    auto producer = accept.get();
+    ASSERT_TRUE(producer);
+    ASSERT_TRUE(display.helper_started());
+    ASSERT_EQ(decoder.closes, 0);
+
+    display.receiver_lost();
+    EXPECT_EQ(display.state(), DisplayState::unavailable);
+    EXPECT_EQ(display.consumer(), aa::core::ConsumerId{});
+    EXPECT_FALSE(display.helper_started());
+    EXPECT_FALSE(display.attached_to(*owner.value()));
+    ::pollfd peer{producer.value().native_handle(), 0, 0};
+    ASSERT_EQ(::poll(&peer, 1, 1000), 1);
+    EXPECT_NE(peer.revents & POLLHUP, 0);
+
+    display.receiver_lost();
+    display.shutdown();
+    EXPECT_EQ(decoder.closes, 1);
+    EXPECT_EQ(receiver->count_calls("StopProjection"), 0U);
+    EXPECT_EQ(receiver->count_calls("UnregisterConsumer"), 0U);
+}
 
 TEST(DummyDisplayRegistration, MalformedRegistrationReplyUnwindsTheName) {
     // Given: a scripted receiver whose RegisterConsumer reply carries

@@ -13,6 +13,11 @@ aa-wireless-receiver --store-dir DIR --phone-id N --video-profiles 1920x1080@60:
 aa-dummy-display --decoder software --presentation cpu --media-thread gui --video-profiles 2560x1440@60:h264,1920x1080@60:h265,1280x720@30:h264
 ```
 
+The reference display can start before the receiver and stays open across
+receiver restarts. It shows `unavailable` while disconnected. After it
+re-registers, press F5 to request projection, or use `--test-only-autostart`
+to request projection after every attachment.
+
 `--video-profiles` accepts comma-separated `WIDTHxHEIGHT@FPS:CODEC`, without
 spaces. Both receivers parse it with the same `aa::config` helper, so a wireless
 service offer names the profiles it was configured with. Every video combination

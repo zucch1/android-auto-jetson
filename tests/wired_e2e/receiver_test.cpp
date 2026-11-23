@@ -6219,16 +6219,32 @@ TEST(WiredReceiver, WorkerGuidanceStallBurstInProductionFormatCatchesUp) {
     const auto guidance_format =
         config.roles[aa::audio::role_index(aa::audio::Role::guidance)].input_format;
     ASSERT_EQ(guidance_format, (aa::audio::AudioFormat{16000, 1, 16}));
-    ConcreteAudioRenderWorker audio{config, gated_router(gate)};
+    const auto arrival = steady_ns() - 10'000'000'000LL;
+    std::atomic<std::int64_t> clock_ns{arrival};
+    ConcreteAudioRenderWorker audio{config, gated_router(gate),
+                                    [&] { return aa::core::Nanoseconds{clock_ns.load()}; }};
     ASSERT_TRUE(audio.ready());
     const auto role = aa::protocol::ChannelRole::guidance_audio;
     const std::vector<std::byte> pcm(2048, std::byte{1}); // 1024 mono frames: 64 ms at 16 kHz
-    const auto arrival = steady_ns();
     for (std::uint64_t sequence = 1; sequence <= 16; ++sequence) {
         ASSERT_TRUE(audio.submit({{role, sequence, {arrival}}, pcm}, {role, 0, sequence, 7}));
         ASSERT_TRUE(audio.wait_idle(std::chrono::steady_clock::now() + std::chrono::seconds{2}));
         ASSERT_FALSE(audio.failure()) << sequence;
     }
+    const auto written_end_ns = [&]() -> std::int64_t {
+        if (gate->timestamps.empty()) { return arrival; }
+        const auto last_piece_frames = static_cast<std::uint64_t>(gate->pcm.back().size() / 4);
+        return gate->timestamps.back().count +
+            static_cast<std::int64_t>((last_piece_frames * 1'000'000'000ULL) / 48000ULL);
+    };
+    std::size_t writes_before_resume = 0;
+    std::int64_t burst_end_ns = arrival;
+    {
+        std::lock_guard lock(gate->mutex);
+        writes_before_resume = gate->timestamps.size();
+        burst_end_ns = written_end_ns();
+    }
+    clock_ns.store(arrival + 100'000'000);
     ASSERT_TRUE(audio.submit({{role, 17, {arrival + 100'000'000}}, pcm}, {role, 0, 17, 7}));
     ASSERT_TRUE(audio.wait_idle(std::chrono::steady_clock::now() + std::chrono::seconds{2}));
     const bool failed = audio.failure().has_value();
@@ -6240,6 +6256,7 @@ TEST(WiredReceiver, WorkerGuidanceStallBurstInProductionFormatCatchesUp) {
     const auto report = audio.final_report();
     ASSERT_TRUE(report);
     EXPECT_FALSE(report->render_failure);
+    EXPECT_EQ(report->stats.chunks_submitted, 17U);
     // Logged at the 48 kHz output rate, never the 16 kHz input rate.
     const std::regex catch_up{
         R"(\{"event":"audio_catch_up","frames":([0-9]+),"frames_total":([0-9]+),"rate":48000,"events_lifetime":([0-9]+),"frames_lifetime":([0-9]+)(?:,"emit_ns":[0-9]+)?\})"};
@@ -6254,12 +6271,24 @@ TEST(WiredReceiver, WorkerGuidanceStallBurstInProductionFormatCatchesUp) {
     EXPECT_EQ(logged, report->stats.frames_caught_up) << output;
     std::lock_guard lock(gate->mutex);
     ASSERT_FALSE(gate->timestamps.empty());
-    // Judged by where the last write ends, not where its last piece starts: a
-    // 64 ms run inside the watermark is written as 50 + 14 ms. It ends at most
-    // the 90 ms watermark past the end of the resumed parent's own PCM (#173).
-    const auto last_frames = static_cast<std::int64_t>(gate->pcm.back().size() / 4);
-    EXPECT_LE(gate->timestamps.back().count + last_frames * 1'000'000'000LL / 48000,
-              arrival + 100'000'000 + 64'000'000 + 90'000'000);
+    // #181: assert the catch-up cursor invariant on the worker's scheduled
+    // 48 kHz timeline (matching IncrementalMaxSizeGuidanceBurstSurvivesTheRealResampler):
+    // never more than the 90 ms watermark past the end of the newest parent's
+    // own 64 ms PCM. Under CPU load, GStreamer's audioresample/appsink can
+    // split a 64 ms chunk down to 96 frames (wholly absorbed by the 5 ms
+    // bounded trim) or coalesce a carryover buffer onto chunk 17 while
+    // source_phase stays <= 90 ms (causing render_step() to emit three 50 ms
+    // quanta so timestamps.back() lands ~29 ms past arrival + 190 ms even
+    // though chunk 17 started ~19 ms behind arrival).
+    constexpr std::int64_t kGuidanceChunkNs = 64'000'000;
+    constexpr std::int64_t kCatchUpWatermarkNs = 90'000'000;
+    const auto resumed_arrival = arrival + 100'000'000;
+    EXPECT_LE(burst_end_ns, arrival + kGuidanceChunkNs + kCatchUpWatermarkNs);
+    if (gate->timestamps.size() > writes_before_resume) {
+        EXPECT_LE(gate->timestamps[writes_before_resume].count,
+                  resumed_arrival + kCatchUpWatermarkNs);
+    }
+    EXPECT_LE(written_end_ns(), resumed_arrival + kGuidanceChunkNs + kCatchUpWatermarkNs);
 }
 
 // A stand-in for the guidance resampler with a fixed output schedule (#155
