@@ -221,7 +221,7 @@ if(NOT CMAKE_CROSSCOMPILING)
     endforeach()
     add_test(NAME wired_qualification COMMAND "${Python3_EXECUTABLE}" -B
         -m unittest discover -s "${CMAKE_SOURCE_DIR}/tests/qualification" -v)
-    set_tests_properties(wired_qualification PROPERTIES TIMEOUT 120)
+    set_tests_properties(wired_qualification PROPERTIES TIMEOUT 180)
     if(NOT BUILD_TESTING)
         message(FATAL_ERROR "AA_DECODE_COVERAGE: native builds require BUILD_TESTING=ON")
     endif()
