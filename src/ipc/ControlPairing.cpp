@@ -16,6 +16,7 @@ core::Result<core::PairingRequestId> ControlService::request_add_phone(const Bus
         retire_failed_pairing(active.value().consumer, expired, peer);
         (void)gate_.cancel({active.value().consumer, active.value().name}, expired);
         events_.emit(PairingClosed{expired});
+        finalize_pairing_outcome(expired, "expired");
     }
     const auto request = gate_.request({active.value().consumer, active.value().name});
     if (!request) {
@@ -51,6 +52,7 @@ core::Result<core::PairingRequestId> ControlService::request_add_phone(const Bus
         retire_failed_pairing(active.value().consumer, request.value(), captured_peer);
         return Error{ErrorCode::trust_rejected};
     }
+    record_pairing_pending(request.value(), active.value().consumer);
     events_.emit(PairingRequested{request.value()});
     events_.emit(DiagnosticEmitted{DiagnosticSeverity::info, "pairing_requested", request.value().value});
     return request;
@@ -74,6 +76,8 @@ core::Result<void> ControlService::confirm_phone_pairing(const BusName& caller, 
         retire_failed_pairing(active.value().consumer, request, peer);
         (void)gate_.cancel({active.value().consumer, active.value().name}, request);
         events_.emit(PairingClosed{request});
+        finalize_pairing_outcome(
+            request, live.error().code() == ErrorCode::session_pairing_timeout ? "expired" : "failed");
         return live.error();
     }
     if (confirmation_ != nullptr) {
@@ -84,6 +88,7 @@ core::Result<void> ControlService::confirm_phone_pairing(const BusName& caller, 
             retire_failed_pairing(active.value().consumer, request, peer);
             (void)gate_.cancel({active.value().consumer, active.value().name}, request);
             events_.emit(PairingClosed{request});
+            finalize_pairing_outcome(request, "failed");
             events_.emit(DiagnosticEmitted{DiagnosticSeverity::warning, "pairing_helper_failed", request.value});
             return granted.error();
         }
@@ -96,6 +101,9 @@ core::Result<void> ControlService::confirm_phone_pairing(const BusName& caller, 
             retire_failed_pairing(active.value().consumer, request, peer);
             (void)gate_.cancel({active.value().consumer, active.value().name}, request);
             events_.emit(PairingClosed{request});
+            finalize_pairing_outcome(
+                request, still_live.error().code() == ErrorCode::session_pairing_timeout ? "expired"
+                                                                                         : "failed");
             return still_live.error();
         }
     }
@@ -110,7 +118,9 @@ core::Result<void> ControlService::confirm_phone_pairing(const BusName& caller, 
 }
 
 core::Result<void> ControlService::persist_pairing(const Registered& active, core::PairingRequestId request, bool* durable) {
-    if (durable) *durable = true;
+    bool local_durable = true;
+    if (!durable) durable = &local_durable;
+    *durable = true;
     const bool comparison = open_pairing_ && open_pairing_->request == request && open_pairing_->awaiting_acceptance;
     // Captured before pairing_confirmed() consumes the pending snapshot.
     const auto compared_peer = comparison ? open_pairing_->peer : phones_.pairing_wireless_identity(request);
@@ -118,7 +128,7 @@ core::Result<void> ControlService::persist_pairing(const Registered& active, cor
     if (!approved && approved.error().code() == ErrorCode::trust_store_not_durable) {
         if (const auto committed = phones_.committed_pairing()) {
             approved = *committed;
-            if (durable) *durable = false;
+            *durable = false;
             events_.emit(DiagnosticEmitted{DiagnosticSeverity::warning, "pairing_approval_not_durable", request.value});
         }
     }
@@ -130,12 +140,20 @@ core::Result<void> ControlService::persist_pairing(const Registered& active, cor
         }
         (void)gate_.cancel({active.consumer, active.name}, request);
         events_.emit(PairingClosed{request});
+        const std::string_view outcome =
+            approved.error().code() == ErrorCode::trust_store_not_durable ? "not_durable"
+            : approved.error().code() == ErrorCode::session_pairing_timeout ? "expired"
+                                                                            : "failed";
+        finalize_pairing_outcome(request, outcome);
         events_.emit(DiagnosticEmitted{DiagnosticSeverity::warning, "pairing_request_denied", request.value});
         return approved.error();
     }
     open_pairing_ = OpenPairing{request, approved.value(), phones_.wireless_identity(approved.value()),
                                now() + std::chrono::seconds(60)};
-    if (!comparison) events_.emit(PairingOpened{request});
+    if (!comparison) {
+        events_.emit(PairingOpened{request});
+        finalize_pairing_outcome(request, *durable ? "approved" : "not_durable");
+    }
     events_.emit(DiagnosticEmitted{DiagnosticSeverity::info, comparison ? "pairing_approved" : "pairing_opened", request.value});
     return {};
 }
@@ -161,6 +179,9 @@ core::Result<std::map<std::string, std::string>> ControlService::pairing_candida
         phones_.pairing_cancelled(request);
         (void)gate_.cancel({active.value().consumer, active.value().name}, request);
         events_.emit(PairingClosed{request});
+        finalize_pairing_outcome(
+            request, (!live && live.error().code() == ErrorCode::session_pairing_timeout) ? "expired"
+                                                                                           : "failed");
         return live ? Error{ErrorCode::trust_unknown_phone} : live.error();
     }
     events_.emit(DiagnosticEmitted{DiagnosticSeverity::info, "pairing_candidate_presented", request.value});
@@ -183,6 +204,7 @@ core::Result<void> ControlService::cancel_phone_pairing(const BusName& caller, c
     if (open_pairing_ && open_pairing_->request == request) open_pairing_.reset();
     retire_failed_pairing(active.value().consumer, request, peer);
     events_.emit(PairingClosed{request});
+    finalize_pairing_outcome(request, "cancelled");
     events_.emit(DiagnosticEmitted{DiagnosticSeverity::info, "pairing_closed", request.value});
     return {};
 }
@@ -195,9 +217,13 @@ core::Result<void> ControlService::forget_phone(const BusName& caller, core::Pho
     if (!phone) return Error{ErrorCode::invalid_argument};
     return revoke_phone(active.value(), phone);
 }
-core::Result<void> ControlService::revoke_phone(const Registered& active, core::PhoneId phone) {
+core::Result<void> ControlService::revoke_phone(const Registered& active, core::PhoneId phone,
+                                                bool* store_retracted,
+                                                core::PairingRequestId retracting_request) {
+    if (store_retracted) *store_retracted = false;
     for (auto it = revocations_.begin(); it != revocations_.end(); ++it) {
         if (it->snapshot.phone != phone) continue;
+        if (store_retracted) *store_retracted = true;
         const auto retried = attempt_revocation(*it);
         const bool not_durable = it->not_durable;
         if (!it->progress.complete()) request_reconcile();
@@ -208,6 +234,7 @@ core::Result<void> ControlService::revoke_phone(const Registered& active, core::
     const auto forgotten = phones_.forget(phone);
     const bool landed = forgotten || forgotten.error().code() == ErrorCode::trust_store_not_durable;
     if (!landed) return forgotten.error();
+    if (store_retracted) *store_retracted = true;
     const auto snapshot = phones_.take_revocation_v1();
     const auto peer = snapshot ? helper::revocation_peer(*snapshot) : std::nullopt;
     auto closed = phones_.take_invalidated_pairings();
@@ -222,6 +249,9 @@ core::Result<void> ControlService::revoke_phone(const Registered& active, core::
     for (const auto request : closed) {
         (void)gate_.cancel({active.consumer, active.name}, request);
         events_.emit(PairingClosed{request});
+        if (request != retracting_request) {
+            finalize_pairing_outcome(request, "cancelled");
+        }
     }
     core::Result<void> external;
     {

@@ -7,6 +7,7 @@
 // supplies its own identity.
 #include <aa/ipc/BusPeerLookup.hpp>
 #include <aa/ipc/Contract.hpp>
+#include <aa/ipc/ControlBusClient.hpp>
 #include <aa/ipc/ControlBusService.hpp>
 #include <aa/ipc/ControlDispatcher.hpp>
 #include <aa/ipc/ControlService.hpp>
@@ -467,7 +468,7 @@ TEST(BusBoundary, PropertiesGetUsesVariantWireEncoding) {
     ASSERT_EQ(reply.value().type, bus::MessageType::method_return);
     ASSERT_EQ(reply.value().signature, "v");
     const std::vector<std::uint8_t> expected{0x01, 0x73, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00,
-                                             0x31, 0x2e, 0x31, 0x2e, 0x30, 0x00};
+                                             0x31, 0x2e, 0x32, 0x2e, 0x30, 0x00};
     EXPECT_EQ(reply.value().body, expected);
     bus::Cursor cursor(reply.value().body);
     const auto contained = cursor.read_signature();
@@ -475,7 +476,7 @@ TEST(BusBoundary, PropertiesGetUsesVariantWireEncoding) {
     ASSERT_TRUE(contained.has_value());
     EXPECT_EQ(contained.value(), "s");
     ASSERT_TRUE(value.has_value());
-    EXPECT_EQ(value.value(), "1.1.0");
+    EXPECT_EQ(value.value(), "1.2.0");
     EXPECT_TRUE(cursor.done());
 }
 
@@ -499,7 +500,7 @@ TEST(BusBoundary, PropertiesGetAllUsesVariantDictionaryEncoding) {
     const std::vector<std::uint8_t> expected{
         0x22, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0e, 0x00, 0x00, 0x00, 0x43,
         0x6f, 0x6e, 0x74, 0x72, 0x61, 0x63, 0x74, 0x53, 0x65, 0x6d, 0x56, 0x65, 0x72,
-        0x00, 0x01, 0x73, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00, 0x31, 0x2e, 0x31,
+        0x00, 0x01, 0x73, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00, 0x31, 0x2e, 0x32,
         0x2e, 0x30, 0x00};
     EXPECT_EQ(reply.value().body, expected);
     bus::Cursor cursor(reply.value().body);
@@ -517,7 +518,7 @@ TEST(BusBoundary, PropertiesGetAllUsesVariantDictionaryEncoding) {
     EXPECT_EQ(contained.value(), "s");
     const auto value = cursor.read_string();
     ASSERT_TRUE(value.has_value());
-    EXPECT_EQ(value.value(), "1.1.0");
+    EXPECT_EQ(value.value(), "1.2.0");
     EXPECT_TRUE(cursor.done());
 }
 
@@ -540,7 +541,7 @@ TEST(BusBoundary, PropertiesSetReturnsPropertyReadOnly) {
     ASSERT_TRUE(reply.has_value());
     EXPECT_EQ(reply.value().type, bus::MessageType::error_reply);
     EXPECT_EQ(reply.value().error_name, "org.freedesktop.DBus.Error.PropertyReadOnly");
-    EXPECT_EQ(bus_state.service->capabilities().at("contract.semver"), "1.1.0");
+    EXPECT_EQ(bus_state.service->capabilities().at("contract.semver"), "1.2.0");
 }
 
 TEST(BusBoundary, OversizeCallIsDrainedAndTheNextCallSurvives) {
@@ -646,6 +647,86 @@ TEST(BusBoundary, DropDiagnosticsAggregateAtMostOncePerInterval) {
     EXPECT_FALSE(throttle.record(start + std::chrono::seconds(10)));
     EXPECT_EQ(throttle.record(start + std::chrono::seconds(20)), 2U);
     EXPECT_EQ(throttle.record(start + std::chrono::seconds(100)), 1U);
+}
+
+TEST(BusBoundary, ListPhonesAndPairingOutcomeRoundTripOverRealSessionBus) {
+    aa::ipc::test::SequencePairingIds ids;
+    aa::ipc::test::RecordingPhoneDirectory phones;
+    phones.listed_phones = std::vector<std::map<std::string, std::string>>{
+        {{"phone_id", "1"},
+         {"label", "id-0123456789abcdef"},
+         {"transport", "wired"},
+         {"strength", "serial-backed"}},
+        {{"phone_id", "4"},
+         {"label", "id-fedcba9876543210"},
+         {"transport", "wireless"},
+         {"strength", "bond-backed"}},
+    };
+    auto service = aa::ipc::ControlBusService::start(
+        {static_cast<std::uint32_t>(::getuid())}, {ids, phones});
+    ASSERT_TRUE(service.has_value());
+
+    std::atomic<bool> running{true};
+    std::jthread server_thread([&] {
+        while (running.load()) {
+            const auto step = service.value().cycle(aa::core::Milliseconds{10});
+            if (!step.has_value()) {
+                break;
+            }
+        }
+    });
+
+    auto client = aa::ipc::ControlBusClient::connect();
+    ASSERT_TRUE(client.has_value());
+
+    const auto caps = client.value().get_capabilities();
+    ASSERT_TRUE(caps.has_value());
+    EXPECT_EQ(caps.value().at("contract.semver"), "1.2.0");
+    EXPECT_EQ(caps.value().at("phones.list"), "true");
+    EXPECT_EQ(caps.value().at("pairing.outcomes"), "true");
+
+    // Unregistered consumer is rejected over real D-Bus.
+    const auto denied = client.value().list_phones();
+    ASSERT_FALSE(denied.has_value());
+    EXPECT_EQ(denied.error().code(), ErrorCode::ipc_consumer_rejected);
+
+    ASSERT_TRUE(client.value().register_consumer(BusName{kConsumerName}).has_value());
+    const auto listed = client.value().list_phones();
+    ASSERT_TRUE(listed.has_value());
+    ASSERT_EQ(listed.value().size(), 2U);
+    EXPECT_EQ(listed.value()[0].at("phone_id"), "1");
+    EXPECT_EQ(listed.value()[0].at("transport"), "wired");
+    EXPECT_EQ(listed.value()[1].at("phone_id"), "4");
+    EXPECT_EQ(listed.value()[1].at("transport"), "wireless");
+
+    const auto req = client.value().request_add_phone();
+    ASSERT_TRUE(req.has_value());
+    const auto pending = client.value().pairing_outcome(req.value());
+    ASSERT_TRUE(pending.has_value());
+    EXPECT_EQ(pending.value(), "pending");
+
+    ASSERT_TRUE(client.value().confirm_phone_pairing(req.value()).has_value());
+    const auto approved = client.value().pairing_outcome(req.value());
+    ASSERT_TRUE(approved.has_value());
+    EXPECT_EQ(approved.value(), "approved");
+
+    bool saw_completed = false;
+    for (int i = 0; i < 8 && !saw_completed; ++i) {
+        const auto sig = client.value().wait_signal(aa::core::Milliseconds{200});
+        if (!sig.has_value()) {
+            break;
+        }
+        if (sig.value().member == "PairingCompleted" && sig.value().request == req.value()) {
+            EXPECT_EQ(sig.value().outcome, "approved");
+            saw_completed = true;
+        }
+    }
+    EXPECT_TRUE(saw_completed);
+
+    ASSERT_TRUE(client.value().unregister_consumer().has_value());
+    running.store(false);
+    server_thread.join();
+    service.value().close();
 }
 
 // Substitute only the authenticated connection's transport, leaving production

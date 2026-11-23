@@ -398,6 +398,7 @@ TEST_F(AcknowledgementOrder, CommitFollowsTheDurableStoreWrite) {
     EXPECT_TRUE(bridge.approved_at_commit) << "committed before the trust write";
     EXPECT_EQ(store.phones().size(), 1U); EXPECT_EQ(bridge.forgets, 0);
     EXPECT_FALSE(has_diagnostic("pairing_commit_failed"));
+    EXPECT_EQ(control.pairing_outcome(caller, request).value(), "approved");
 }
 TEST_F(AcknowledgementOrder, FailedCommitRetractsTheApproval) {
     bridge.commitment = Error{ErrorCode::timeout};
@@ -411,6 +412,7 @@ TEST_F(AcknowledgementOrder, FailedCommitRetractsTheApproval) {
     EXPECT_TRUE(bridge.snapshots[0].phone) << "the retraction must revoke the approved phone";
     EXPECT_EQ(helper::revocation_peer(bridge.snapshots[0]), bridge.prepared);
     EXPECT_EQ(control.pending_revocations(), 0U);
+    EXPECT_EQ(control.pairing_outcome(caller, request).value(), "retracted");
 }
 TEST_F(AcknowledgementOrder, NotDurableApprovalIsNeverCommittedAndIsRetracted) {
     {
@@ -422,6 +424,24 @@ TEST_F(AcknowledgementOrder, NotDurableApprovalIsNeverCommittedAndIsRetracted) {
     EXPECT_TRUE(has_diagnostic("pairing_commit_failed"));
     EXPECT_TRUE(store.phones().empty());
     EXPECT_EQ(bridge.snapshots.size(), 1U);
+    EXPECT_EQ(control.pairing_outcome(caller, request).value(), "retracted");
+}
+TEST_F(AcknowledgementOrder, FailedRetractionAfterCommitFailureReportsRetractionFailed) {
+    bridge.commitment = Error{ErrorCode::timeout};
+    std::optional<trust::test::faults::ScopedFault> retract_fault;
+    bridge.on_commit = [&] {
+        retract_fault.emplace(trust::test::faults::Fault::renameat);
+    };
+    accept();
+    retract_fault.reset();
+    EXPECT_EQ(store.phones().size(), 1U);
+    EXPECT_EQ(control.pairing_outcome(caller, request).value(), "retraction_failed");
+}
+
+TEST_F(AcknowledgementOrder, RejectedComparisonReportsRejectedOutcome) {
+    ASSERT_TRUE(control.respond_pairing_comparison(caller, request, {79, false}));
+    EXPECT_TRUE(store.phones().empty());
+    EXPECT_EQ(control.pairing_outcome(caller, request).value(), "rejected");
 }
 
 // With a reconciling helper (the production BusClient) the trust store is the single authority.
@@ -440,6 +460,7 @@ TEST_F(AcknowledgementOrder, FailedCommitKeepsTheDurableApprovalForReconciliatio
     EXPECT_EQ(control.pending_revocations(), 0U);
     EXPECT_GE(bridge.cancellations, 1) << "the enrolment's source was not retired";
     EXPECT_EQ(count_closed(), 1U);
+    EXPECT_EQ(control.pairing_outcome(caller, request).value(), "approved_commit_failed");
     (void)control.state();
     ASSERT_FALSE(bridge.reconciled_sets.empty()) << "no reconciliation after the failed commit";
     EXPECT_EQ(bridge.reconciled_sets.back(), std::vector<helper::PeerIdentity>{*bridge.prepared});

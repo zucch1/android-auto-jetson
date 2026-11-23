@@ -21,7 +21,7 @@
 -->
 <node name="/org/custom/AndroidAutoReceiver">
   <interface name="org.custom.AndroidAutoReceiver1">
-    <annotation name="org.custom.AndroidAutoReceiver1.ContractSemVer" value="1.1.0"/>
+    <annotation name="org.custom.AndroidAutoReceiver1.ContractSemVer" value="1.2.0"/>
 
     <!-- Registers caller as THE session consumer. Caller must own
          consumer_name and match the active session user; only one consumer
@@ -128,6 +128,24 @@
     <method name="RequestIdrRecovery">
     </method>
 
+    <!-- Consumer-only redacted list of approved phones (since contract 1.2.0).
+         Each entry carries phone_id (decimal uint64 for ForgetPhone), label
+         (per-process pseudonym, never raw serials/MACs/ports), transport
+         ("wired", "wireless", or "opaque"), and strength. Trust-store schema
+         v3 stores no timestamps, so last_seen is omitted. -->
+    <method name="ListPhones">
+      <arg name="phones" type="aa{ss}" direction="out"/>
+    </method>
+
+    <!-- Consumer-only query of a one-time pairing request's outcome (since
+         contract 1.2.0). Returns a closed-set outcome string: "pending",
+         "approved", "approved_commit_failed", "not_durable", "retracted",
+         "retraction_failed", "rejected", "cancelled", "expired", or "failed". -->
+    <method name="GetPairingOutcome">
+      <arg name="request_id" type="t" direction="in"/>
+      <arg name="outcome" type="s" direction="out"/>
+    </method>
+
     <!-- One-time pairing request id awaiting ConfirmPhonePairing. -->
     <signal name="PairingRequest">
       <arg name="request_id" type="t"/>
@@ -141,6 +159,14 @@
     <!-- A pending request or open window closed for this request id. -->
     <signal name="PairingClosed">
       <arg name="request_id" type="t"/>
+    </signal>
+
+    <!-- Terminal outcome for a pairing request_id (since contract 1.2.0).
+         Carries only request_id and the closed-set outcome string (never phone
+         identifiers or secrets). -->
+    <signal name="PairingCompleted">
+      <arg name="request_id" type="t"/>
+      <arg name="outcome" type="s"/>
     </signal>
 
     <!-- Contract state changed; mirrors GetState. -->

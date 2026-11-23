@@ -176,6 +176,10 @@ class StorePhones final : public aa::ipc::PhoneDirectory {
     [[nodiscard]] aa::core::Result<void> forget(aa::core::PhoneId phone) override {
         return control_.forget(phone);
     }
+    [[nodiscard]] aa::core::Result<std::vector<std::map<std::string, std::string>>> list_phones()
+        const override {
+        return control_.list_phones();
+    }
     std::optional<aa::helper::RevocationV1> take_revocation_v1() override {
         return control_.take_revocation_v1();
     }

@@ -12,6 +12,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace aa::ipc {
 
@@ -28,7 +29,7 @@ namespace aa::ipc {
 // wait_signal(), so interleaved signals are never lost.
 class ControlBusClient final {
 public:
-    // One declared contract signal as received on the wire (the five members
+    // One declared contract signal as received on the wire (the six members
     // of the contract; per-member fields carry that member's arguments).
     struct ContractSignal final {
         std::string member{};
@@ -38,6 +39,7 @@ public:
         DiagnosticSeverity severity{};
         std::string event{};
         std::uint64_t subject{};
+        std::string outcome{};
     };
 
     // Connects to the session bus (DBUS_SESSION_BUS_ADDRESS) and subscribes
@@ -61,15 +63,18 @@ public:
     [[nodiscard]] core::Result<void> request_idr_recovery();
     [[nodiscard]] core::Result<void> set_display_viewport(Viewport viewport);
     [[nodiscard]] core::Result<StateSnapshot> get_state();
+    [[nodiscard]] core::Result<std::map<std::string, std::string>> get_capabilities();
     [[nodiscard]] core::Result<std::uint64_t> ping();
 
-    // Enrolment (RequestAddPhone / GetPairingCandidate / ConfirmPhonePairing /
-    // CancelPhonePairing): the consumer side of the add-phone flow (#133).
+    // Enrolment / approved-phone management (contract 1.1.0+ / 1.2.0+).
+    [[nodiscard]] core::Result<std::vector<std::map<std::string, std::string>>> list_phones();
+    [[nodiscard]] core::Result<std::string> pairing_outcome(core::PairingRequestId request);
     [[nodiscard]] core::Result<core::PairingRequestId> request_add_phone();
     [[nodiscard]] core::Result<std::map<std::string, std::string>> pairing_candidate(
         core::PairingRequestId request);
     [[nodiscard]] core::Result<void> confirm_phone_pairing(core::PairingRequestId request);
     [[nodiscard]] core::Result<void> cancel_phone_pairing(core::PairingRequestId request);
+    [[nodiscard]] core::Result<void> forget_phone(core::PhoneId phone);
 
     // Waits for the next declared contract signal (parked ones first). An
     // expired wait is the typed error `timeout`.

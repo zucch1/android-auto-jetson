@@ -10,7 +10,9 @@ namespace aa::app {
 
 WiredPhoneControl::WiredPhoneControl(trust::ApprovedPhoneStore& store, WiredSession& session,
                                      Persist persist)
-    : store_(store), session_(session), persist_(std::move(persist)) {}
+    : store_(store), session_(session), persist_(std::move(persist)) {
+    refresh_listed();
+}
 
 WiredPhoneControl::~WiredPhoneControl() {
     // An owner that never reached finish(): never block destruction on disk.
@@ -19,10 +21,24 @@ WiredPhoneControl::~WiredPhoneControl() {
     }
 }
 
-void WiredPhoneControl::bind_owner() {
+void WiredPhoneControl::refresh_listed() {
+    auto snapshot = trust::list_approved_phones(store_);
     const std::lock_guard lock(mutex_);
-    assert(owner_ == std::thread::id{});
-    owner_ = std::this_thread::get_id();
+    listed_ = std::move(snapshot);
+}
+
+core::Result<std::vector<std::map<std::string, std::string>>> WiredPhoneControl::list_phones() {
+    const std::lock_guard lock(mutex_);
+    return listed_;
+}
+
+void WiredPhoneControl::bind_owner() {
+    {
+        const std::lock_guard lock(mutex_);
+        assert(owner_ == std::thread::id{});
+        owner_ = std::this_thread::get_id();
+    }
+    refresh_listed();
 }
 
 void WiredPhoneControl::assert_owner() {
@@ -135,6 +151,7 @@ void WiredPhoneControl::settle() {
     auto snapshot = std::move(in_flight_snapshot_);
     auto result = store_.apply_forget(*prepared_, std::move(written));
     prepared_.reset();
+    refresh_listed();
     const bool committed = result.has_value() ||
                             result.error().code() == ErrorCode::trust_store_not_durable;
     {
