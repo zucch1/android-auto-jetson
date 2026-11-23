@@ -268,12 +268,20 @@ remaining excess), `credit_window` (the advertised
 accepted and not yet released for ACK: our side, normally 1 because acks go
 out on receipt) and `max_arrival_burst` (the most chunks of one channel that
 arrived within 10 ms of each other: the phone's side, above 1 when it uses
-more than one credit at once). Each underrun also logs
+more than one credit at once). The wired receiver's lossless
+playout (#228) never trims, sheds or pads, so those counters stay `0`; its
+records add `frames_compressed` and `frames_stretched` (output frames the rate
+correction made the decoded runs shorter or longer by: nothing is dropped or
+inserted), `playout_overflows` (chunks cut by the 2 s emergency bound) and
+`frames_overflowed` (what they lost, a subset of `frames_trimmed`, also logged
+as `audio_playout_overflow` with `frames`, `frames_lifetime` and `depth_ms`).
+There `playout_offset_ms` and `playout_offset_ns` are the media stream's while
+media plays. Each underrun also logs
 `audio_playout_underrun` with `underruns_lifetime`, `late_ms` (how long after
 its slot the chunk arrived) and `depth_ms` (the depth it re-anchored with),
 and each anchor logs `audio_playout_anchor` with `reason` (`start` or
 `resume`), `skipped_ms` (elapsed time jumped over without a write),
-`depth_ms` and `anchors_lifetime`. The wireless VideoOutlet logs
+`depth_ms` and `anchors_lifetime`. The VideoOutlet logs
 `video_hold_capped` (`requested_ms`, `cap_ms` 400, `capped_frames`, counted
 when a capped frame is released) when the offset it follows exceeds its hold
 cap, and `video_release_late` (`late_ms`, `late_releases`, `by`: the path that

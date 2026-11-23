@@ -144,14 +144,33 @@ task 32.
 
 ## Wired audio playout policy and added latency (#228)
 
-`aa-wired-receiver` uses the no-loss playout clock by default (`--audio-playout-ms`
-default `60` ms, max `180` ms; stop-and-wait `max_unacked 1`; catch-up off) with
-video held to match (`--video-delay-ms match`, following `audio_write_completed`'s
-`playout_offset_ns`). This adds ~`60` ms of latency to wired audio, video,
-touch-to-photon, and IDR recovery (leaving ~`940` ms of the `1.0` s
-`waiting_idr_max` budget) while keeping A/V lip-sync unchanged and keeping
-`frames_trimmed` at `0` through steady state, bursts, and guidance prompts over
-media. `--audio-playout-ms 0` restores the legacy arrival-time model.
+`aa-wired-receiver` uses the lossless playout clock by default
+(`--audio-playout-ms` default `60` ms, max `180` ms; stop-and-wait
+`max_unacked 1`; catch-up off) with video held to match (`--video-delay-ms
+match`, following `audio_write_completed`'s `playout_offset_ns`). Wired audio
+drops no sample and inserts silence only for a stream start, a resume or a real
+underrun; the cost is latency:
+
+- steady: ~`60` ms on wired audio, video, touch-to-photon and IDR recovery
+  (leaving ~`940` ms of the `1.0` s `waiting_idr_max` budget);
+- after a stall with a full 8-chunk backlog: up to ~`360` ms (video hold cap
+  `400` ms, leaving ~`600` ms of that budget), drained by playing 0.5% fast, up
+  to 1% while the excess is over `100` ms: about `10` s per 100 ms of deep excess,
+  ~`45` s from ~`360` ms to `75` ms;
+- beyond `2` s of backlog only (above the 1.6 s a role can queue): the excess is
+  cut and logged (`audio_playout_overflow`, `playout_overflows`,
+  `frames_overflowed`).
+
+Check on a long hold with navigation prompts over music, from the last
+`media_timing`: `frames_trimmed`, `frames_shed`, `frames_padded`,
+`frames_caught_up`, `playout_overflows` all `0`; `frames_silence` and
+`frames_skipped` grow only with `audio_playout_underrun` or
+`audio_playout_anchor` records; `frames_compressed` / `frames_stretched` follow
+the phone's clock (a few hundred ppm of `frames_decoded`). No
+`audio_stall_bypass` (that path drops audio once a sink write has blocked for
+over about 1.5 s and the queue is full). Listen for pitch movement after a provoked stall: 1% is 17 cents, slid
+in over about half a second. `--audio-playout-ms 0` restores the legacy
+arrival-time model.
 
 ## Privacy
 
