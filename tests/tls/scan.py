@@ -11,7 +11,8 @@ real source tree (it must prove absence), and binds the scanner digest denylist
 to the sanitization record in third_party/provenance/inventory.json. Negative
 mode plants credential-shaped material in a private fixture and requires
 rejection: private-key PEM blocks, certificate PEM blocks, the historical
-credential file names and planted copies under source-like directories.
+credential file names, token patterns and planted copies under source-like
+directories. Non-regular entries and symlinks have distinct rejections.
 Reencodings mode is the adversarial bypass regression: it re-derives the
 recorded historical certificate/private key from the git blobs pinned in the
 sanitization record (read-only; the bytes match the recorded original_sha256
@@ -30,6 +31,7 @@ from pathlib import Path
 import base64
 import hashlib
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -37,7 +39,7 @@ import tempfile
 
 def run(scanner: Path, target: Path) -> subprocess.CompletedProcess[str]:
     return subprocess.run([sys.executable, '-B', str(scanner), str(target)],
-                          capture_output=True, text=True, check=False)
+                          capture_output=True, text=True, check=False, timeout=30)
 
 
 def prove_absence(root: Path) -> None:
@@ -76,6 +78,10 @@ def plant_rejections(root: Path) -> None:
             'src/__pycache__/planted.pem': key,
             'third_party/aasdk/planted.pem': key,
             'third_party/compat-credentials/injected.key': key,
+            'third_party/compat-credentials/headunit.key': key,
+            'third_party/compat-credentials/headunit.crt': certificate,
+            'token.txt': b'token=' + b'ghp_' + b'a' * 36 + b'\n',
+            'token.b64': base64.b64encode(b'github_pat_' + b'a' * 82),
             'headunit.key': key,
             'anywhere/headunit.crt': certificate,
             'wrapped-cert.txt': b'prologue\n' + certificate + b'epilogue\n',
@@ -105,6 +111,12 @@ def plant_rejections(root: Path) -> None:
         result = run(scanner, fixture)
         assert result.returncode == 0, result
         (workspace / 'local').unlink()
+        fifo = fixture / 'non-regular'
+        os.mkfifo(fifo)
+        result = run(scanner, fixture)
+        assert result.returncode == 1, result
+        assert result.stdout == 'tls-key-scan: FAIL non-regular-source\n', result
+        fifo.unlink()
         historical = denied_digests(scanner)
         payload = b'synthetic stand-in for a digest-checked copy\n'
         assert hashlib.sha256(payload).hexdigest() not in historical, payload
@@ -240,7 +252,7 @@ def main() -> int:
     root = Path(sys.argv[1]).resolve()
     if '--negative' in sys.argv:
         plant_rejections(root)
-        print('tls-key-scan-negative: PASS planted-marker-name-cert-rejected')
+        print('tls-key-scan-negative: PASS credential-plants-and-special-entries-rejected')
         return 0
     if '--reencodings' in sys.argv:
         reencoding_rejections(root)

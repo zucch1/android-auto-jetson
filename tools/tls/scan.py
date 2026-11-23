@@ -6,18 +6,21 @@
 # Run: python3 -B tools/tls/scan.py ROOT
 #     python3 -B tools/tls/scan.py --print-denylist
 #     python3 -B tools/tls/scan.py --print-der-denylist
-"""Prove absence of head-unit credential copies: no allowlist, zero tolerance.
+"""Scan the source tree for credential material with no allowlist.
 
 Rejects (with no exceptions anywhere in the scanned tree):
 - any private-key or certificate PEM block, in any armor spelling (CERTIFICATE,
   TRUSTED CERTIFICATE, X509 CERTIFICATE, any *PRIVATE KEY*),
+- selected GitHub access token formats,
 - any file named headunit.key or headunit.crt (the historical credential names),
 - any byte-identical copy of the removed 2026-10-10 credential (digest denylist),
 - recognizable re-encodings of that same removed certificate/private key:
   raw DER, whitespace-stripped base64 or hex of any of the above (decoded, then
   matched again as digest or PEM armor; decodes nest),
 - any symlink outside the excluded top-level development/cache directories;
-  symlinks are reported as `symlink-present`, not misdiagnosed as credentials.
+  symlinks are reported as `symlink-present`,
+- non-regular filesystem entries (for example FIFOs), reported as
+  `non-regular-source`.
 
 The digest denylist pins the two distinct historical byte strings that were
 published in three copies each (original SHA-256 identities, recorded as the
@@ -49,6 +52,7 @@ import base64
 import binascii
 import hashlib
 import re
+import stat
 import sys
 from typing import Final
 
@@ -68,6 +72,9 @@ FORBIDDEN_NAMES: Final = frozenset(('headunit.key', 'headunit.crt'))
 MARKER: Final = re.compile(
     rb'-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----'
     rb'|-----BEGIN (?:[A-Z0-9]+ )*CERTIFICATE-----')
+GITHUB_TOKEN: Final = re.compile(
+    rb'(?<![A-Za-z0-9_])(?:gh[pousr]_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{82})'
+    rb'(?![A-Za-z0-9_])')
 PEM_BLOCK: Final = re.compile(
     rb'-----BEGIN (?:[A-Z0-9]+ )*(?:PRIVATE KEY|CERTIFICATE)-----'
     rb'(.*?)'
@@ -115,12 +122,12 @@ def derived(data: bytes) -> set[bytes]:
 
 
 def hits(data: bytes) -> bool:
-    """Return True when any derived shape is a known identity or PEM armor."""
+    """Return True when any derived shape is a known identity or a credential marker."""
     digests = FORBIDDEN_DIGESTS | FORBIDDEN_DER_DIGESTS
     for blob in derived(data):
         if hashlib.sha256(blob).hexdigest() in digests:
             return True
-        if MARKER.search(blob):
+        if MARKER.search(blob) or GITHUB_TOKEN.search(blob):
             return True
     return False
 
@@ -147,8 +154,11 @@ def rejection(root: Path) -> str | None:
                 return 'symlink-present'
         for name in files:
             path = directory / name
-            if path.is_symlink():
+            mode = path.lstat().st_mode
+            if stat.S_ISLNK(mode):
                 return 'symlink-present'
+            if not stat.S_ISREG(mode):
+                return 'non-regular-source'
             if name in FORBIDDEN_NAMES:
                 return 'credential-material-present'
             data = path.read_bytes()
