@@ -159,6 +159,18 @@ class PrivacyTests(PackageTest):
         rebind(self.manifest, 'session_trace')
         self.assertEqual(self.cli('check_privacy.py').returncode, 0)
 
+    def test_raw_material_after_escaped_whitespace_is_checked(self) -> None:
+        path = self.root / 'session.jsonl'
+        for control in ('AA-0123456789abcdef', '02:00:5e:00:53:01',
+                        'iSerial 3 TESTONLY0RAW', 'Bearer TESTONLYRAWTOKEN',
+                        '12.345678, -98.765432'):
+            for separator in ('\n', '\t'):
+                write(path, {'nested': [{'log': 'header' + separator + control}]})
+                rebind(self.manifest, 'session_trace')
+                result = self.cli('check_privacy.py')
+                self.assertEqual(result.returncode, 1, (control, separator))
+                self.assertNotIn(control, result.stdout + result.stderr)
+
     def test_unreferenced_capture_files_fail(self) -> None:
         # Given: raw material must fail even outside manifest references.
         for filename, data in (('traffic.pcap', b'fake capture'),

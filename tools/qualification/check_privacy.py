@@ -24,7 +24,7 @@ MAC: Final = re.compile(
     r'(?i)(?<![0-9a-f])(?:[0-9a-f]{2}[:-]){5}[0-9a-f]{2}(?![0-9a-f])|'
     r'dev_(?:[0-9a-f]{2}_){5}[0-9a-f]{2}(?![0-9a-f])')
 RAW_AP_NAME: Final = re.compile(r'(?i)(?<![0-9a-z])AA-[0-9a-f]{16}(?![0-9a-z])')
-IW_SSID: Final = re.compile(r'(?im)^[ \t]*ssid[ \t]+(?![ \t]*[:=])([^\r\n]*)')
+IW_SSID: Final = re.compile(r'(?m)^[ \t]*ssid[ \t]+(?![ \t]*[:=])([^\r\n]*)')
 GETPROP_SERIAL: Final = re.compile(r'(?i)\[ro\.(?:boot\.)?serialno\][ \t]*:[ \t]*([^\r\n]*)')
 SENSITIVE_LABEL: Final = (
     r'''(?:(?:(?:usb|phone|device|adb)[_ -]?)?serial(?:[_ -]?number|no)?|iSerial|'''
@@ -54,6 +54,12 @@ MAGIC: Final = (b'\xd4\xc3\xb2\xa1', b'\xa1\xb2\xc3\xd4', b'\x0a\x0d\x0d\x0a',
 
 
 def check_text_values(text: str) -> None:
+    # Run the raw-material patterns on the decoded string too: in json.dumps
+    # output a newline or tab becomes the letters "n"/"t", which defeats the
+    # word-boundary lookarounds below.
+    require(not MAC.search(text), 'PRIVACY_RAW_MAC')
+    require(not RAW_CONTENT.search(text) and not RAW_AP_NAME.search(text),
+            'PRIVACY_RAW_MATERIAL')
     for match in SENSITIVE.finditer(text):
         require(SAFE_VALUE.fullmatch(match[1].strip()) is not None, 'PRIVACY_SENSITIVE_VALUE')
     for match in IW_SSID.finditer(text):
