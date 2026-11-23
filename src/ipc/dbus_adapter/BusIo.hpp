@@ -36,6 +36,9 @@ inline int remaining(Deadline until) {
                                                   std::size_t* filled_out = nullptr) {
     std::size_t filled = 0;
     if (filled_out != nullptr) *filled_out = 0;
+    // A closed connection (fd -1) must fail now: poll() ignores negative
+    // descriptors and would sleep for the whole timeout instead.
+    if (fd < 0) return Error{ErrorCode::transport_closed};
     while (filled < out.size()) {
         if (std::chrono::steady_clock::now() >= until) return Error{ErrorCode::timeout};
         ::pollfd descriptor{fd, POLLIN, 0};
@@ -67,6 +70,7 @@ inline int remaining(Deadline until) {
 
 [[nodiscard]] inline core::Result<void> write_full(int fd, std::span<const std::uint8_t> data, Deadline until = deadline()) {
     std::size_t sent = 0;
+    if (fd < 0) return Error{ErrorCode::transport_closed};
     while (sent < data.size()) {
         if (std::chrono::steady_clock::now() >= until) return Error{ErrorCode::timeout};
         ::pollfd descriptor{fd, POLLOUT, 0};

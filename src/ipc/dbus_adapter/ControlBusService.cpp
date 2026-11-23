@@ -151,6 +151,7 @@ core::Result<std::size_t> ControlBusService::cycle(core::Milliseconds idle_inter
     }
     const int limit = static_cast<int>(idle_interval.count < 0 ? 1000 :
                                        std::min<std::int64_t>(idle_interval.count, 1000));
+    if (impl_->connection->native_handle() < 0) return Error{ErrorCode::transport_closed};
     ::pollfd descriptor{impl_->connection->native_handle(), POLLIN, 0};
     const int ready = ::poll(&descriptor, 1, limit);
     if (ready < 0) {

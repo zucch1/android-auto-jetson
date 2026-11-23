@@ -467,6 +467,7 @@ core::Result<ControlBusClient::ContractSignal> ControlBusClient::wait_signal(
             }
             limit = remaining > 2000 ? 2000 : static_cast<int>(remaining);
         }
+        if (impl_->connection->native_handle() < 0) return Error{ErrorCode::transport_closed};
         ::pollfd descriptor{impl_->connection->native_handle(), POLLIN, 0};
         const int ready = ::poll(&descriptor, 1, limit);
         if (ready < 0) {

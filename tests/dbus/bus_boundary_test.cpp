@@ -743,6 +743,27 @@ TEST_F(SocketBoundary, PeerClosingBeforeHeaderClosesConnection) {
     EXPECT_EQ(receiver->native_handle(), -1);
 }
 
+TEST_F(SocketBoundary, ClosedConnectionFailsFastInsteadOfPollingMinusOne) {
+    ::close(peer); peer = -1;
+    ASSERT_FALSE(receiver->read_message().has_value());
+    ASSERT_EQ(receiver->native_handle(), -1);
+    // poll() ignores a negative descriptor, so without the guard each of these
+    // would sleep for its whole deadline and report a timeout or I/O error.
+    const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    const auto start = std::chrono::steady_clock::now();
+    const auto again = receiver->read_message();
+    ASSERT_FALSE(again.has_value());
+    EXPECT_EQ(again.error().code(), ErrorCode::transport_closed);
+    std::array<std::uint8_t, 16> buffer{};
+    const auto read = bus::bus_io::read_full(-1, buffer, until);
+    ASSERT_FALSE(read.has_value());
+    EXPECT_EQ(read.error().code(), ErrorCode::transport_closed);
+    const auto wrote = bus::bus_io::write_full(-1, buffer, until);
+    ASSERT_FALSE(wrote.has_value());
+    EXPECT_EQ(wrote.error().code(), ErrorCode::transport_closed);
+    EXPECT_LT(std::chrono::steady_clock::now() - start, std::chrono::milliseconds(200));
+}
+
 TEST_F(SocketBoundary, PeerClosingMidDrainClosesConnection) {
     const auto oversized = frame(1024 * 1024);
     ASSERT_TRUE(bus::bus_io::write_full(peer, std::span{oversized}.first(5000)));

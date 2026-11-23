@@ -307,7 +307,7 @@ Actions (wire numbers are append-only):
 | 1 | AP acquire | channel 36/40/44/48 and equal to ap.conf (default 36); one-use AP grant |
 | 2 | Open pairing (fixed backend 60-second-window contract) | channel 0; distinct one-use pairing grant and captured peer binding |
 | 3 | AP release | channel 0, grant 0, same receiver binding |
-| 4 | AP status | channel 0, grant 0, same binding |
+| 4 | AP status | channel 0, grant 0, same binding; the startup probe from a newly verified receiver may take over the binding once the previous unique name is confirmed unowned (see Receiver identity) |
 | 5 | USB policy status | channel 0, grant 0, same binding |
 | 6 | ModemManager exclusion status | channel 0, grant 0, same binding |
 | 7/8 | BlueZ register/unregister fixed AA profile | channel 0, grant 0, same binding |
@@ -375,6 +375,8 @@ lookup 100ms, no auto-start and a captured unique destination. BlueZ daemon
 owner changes invalidate observations and close FDs. Adapter BlueZ timeouts are
 also set to 60s. Cleanup retries failed quiet-property writes. Crash/restart
 reconciliation limits are explicit in the task36 document, not target-qualified.
+
+The `NameHasOwner` check for the previous receiver runs on the credential connection with a 200 ms deadline; an error or timeout keeps the old binding and answers `helper_unavailable`.
 
 Credential RPCs share an absolute 500 ms deadline and helper export read/reply
 steps 500 ms. Typed client calls use the caller's timeout capped at one second;
