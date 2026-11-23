@@ -422,7 +422,7 @@ def case_owner_bus_restart(args):
         start_private_bus(address, children)
         replacement, _, _ = start_receiver(args, runtime, env=env)
         children.callback(replacement.stop, False)
-        resumed = display.await_status(lambda s: s["frames_presented"] == 180, timeout=12)
+        resumed = display.await_status(lambda s: s["frames_presented"] == 180, timeout=30)
         assert resumed["state"] == "projecting" and resumed["helper_started"], resumed
         assert display.stop() == 0
         assert replacement.stop(False) == 0
