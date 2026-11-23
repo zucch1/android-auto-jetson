@@ -4288,14 +4288,32 @@ class ReceiverAudioDispatch : public testing::Test {
         }
         return receive(channel, aa::protocol::encode(aa::protocol::AvSinkStart{7, 0}).value());
     }
+    // Services the owner until the render worker is idle. It polls with a
+    // bound instead of calling receive_with_audio(): that helper re-reads
+    // audio.outstanding() and, once the worker has gone idle in between,
+    // takes its blocking receive, which on this scripted transport with
+    // nothing queued fails as transport_closed (#202). On a live link that
+    // blocking receive is the intended idle path and simply waits for the
+    // phone's next frame.
     aa::core::Result<void> wait_owner() {
         const auto until = std::chrono::steady_clock::now() + std::chrono::seconds{2};
         while (audio.outstanding() && std::chrono::steady_clock::now() < until) {
-            auto result = receive_with_audio(session, audio);
-            if (!result) { return result.error(); }
+            if (auto serviced = service_audio_completions(session, audio); !serviced) {
+                return serviced.error();
+            }
+            const auto slice = std::min(until, std::chrono::steady_clock::now() +
+                                                   std::chrono::milliseconds{5});
+            auto polled = session.poll_transport(slice);
+            if (!polled) { return polled.error(); }
+        }
+        // Service once more before judging the deadline, so a worker error
+        // latched during the last poll is reported as itself, not as a
+        // generic timeout, and a queued credit is still sent.
+        if (auto serviced = service_audio_completions(session, audio); !serviced) {
+            return serviced.error();
         }
         if (audio.outstanding()) { return aa::Error{aa::ErrorCode::timeout}; }
-        return service_audio_completions(session, audio);
+        return {};
     }
 };
 
@@ -4671,7 +4689,8 @@ TEST_F(ReceiverAudioDispatch, VariableMediaParentsRenderFifoAndCreditExactlyOnce
         if (i == 0) { ASSERT_EQ(transport.wire.sent_count(), before + 1); }
         if (i == 1) { gate->release(); }
         if (i >= 1) {
-            ASSERT_TRUE(wait_owner());
+            const auto owned = wait_owner();
+            ASSERT_TRUE(owned) << aa::to_string(owned.error().code());
             EXPECT_EQ(transport.wire.sent_count(), before + i + 1);
             ASSERT_TRUE(service_audio_completions(session, audio));
             EXPECT_EQ(transport.wire.sent_count(), before + i + 1);
