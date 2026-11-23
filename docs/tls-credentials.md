@@ -96,11 +96,13 @@ removed. Checked OpenSSL buffer-length conversions reject oversized lengths.
 The repository marker scanner excludes only the root operational paths `.git`,
 `.omo`, `.claude`, `build` and `.local`. All other content, including `__pycache__`
 directories at every depth and source directories named `build`, is scanned.
-The scanner allowlists nothing: any private-key or certificate PEM block, any
-file named `headunit.key`/`headunit.crt`, selected GitHub token patterns, and
-copies of the removed credential (including supported re-encodings) fail the
-scan. The historical credential digests are pinned. Effective-stage scanning
-also has no exceptions.
+The scanner allows at most one labeled public PEM reference by exact path
+and digest under `third_party/compat-credentials/`. That pin is unpopulated.
+Any key or certificate PEM block, any file named `headunit.key`/`headunit.crt`,
+selected GitHub token patterns, and copies of the removed credential
+(including supported re-encodings) fail the scan of the current tree. The
+historical credential digests are always denied. Effective-stage scanning
+has no exceptions.
 
 ## Executed host tests, not target acceptance
 

@@ -6,9 +6,13 @@
 # Run: python3 -B tools/tls/scan.py ROOT
 #     python3 -B tools/tls/scan.py --print-denylist
 #     python3 -B tools/tls/scan.py --print-der-denylist
-"""Scan the source tree for credential material with no allowlist.
+"""Scan the source tree for credential material.
 
-Rejects (with no exceptions anywhere in the scanned tree):
+The only PEM exception is a labeled public compatibility reference pinned by
+exact repository-relative path and SHA-256. There is no active exception since
+the historical reference was removed.
+
+Rejects:
 - any private-key or certificate PEM block, in any armor spelling (CERTIFICATE,
   TRUSTED CERTIFICATE, X509 CERTIFICATE, any *PRIVATE KEY*),
 - selected GitHub access token formats,
@@ -82,6 +86,10 @@ PEM_BLOCK: Final = re.compile(
 HEX: Final = re.compile(rb'[0-9a-fA-F]+')
 EXCLUDED: Final = frozenset(('.git', '.omo', '.claude', 'build', '.local'))
 MAX_DERIVED: Final = 16
+COMPATIBILITY_DIRECTORY: Final = Path('third_party/compat-credentials')
+# The removed reference remains denied. An entry here would identify one
+# labeled public reference as (exact repository-relative path, SHA-256).
+PUBLIC_COMPATIBILITY_REFERENCE: Final[tuple[Path, str] | None] = None
 
 
 def derived(data: bytes) -> set[bytes]:
@@ -121,13 +129,13 @@ def derived(data: bytes) -> set[bytes]:
     return seen
 
 
-def hits(data: bytes) -> bool:
+def hits(data: bytes, *, permit_public_pem: bool = False) -> bool:
     """Return True when any derived shape is a known identity or a credential marker."""
     digests = FORBIDDEN_DIGESTS | FORBIDDEN_DER_DIGESTS
     for blob in derived(data):
         if hashlib.sha256(blob).hexdigest() in digests:
             return True
-        if MARKER.search(blob) or GITHUB_TOKEN.search(blob):
+        if GITHUB_TOKEN.search(blob) or (not permit_public_pem and MARKER.search(blob)):
             return True
     return False
 
@@ -141,6 +149,11 @@ def rejection(root: Path) -> str | None:
     """
     if not root.is_dir():
         raise ValueError(f'scan root is not a directory: {root}')
+
+    reference = PUBLIC_COMPATIBILITY_REFERENCE
+    if reference is not None and reference[0].parent != COMPATIBILITY_DIRECTORY:
+        return 'invalid-public-reference-path'
+    reference_seen = False
 
     def raise_error(error: OSError) -> None:
         raise error
@@ -162,8 +175,15 @@ def rejection(root: Path) -> str | None:
             if name in FORBIDDEN_NAMES:
                 return 'credential-material-present'
             data = path.read_bytes()
-            if hits(data):
+            is_reference = reference is not None and path.relative_to(root) == reference[0]
+            if is_reference:
+                if hashlib.sha256(data).hexdigest() != reference[1]:
+                    return 'public-reference-digest-mismatch'
+                reference_seen = True
+            if hits(data, permit_public_pem=is_reference):
                 return 'credential-material-present'
+    if reference is not None and not reference_seen:
+        return 'public-reference-missing'
     return None
 
 
@@ -191,7 +211,10 @@ def main() -> int:
     if rejected is not None:
         print(f'tls-key-scan: FAIL {rejected}')
         return 1
-    print('tls-key-scan: PASS zero-credential-copies no-allowlist')
+    if PUBLIC_COMPATIBILITY_REFERENCE is None:
+        print('tls-key-scan: PASS zero-credential-copies no-allowlist')
+    else:
+        print('tls-key-scan: PASS pinned-public-reference-only')
     return 0
 
 

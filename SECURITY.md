@@ -2,7 +2,11 @@
 
 ## Supported versions and reporting
 
-This project is in pre-release development. Report undisclosed vulnerabilities
+This project is in pre-release development. It has no Google Android Auto
+certification or official SDK status. The implementation uses a
+reverse-engineered protocol, so undocumented behavior, phone updates or
+protocol changes can break compatibility and invalidate assumptions about
+message handling. Report undisclosed vulnerabilities
 privately through GitHub Security Advisories or contact the maintainer
 (`@zucch1`) through GitHub. Acknowledgement is best effort within seven days.
 
@@ -30,9 +34,11 @@ supplies no credential or fallback. See [TLS credential handling](docs/tls-crede
 compatibility HU credential was removed from the source tree and distribution,
 but its private key remains in reachable Git history. Treat that credential as
 exposed and replace it wherever it is still in use. The current tree has no
-credential exception. The scanner pins the removed credential's identities as
-denied digests. History remediation and cleanup of any old local copies remain
-owner decisions before publication of a release or tag. See the
+credential exception. The scanner can permit PEM armor for one labeled
+public reference under `third_party/compat-credentials/` when both the exact
+repository-relative path and SHA-256 match. The removed credential's digests
+remain denied even if pinned as a reference. History remediation and cleanup
+of any old local copies remain owner decisions before a release or tag. See the
 [credential disposition](third_party/compat-credentials/README.md).
 
 ## Phone trust and local authorization
@@ -124,10 +130,12 @@ ctest --preset host-dev --no-tests=error -R security_hardening --output-on-failu
 python3 -B tools/tls/scan.py .
 ```
 
-CTest also selects the same profile with `-L '^security_hardening$'`. It
-covers seeded malformed-input fuzz smoke, unauthorized D-Bus and helper
-requests, simulated unknown devices, secret scanning, diagnostic redaction,
-and trust-store and HU file permissions.
+CTest also selects the same profile with `-L '^security_hardening$'`. The
+fixtures cover authorized D-Bus, TLS and wired admission flows. They assert
+that unknown local peers and phones, malformed protobuf and insecure HU key
+permissions fail closed. The profile also checks seeded framing fuzz smoke,
+helper authorization, trust-store permissions, diagnostic redaction and
+credential scanning, including the exact-path and digest rule.
 
 The source-tree scanner recognizes key and certificate PEM armor, selected
 GitHub token formats, historical HU filenames and pinned historical HU

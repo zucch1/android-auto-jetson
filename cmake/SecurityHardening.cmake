@@ -8,9 +8,11 @@ endif()
 # as the component suites and run without provisioned services or hardware.
 add_test(NAME security_hardening_framing COMMAND aa_transport_frame_test
     --gtest_filter=FuzzSmoke.*:Malformed.*)
-add_test(NAME security_hardening_unauthorized_ipc COMMAND "${AA_DBUS_RUN_SESSION}" --
+add_test(NAME security_hardening_protobuf COMMAND aa_protocol_adapter_test
+    --gtest_filter=MessageReject.*)
+add_test(NAME security_hardening_ipc_authority COMMAND "${AA_DBUS_RUN_SESSION}" --
     "$<TARGET_FILE:aa_dbus_contract_test>"
-    --gtest_filter=AccessControl.*:BusBoundary.UnauthorizedCallerIsRejectedThroughTheBoundary:BusSocketAuth.*)
+    --gtest_filter=AccessControl.*:BusBoundary.RealCallsDispatchThroughBoundaryWithDaemonStampedIdentity:BusBoundary.UnauthorizedCallerIsRejectedThroughTheBoundary:BusSocketAuth.*)
 add_test(NAME security_hardening_helper_authority COMMAND aa_system_helper_test
     --gtest_filter=HelperCore.*:HelperIdentity.*)
 add_test(NAME security_hardening_unknown_device COMMAND aa_usb_aoa_test
@@ -20,6 +22,10 @@ add_test(NAME security_hardening_trust_store COMMAND aa_trust_store_test
 add_test(NAME security_hardening_diagnostics
     COMMAND "${Python3_EXECUTABLE}" -B "${CMAKE_SOURCE_DIR}/tests/diagnostics/test_json.py"
         "$<TARGET_FILE:aa_diagnostics_json_probe>")
+
+add_test(NAME security_hardening_authorized_tls
+    COMMAND "${Python3_EXECUTABLE}" -B "${CMAKE_SOURCE_DIR}/tests/tls/handshake.py"
+        "${CMAKE_SOURCE_DIR}" "$<TARGET_FILE:aa_tls_handshake>" approved)
 
 foreach(case insecure symlink hardlink malformed)
     add_test(NAME security_hardening_credential_${case}
@@ -37,9 +43,9 @@ list(FILTER _aa_security_tests INCLUDE REGEX "^security_hardening_")
 set_tests_properties(${_aa_security_tests} PROPERTIES LABELS security_hardening TIMEOUT 60)
 unset(_aa_security_tests)
 # Preserve the isolation used by the source suites for their timed IPC work.
-set_tests_properties(security_hardening_unauthorized_ipc security_hardening_helper_authority
+set_tests_properties(security_hardening_ipc_authority security_hardening_helper_authority
     PROPERTIES RUN_SERIAL TRUE)
 
 add_custom_target(security_hardening_tests DEPENDS
-    aa_transport_frame_test aa_dbus_contract_test aa_system_helper_test aa_usb_aoa_test
-    aa_trust_store_test aa_diagnostics_json_probe aa_credential_probe)
+    aa_transport_frame_test aa_protocol_adapter_test aa_dbus_contract_test aa_system_helper_test
+    aa_usb_aoa_test aa_trust_store_test aa_diagnostics_json_probe aa_tls_handshake aa_credential_probe)
