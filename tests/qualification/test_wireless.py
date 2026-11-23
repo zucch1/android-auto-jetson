@@ -23,7 +23,8 @@ from results import performance
 def wireless_result(name: str, provenance: dict, stamp: str, *, scoped: bool = False,
                     excursions: bool = True) -> dict:
     seconds, duration = DURATIONS[name]
-    raw = capture_v3(seconds, provenance)
+    # A sparse synthetic series still exercises every signed A/V gate.
+    raw = capture_v3(seconds, provenance, pair_interval_ns=500_000_000)
     usb = {'readable': True, 'phone_attached': False, 'aoa_attached': False}
     snapshot = {'wifi': {'connected': True, 'channel': 36, 'frequency_mhz': 5180}}
     raw.update(mode='wireless', ap_channel=36, ap_interface='wlan0',
@@ -44,7 +45,7 @@ def wireless_result(name: str, provenance: dict, stamp: str, *, scoped: bool = F
         # Exercise the exact allowance in both runs, including a pair at the hard cap.
         series = raw['av_series']['pair_skew_ns']
         for index in range(seconds // 1800):
-            series[300 + 30_000 * index] = -150_000_000
+            series[20 + 2_000 * index] = -150_000_000
     return build_result(raw, duration_requested=duration if name == 'perf_30m' else f'{seconds}s',
                         now=stamp, capture_path=None, capture_sha256=None)
 
