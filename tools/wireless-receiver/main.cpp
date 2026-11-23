@@ -5,6 +5,7 @@
 #include <aa/trust/PairingPolicy.hpp>
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <optional>
@@ -40,9 +41,14 @@ int receiver_main(int argc, char **argv) {
         return 3;
     }
 #if defined(AA_WIRELESS_ALLOW_HELPER_BUS_ADDRESS) && AA_WIRELESS_ALLOW_HELPER_BUS_ADDRESS
+    const auto* same_uid_fixture = std::getenv("AA_WIRELESS_TEST_SAME_UID_HELPER");
+    const auto open_private_helper =
+        same_uid_fixture && std::strcmp(same_uid_fixture, "1") == 0
+            ? aa::helper::BusClient::private_bus_for_test
+            : aa::helper::BusClient::private_bus;
     auto helper = options->helper_address.empty()
                       ? aa::helper::BusClient::system(store)
-                      : aa::helper::BusClient::private_bus_for_test(options->helper_address, store);
+                      : open_private_helper(options->helper_address, store);
 #else
     auto helper = aa::helper::BusClient::system(store);
 #endif

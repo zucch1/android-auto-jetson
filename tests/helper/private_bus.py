@@ -183,7 +183,7 @@ def run(build: Path, directory: Path) -> None:
 def receiver_startup(build: Path, directory: Path) -> None:
     receiver = build / "aa-wireless-receiver"
     fixture = build / "aa_system_helper_fixture"
-    env = dict(os.environ)
+    env = dict(os.environ, AA_WIRELESS_TEST_SAME_UID_HELPER="1")
     uid = directory / "session.uid"
     uid.write_text(f"{os.getuid()}\n")
     uid.chmod(0o600)
@@ -200,6 +200,12 @@ def receiver_startup(build: Path, directory: Path) -> None:
         helper_args = [str(fixture), "helper", address, str(directory), str(effects)]
         with process(helper_args, env) as helper:
             assert line(helper) == "ready"
+            if os.getuid() != 0:
+                result = subprocess.run([*args, "--duration-ms", "100"],
+                                        env={**env, "AA_WIRELESS_TEST_SAME_UID_HELPER": "0"},
+                                        capture_output=True, text=True, timeout=3)
+                assert result.returncode == 3 and "AP status: helper_rejected" in result.stderr, result
+                assert not effects.exists()
             with process([*args, "--duration-ms", "10000"], env) as first:
                 ready = line(first, 3)
                 assert '"state":"pairing_only"' in ready, ready

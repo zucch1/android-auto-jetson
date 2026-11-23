@@ -35,7 +35,7 @@ inline constexpr const char *usage =
     "  --exact-video-profiles offer only --video-profiles without appending the\n"
     "                       1280x720@30:h264 fallback profile\n"
 #if defined(AA_WIRELESS_ALLOW_HELPER_BUS_ADDRESS) && AA_WIRELESS_ALLOW_HELPER_BUS_ADDRESS
-    "  --helper-bus-address ADDRESS  private test bus with a same-UID helper (default: system bus)\n"
+    "  --helper-bus-address ADDRESS  explicit alternate helper bus (default: system bus)\n"
 #endif
     "  --idr-recovery auto|nudge|transition  IDR recovery strategy (default auto)\n"
     "  --audio-sink pulse|pipewire|automatic  audio routing element (default pulse)\n"
