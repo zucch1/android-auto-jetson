@@ -162,7 +162,7 @@ TEST_F(HelperConfirmation, DurableIncompleteApErrorPrecedesBondError) {
     EXPECT_EQ(retried.error().code(), ErrorCode::helper_rejected);
 }
 TEST_F(HelperConfirmation, WiredAndOpaqueDeletionRequireOnlyAp) {
-    for (const trust::TransportIdentity& identity : {trust::TransportIdentity{trust::WiredIdentity{"18d1", "2d00", "serial", "", "", "", "1-2"}},
+    for (const trust::TransportIdentity& identity : {trust::TransportIdentity{trust::WiredIdentity{"04e8", "6860", "serial", "", "", "", "1-2"}},
                                                    trust::TransportIdentity{trust::OpaqueIdentity{"legacy-key"}}}) {
         const auto phone = store.approve(identity); ASSERT_TRUE(phone);
         EXPECT_TRUE(control.forget_phone(caller, phone.value()));
@@ -227,7 +227,7 @@ TEST_F(HelperConfirmation, MissingCommittedSnapshotIsContractFailureNotCleanupSu
     EXPECT_EQ(bridge.forgets, 0);
 }
 TEST_F(HelperConfirmation, WiredOpenPairingClosesOnceDespitePendingAp) {
-    phones.note_candidate(trust::WiredIdentity{"18d1", "2d00", "serial", "", "", "", "1-2"});
+    phones.note_candidate(trust::WiredIdentity{"04e8", "6860", "serial", "", "", "", "1-2"});
     const auto request = control.request_add_phone(caller); ASSERT_TRUE(request);
     ASSERT_TRUE(control.confirm_phone_pairing(caller, request.value()));
     const auto phone = store.phones().front().phone_id;
