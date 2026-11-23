@@ -4301,12 +4301,19 @@ class ReceiverAudioDispatch : public testing::Test {
             if (auto serviced = service_audio_completions(session, audio); !serviced) {
                 return serviced.error();
             }
-            auto polled = session.poll_transport(aa::core::Deadline::Clock::now() +
-                                                 std::chrono::milliseconds{5});
+            const auto slice = std::min(until, std::chrono::steady_clock::now() +
+                                                   std::chrono::milliseconds{5});
+            auto polled = session.poll_transport(slice);
             if (!polled) { return polled.error(); }
         }
+        // Service once more before judging the deadline, so a worker error
+        // latched during the last poll is reported as itself, not as a
+        // generic timeout, and a queued credit is still sent.
+        if (auto serviced = service_audio_completions(session, audio); !serviced) {
+            return serviced.error();
+        }
         if (audio.outstanding()) { return aa::Error{aa::ErrorCode::timeout}; }
-        return service_audio_completions(session, audio);
+        return {};
     }
 };
 
