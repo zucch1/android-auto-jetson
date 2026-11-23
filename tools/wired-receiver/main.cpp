@@ -55,6 +55,7 @@
 
 #include <array>
 #include <atomic>
+#include <charconv>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -67,6 +68,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <stop_token>
 #include <string>
 #include <system_error>
 #include <thread>
@@ -367,18 +369,20 @@ int run_wired_enrolment(aa::ipc::ControlBusService &bus, aa::app::WiredEnrolment
 const char *const kUsage =
     "usage: aa-wired-receiver --port <usb-port-context> [--store PATH]\n"
     "                         [--video-socket PATH] [--input-socket PATH]\n"
-    "                         [--duration-ms N] [--no-bus]\n"
+    "                         [--duration-ms N] [--reconnect-ms N] [--no-bus]\n"
     "                         [--require-video-consumer] [--wired-enrolment]\n"
     "                         [--screen-<field> N]... [--screen-experimental-geometry]\n"
     "                         [--audio-sink pulse|pipewire|automatic]\n"
     "                         [--require-usb-serial SERIAL]\n"
     "  runs the wired session over USB/AOA with TrustStore admission;\n"
     "  the approved-phones store must already contain the phone (fail closed).\n"
+    "  --reconnect-ms bounds recovery from link loss to active\n"
+    "  (1..120000 ms, default 30000).\n"
     "  --wired-enrolment: when admission refuses the phone, keep the D-Bus\n"
     "  contract up for 120 s so the registered consumer can approve that exact\n"
     "  refused phone (RequestAddPhone, GetPairingCandidate, then\n"
     "  ConfirmPhonePairing = yes or CancelPhonePairing = no; aa-wired-enrol is\n"
-    "  the terminal reference). An approval exits 0 (replug to connect); no\n"
+    "  the terminal reference). An approval exits 0 (restart to connect); no\n"
     "  approval exits 3. Needs the bus (not with --no-bus).\n"
     "  --require-usb-serial pins the run to one physical phone: the first link\n"
     "  and every reconnect must carry this pre-switch USB serial (the adb\n"
@@ -417,6 +421,7 @@ int receiver_main(int argc, char **argv) {
     std::string video_socket = aa::ipc::production_video_socket_path().value;
     std::string input_socket = aa::ipc::production_input_socket_path().value;
     std::int64_t duration_ms = 0;
+    std::int64_t reconnect_ms = 30'000;
     bool no_bus = false;
     bool require_video_consumer = false;
     bool wired_enrolment = false;
@@ -457,6 +462,14 @@ int receiver_main(int argc, char **argv) {
             input_socket = argv[++index];
         } else if (std::strcmp(argv[index], "--duration-ms") == 0 && index + 1 < argc) {
             duration_ms = std::strtoll(argv[++index], nullptr, 10);
+        } else if (std::strcmp(argv[index], "--reconnect-ms") == 0 && index + 1 < argc) {
+            const std::string_view value{argv[++index]};
+            const auto end = value.data() + value.size();
+            const auto [ptr, ec] = std::from_chars(value.data(), end, reconnect_ms);
+            if (ec != std::errc{} || ptr != end || reconnect_ms < 1 || reconnect_ms > 120'000) {
+                std::fputs("invalid --reconnect-ms\n", stderr);
+                return 2;
+            }
         } else if (std::strcmp(argv[index], "--no-bus") == 0) {
             no_bus = true;
         } else if (std::strcmp(argv[index], "--require-video-consumer") == 0) {
@@ -579,6 +592,7 @@ int receiver_main(int argc, char **argv) {
 
     aa::app::WiredSessionConfig session_config{};
     session_config.lifecycle.phases.negotiate = Milliseconds{15'000};
+    session_config.lifecycle.wired_reconnect = Milliseconds{reconnect_ms};
     session_config.input_enabled = true;
     session_config.input = input;
     aa::app::WiredSession session{{store, clock, diagnostics}, session_config};
@@ -738,6 +752,7 @@ int receiver_main(int argc, char **argv) {
     std::atomic<bool> admitted{false};
     std::mutex gate_mutex;
     std::condition_variable gate_cv;
+    aa::core::CancellationSource reconnect_stop;
     bool runtime_failed = false;
 
     auto service_control = [&] {
@@ -839,7 +854,10 @@ int receiver_main(int argc, char **argv) {
             return lost.error();
         }
         video_outlet.reset();
-        const auto budget = session.io_deadline();
+        const auto session_budget = session.io_deadline();
+        const std::stop_callback cancel_reconnect{session_budget.cancellation,
+                                                  [&] { reconnect_stop.request_stop(); }};
+        const aa::core::Deadline budget{session_budget.until, reconnect_stop.get_token()};
         while (g_running.load()) {
             if (service_control()) {
                 return aa::Error{aa::ErrorCode::cancelled};
@@ -849,7 +867,7 @@ int receiver_main(int argc, char **argv) {
                 return checked.error();
             }
             auto relink = aa::app::open_wired_link(selector, accessory, store, budget);
-            if (service_control()) {
+            if (!g_running.load() || service_control()) {
                 return aa::Error{aa::ErrorCode::cancelled};
             }
             if (relink) {
@@ -1151,6 +1169,9 @@ int receiver_main(int argc, char **argv) {
     }
 
     g_running.store(false);
+    // A link open can wait for re-enumeration while the owner holds the mutex.
+    // Wake it before taking the mutex for the ordered session stop.
+    reconnect_stop.request_stop();
 #ifdef AA_WIRED_RECEIVER_SHUTDOWN_TEST
     if (shutdown_observation) {
         shutdown_observation->published_false();

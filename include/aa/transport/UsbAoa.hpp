@@ -10,6 +10,8 @@
 // port -> AOA switch (GET_PROTOCOL/SEND_STRING x6/START) -> capture the phone's
 // pre-switch and accessory-mode descriptor identities -> admission over the
 // captured WiredIdentity -> claim the accessory bulk pipe (IN 0x81 / OUT 0x01).
+// If the selected device is already in AOA mode, reset that device and wait
+// within the open deadline for phone mode before running the same pipeline.
 //
 // TRUST: AOA enumeration success is NEVER trust. The endpoint is released only
 // for an identity `admit` accepts; every other case fails closed with

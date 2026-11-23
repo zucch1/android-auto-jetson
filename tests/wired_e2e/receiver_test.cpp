@@ -1312,6 +1312,9 @@ std::atomic<int> runtime_connects{0};
 std::atomic<int> runtime_ciphers{0};
 std::atomic<int> runtime_sends{0};
 bool runtime_recovers = false;
+bool runtime_wait_for_reenumeration = false;
+std::chrono::milliseconds runtime_reenumeration_delay{0};
+std::chrono::steady_clock::time_point runtime_link_lost_at;
 bool runtime_quiet = false;
 std::atomic<bool> runtime_waiting{false};
 std::atomic<bool> runtime_closed{false};
@@ -1712,7 +1715,20 @@ runtime_open_link(const aa::transport::UsbDeviceSelector &selector,
         admission_link_state->cv.notify_all();
         return aa::app::WiredLink{std::move(transport), runtime_phone};
     }
-    if (attempt == 1 || (runtime_recovers && attempt >= 4)) {
+    if (attempt == 2) {
+        runtime_link_lost_at = std::chrono::steady_clock::now();
+        if (runtime_wait_for_reenumeration) {
+            std::mutex mutex;
+            std::condition_variable_any cv;
+            std::unique_lock lock(mutex);
+            cv.wait_until(lock, deadline.cancellation, deadline.until, [] { return false; });
+            return aa::Error{deadline.cancellation.stop_requested() ? aa::ErrorCode::cancelled
+                                                                    : aa::ErrorCode::timeout};
+        }
+    }
+    if (attempt == 1 ||
+        (runtime_recovers && attempt >= 4 &&
+         std::chrono::steady_clock::now() - runtime_link_lost_at >= runtime_reenumeration_delay)) {
         const auto &phone = attempt >= 4 && !runtime_reconnect_phone.key.empty()
                                 ? runtime_reconnect_phone : runtime_phone;
         return aa::app::WiredLink{std::make_unique<RuntimeTransport>(attempt == 1), phone};
@@ -2515,6 +2531,31 @@ TEST(WiredReceiver, TransientLinkLossRetriesUntilFreshSessionRecovers) {
         << result.output;
 }
 
+TEST(WiredReceiver, DefaultReconnectWindowSurvivesSlowUsbReenumeration) {
+    runtime_reenumeration_delay = std::chrono::milliseconds{5'200};
+    const auto result = run_runtime(true, 7'000);
+    runtime_reenumeration_delay = std::chrono::milliseconds{0};
+
+    EXPECT_EQ(result.code, 0) << result.output;
+    EXPECT_EQ(runtime_ciphers.load(), 2);
+    const auto active = result.output.find("\"to_state\":\"active\"");
+    ASSERT_NE(active, std::string::npos) << result.output;
+    EXPECT_NE(result.output.find("\"to_state\":\"active\"", active + 1), std::string::npos)
+        << result.output;
+}
+
+TEST(WiredReceiver, ShutdownInterruptsAReconnectWaitingForReenumeration) {
+    runtime_wait_for_reenumeration = true;
+    runtime_extra_args = {"--reconnect-ms", "3000"};
+    const auto result = run_runtime(false, 750);
+    runtime_extra_args.clear();
+    runtime_wait_for_reenumeration = false;
+
+    EXPECT_EQ(result.code, 0) << result.output;
+    EXPECT_EQ(runtime_connects.load(), 2);
+    EXPECT_LT(result.elapsed, std::chrono::seconds{3});
+}
+
 TEST(WiredReceiver, RequiredUsbSerialAdmitsTheSamePhoneAcrossReconnects) {
     // Given the qualification pin naming the attached phone's USB serial.
     runtime_extra_args = {"--require-usb-serial", "SYNTHETIC"};
@@ -2563,11 +2604,26 @@ TEST(WiredReceiver, RequiredUsbSerialMustNotBeEmpty) {
 }
 
 TEST(WiredReceiver, PermanentLinkLossExitsNonzeroWithinWiredRecoveryBudget) {
-    const auto result = run_runtime(false);
+    runtime_extra_args = {"--reconnect-ms", "300"};
+    const auto result = run_runtime(false, 2'000);
+    runtime_extra_args.clear();
+
     EXPECT_EQ(result.code, 1) << "dead session returned clean success: " << result.output;
-    EXPECT_GE(runtime_connects.load(), 3);
+    EXPECT_GE(runtime_connects.load(), 2);
     EXPECT_EQ(runtime_ciphers.load(), 1);
-    EXPECT_LT(result.elapsed, std::chrono::milliseconds{5500});
+    EXPECT_LT(result.elapsed, std::chrono::seconds{2});
+    EXPECT_NE(result.output.find("\"to_state\":\"failed\""), std::string::npos) << result.output;
+}
+
+TEST(WiredReceiver, InvalidReconnectWindowIsAUsageError) {
+    for (const auto *value : {"0", "-1", "120001", "5000ms", ""}) {
+        SCOPED_TRACE(value);
+        runtime_extra_args = {"--reconnect-ms", value};
+        const auto result = run_runtime(false);
+        runtime_extra_args.clear();
+        EXPECT_EQ(result.code, 2);
+        EXPECT_EQ(runtime_connects.load(), 0);
+    }
 }
 
 TEST(WiredReceiver, ActiveFramesShutdownOrdersStopAndReset) {

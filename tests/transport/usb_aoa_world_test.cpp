@@ -179,6 +179,60 @@ TEST(UsbAoaWorld, BoundedDescriptorReadsPreserveAdmissionIdentity) {
     EXPECT_FALSE(contains(read_log(), "libusb_detach_kernel_driver"));
 }
 
+TEST(UsbAoaWorld, AlreadyInAccessoryModeResetsAndAdmitsTheFreshPhoneIdentity) {
+    set_scenario("stuck-accessory");
+    const aa::trust::WiredIdentity approved{
+        "04e8", "6860", "TEST-SERIAL-001", "Android", "Android Auto", "HU-AAAAAA001", "1-2.1"};
+    auto link = tr::connect_usb_aoa(tr::UsbDeviceSelector{"1-2.1"}, {},
+                                    [&](const auto &identity) { return identity == approved; });
+
+    ASSERT_TRUE(link.has_value());
+    EXPECT_EQ(link.value().identity, approved);
+    EXPECT_EQ(link.value().pre_switch.vendor_id, 0x04E8);
+    EXPECT_TRUE(link.value().switch_report.started);
+    const auto log = read_log();
+    EXPECT_EQ(count_of(log, "libusb_reset_device"), 1);
+    EXPECT_LT(log.find("libusb_reset_device"), log.find("libusb_control_transfer:53:0"));
+}
+
+TEST(UsbAoaWorld, UnapprovedAccessoryWithTheSameAoaStringsIsRefusedAfterReset) {
+    set_scenario("unknown-accessory");
+    const aa::trust::WiredIdentity approved{
+        "04e8", "6860", "TEST-SERIAL-001", "Android", "Android Auto", "HU-AAAAAA001", "1-2.1"};
+    auto unknown = approved;
+    unknown.usb_serial = "TEST-SERIAL-OTHER";
+    aa::trust::WiredIdentity refused;
+    auto link = tr::connect_usb_aoa(
+        tr::UsbDeviceSelector{"1-2.1"}, {},
+        [&](const auto &identity) { return identity == approved; }, {}, &refused);
+
+    ASSERT_FALSE(link.has_value());
+    EXPECT_EQ(link.error().code(), ErrorCode::transport_unauthorized_peer);
+    EXPECT_EQ(refused, unknown);
+    EXPECT_EQ(count_of(read_log(), "libusb_reset_device"), 1);
+    EXPECT_FALSE(contains(read_log(), "libusb_bulk_transfer"));
+}
+
+TEST(UsbAoaWorld, PersistentAccessoryModeNeverReachesAdmission) {
+    set_scenario("persistent-accessory");
+    const aa::core::Deadline budget{
+        aa::core::Deadline::Clock::now() + std::chrono::milliseconds{250}, {}};
+    auto link = tr::connect_usb_aoa(
+        tr::UsbDeviceSelector{"1-2.1"}, {},
+        [](const auto &) {
+            ADD_FAILURE() << "accessory descriptors reached admission";
+            return true;
+        },
+        budget);
+
+    ASSERT_FALSE(link.has_value());
+    EXPECT_EQ(link.error().code(), ErrorCode::timeout);
+    const auto log = read_log();
+    EXPECT_EQ(count_of(log, "libusb_reset_device"), 1);
+    EXPECT_FALSE(contains(log, "libusb_control_transfer:53:0"));
+    EXPECT_FALSE(contains(log, "libusb_claim_interface"));
+}
+
 TEST(UsbAoaWorld, ExpiredCallerDeadlinePreventsAccessoryClaim) {
     set_scenario("happy");
     auto factory = ua::make_libusb_link_factory();
