@@ -328,9 +328,9 @@ stage.
 
 ## Soak stages: moving-map workload and signed A/V (v3)
 
-From capture `aa-projection-perf-capture/3` and result `aa-projection-perf/3`
-on (#137), every live soak stage (1800 s, then 7200 s) runs the drive smoke's
-workload and is judged by its A/V contract.
+Starting with v3 captures and result `aa-projection-perf/3` (#137), every
+live soak stage (1800 s, then 7200 s) runs the drive smoke's workload and
+is judged by its A/V contract.
 
 **Workload.** `tools/perf/aa_moving_map.py` is the one implementation, shared
 with the drive smoke. Before the receiver starts, the collector resets the
@@ -1182,9 +1182,8 @@ the withdrawn 33 ms gate is **not** restored.
 
 ## Provenance and equivalence
 
-Both runs require capture `aa-projection-perf-capture/3` and result
-`aa-projection-perf/3` (historical runs: `/2`, judged by the v2 contract), with
-`measurement_coverage` policy
+Both runs require v3 captures and result `aa-projection-perf/3` (historical
+runs use `/2` with the v2 contract), with `measurement_coverage` policy
 `active-window-coverage/1`. V1 results remain explicitly validatable against
 their unchanged schema, not automatically qualified as v2. Independently parse
 coverage after export removes the capture: labels/hashes alone prove neither

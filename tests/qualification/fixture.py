@@ -18,6 +18,25 @@ from aa_perf_report import build_result
 from synthetic_capture import capture, capture_v3
 
 
+# Invented inputs in the formats emitted by the wireless stack.
+WIRELESS_PRIVACY_CONTROLS = (
+    ('/org/bluez/hci0/dev_02_11_22_33_44_55', 'dev_02_11_22_33_44_55'),
+    ('wpa_passphrase=TESTONLY_RAW', 'TESTONLY_RAW'),
+    ('wpa_psk=TESTONLY_RAW', 'TESTONLY_RAW'),
+    ('pre_shared_key=TESTONLY_RAW', 'TESTONLY_RAW'),
+    ('car_wifi_bssid=021122334455', '021122334455'),
+    ('aa_ssid=TESTONLY_RAW', 'TESTONLY_RAW'),
+    ('hotspot_ssid=TESTONLY_RAW', 'TESTONLY_RAW'),
+    ('\tssid TESTONLY_RAW', 'TESTONLY_RAW'),
+    ('\tssid [REDACTED] TESTONLY_RAW', 'TESTONLY_RAW'),
+    ('associated with AA-0123456789abcdef', 'AA-0123456789abcdef'),
+    ('[ro.serialno]: [TESTONLY_RAW]', 'TESTONLY_RAW'),
+    ('bdaddr=021122334455', '021122334455'),
+    ('bt_address=021122334455', '021122334455'),
+    ('bluetooth_address=021122334455', '021122334455'),
+)
+
+
 class PackageTest(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory(prefix='wired-qualification-')
