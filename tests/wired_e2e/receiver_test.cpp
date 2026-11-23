@@ -6254,7 +6254,12 @@ TEST(WiredReceiver, WorkerGuidanceStallBurstInProductionFormatCatchesUp) {
     EXPECT_EQ(logged, report->stats.frames_caught_up) << output;
     std::lock_guard lock(gate->mutex);
     ASSERT_FALSE(gate->timestamps.empty());
-    EXPECT_LE(gate->timestamps.back().count, arrival + 100'000'000 + 90'000'000);
+    // Judged by where the last write ends, not where its last piece starts: a
+    // 64 ms run inside the watermark is written as 50 + 14 ms. It ends at most
+    // the 90 ms watermark past the end of the resumed parent's own PCM (#173).
+    const auto last_frames = static_cast<std::int64_t>(gate->pcm.back().size() / 4);
+    EXPECT_LE(gate->timestamps.back().count + last_frames * 1'000'000'000LL / 48000,
+              arrival + 100'000'000 + 64'000'000 + 90'000'000);
 }
 
 // A stand-in for the guidance resampler with a fixed output schedule (#155

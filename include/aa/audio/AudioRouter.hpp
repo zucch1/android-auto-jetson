@@ -201,11 +201,14 @@ struct SinkWriteProgress final {
 // only the part beyond what the bounded max_trim policy would have removed.
 // A run whose decoded output exceeds its parent's own PCM duration (input
 // bytes at the role's input format) starts with resampler carryover from
-// earlier parents; when the run is already behind placement or overlaps an
-// earlier parent on its role, the catch-up judges its phase by that older
-// source time so stale carryover is trimmed first and a caught-up run never
-// leaves the cursor more than `target` past the end of its parent's PCM. An
-// on-time non-overlapping run never lets carryover alone trigger catch-up. The
+// earlier parents. The part of it that is a backlog - decoded from parents
+// overlapping an earlier parent on their role by more than arrival jitter (a
+// burst), or held across a pause longer than 200 ms or the end of the stream
+// (a stale tail) - makes the catch-up judge the run's phase by that older
+// source time, so stale carryover is trimmed first and a caught-up burst run
+// never leaves the cursor more than `target` past the end of its parent's PCM.
+// Carryover of an on-time stream never counts, even while concurrent media
+// keeps the shared cursor ahead of its arrival (phase > 0, #173). The
 // router's 200 ms late-arrival cap judges a caught-up run by its parent's own
 // PTS range against the committed source-time frontier (bounded by cursor): it
 // fails only when the parent's end (timestamp plus input duration) is more than

@@ -127,9 +127,9 @@ struct Run final {
     // at the head of a later run, so `frames` can be shorter or longer.
     std::uint64_t content_frames{};
     // Output beyond the parent's own duration (#154): the head of `pcm` is
-    // carryover from earlier parents, at least this long, so its source
-    // samples are at least carried_ns older than `timestamp`.
-    std::int64_t carried_ns{};
+    // carryover from earlier parents. This much of it is a backlog (see
+    // CarryTracker), its samples at least stale_carry_ns older than `timestamp`.
+    std::int64_t stale_carry_ns{};
     // Playout decision (PlayoutPolicy), fixed once the run heads its role:
     // every earlier run of the role is committed by then, so the decision no
     // longer depends on a dry-run plan.
@@ -169,20 +169,61 @@ struct ScheduledRun final {
     std::uint64_t applied_pad_frames{0};
 };
 
+// What one role's decoder still holds, in output frames, and how much of it
+// (the oldest part: the decoder is a FIFO) is a backlog rather than the tail
+// of a continuous on-time stream. Judged when a parent is decoded, only from
+// the role's own source timeline (timestamps and PCM durations). Placement
+// phase says nothing here: concurrent media keeps the shared cursor up to a
+// chunk ahead of real time, so an on-time guidance run is routinely placed
+// behind its arrival with no backlog at all (#173).
+struct CarryTracker final {
+    std::uint64_t held{};
+    std::uint64_t backlog{};
+    // End of the role's decoded parents' PCM; empty for a new stream.
+    std::optional<std::int64_t> source_end_ns{};
+
+    // One decoded parent: content frames went in, out frames came back.
+    // Returns the frames of its carryover that are a backlog:
+    // - Burst: the parent starts before its predecessors end, so the role is
+    //   arriving faster than real time. Arrivals are receipt stamps, early by
+    //   a few ms as often as late, so only an overlap beyond the jitter
+    //   allowance (at most half the parent, so a burst of short parents still
+    //   counts) is a burst. What the decoder keeps of it stays a backlog until
+    //   it comes out, even at the head of a later on-time run.
+    // - Pause: the parent starts more than `pause` after its predecessors end
+    //   or opens a new stream: what the decoder held is an old prompt's tail.
+    [[nodiscard]] std::uint64_t decoded(std::int64_t timestamp_ns, std::int64_t content_ns,
+                                        std::uint64_t content, std::uint64_t out,
+                                        std::int64_t jitter_ns, std::int64_t pause_ns) noexcept {
+        // timestamp_ns and source_end_ns are >= 0: no difference overflows.
+        const std::int64_t lead = source_end_ns ? *source_end_ns - timestamp_ns : 0;
+        const bool burst = lead > std::min(jitter_ns, content_ns / 2);
+        const bool pause = !source_end_ns || -lead > pause_ns;
+        const auto carried = out > content ? out - content : 0;
+        if (burst || pause) { backlog = std::max(held, carried); }
+        const auto stale = std::min(carried, backlog);
+        if (burst) { backlog += content; }
+        const auto in = held + content;
+        held = in > out ? in - out : 0;
+        backlog = std::min(held, backlog > out ? backlog - out : 0);
+        const auto end = timestamp_ns > INT64_MAX - content_ns ? INT64_MAX : timestamp_ns + content_ns;
+        source_end_ns = std::max(source_end_ns.value_or(end), end);
+        return stale;
+    }
+};
+
 // Drift trim of one unplaced run. The catch-up (#154) judges the run by the
-// source time of its oldest sample when the run is already behind placement or
-// overlaps an earlier parent on its role (`backlog_carry`): decoder carryover
-// at its head is older than the parent's timestamp by at least carried_ns, so
-// a coalesced burst run is trimmed through that stale audio too, and placing
-// it can never carry the cursor more than the drift target past the end of its
-// own parent's PCM. An on-time non-overlapping run (phase <= 0 and no source
-// overlap) never lets carryover alone trigger catch-up. Runs the catch-up does
-// not take keep the bounded trim on their raw phase.
+// source time of its oldest stale sample: the part of its decoder carryover
+// that is a backlog (CarryTracker) is older than the parent's timestamp by at
+// least stale_carry_ns, so a coalesced burst run is trimmed through that audio
+// too, and placing it can never carry the cursor more than the drift target
+// past the end of its own parent's PCM. An on-time run's carryover never
+// counts, whatever its phase. Runs the catch-up does not take keep the bounded
+// trim on their raw phase.
 void plan_drift_trim(const LivePcmDriftCorrector& drift, core::Nanoseconds phase,
-                     const Run& run, bool backlog_carry, ScheduledRun& entry) noexcept {
-    const std::int64_t effective_carried = backlog_carry ? run.carried_ns : 0;
+                     const Run& run, ScheduledRun& entry) noexcept {
     const core::Nanoseconds source_phase{
-        phase.count > INT64_MAX - effective_carried ? INT64_MAX : phase.count + effective_carried};
+        phase.count > INT64_MAX - run.stale_carry_ns ? INT64_MAX : phase.count + run.stale_carry_ns};
     entry.catching_up = drift.catches_up(source_phase);
     const core::Nanoseconds judged = entry.catching_up ? source_phase : phase;
     entry.head_trim_frames = drift.trim_frames(judged, run.frames);
@@ -371,10 +412,14 @@ struct AudioRouter::Impl final {
     std::uint64_t playback_cursor_frames{0};
     std::array<std::uint64_t, kRoleCount> role_end_frames{};
     // Committed source-time frontier (max intended + content_frames across
-    // placed/committed runs, advanced on elapsed skips) so late_beyond_cap and
-    // carryover burst detection are not distorted by placement-phase inflation.
+    // placed/committed runs, advanced on elapsed skips) so late_beyond_cap is
+    // not distorted by placement-phase inflation. The per-role frontiers are
+    // each role's share of it (cancel_pending).
     std::uint64_t source_frontier_frames{0};
     std::array<std::uint64_t, kRoleCount> role_source_frontier_frames{};
+    // Per-role decoder carryover. Cancelling or resetting a role ends its
+    // stream (source_end_ns); its decoder keeps what it holds.
+    std::array<CarryTracker, kRoleCount> carry{};
     // Disjoint, sorted [start, end) steady-clock intervals during which the
     // owner withheld peer credit (note_backpressure). Empty for every caller
     // that never records one, which keeps the strict gap policy unchanged.
@@ -1020,12 +1065,15 @@ core::Result<void> AudioRouter::submit(const protocol::MessageView& message,
                 input_frames * impl_->config.output_format.sample_rate_hz / input.sample_rate_hz;
         }
     }
-    if (run.frames > run.content_frames) {
-        // At most 64 KiB of input per parent: frames * 1e9 cannot overflow.
-        run.carried_ns = static_cast<std::int64_t>(
-            (run.frames - run.content_frames) * 1'000'000'000ULL
-            / impl_->config.output_format.sample_rate_hz);
-    }
+    // The decoder holds a few seconds at most (64 KiB of input per parent):
+    // frames * 1e9 cannot overflow.
+    const auto frames_to_ns = [&](std::uint64_t frames) {
+        return static_cast<std::int64_t>(
+            frames * 1'000'000'000ULL / impl_->config.output_format.sample_rate_hz);
+    };
+    run.stale_carry_ns = frames_to_ns(impl_->carry[index].decoded(
+        run.timestamp.count, frames_to_ns(run.content_frames), run.content_frames, run.frames,
+        impl_->config.live_pcm_drift.high_watermark.count, 200'000'000LL));
     run.submitted_at_ns = submitted_at_ns;
     if (run.frames == 0) {
         return Error{ErrorCode::audio_format_unsupported};
@@ -1117,7 +1165,6 @@ core::Result<void> AudioRouter::pump() {
     bool schedule_ok = true;
     for (std::size_t i = 0; i < kRoleCount; ++i) {
         std::uint64_t role_end = impl_->role_end_frames[i];
-        std::uint64_t role_source_frontier = impl_->role_source_frontier_frames[i];
         for (const Run& run : impl_->pending[i]) {
             std::int64_t intended = 0;
             if (!impl_->ns_to_frames_signed(core::Nanoseconds{run.timestamp.count - base_ns},
@@ -1142,10 +1189,7 @@ core::Result<void> AudioRouter::pump() {
             // Over-watermark runs lose bounded head frames and the timeline
             // advances by the retained frames only.
             const core::Nanoseconds phase{planned_ns - run.timestamp.count};
-            const bool backlog_carry =
-                phase.count > 0 || intended < 0
-                || static_cast<std::uint64_t>(intended) < role_source_frontier;
-            plan_drift_trim(impl_->drift, phase, run, backlog_carry, entry);
+            plan_drift_trim(impl_->drift, phase, run, entry);
             if (late_beyond_cap(cursor, impl_->source_frontier_frames, intended, run, entry,
                                 cap_frames)) {
                 schedule_ok = false;
@@ -1164,8 +1208,7 @@ core::Result<void> AudioRouter::pump() {
             role_end = entry.end_frame;
             new_role_ends[i] = entry.end_frame;
             const std::uint64_t run_source_end = source_end_frame(intended, run.content_frames);
-            role_source_frontier = std::max(role_source_frontier, run_source_end);
-            new_role_source_frontiers[i] = role_source_frontier;
+            new_role_source_frontiers[i] = std::max(new_role_source_frontiers[i], run_source_end);
             planned_source_frontier = std::max(planned_source_frontier, run_source_end);
             entry.run = &run;
             planned_retained += retained;
@@ -1425,6 +1468,16 @@ void AudioRouter::cancel_pending(protocol::ChannelRole role) {
     }
     impl_->role_end_frames[role_index(*index)] = impl_->playback_cursor_frames;
     impl_->role_source_frontier_frames[role_index(*index)] = 0;
+    impl_->carry[role_index(*index)].source_end_ns.reset();
+    // The cancelled role's discarded remainder is not source audio any more:
+    // the shared frontier falls back to what was played (the cursor) or to the
+    // other roles' own frontiers. What was played keeps counting, so a later
+    // backward timestamp jump is still judged late.
+    auto kept_frontier = impl_->playback_cursor_frames;
+    for (const auto frontier : impl_->role_source_frontier_frames) {
+        kept_frontier = std::max(kept_frontier, frontier);
+    }
+    impl_->source_frontier_frames = std::min(impl_->source_frontier_frames, kept_frontier);
     ++impl_->generations[role_index(*index)];
 }
 
@@ -1478,6 +1531,7 @@ void AudioRouter::reset_session_timeline() {
     for (std::size_t i = 0; i < kRoleCount; ++i) {
         impl_->pending[i].clear();
         impl_->reset_playout(i);
+        impl_->carry[i].source_end_ns.reset();
         ++impl_->generations[i];
     }
     impl_->timeline_base.reset();
@@ -1568,7 +1622,6 @@ core::Result<RenderStep> AudioRouter::render_step() {
     }
     for (std::size_t role = 0; role < kRoleCount && valid; ++role) {
         auto role_end = impl_->role_end_frames[role];
-        auto role_source_frontier = impl_->role_source_frontier_frames[role];
         bool anchored = impl_->playout[role].anchored;
         for (auto& run : impl_->pending[role]) {
             diagnostic.offending = run.header;
@@ -1635,8 +1688,6 @@ core::Result<RenderStep> AudioRouter::render_step() {
                 diagnostic.intended = entry.intended;
                 diagnostic.start = entry.start_frame;
                 anchored = true;
-                role_source_frontier =
-                    std::max(role_source_frontier, source_end_frame(*entry.intended, run.content_frames));
             } else {
                 std::int64_t intended = 0;
                 if (!impl_->ns_to_frames_signed(
@@ -1658,10 +1709,7 @@ core::Result<RenderStep> AudioRouter::render_step() {
                     break;
                 }
                 const core::Nanoseconds phase{placed_ns - run.timestamp.count};
-                const bool backlog_carry =
-                    phase.count > 0 || intended < 0
-                    || static_cast<std::uint64_t>(intended) < role_source_frontier;
-                plan_drift_trim(impl_->drift, phase, run, backlog_carry, entry);
+                plan_drift_trim(impl_->drift, phase, run, entry);
                 if (!run.preflighted &&
                     late_beyond_cap(cursor, impl_->source_frontier_frames, intended, run, entry,
                                     cap)) {
@@ -1670,8 +1718,6 @@ core::Result<RenderStep> AudioRouter::render_step() {
                     valid = false;
                     break;
                 }
-                role_source_frontier =
-                    std::max(role_source_frontier, source_end_frame(intended, run.content_frames));
             }
             const auto remaining = run.frames - entry.head_trim_frames;
             diagnostic.start = entry.start_frame;

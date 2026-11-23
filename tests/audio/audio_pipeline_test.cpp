@@ -5580,6 +5580,288 @@ TEST_F(AudioPipelineRoute, IncrementalOnTimeGuidanceSplitDoesNotTriggerCarryover
     EXPECT_EQ(route.report().stats.frames_trimmed, 0U);
 }
 
+namespace {
+
+// Steady on-time media (one 42.67 ms chunk per 42.67 ms, rendered as it
+// arrives, so the shared cursor always runs ahead of real time) with 200 ms
+// guidance parents whose first run the resampler splits: 96 frames come out
+// of the first parent, the rest at the head of the next one's run. Guidance
+// parents arrive at guidance_at_us; returns the route right after the last.
+[[nodiscard]] std::optional<BurstRoute> run_media_with_split_guidance(
+    const std::vector<std::int64_t>& guidance_at_us) {
+    constexpr std::int64_t kStart = 1'000'000'000;
+    constexpr std::uint64_t kChunkFrames = 2048;
+    std::optional<BurstRoute> burst;
+    burst.emplace(90'000'000, aa::audio::AudioFormat{16000, 1, 16},
+                  ScriptedResampler::decoder([](std::size_t call, std::size_t buffered) {
+                      return call == 0 ? std::size_t{96} : std::min<std::size_t>(buffered, 19098); }));
+    if (!burst->route) { return std::nullopt; }
+    const auto chunk = constant_pcm({kMediaLevel, kChunkFrames});
+    std::uint64_t next_media = 0;
+    const auto media_until = [&](std::int64_t end_ns) {
+        for (;; ++next_media) {
+            const auto at = static_cast<std::int64_t>(next_media * kChunkFrames * 1'000'000'000ULL / 48000ULL);
+            if (at > end_ns) { return true; }
+            if (!burst->route->submit(make_message(aa::protocol::ChannelRole::media_audio, next_media,
+                                                   aa::core::Nanoseconds{kStart + at}, chunk))
+                || !burst->drain()) { return false; }
+        }
+    };
+    for (std::size_t i = 0; i < guidance_at_us.size(); ++i) {
+        const auto at = guidance_at_us[i] * 1000;
+        if (!media_until(at)
+            || !burst->route->submit(make_message(aa::protocol::ChannelRole::guidance_audio, i,
+                   aa::core::Nanoseconds{kStart + at}, guidance_parent(static_cast<std::int16_t>(1000 + i))))
+            || !burst->drain()) { return std::nullopt; }
+    }
+    return burst;
+}
+
+} // namespace
+
+// #173 P2: the same on-time prompt while media plays. The first guidance
+// parent arrives inside a media chunk, so it is placed up to a chunk behind
+// its arrival (0 < phase < 43 ms, above and below the 20 ms high watermark)
+// with no stall and no burst. That phase is the shared cursor's, not a
+// guidance backlog: the resampler carryover must not turn it into a catch-up
+// (~186-213 ms of speech). Only the bounded 5 ms trim of the ordinary drift
+// policy may apply, once per parent.
+TEST_F(AudioPipelineRoute, IncrementalOnTimeGuidanceSplitUnderMediaDoesNotTriggerCarryoverCatchUp) {
+    for (const std::int64_t offset_us : {1'000, 10'000, 22'000, 30'000, 42'000}) {
+        SCOPED_TRACE(offset_us);
+        const std::int64_t first = 2 * 42'667 + offset_us;
+        auto burst = run_media_with_split_guidance({first, first + 200'000});
+        ASSERT_TRUE(burst);
+        const auto& stats = burst->route->report().stats;
+        EXPECT_EQ(stats.frames_caught_up, 0U);
+        EXPECT_LE(stats.frames_trimmed, 2U * 240U);
+        EXPECT_GE(stats.frames_decoded, 19194U);
+    }
+}
+
+// #173: arrivals are receipt stamps, never exactly one parent apart. A parent
+// a few ms early overlaps its predecessor's nominal end without any burst.
+TEST_F(AudioPipelineRoute, IncrementalOnTimeGuidanceSplitToleratesArrivalJitter) {
+    for (const std::int64_t jitter_us : {-19'000, -2'000, -1, 1, 2'000, 19'000}) {
+        SCOPED_TRACE(jitter_us);
+        const std::int64_t first = 2 * 42'667 + 10'000;
+        auto mixed = run_media_with_split_guidance({first, first + 200'000 + jitter_us});
+        ASSERT_TRUE(mixed);
+        EXPECT_EQ(mixed->route->report().stats.frames_caught_up, 0U);
+        EXPECT_LE(mixed->route->report().stats.frames_trimmed, 2U * 240U);
+
+        BurstRoute alone{90'000'000, aa::audio::AudioFormat{16000, 1, 16},
+            ScriptedResampler::decoder([](std::size_t call, std::size_t buffered) {
+                return call == 0 ? std::size_t{96} : buffered; })};
+        ASSERT_TRUE(alone.route);
+        ASSERT_TRUE(alone.route->submit(make_message(guidance, 0, base, guidance_parent(1000))));
+        ASSERT_TRUE(alone.drain());
+        ASSERT_TRUE(alone.route->submit(make_message(guidance, 1,
+            aa::core::Nanoseconds{base.count + 200'000'000 + jitter_us * 1000}, guidance_parent(2000))));
+        // Only 96 frames (2 ms) played: more than 2 ms late the silence before
+        // this parent exceeds the 200 ms gap cap, with or without catch-up.
+        if (jitter_us > 2'000) { continue; }
+        ASSERT_TRUE(alone.drain());
+        EXPECT_EQ(alone.route->report().stats.frames_trimmed, 0U);
+    }
+}
+
+// Carryover is still stale audio when it is a backlog: guidance parents that
+// arrive faster than real time while media plays are caught up through it,
+// and the cursor never runs more than the watermark past the newest parent.
+TEST_F(AudioPipelineRoute, IncrementalGuidanceBurstUnderMediaStillCatchesUpItsCarryover) {
+    const std::int64_t first = 2 * 42'667 + 10'000;
+    for (const std::int64_t spacing_us : {0, 1'000, 100'000, 170'000}) {
+        SCOPED_TRACE(spacing_us);
+        auto burst = run_media_with_split_guidance({first, first + spacing_us});
+        ASSERT_TRUE(burst);
+        EXPECT_GT(burst->route->report().stats.frames_caught_up, 0U);
+        EXPECT_LE(burst->written_end_ns(),
+                  1'000'000'000 + (first + spacing_us + 200'000 + 90'000) * 1000);
+    }
+}
+
+// Parents no longer than the jitter allowance still count as a burst: ten
+// 20 ms parents 1 ms apart, all held by the resampler until the last.
+TEST_F(AudioPipelineRoute, IncrementalShortParentBurstStillCatchesUpItsCarryover) {
+    BurstRoute burst{90'000'000, aa::audio::AudioFormat{16000, 1, 16},
+        ScriptedResampler::decoder([](std::size_t call, std::size_t buffered) {
+            return call < 9 ? std::size_t{1} : buffered; })};
+    ASSERT_TRUE(burst.route);
+    for (std::uint64_t i = 0; i < 10; ++i) {
+        ASSERT_TRUE(burst.route->submit(make_message(guidance, i,
+            aa::core::Nanoseconds{base.count + static_cast<std::int64_t>(i) * 1'000'000},
+            guidance_parent(1000, 640))));
+        ASSERT_TRUE(burst.drain()) << i;
+    }
+    EXPECT_GT(burst.route->report().stats.frames_caught_up, 0U);
+    EXPECT_LE(burst.written_end_ns(), base.count + (9 + 20 + 90) * 1'000'000);
+}
+
+// Burst audio the resampler keeps until after the burst is still a backlog
+// when it comes out, at the head of an on-time run that overlaps nothing:
+// four 64 ms parents at one arrival, held back, then one 100 ms later. Only
+// the burst's share of the carryover counts; on-time audio after it does not.
+TEST_F(AudioPipelineRoute, IncrementalBurstHeldByTheResamplerIsCaughtUpWhenItComesOut) {
+    for (const bool with_media : {false, true}) {
+        SCOPED_TRACE(with_media);
+        BurstRoute burst{90'000'000, aa::audio::AudioFormat{16000, 1, 16},
+            ScriptedResampler::decoder([](std::size_t call, std::size_t buffered) {
+                return call < 4 ? std::size_t{1} : buffered; })};
+        ASSERT_TRUE(burst.route);
+        const auto chunk = constant_pcm({kMediaLevel, 2048});
+        std::uint64_t sequence = 0;
+        const auto at = [&](std::int64_t ms, aa::protocol::ChannelRole role,
+                            const std::vector<std::byte>& pcm) {
+            ASSERT_TRUE(burst.route->submit(make_message(role, sequence++,
+                aa::core::Nanoseconds{base.count + ms * 1'000'000}, pcm)));
+            ASSERT_TRUE(burst.drain());
+        };
+        const auto prompt = guidance_parent(1000, 2048); // 64 ms
+        for (int i = 0; i < 4; ++i) { at(0, guidance, prompt); }
+        if (with_media) { at(50, media, chunk); at(93, media, chunk); }
+        at(100, guidance, prompt); // 4 x 64 ms held, 36 ms after their nominal end
+        EXPECT_GT(burst.route->report().stats.frames_caught_up, 0U);
+        // All four held parents are stale, the last burst parent's own audio
+        // included: the run ends on the 15 ms target.
+        EXPECT_LE(burst.written_end_ns(), base.count + (100 + 64 + 16) * 1'000'000);
+    }
+}
+
+// Carryover held across a pause belongs to the previous prompt: it is stale
+// and dropped, so it neither plays before the next prompt nor delays it. The
+// next prompt's own 9600 frames lose at most its phase above the target.
+TEST_F(AudioPipelineRoute, IncrementalStaleCarryoverIsNotPlayedBeforeTheNextPrompt) {
+    const std::int64_t first = 2 * 42'667 + 10'000;
+    auto burst = run_media_with_split_guidance({first, first + 1'000'000});
+    ASSERT_TRUE(burst);
+    const auto& stats = burst->route->report().stats;
+    EXPECT_GE(stats.frames_trimmed, 9504U - 720U);
+    EXPECT_LE(stats.frames_trimmed, 9504U + 2U * 2048U);
+    EXPECT_LE(burst->written_end_ns(),
+              1'000'000'000 + (first + 1'000'000 + 200'000 + 20'000) * 1000);
+}
+
+namespace {
+
+// #155 F1's schedule at `offset_ns`: three media chunks at once, a 200 ms
+// guidance parent 30 ms later placed just under the watermark (cursor ~313 ms
+// ahead, source frontier 230 ms), then a short media chunk at 40 ms whose
+// end is 147 ms behind that frontier but 230 ms behind the cursor. It survives
+// only while the source frontier is this schedule's own.
+[[nodiscard]] aa::core::Result<void> run_frontier_sensitive_schedule(BurstRoute& burst,
+                                                                     std::int64_t start_ns,
+                                                                     std::uint64_t sequence) {
+    const auto chunk = constant_pcm({1000, 2048});
+    for (std::uint64_t i = 0; i < 3; ++i) {
+        if (auto sent = burst.route->submit(make_message(aa::protocol::ChannelRole::media_audio,
+                sequence + i, aa::core::Nanoseconds{start_ns}, chunk)); !sent) { return sent; }
+    }
+    if (auto drained = burst.drain(); !drained) { return drained; }
+    if (auto sent = burst.route->submit(make_message(aa::protocol::ChannelRole::guidance_audio,
+            sequence, aa::core::Nanoseconds{start_ns + 30'000'000}, guidance_parent(1500))); !sent) {
+        return sent;
+    }
+    if (auto drained = burst.drain(); !drained) { return drained; }
+    if (auto sent = burst.route->submit(make_message(aa::protocol::ChannelRole::media_audio,
+            sequence + 3, aa::core::Nanoseconds{start_ns + 40'000'000}, chunk)); !sent) { return sent; }
+    return burst.drain();
+}
+
+} // namespace
+
+// The same when the role's stream was cancelled or the session reset while the
+// decoder held its tail: the next stream never starts with the old one's audio.
+TEST_F(AudioPipelineRoute, IncrementalCarryoverOfAnEndedStreamIsNotPlayed) {
+    for (const bool reset : {false, true}) {
+        SCOPED_TRACE(reset);
+        BurstRoute burst{90'000'000, aa::audio::AudioFormat{16000, 1, 16},
+            ScriptedResampler::decoder([](std::size_t call, std::size_t buffered) {
+                return call == 0 ? std::size_t{96} : buffered; })};
+        ASSERT_TRUE(burst.route);
+        ASSERT_TRUE(burst.route->submit(make_message(guidance, 0, base, guidance_parent(1000))));
+        ASSERT_TRUE(burst.drain());
+        if (reset) { burst.route->reset_session_timeline(); }
+        else { burst.route->cancel_pending(guidance); }
+        ASSERT_TRUE(burst.route->submit(make_message(guidance, 1,
+            aa::core::Nanoseconds{base.count + 200'000'000}, guidance_parent(2000))));
+        ASSERT_TRUE(burst.drain());
+        // The same timestamps as an on-time continuation, which would keep all
+        // of it; here all of the 9504 held frames above the 15 ms target, nothing more.
+        EXPECT_EQ(burst.route->report().stats.frames_trimmed, 9504U - 720U);
+    }
+}
+
+// #173 P3: a cancelled stream's discarded remainder is not recent source
+// audio. A 1 s guidance parent cancelled after its first 50 ms must not keep
+// the shared frontier 950 ms ahead and judge a later schedule late by it;
+// what it did play (up to the cursor) still counts.
+TEST_F(AudioPipelineRoute, IncrementalCancellationRetiresTheUnplayedSourceFrontier) {
+    BurstRoute burst{90'000'000, aa::audio::AudioFormat{16000, 1, 16},
+        ScriptedResampler::decoder([](std::size_t, std::size_t buffered) { return buffered; })};
+    ASSERT_TRUE(burst.route);
+    auto& route = *burst.route;
+    ASSERT_TRUE(route.submit(make_message(guidance, 100, base, guidance_parent(1000, 32000))));
+    ASSERT_TRUE(route.render_step());
+    ASSERT_EQ(burst.written_end_ns(), base.count + 50'000'000);
+    route.cancel_pending(guidance);
+
+    const auto ran = run_frontier_sensitive_schedule(burst, base.count + 50'000'000, 200);
+
+    ASSERT_TRUE(ran) << aa::to_string(ran.error().code());
+    EXPECT_FALSE(route.report().render_failure);
+}
+
+// The played part keeps counting: after a cancellation a backward jump of the
+// role's timestamps more than the cap behind what it played is still late.
+TEST_F(AudioPipelineRoute, IncrementalCancellationKeepsThePlayedSourceFrontier) {
+    BurstRoute burst{90'000'000, aa::audio::AudioFormat{16000, 1, 16},
+        ScriptedResampler::decoder([](std::size_t, std::size_t buffered) { return buffered; })};
+    ASSERT_TRUE(burst.route);
+    auto& route = *burst.route;
+    ASSERT_TRUE(route.submit(make_message(guidance, 0, base, guidance_parent(1000, 32000))));
+    for (int i = 0; i < 10; ++i) { ASSERT_TRUE(route.render_step()); }
+    ASSERT_EQ(burst.written_end_ns(), base.count + 500'000'000);
+    route.cancel_pending(guidance);
+    ASSERT_TRUE(route.submit(make_message(guidance, 1, base, guidance_parent(2000))));
+
+    ASSERT_FALSE(burst.drain());
+    ASSERT_TRUE(route.report().render_failure);
+    EXPECT_EQ(route.report().render_failure->reason, aa::audio::RenderFailureReason::late);
+}
+
+// #173 P3: a session reset clears the shared and the per-role source frontier.
+// The previous session's media ended 600 ms into its timeline; on the new one
+// the F1 schedule is not judged late by it, neither directly (the shared
+// frontier) nor once a guidance cancellation falls back to the other roles'.
+TEST_F(AudioPipelineRoute, IncrementalSessionResetClearsTheSourceFrontiers) {
+    for (const bool cancelled : {false, true}) {
+        SCOPED_TRACE(cancelled);
+        BurstRoute burst{90'000'000, aa::audio::AudioFormat{16000, 1, 16},
+            ScriptedResampler::decoder([](std::size_t, std::size_t buffered) { return buffered; })};
+        ASSERT_TRUE(burst.route);
+        auto& route = *burst.route;
+        for (std::uint64_t i = 0; i < 3; ++i) {
+            ASSERT_TRUE(route.submit(make_message(media, i,
+                aa::core::Nanoseconds{base.count + static_cast<std::int64_t>(i) * 200'000'000},
+                constant_pcm({1000, 9600}))));
+            ASSERT_TRUE(burst.drain());
+        }
+        route.reset_session_timeline();
+        auto start = base.count + 5'000'000'000;
+        if (cancelled) {
+            ASSERT_TRUE(route.submit(make_message(guidance, 100, aa::core::Nanoseconds{start},
+                                                  guidance_parent(1000, 32000))));
+            ASSERT_TRUE(route.render_step());
+            route.cancel_pending(guidance);
+            start += 50'000'000;
+        }
+        const auto ran = run_frontier_sensitive_schedule(burst, start, 200);
+        ASSERT_TRUE(ran) << aa::to_string(ran.error().code());
+        EXPECT_FALSE(route.report().render_failure);
+    }
+}
+
 TEST_F(AudioPipelineRoute, IncrementalQueuedParentsDoNotBecomeLateArrivalsBetweenSteps) {
     open_incremental();
     for (std::uint64_t i = 0; i < 12; ++i) { enqueue(media, i, {1000, 960}); }

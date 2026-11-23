@@ -431,7 +431,8 @@ RouterConfig pcm_router_config(AudioTelemetryCallbacks telemetry, SinkBackend ba
     // placed after the cursor far behind its arrival. A run placed more than
     // 90 ms (the A/V excursion bound) behind its arrival is trimmed from its
     // head down to the 15 ms drift target at once instead of 5 ms per chunk
-    // (resampler carryover at a run's head counts at its older source time),
+    // (resampler carryover at the head of a burst run counts at its older
+    // source time; that of an on-time run does not, #173),
     // and the router's 200 ms late cap judges such a caught-up run by the end
     // of its parent's own PTS range against the committed source-time frontier.
     // A stall's burst - including 200 ms guidance parents stamped milliseconds

@@ -139,8 +139,8 @@ Policy (wired is unchanged: stop-and-wait and the arrival model with the
   13 times. The replay tests release chunks in groups of 2-5 and expect no
   trim, silence or underrun, and pad tests run with groups of 3 and 4.
 - **Catch-up is not used for wireless.** `--audio-catch-up-watermark-ms`
-  is accepted only with `--audio-playout-ms 0`, which restores the arrival
-  model (with `--audio-max-unacked 1`, exactly #180's behaviour). Playout
+  (0, the default, or 20..200) is accepted only with `--audio-playout-ms 0`,
+  which restores the arrival model (with `--audio-max-unacked 1`, exactly #180's behaviour). Playout
   also requires the drift policy itself (`live_pcm_drift.enabled`); the
   router refuses to open without it.
 - **Video** (`--video-delay-ms`, default `match`): the receiver holds every

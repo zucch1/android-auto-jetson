@@ -272,7 +272,7 @@ private:
     std::optional<std::uint64_t> idle_resume_id_;
     std::uint64_t idle_resume_frames_{};
     std::uint64_t idle_sequence_{};
-    // Catch-up (#155) totals over the worker's life, across sink reopens.
+    // Catch-up (#155) totals over the worker's life, across reopens and sessions.
     std::uint64_t catch_up_events_lifetime_{};
     std::uint64_t catch_up_frames_lifetime_{};
     const std::uint32_t credit_window_;

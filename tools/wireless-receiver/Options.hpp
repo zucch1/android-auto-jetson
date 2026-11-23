@@ -40,7 +40,7 @@ inline constexpr const char *usage =
     "  --idr-recovery auto|nudge|transition  IDR recovery strategy (default auto)\n"
     "  --audio-sink pulse|pipewire|automatic  audio routing element (default pulse)\n"
     "  --audio-catch-up-watermark-ms N        post-stall catch-up watermark in ms\n"
-    "                                         (0 disables catch-up, default 0; max 1000;\n"
+    "                                         (0 disables catch-up, default 0; else 20..200;\n"
     "                                         needs --audio-playout-ms 0)\n"
     "  --audio-playout-ms N   wireless audio playout buffer in ms: chunks play back to\n"
     "                       back N ms after the arrival that anchored the stream\n"
@@ -150,7 +150,12 @@ inline std::optional<Options> parse_options(int argc, const char *const *argv,
             std::uint64_t number{};
             const auto [end, error] =
                 std::from_chars(value.data(), value.data() + value.size(), number);
-            if (error != std::errc{} || end != value.data() + value.size() || number > 1000)
+            if (error != std::errc{} || end != value.data() + value.size())
+                return std::nullopt;
+            // Catch-up never acts below the drift high watermark (20 ms), and
+            // above the router's 200 ms late cap a run is rejected before it
+            // could (#173): values outside 20..200 would be silently useless.
+            if (number != 0 && (number < 20 || number > 200))
                 return std::nullopt;
             options.audio_catch_up_watermark_ms = static_cast<std::int64_t>(number);
         } else if (arg == "--audio-playout-ms" || arg == "--audio-max-unacked") {
