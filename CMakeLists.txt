@@ -263,13 +263,14 @@ if(NOT CMAKE_CROSSCOMPILING)
     set(_aa_expect_split 0)
     set(_aa_expect_inline_dwarf 0)
     if(CMAKE_BUILD_TYPE MATCHES "^(Debug|RelWithDebInfo)$")
-        if(NOT AA_ENABLE_ASAN)
-            # Require the default host-dev/RelWithDebInfo split unconditionally
-            # so flipping AA_SPLIT_DEBUG_INFO's default or missing objcopy fails
-            # loudly instead of turning CI green.
-            set(_aa_expect_split 1)
-        else()
+        if(AA_ENABLE_ASAN OR NOT AA_SPLIT_DEBUG_INFO)
+            # ASan and explicit -DAA_SPLIT_DEBUG_INFO=OFF opt-outs keep DWARF
+            # inline. The fixture matrix still proves the module default is ON.
             set(_aa_expect_inline_dwarf 1)
+        else()
+            # Split requested (the default): require it, so a missing objcopy
+            # fails loudly instead of silently leaving the binary unsplit.
+            set(_aa_expect_split 1)
         endif()
     endif()
     add_test(NAME build_debug_info_split COMMAND "${Python3_EXECUTABLE}" -B -E

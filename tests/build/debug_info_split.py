@@ -217,7 +217,9 @@ def main() -> int:
         if args.expect_split:
             if args.objcopy is not None:
                 require(
-                    bool(args.objcopy) and Path(args.objcopy).is_file(),
+                    bool(args.objcopy)
+                    and not args.objcopy.endswith("-NOTFOUND")
+                    and (Path(args.objcopy).is_file() or shutil.which(args.objcopy) is not None),
                     f"active-build:{args.binary.name}: split debug info is required for default "
                     f"host Debug/RelWithDebInfo builds, but CMAKE_OBJCOPY is unset or missing "
                     f"({args.objcopy!r})",
