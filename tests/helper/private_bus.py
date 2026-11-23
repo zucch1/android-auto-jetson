@@ -31,15 +31,16 @@ def process(args: list[str], env: dict[str, str]) -> Iterator[subprocess.Popen[b
             child.wait(timeout=5)
 
 
-def line(child: subprocess.Popen[bytes], timeout: float = 10) -> str:
-    assert child.stdout is not None
+def line(child: subprocess.Popen[bytes], timeout: float = 10, *, stderr: bool = False) -> str:
+    stream = child.stderr if stderr else child.stdout
+    assert stream is not None
     deadline = time.monotonic() + timeout
     data = bytearray()
     while not data.endswith(b"\n"):
         remaining = deadline - time.monotonic()
-        assert remaining > 0 and select.select([child.stdout], [], [], remaining)[0], "process line deadline"
-        byte = os.read(child.stdout.fileno(), 1)
-        assert byte, f"process closed stdout: {child.poll()}"
+        assert remaining > 0 and select.select([stream], [], [], remaining)[0], "process line deadline"
+        byte = os.read(stream.fileno(), 1)
+        assert byte, f"process closed output: {child.poll()}"
         data.extend(byte)
         assert len(data) <= 65536
     return data.decode().rstrip("\n")
@@ -179,10 +180,55 @@ def run(build: Path, directory: Path) -> None:
         print(f"production_helper_peak_rss_bytes={production_peak}")
 
 
+def receiver_startup(build: Path, directory: Path) -> None:
+    receiver = build / "aa-wireless-receiver"
+    fixture = build / "aa_system_helper_fixture"
+    env = dict(os.environ)
+    uid = directory / "session.uid"
+    uid.write_text(f"{os.getuid()}\n")
+    uid.chmod(0o600)
+    digest = directory / "receiver.sha256"
+    effects = directory / "effects"
+    with contextlib.ExitStack() as stack:
+        buses = [stack.enter_context(process(["dbus-daemon", "--session", "--nofork",
+                                             "--print-address=1"], env)) for _ in range(2)]
+        address, env["DBUS_SESSION_BUS_ADDRESS"] = [line(bus) for bus in buses]
+        args = [str(receiver), "--store-dir", str(directory), "--pairing-only",
+                "--helper-bus-address", address]
+        digest.write_text(hashlib.sha256(receiver.read_bytes()).hexdigest() + "\n")
+        digest.chmod(0o600)
+        helper_args = [str(fixture), "helper", address, str(directory), str(effects)]
+        with process(helper_args, env) as helper:
+            assert line(helper) == "ready"
+            with process([*args, "--duration-ms", "10000"], env) as first:
+                ready = line(first, 3)
+                assert '"state":"pairing_only"' in ready, ready
+                with process([*args, "--duration-ms", "100"], env) as second:
+                    # Keep the first receiver alive until the helper sees the second probe.
+                    assert "previous receiver still connected" in line(helper, 3, stderr=True)
+                    first.terminate()
+                    assert first.wait(timeout=3) == 0
+                    output, error = second.communicate(timeout=6)
+                    assert second.returncode == 0 and b'"state":"pairing_only"' in output, (output, error)
+            assert effects.read_text().splitlines().count("effect 4") == 2
+        effects.unlink()
+        digest.write_text("0" * 64 + "\n")
+        with process(helper_args, env) as helper:
+            assert line(helper) == "ready"
+            result = subprocess.run([*args, "--duration-ms", "100"], env=env,
+                                    capture_output=True, text=True, timeout=3)
+            assert result.returncode == 3 and "AP status: helper_rejected" in result.stderr, result
+            assert "receiver identity verification failed" in line(helper, 1, stderr=True)
+            assert not effects.exists()
+
+
 def main() -> None:
     build = Path(sys.argv[1]).resolve()
     with tempfile.TemporaryDirectory(prefix="helper-", dir=build) as temporary:
-        run(build, Path(temporary))
+        if sys.argv[2:] == ["receiver-startup"]:
+            receiver_startup(build, Path(temporary))
+        else:
+            run(build, Path(temporary))
 
 
 if __name__ == "__main__":

@@ -324,7 +324,7 @@ AA owns autostart of its own units. Infotainment starts independently and must n
 ### User vs System Boundaries and Packaged Defaults
 
 - **System unit (`/usr/lib/systemd/system/aa-system-helper.service`):** Runs as `root` with `aa-system-helper.service`, the system D-Bus policy + per-UID delivery fragment, `/etc/android-auto-receiver/session.uid`, `/etc/android-auto-receiver/receiver.sha256`, `/etc/android-auto-receiver/ap.conf`, and `70-android-auto-receiver.rules`.
-- **Packaged user unit (`/usr/lib/systemd/user/aa-receiver.service`, PR `#205` / `#189`):** Runs in the user session (`PartOf=graphical-session.target`, `WantedBy=graphical-session.target`, `LimitCORE=0`) and starts `/usr/bin/aa-wireless-receiver --store-dir %S/android-auto-receiver --pairing-only`.
+- **Packaged user unit (`/usr/lib/systemd/user/aa-receiver.service`, PR `#205` / `#189`):** Runs in the user session (`PartOf=graphical-session.target`, `WantedBy=graphical-session.target`, `LimitCORE=0`) and starts `/usr/bin/aa-wireless-receiver --store-dir %S/android-auto-receiver --pairing-only`. It restarts on failure after two seconds (`Restart=on-failure`, `RestartSec=2`) with at most five starts per 60-second interval (`StartLimitIntervalSec=60`, `StartLimitBurst=5`).
 - **Operator activation and projection-mode override:**
   - Package maintainer scripts never enable or start either `aa-system-helper.service` or `aa-receiver.service`; operators must enable and start them explicitly.
   - The packaged `--pairing-only` default **cannot project** (`tools/wireless-receiver/Options.hpp`). Presence of `org.custom.AndroidAutoReceiver` on the session D-Bus therefore does **not** imply projection readiness — it may only be serving enrolment/control in `--pairing-only` mode.

@@ -142,6 +142,9 @@ endif()
     set(_aa_allow_helper_bus 0)
     if(AA_ENABLE_TEST_HELPER_BUS)
         set(_aa_allow_helper_bus 1)
+        add_test(NAME wireless_receiver_helper_startup COMMAND "${Python3_EXECUTABLE}" -B
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/helper/private_bus.py" "${CMAKE_BINARY_DIR}" receiver-startup)
+        set_tests_properties(wireless_receiver_helper_startup PROPERTIES TIMEOUT 20)
     endif()
     add_test(NAME wireless_receiver_smoke COMMAND "${CMAKE_COMMAND}"
         "-DAA_ALLOW_HELPER_BUS=${_aa_allow_helper_bus}"

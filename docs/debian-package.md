@@ -63,7 +63,9 @@ archive. The AP example is under the package documentation directory.
 
 The receiver unit is installed in `/usr/lib/systemd/user`. Its reference
 command starts the wireless receiver in pairing-only mode and uses the
-user manager's state directory. The helper is a separate system unit.
+user manager's state directory. The unit restarts on failure after two
+seconds and allows up to five starts within 60 seconds. The helper is
+a separate system unit.
 Package configuration checks that the shipped default-deny helper policy
 is present and reloads udev so the packaged USB rule applies without a reboot.
 Both services require explicit operator activation; the maintainer scripts

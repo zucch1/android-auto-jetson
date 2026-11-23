@@ -2,8 +2,7 @@
 #pragma once
 
 // Minimal real D-Bus client connection (task 21): EXTERNAL auth + Hello and the
-// four org.freedesktop.DBus calls the peer-credential lookup needs
-// (GetNameOwner, GetConnectionUnixUser, RequestName, ReleaseName). Private to
+// org.freedesktop.DBus calls for name ownership and peer credentials. Private to
 // src/ipc/dbus_adapter except through BusPeerLookup. Pure POSIX sockets over
 // the session bus — no external D-Bus library. All replies are parsed strictly
 // by BusWire and malformed answers fail closed with a typed transport error.
@@ -57,6 +56,7 @@ public:
     // match rule (standard daemon interface, required to receive signals).
     [[nodiscard]] core::Result<void> add_match(std::string_view rule);
     [[nodiscard]] core::Result<BusName> get_name_owner(const BusName& name);
+    [[nodiscard]] core::Result<bool> name_has_owner(const BusName& name);
     [[nodiscard]] core::Result<std::uint32_t> get_connection_unix_uid(const BusName& name);
     [[nodiscard]] core::Result<std::uint32_t> get_connection_unix_pid(const BusName& name);
 

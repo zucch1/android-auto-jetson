@@ -2,11 +2,16 @@
 #include <aa/helper/SystemHelper.hpp>
 #include "crypto_adapter/Crypto.hpp"
 #include <algorithm>
+#include <cstdio>
 
 namespace aa::helper {
 namespace {
 bool privileged(Action action) {
     return action == Action::acquire_ap || action == Action::open_pairing;
+}
+Error deny_receiver(const char* reason, ErrorCode code = ErrorCode::helper_rejected) {
+    std::fprintf(stderr, "system-helper: receiver request denied: %s\n", reason);
+    return Error{code};
 }
 }
 core::Result<State> UnavailableBackend::apply(Action action, std::uint32_t) {
@@ -17,12 +22,27 @@ core::Result<State> UnavailableBackend::apply(Action action, std::uint32_t) {
     default: return Error{ErrorCode::helper_unavailable};
     }
 }
-core::Result<void> SystemHelper::authenticate(const std::string& sender) {
-    if (sender.empty() || sender.size() > 255 || sender.front() != ':') return Error{ErrorCode::helper_rejected};
+core::Result<void> SystemHelper::authenticate(const std::string& sender, bool startup_probe) {
+    if (sender.empty() || sender.size() > 255 || sender.front() != ':')
+        return deny_receiver("invalid sender");
     const auto identity = identities_.resolve(sender);
-    if (!identity.has_value() || identity.value().unique_name != sender)
-        return Error{ErrorCode::helper_rejected};
-    if (receiver_ && *receiver_ != identity.value()) return Error{ErrorCode::helper_rejected};
+    if (!identity || identity.value().unique_name != sender)
+        return deny_receiver("receiver identity verification failed");
+    if (receiver_ && *receiver_ != identity.value()) {
+        if (receiver_->unique_name == sender)
+            return deny_receiver("bound receiver identity changed");
+        if (!startup_probe)
+            return deny_receiver("another receiver is bound");
+        // A replacement can arrive between liveness ticks. Require a daemon
+        // confirmation of disconnect before cleaning up the old authority.
+        const auto connected = identities_.name_has_owner(receiver_->unique_name);
+        if (!connected || connected.value()) {
+            return deny_receiver(connected ? "previous receiver still connected" :
+                                             "previous receiver connection check failed",
+                                 ErrorCode::helper_unavailable);
+        }
+        bus_lost();
+    }
     if (!receiver_) receiver_ = identity.value();
     return {};
 }
@@ -58,7 +78,9 @@ core::Result<std::uint64_t> SystemHelper::issue(const std::string& sender, Sourc
 core::Result<State> SystemHelper::execute(const std::string& sender, Invocation invocation, Time now) {
     const auto began = std::chrono::steady_clock::now();
     const auto [action, channel, grant] = invocation;
-    if (!authenticate(sender)) return Error{ErrorCode::helper_rejected};
+    const bool startup_probe = action == Action::ap_status && channel == 0 && grant == 0;
+    if (const auto authenticated = authenticate(sender, startup_probe); !authenticated)
+        return authenticated.error();
     expire(now + (std::chrono::steady_clock::now() - began));
     if (action < Action::acquire_ap || action > Action::close_pairing)
         return Error{ErrorCode::helper_rejected};

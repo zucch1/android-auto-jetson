@@ -7,6 +7,7 @@ class HandoffIds final : public IdentityLookup {
 public:
     std::uint64_t start{1};
     core::Result<ReceiverIdentity> resolve(const std::string& sender) override { return ReceiverIdentity{sender, 1000, 123, start, std::string(64, 'a')}; }
+    core::Result<bool> name_has_owner(const std::string&) override { return true; }
 };
 class HandoffBackend final : public Backend {
 public:

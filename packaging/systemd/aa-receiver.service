@@ -3,6 +3,8 @@
 Description=Android Auto receiver in the user session
 Documentation=file:/usr/share/doc/android-auto-receiver/debian-package.md
 PartOf=graphical-session.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -12,6 +14,8 @@ StateDirectoryMode=0700
 UMask=0077
 NoNewPrivileges=yes
 LimitCORE=0
+Restart=on-failure
+RestartSec=2
 
 [Install]
 WantedBy=graphical-session.target
