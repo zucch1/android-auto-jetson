@@ -255,6 +255,13 @@ if [ "${1:-}" = "install" ]; then
     fi
     deb="${@: -1}"
     ver="$(/usr/bin/dpkg-deb --field "$deb" Version)"
+    # Real APT semantics: an already-installed identical version is a no-op without --reinstall.
+    reinstall=0
+    for arg in "$@"; do [ "$arg" = "--reinstall" ] && reinstall=1; done
+    if [ "$reinstall" = 0 ] && grep -qx "android-auto-receiver	$ver" "$status_file" 2>/dev/null; then
+        echo "android-auto-receiver is already the newest version ($ver)."
+        exit 0
+    fi
     /usr/bin/dpkg-deb --extract "$deb" "$root"
     grep -v '^android-auto-receiver[[:space:]]' "$status_file" > "$status_file.new" || true
     printf 'android-auto-receiver\t%s\n' "$ver" >> "$status_file.new"
@@ -679,6 +686,23 @@ class DeployHarnessTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(archive.read_bytes(), self.pkg_v1.read_bytes())
         self.assertEqual((state / "previous.env").read_bytes(), previous)
+
+    def test_identical_redeploy_reinstalls_modified_receiver(self) -> None:
+        result = self.install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        receiver = self.target / "usr/bin/aa-wireless-receiver"
+        digest = self.target / "etc/android-auto-receiver/receiver.sha256"
+        good = receiver.read_bytes()
+        for tamper in ("modify", "delete"):
+            with self.subTest(tamper=tamper):
+                if tamper == "modify":
+                    receiver.write_bytes(b"MODIFIED-RECEIVER\n")
+                else:
+                    receiver.unlink()
+                result = self.install()
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(receiver.read_bytes(), good)
+                self.assertEqual(digest.read_text().strip(), hashlib.sha256(good).hexdigest())
 
     def test_lock_timeout_reports_holder_check_and_cleans_staging(self) -> None:
         result = self.install(FAKE_LOCK_TIMEOUT="1")

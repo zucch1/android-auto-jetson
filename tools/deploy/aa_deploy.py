@@ -700,7 +700,7 @@ def build_install_script(
         install -m 0644 -o root -g root {shlex.quote(staged_deb)} "$incoming_deb"
         [ "$(sha256sum "$incoming_deb" | cut -d' ' -f1)" = "$deb_sha" ] ||
             fail "install: cached .deb sha256 mismatch"
-        if ! env DEBIAN_FRONTEND=noninteractive apt-get install -y "$incoming_deb"; then
+        if ! env DEBIAN_FRONTEND=noninteractive apt-get install -y --reinstall "$incoming_deb"; then
             fail "install: apt-get install failed; deploy backups retained in $run_dir"
         fi
         read_installed_version
@@ -771,7 +771,7 @@ def build_rollback_script(state_dir: str, run_dir: str) -> str:
                 [ "$(sha256sum "$prev_deb" | cut -d' ' -f1)" = "$prev_sha" ] ||
                     fail "rollback: previous .deb sha256 mismatch"
                 if [ "$effective_restart" = 1 ]; then touch -- "$restart_pending"; fi
-                env DEBIAN_FRONTEND=noninteractive apt-get install -y --allow-downgrades "$prev_deb"
+                env DEBIAN_FRONTEND=noninteractive apt-get install -y --reinstall --allow-downgrades "$prev_deb"
                 read_installed_version
                 [[ -n "$prev_ver" && "$installed_version" = "$prev_ver" ]] ||
                     fail "rollback: previous Debian version was not installed; recovery state retained"
