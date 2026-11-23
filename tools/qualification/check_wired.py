@@ -8,25 +8,11 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 from pathlib import Path
 
 from check_privacy import scan
-from common import Document, EvidenceError, load, package_file, require
-from results import performance, projection, provenance, recovery
-
-
-RETIRED_NAME_TAGS = ('.interrupted.', '.disqualified.')
-RETIRED_FIELDS = frozenset({'interrupted'})
-
-
-def artifact(root: Path, ref: Document) -> Path:
-    ref.keys({'path', 'sha256'})
-    path = package_file(root, ref.text('path'))
-    require(hashlib.sha256(path.read_bytes()).hexdigest() == ref.text('sha256'),
-            'ARTIFACT_SHA256_MISMATCH')
-    require(path.stat().st_size > 0, 'EMPTY_ARTIFACT')
-    return path
+from common import EvidenceError, artifact, load, package_file, require
+from results import load_performance, performance, projection, provenance, recovery
 
 
 def check(manifest: Path) -> None:
@@ -61,11 +47,7 @@ def check(manifest: Path) -> None:
     projection(projection_result)
     recovery(recovery_result)
     for name, seconds in (('perf_30m', 1800), ('soak_2h', 7200)):
-        # A stage the soak chain retired (interrupted or disqualified) never
-        # qualifies, whatever the manifest says: by name and by its own marker.
-        require(not any(tag in paths[name].name for tag in RETIRED_NAME_TAGS), 'RETIRED_RESULT')
-        result = load(paths[name])
-        require(not RETIRED_FIELDS & set(result.values), 'RETIRED_RESULT')
+        result = load_performance(paths[name])
         performance(result, seconds)
         require(result.child('provenance').values == doc.child('provenance').values,
                 'PROVENANCE_MISMATCH')

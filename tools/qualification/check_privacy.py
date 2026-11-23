@@ -22,10 +22,11 @@ CAPTURE_NAME: Final = re.compile(
     r'\.(?:pcapng?|cap|h264|264|aac|wav|pcm|mp4|bin|key|pem|crt|p12|zip|gz|tar)$')
 MAC: Final = re.compile(r'(?i)(?<![0-9a-f])(?:[0-9a-f]{2}[:-]){5}[0-9a-f]{2}(?![0-9a-f])')
 SENSITIVE: Final = re.compile(
-    r'''(?ix)["']?\b(?:usb[_ -]?serial|serial(?:[_ -]?number|no)?|iSerial|'''
-    r'''android_id|imei|imsi|mac(?:_address)?|bssid|ssid|latitude|longitude|'''
-    r'''phone[_ -]?id|identity|device[_ -]?id|subscriber[_ -]?id|meid|udid|uuid|guid|'''
-    r'''location|gps|password|passwd|psk|(?:access_|refresh_)?token|'''
+    r'''(?ix)["']?\b(?:(?:(?:usb|phone|device|adb)[_ -]?)?serial(?:[_ -]?number|no)?|iSerial|'''
+    r'''android[_ -]?id|imei|imsi|(?:(?:bt|bluetooth|wifi|peer)[_ -]?)?mac(?:[_ -]?address)?|'''
+    r'''(?:(?:ap|wifi)[_ -]?)?(?:bssid|ssid|psk|passphrase)|latitude|longitude|'''
+    r'''(?:phone|device|subscriber)[_ -]?(?:identifier|identity|id)|identity|meid|udid|uuid|guid|'''
+    r'''location|gps|password|passwd|(?:access_|refresh_)?token|'''
     r'''api[_-]?key|private[_-]?key|(?:client_)?secret|authorization)'''
     r'''["']?\s*[:=][ \t]*([^\r\n]*)''')
 SAFE_VALUE: Final = re.compile(

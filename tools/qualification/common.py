@@ -2,6 +2,7 @@
 """Small stdlib-only JSON boundary, matching the existing evidence tools."""
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import re
@@ -113,3 +114,12 @@ def package_file(root: Path, relative: str) -> Path:
     require(target.resolve().is_relative_to(root.resolve()), 'ARTIFACT_OUTSIDE_PACKAGE')
     require(stat.S_ISREG(target.stat().st_mode), 'NON_REGULAR_FILE')
     return target
+
+
+def artifact(root: Path, ref: Document) -> Path:
+    ref.keys({'path', 'sha256'})
+    path = package_file(root, ref.text('path'))
+    require(hashlib.sha256(path.read_bytes()).hexdigest() == ref.text('sha256'),
+            'ARTIFACT_SHA256_MISMATCH')
+    require(path.stat().st_size > 0, 'EMPTY_ARTIFACT')
+    return path

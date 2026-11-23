@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 from typing import Final
 
-from common import DIGEST, Document, EvidenceError, require
+from common import DIGEST, Document, EvidenceError, load, require
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'perf'))
 import aa_perf_schema
@@ -112,7 +112,16 @@ def recovery(doc: Document) -> None:
     require(seen == set(RECOVERY) | {'malformed_input'}, 'INCOMPLETE_RECOVERY_MATRIX')
 
 
-def performance(doc: Document, seconds: int) -> None:
+def load_performance(path: Path) -> Document:
+    """Exclude stages retired by the soak chain, before judging the measurements."""
+    require(not any(tag in path.name for tag in ('.interrupted.', '.disqualified.')),
+            'RETIRED_RESULT')
+    doc = load(path)
+    require('interrupted' not in doc.values, 'RETIRED_RESULT')
+    return doc
+
+
+def performance(doc: Document, seconds: int, *, mode: str = 'wired') -> None:
     doc.equal('task', '32. Measure wired performance and two-hour soak')
     require('capture' not in doc.values, 'RAW_CAPTURE_REFERENCE')
     version = doc.text('schema')
@@ -120,9 +129,8 @@ def performance(doc: Document, seconds: int) -> None:
     schema = aa_perf_schema.load_schema(aa_perf_schema.schema_for(version))
     require(not aa_perf_schema.validate(doc.values, schema), 'PERF_SCHEMA')
     version3 = version == 'aa-projection-perf/3'
-    # Wired qualification counts wired results only: a wireless stage (v3
-    # mode "wireless", tools/perf/aa_transport.py) never stands in for one.
-    doc.equal('mode', 'wired')
+    doc.equal('mode', mode)
+    require(mode == 'wired' or version3, 'WIRELESS_PERF_SCHEMA_VERSION')
     doc.equal('measurement_origin', 'live')
     doc.equal('qualification_status', 'COMPLETE_LIVE')
     doc.equal('verdict', 'PASS')
@@ -147,7 +155,9 @@ def performance(doc: Document, seconds: int) -> None:
     except CoverageError as error:
         raise EvidenceError('INVALID_PERF_COVERAGE') from error
     require(not gaps, 'INCOMPLETE_PERF_COVERAGE')
-    require(0 <= run.number('startup_wait_seconds') <= 60, 'PERF_STARTUP_GRACE')
+    startup_wait = run.number('startup_wait_seconds')
+    require(startup_wait >= 0 and (mode == 'wireless' or startup_wait <= 60),
+            'PERF_STARTUP_GRACE')
     require(run.integer('startup_ms') >= 0, 'PERF_STARTUP')
     for name in ('video_units', 'audio_chunks'):
         require(run.integer(name) > 0, 'MISSING_MEDIA_PROGRESS')
