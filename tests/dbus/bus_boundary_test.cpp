@@ -700,6 +700,70 @@ TEST_F(SocketBoundary, CapPlusOneDrainsExactlyAndParsesNextMessage) {
     EXPECT_EQ(next.value().member, "Ping");
 }
 
+TEST_F(SocketBoundary, NameHasOwnerRejectsInvalidReplies) {
+    struct Case {
+        const char* signature;
+        std::uint32_t value;
+        bool trailing;
+        bus::MessageType type;
+        ErrorCode error;
+    };
+    constexpr Case cases[]{
+        {"u", 1, false, bus::MessageType::method_return, ErrorCode::transport_io},
+        {"b", 2, false, bus::MessageType::method_return, ErrorCode::transport_malformed_frame},
+        {"b", 1, true, bus::MessageType::method_return, ErrorCode::transport_malformed_frame},
+        {"b", 1, false, bus::MessageType::error_reply, ErrorCode::transport_io},
+    };
+    std::uint32_t serial = 2; // Hello used serial 1 before the socket was replaced.
+    for (const auto& item : cases) {
+        SCOPED_TRACE(serial);
+        bus::MessageWriter reply;
+        reply.interface_name("org.freedesktop.DBus")
+            .destination(receiver->unique_name().value).reply_serial(serial)
+            .body_signature(item.signature).put_u32(item.value);
+        if (item.trailing) reply.put_u32(0);
+        if (item.type == bus::MessageType::error_reply)
+            reply.error_name("org.freedesktop.DBus.Error.Failed");
+        auto bytes = reply.build(item.type, serial++);
+        // The first header field is string-typed. Mark it as the daemon-only sender.
+        ASSERT_EQ(bytes.at(16), static_cast<std::uint8_t>(bus::HeaderField::interface_name));
+        bytes[16] = static_cast<std::uint8_t>(bus::HeaderField::sender);
+        ASSERT_TRUE(bus::bus_io::write_full(peer, bytes));
+        const auto result = receiver->name_has_owner(BusName{":1.99"});
+        ASSERT_FALSE(result.has_value());
+        EXPECT_EQ(result.error().code(), item.error);
+    }
+}
+
+TEST_F(SocketBoundary, PeerClosingBeforeHeaderClosesConnection) {
+    ::close(peer); peer = -1;
+    const auto result = receiver->read_message();
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error().code(), ErrorCode::transport_closed);
+    EXPECT_EQ(receiver->native_handle(), -1);
+}
+
+TEST_F(SocketBoundary, ClosedConnectionFailsFastInsteadOfPollingMinusOne) {
+    ::close(peer); peer = -1;
+    ASSERT_FALSE(receiver->read_message().has_value());
+    ASSERT_EQ(receiver->native_handle(), -1);
+    // poll() ignores a negative descriptor, so without the guard each of these
+    // would sleep for its whole deadline and report a timeout or I/O error.
+    const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    const auto start = std::chrono::steady_clock::now();
+    const auto again = receiver->read_message();
+    ASSERT_FALSE(again.has_value());
+    EXPECT_EQ(again.error().code(), ErrorCode::transport_closed);
+    std::array<std::uint8_t, 16> buffer{};
+    const auto read = bus::bus_io::read_full(-1, buffer, until);
+    ASSERT_FALSE(read.has_value());
+    EXPECT_EQ(read.error().code(), ErrorCode::transport_closed);
+    const auto wrote = bus::bus_io::write_full(-1, buffer, until);
+    ASSERT_FALSE(wrote.has_value());
+    EXPECT_EQ(wrote.error().code(), ErrorCode::transport_closed);
+    EXPECT_LT(std::chrono::steady_clock::now() - start, std::chrono::milliseconds(200));
+}
+
 TEST_F(SocketBoundary, PeerClosingMidDrainClosesConnection) {
     const auto oversized = frame(1024 * 1024);
     ASSERT_TRUE(bus::bus_io::write_full(peer, std::span{oversized}.first(5000)));

@@ -1327,7 +1327,7 @@ TEST_F(NmDaemon, RuleRemovalFailureRemainsVisibleAndRetriesSafely) {
     boundary->block_remove = false;
     ASSERT_TRUE(eventually([this] { return !boundary->table; })); ASSERT_TRUE(state(State::inactive));
 }
-TEST_F(NmDaemon, ActualDaemonRejectsOtherUniqueNameAndMalformedRevoke) {
+TEST_F(NmDaemon, ActualDaemonDefersVerifiedStatusAndRejectsForeignRevokes) {
     start(); acquire(); ASSERT_TRUE(state(State::active));
     const auto before = read_text(directory / "state/ap.credentials");
     auto* rogue = g_dbus_connection_new_for_address_sync(address.c_str(),
@@ -1341,7 +1341,9 @@ TEST_F(NmDaemon, ActualDaemonRejectsOtherUniqueNameAndMalformedRevoke) {
         unsigned error{}; guint64 value{}; g_variant_get(reply, "(ut)", &error, &value);
         EXPECT_EQ(error, expected); EXPECT_EQ(value, 0U); g_variant_unref(reply);
     };
-    check("Execute", g_variant_new("(uut)", 4U, 0U, guint64{0}), 1001);
+    // The second connection has the same verified executable as the owner.
+    check("Execute", g_variant_new("(uut)", static_cast<unsigned>(Action::ap_status), 0U, guint64{0}),
+          static_cast<unsigned>(ErrorCode::helper_unavailable));
     check("RevokeAP1", g_variant_new("(t)", guint64{1}), 1001);
     check("RevokeAP1", g_variant_new("(s)", "bad-schema"), 1002);
     (void)g_dbus_connection_close_sync(rogue, nullptr, nullptr); g_object_unref(rogue);

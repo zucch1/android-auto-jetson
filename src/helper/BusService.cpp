@@ -21,6 +21,10 @@ public:
         if (!uid || !pid) return Error{ErrorCode::helper_rejected};
         return inspect_process(sender, uid.value(), pid.value(), policy_, until);
     }
+    core::Result<bool> name_has_owner(const std::string& sender) override {
+        connection_.deadline(Clock::now() + std::chrono::milliseconds(200));
+        return connection_.name_has_owner(ipc::BusName{sender});
+    }
 private:
     BusConnection connection_;
     IdentityPolicy policy_;

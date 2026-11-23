@@ -28,8 +28,10 @@ credential connection with `GetConnectionUnixUser` and
 proc-directory ownership, live process state/starttime, and SHA256 of an opened
 `/proc/PID/exe` FD. That leaf is deliberately followed (it is a kernel symlink).
 The executable inode and process state/starttime are rechecked after hashing.
-The pinned tuple is unique name, UID, PID, starttime and digest. Executable
-content is rehashed on subsequent calls: `exec` does not change starttime.
+The helper binds one verified receiver at a time by unique name, UID, PID,
+starttime and digest. The binding can transfer under the rules in
+[Loss handling and bounds](#loss-handling-and-bounds). Executable content is
+rehashed on subsequent calls because `exec` preserves starttime.
 Effects get a second identity validation immediately before backend dispatch.
 This narrows races; it is not a kernel atomic exec-and-effect transaction.
 
@@ -305,7 +307,7 @@ Actions (wire numbers are append-only):
 | 1 | AP acquire | channel 36/40/44/48 and equal to ap.conf (default 36); one-use AP grant |
 | 2 | Open pairing (fixed backend 60-second-window contract) | channel 0; distinct one-use pairing grant and captured peer binding |
 | 3 | AP release | channel 0, grant 0, same receiver binding |
-| 4 | AP status | channel 0, grant 0, same binding |
+| 4 | AP status | channel 0, grant 0, same binding; the startup probe from a newly verified receiver may take over the binding once the previous unique name is confirmed unowned (see Receiver identity) |
 | 5 | USB policy status | channel 0, grant 0, same binding |
 | 6 | ModemManager exclusion status | channel 0, grant 0, same binding |
 | 7/8 | BlueZ register/unregister fixed AA profile | channel 0, grant 0, same binding |
@@ -353,6 +355,19 @@ every second runs regardless of incoming traffic. Receiver unique-name loss,
 death, UID/starttime/digest change and system-bus failure invalidate pending
 grants and clean the stored owning backend lease internally (no attempt to
 authenticate a dead process). Graceful helper destruction also cleans leases.
+
+While a receiver is still bound, only a newly verified receiver’s
+`Execute(ap_status, 0, 0)` startup probe can transfer the binding. The helper
+checks the previous unique name with `org.freedesktop.DBus.NameHasOwner` on
+the credential connection. If the daemon confirms the name is unowned, the
+helper runs full `bus_lost()` cleanup before binding the verified replacement
+and serving its probe. If the name still has an owner or the check fails, the
+helper preserves the existing binding and authority and returns retryable
+`helper_unavailable` (1000). Unverified calls and any other calls from a
+different receiver while bound return `helper_rejected` (1001). Denial logs
+use fixed reasons without identifiers. The receiver retries only 1000 within
+its startup budget and stops if its bus connection closes.
+
 The GIO adapter services callbacks and monotonic deadlines on a helper-local
 context every cycle (poll capped at 20ms); receiver identity checks remain on
 the independent one-second cadence. BlueZ calls have a 150ms deadline, owner
@@ -360,6 +375,8 @@ lookup 100ms, no auto-start and a captured unique destination. BlueZ daemon
 owner changes invalidate observations and close FDs. Adapter BlueZ timeouts are
 also set to 60s. Cleanup retries failed quiet-property writes. Crash/restart
 reconciliation limits are explicit in the task36 document, not target-qualified.
+
+The `NameHasOwner` check for the previous receiver runs on the credential connection with a 200 ms deadline; an error or timeout keeps the old binding and answers `helper_unavailable`.
 
 Credential RPCs share an absolute 500 ms deadline and helper export read/reply
 steps 500 ms. Typed client calls use the caller's timeout capped at one second;

@@ -18,6 +18,8 @@ class IdentityLookup {
 public:
     virtual ~IdentityLookup() = default;
     virtual core::Result<ReceiverIdentity> resolve(const std::string& unique_name) = 0;
+    // A false result confirms the bus has dropped this connection.
+    virtual core::Result<bool> name_has_owner(const std::string& unique_name) = 0;
 };
 struct IdentityPolicy final {
     std::uint32_t session_uid{};

@@ -54,6 +54,7 @@ VIDEO_CHANNEL_CPP_REL: Final[str] = "src/ipc/video/VideoChannel.cpp"
 INPUT_SOCKET_HPP_REL: Final[str] = "include/aa/ipc/InputSocket.hpp"
 INPUT_CODEC_CPP_REL: Final[str] = "src/ipc/input/InputCodec.cpp"
 INPUT_CHANNEL_CPP_REL: Final[str] = "src/ipc/input/InputChannel.cpp"
+RECEIVER_SERVICE_REL: Final[str] = "packaging/systemd/aa-receiver.service"
 HELPER_SERVICE_REL: Final[str] = "packaging/systemd/aa-system-helper.service"
 HELPER_DBUS_CONF_REL: Final[str] = "packaging/dbus/org.custom.AndroidAutoSystemHelper.conf"
 AP_CONF_REL: Final[str] = "packaging/ap.conf.example"
@@ -735,7 +736,7 @@ def check_contract(root: Path) -> list[Violation]:
     # 5. Packaging units and policy files
     pkg_rows = parse_markdown_table(doc, "Packaging and Policy Units")
     doc_pkg_paths = {unquote_code(row[0]) for row in pkg_rows if len(row) >= 1}
-    expected_pkg = {HELPER_SERVICE_REL, HELPER_DBUS_CONF_REL, AP_CONF_REL, UDEV_RULES_REL}
+    expected_pkg = {RECEIVER_SERVICE_REL, HELPER_SERVICE_REL, HELPER_DBUS_CONF_REL, AP_CONF_REL, UDEV_RULES_REL}
     for rel in sorted(expected_pkg - doc_pkg_paths):
         fail("INTEGRATION_CONTRACT_MISSING_PACKAGING", rel)
     for rel in sorted(expected_pkg):
@@ -775,6 +776,31 @@ def check_contract(root: Path) -> list[Violation]:
                  f"{HELPER_SERVICE_REL} [Install] missing WantedBy=multi-user.target")
         if "/usr/libexec/aa-system-helper" not in doc:
             fail("INTEGRATION_CONTRACT_UNIT_UNDOCUMENTED", "/usr/libexec/aa-system-helper")
+
+    receiver_service = root / RECEIVER_SERVICE_REL
+    if receiver_service.is_file():
+        unit = parse_systemd_unit(receiver_service.read_text(encoding="utf-8"))
+        receiver_doc = [
+            token for line in doc.splitlines()
+            if line.startswith("- **Packaged user unit (")
+            for token in BACKTICK_RE.findall(line)
+        ]
+        for section, key in (
+            ("Unit", "PartOf"),
+            ("Unit", "StartLimitIntervalSec"),
+            ("Unit", "StartLimitBurst"),
+            ("Service", "LimitCORE"),
+            ("Service", "Restart"),
+            ("Service", "RestartSec"),
+            ("Service", "RestartPreventExitStatus"),
+            ("Install", "WantedBy"),
+        ):
+            prefix = f"{key}="
+            documented = [token.removeprefix(prefix) for token in receiver_doc if token.startswith(prefix)]
+            actual = unit.get(section, {}).get(key, [])
+            if len(documented) != 1 or not documented[0] or actual != documented:
+                fail("INTEGRATION_CONTRACT_UNIT_DRIFT",
+                     f"{RECEIVER_SERVICE_REL} [{section}] {key}: doc={documented!r} unit={actual!r}")
 
     helper_conf = root / HELPER_DBUS_CONF_REL
     if helper_conf.is_file():

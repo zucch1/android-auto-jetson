@@ -66,6 +66,7 @@ COPIED_FILES = (
     "src/helper/SystemHelper.cpp",
     "src/app/WiredSession.cpp",
     "packaging/systemd/aa-system-helper.service",
+    "packaging/systemd/aa-receiver.service",
     "packaging/dbus/org.custom.AndroidAutoSystemHelper.conf",
     "packaging/ap.conf.example",
     "tools/usb-policy/70-android-auto-receiver.rules",
@@ -358,6 +359,24 @@ class IntegrationContractTests(unittest.TestCase):
             res = run_checker(root)
             self.assertEqual(res.returncode, 1, msg=res.stdout + res.stderr)
             self.assertIn("INTEGRATION_CONTRACT_UNIT_DRIFT", res.stdout)
+
+    def test_receiver_unit_directive_drift_fails(self) -> None:
+        for relative, old, new in (
+            ("packaging/systemd/aa-receiver.service", "RestartSec=2", "RestartSec=3"),
+            ("packaging/systemd/aa-receiver.service", "RestartPreventExitStatus=2", ""),
+            ("docs/INTEGRATION-CONTRACT.md", "PartOf=graphical-session.target", "PartOf=other.target"),
+        ):
+            with self.subTest(relative=relative, directive=old), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                stage_tree(root)
+                path = root / relative
+                original = path.read_text(encoding="utf-8")
+                self.assertIn(old, original)
+                path.write_text(original.replace(old, new), encoding="utf-8")
+                res = run_checker(root)
+                self.assertEqual(res.returncode, 1, msg=res.stdout + res.stderr)
+                self.assertIn("INTEGRATION_CONTRACT_UNIT_DRIFT", res.stdout)
+                self.assertIn(old.partition("=")[0], res.stdout)
 
     def test_missing_systemd_unit_fails(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

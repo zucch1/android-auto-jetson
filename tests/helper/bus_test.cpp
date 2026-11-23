@@ -208,6 +208,18 @@ TEST(HelperBus, WrongExecutableCannotIssueEvenWithKnownSource) {
     ASSERT_EQ(reply.value().signature, "ut");
     EXPECT_EQ(body.read_u32().value(), 1001U);
 }
+TEST(HelperNameOwner, ReportsDaemonOwnershipOfReceiverUniqueName) {
+    const char* address = std::getenv("AA_HELPER_TEST_BUS");
+    const char* name = std::getenv("AA_HELPER_TEST_RECEIVER_NAME");
+    ASSERT_NE(address, nullptr);
+    ASSERT_NE(name, nullptr);
+    auto lookup = BusConnection::connect_private(address);
+    ASSERT_TRUE(lookup);
+    const auto owner = lookup.value().name_has_owner(ipc::BusName{name});
+    ASSERT_TRUE(owner);
+    EXPECT_EQ(owner.value(), std::getenv("AA_HELPER_TEST_RECEIVER_EXITED") == nullptr);
+}
+
 TEST(HelperFlood, DirectedTrafficCannotStarveLiveness) {
     const char* address = std::getenv("AA_HELPER_TEST_BUS"); ASSERT_NE(address, nullptr);
     auto caller = BusConnection::connect_private(address); ASSERT_TRUE(caller);

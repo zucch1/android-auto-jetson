@@ -10,6 +10,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import os
+import re
 from pathlib import Path
 import select
 import subprocess
@@ -31,15 +32,16 @@ def process(args: list[str], env: dict[str, str]) -> Iterator[subprocess.Popen[b
             child.wait(timeout=5)
 
 
-def line(child: subprocess.Popen[bytes], timeout: float = 10) -> str:
-    assert child.stdout is not None
+def line(child: subprocess.Popen[bytes], timeout: float = 10, *, stderr: bool = False) -> str:
+    stream = child.stderr if stderr else child.stdout
+    assert stream is not None
     deadline = time.monotonic() + timeout
     data = bytearray()
     while not data.endswith(b"\n"):
         remaining = deadline - time.monotonic()
-        assert remaining > 0 and select.select([child.stdout], [], [], remaining)[0], "process line deadline"
-        byte = os.read(child.stdout.fileno(), 1)
-        assert byte, f"process closed stdout: {child.poll()}"
+        assert remaining > 0 and select.select([stream], [], [], remaining)[0], "process line deadline"
+        byte = os.read(stream.fileno(), 1)
+        assert byte, f"process closed output: {child.poll()}"
         data.extend(byte)
         assert len(data) <= 65536
     return data.decode().rstrip("\n")
@@ -179,10 +181,91 @@ def run(build: Path, directory: Path) -> None:
         print(f"production_helper_peak_rss_bytes={production_peak}")
 
 
+def unique_names(address: str) -> set[str]:
+    output = subprocess.check_output(
+        ["dbus-send", f"--bus={address}", "--print-reply", "--dest=org.freedesktop.DBus",
+         "/org/freedesktop/DBus", "org.freedesktop.DBus.ListNames"], text=True, timeout=2,
+    )
+    # ListNames includes the short-lived connection that issued the query.
+    query = re.search(r"destination=(:[\d.]+)", output)
+    assert query, output
+    return set(re.findall(r'string "(:[\d.]+)"', output)) - {query[1]}
+
+
+def receiver_startup(build: Path, directory: Path) -> None:
+    receiver = build / "aa-wireless-receiver"
+    fixture = build / "aa_system_helper_fixture"
+    env = dict(os.environ, AA_WIRELESS_TEST_SAME_UID_HELPER="1")
+    uid = directory / "session.uid"
+    uid.write_text(f"{os.getuid()}\n")
+    uid.chmod(0o600)
+    digest = directory / "receiver.sha256"
+    effects = directory / "effects"
+    with contextlib.ExitStack() as stack:
+        buses = [stack.enter_context(process(["dbus-daemon", "--session", "--nofork",
+                                             "--print-address=1"], env)) for _ in range(2)]
+        address, env["DBUS_SESSION_BUS_ADDRESS"] = [line(bus) for bus in buses]
+        args = [str(receiver), "--store-dir", str(directory), "--pairing-only",
+                "--helper-bus-address", address]
+        digest.write_text(hashlib.sha256(receiver.read_bytes()).hexdigest() + "\n")
+        digest.chmod(0o600)
+        helper_args = [str(fixture), "helper", address, str(directory), str(effects)]
+        with process(helper_args, env) as helper:
+            assert line(helper) == "ready"
+            if os.getuid() != 0:
+                result = subprocess.run([*args, "--duration-ms", "100"],
+                                        env={**env, "AA_WIRELESS_TEST_SAME_UID_HELPER": "0"},
+                                        capture_output=True, text=True, timeout=3)
+                assert result.returncode == 3 and "AP status: helper_rejected" in result.stderr, result
+                assert not effects.exists()
+            idle_names = unique_names(address)
+            with process([*args, "--duration-ms", "10000"], env) as first:
+                ready = line(first, 3)
+                assert '"state":"pairing_only"' in ready, ready
+                first_name, = unique_names(address) - idle_names
+                lookup_args = [str(build / "aa_system_helper_bus_test"), "--gtest_filter=HelperNameOwner.*"]
+                lookup_env = dict(env, AA_HELPER_TEST_BUS=address, AA_HELPER_TEST_RECEIVER_NAME=first_name)
+                subprocess.run(lookup_args, env=lookup_env, check=True, timeout=3)
+                with process([*args, "--duration-ms", "100"], env) as second:
+                    # Keep the first receiver alive until the helper sees the second probe.
+                    assert "previous receiver still connected" in line(helper, 3, stderr=True)
+                    first.terminate()
+                    assert first.wait(timeout=3) == 0
+                    output, error = second.communicate(timeout=6)
+                    assert second.returncode == 0 and b'"state":"pairing_only"' in output, (output, error)
+                # Check the adapter directly so the helper's one-second sweep cannot mask a bad answer.
+                subprocess.run(lookup_args, env=dict(lookup_env, AA_HELPER_TEST_RECEIVER_EXITED="1"),
+                               check=True, timeout=3)
+            assert effects.read_text().splitlines().count("effect 4") == 2
+        effects.unlink()
+        digest.write_text("0" * 64 + "\n")
+        with process(helper_args, env) as helper:
+            assert line(helper) == "ready"
+            result = subprocess.run([*args, "--duration-ms", "100"], env=env,
+                                    capture_output=True, text=True, timeout=3)
+            assert result.returncode == 3 and "AP status: helper_rejected" in result.stderr, result
+            assert "receiver identity verification failed" in line(helper, 1, stderr=True)
+            assert not effects.exists()
+
+        digest.write_text(hashlib.sha256(receiver.read_bytes()).hexdigest() + "\n")
+        with process(helper_args, dict(env, AA_HELPER_HOLD_STATUS="1")) as helper:
+            assert line(helper) == "ready"
+            with process(args, env) as client:
+                assert line(helper, 3) == "entered"
+                buses[0].terminate()
+                buses[0].wait(timeout=2)
+                # The status request was in flight; EOF must end startup immediately.
+                _, error = client.communicate(timeout=2)
+                assert client.returncode == 3 and b"AP status: helper_unavailable" in error, error
+
+
 def main() -> None:
     build = Path(sys.argv[1]).resolve()
     with tempfile.TemporaryDirectory(prefix="helper-", dir=build) as temporary:
-        run(build, Path(temporary))
+        if sys.argv[2:] == ["receiver-startup"]:
+            receiver_startup(build, Path(temporary))
+        else:
+            run(build, Path(temporary))
 
 
 if __name__ == "__main__":

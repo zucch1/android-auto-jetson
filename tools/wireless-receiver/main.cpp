@@ -3,11 +3,15 @@
 #include "Runtime.hpp"
 #include <aa/tls/Credentials.hpp>
 #include <aa/trust/PairingPolicy.hpp>
+#include <algorithm>
+#include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <optional>
 #include <string>
 #include <system_error>
+#include <thread>
 #include <variant>
 #include <vector>
 
@@ -37,9 +41,14 @@ int receiver_main(int argc, char **argv) {
         return 3;
     }
 #if defined(AA_WIRELESS_ALLOW_HELPER_BUS_ADDRESS) && AA_WIRELESS_ALLOW_HELPER_BUS_ADDRESS
+    const auto* same_uid_fixture = std::getenv("AA_WIRELESS_TEST_SAME_UID_HELPER");
+    const auto open_private_helper =
+        same_uid_fixture && std::strcmp(same_uid_fixture, "1") == 0
+            ? aa::helper::BusClient::private_bus_for_test
+            : aa::helper::BusClient::private_bus;
     auto helper = options->helper_address.empty()
                       ? aa::helper::BusClient::system(store)
-                      : aa::helper::BusClient::private_bus(options->helper_address, store);
+                      : open_private_helper(options->helper_address, store);
 #else
     auto helper = aa::helper::BusClient::system(store);
 #endif
@@ -47,8 +56,20 @@ int receiver_main(int argc, char **argv) {
         report("system helper connection", helper.error().code());
         return 3;
     }
-    if (auto status = helper.value()->status(aa::helper::Action::ap_status); !status) {
-        report("org.custom.AndroidAutoSystemHelper AP status", status.error().code());
+    using namespace std::chrono_literals;
+    // Leave one second of the startup budget for the final status RPC.
+    const auto retry_until = Runtime::Clock::now() + 4s;
+    for (auto delay = 50ms;; delay = std::min(delay * 2, 500ms)) {
+        const auto status = helper.value()->status(aa::helper::Action::ap_status);
+        if (status)
+            break;
+        const auto error = status.error().code();
+        if (error == ErrorCode::helper_unavailable && helper.value()->connected() &&
+            Runtime::Clock::now() + delay < retry_until) {
+            std::this_thread::sleep_for(delay);
+            continue;
+        }
+        report("org.custom.AndroidAutoSystemHelper AP status", error);
         return 3;
     }
     if (options->pairing_only) {

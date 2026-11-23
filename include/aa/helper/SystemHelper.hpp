@@ -154,7 +154,7 @@ private:
         Source source;
         Action action;
     };
-    core::Result<void> authenticate(const std::string& sender);
+    core::Result<void> authenticate(const std::string& sender, bool startup_probe = false);
     void expire(Time now);
     IdentityLookup& identities_;
     Backend& backend_;

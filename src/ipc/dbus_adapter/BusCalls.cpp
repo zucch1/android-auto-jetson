@@ -30,6 +30,7 @@ core::Result<std::uint32_t> BusConnection::send_message(MessageType type,
     const core::SecretScope wipe_bytes{bytes, sensitive};
     const auto sent = bus_io::write_full(fd_, bytes, deadline_.value_or(bus_io::deadline()));
     if (!sent.has_value()) {
+        if (sent.error().code() == ErrorCode::transport_closed) close_connection();
         return sent.error();
     }
     return serial;
@@ -203,6 +204,20 @@ core::Result<BusName> BusConnection::get_name_owner(const BusName& name) {
         return owner.error();
     }
     return BusName{owner.value()};
+}
+
+core::Result<bool> BusConnection::name_has_owner(const BusName& name) {
+    MessageWriter body;
+    body.put_string(name.value);
+    const auto reply = call("NameHasOwner", "s", body);
+    if (!reply) return reply.error();
+    if (reply.value().type != MessageType::method_return || reply.value().signature != "b")
+        return Error{ErrorCode::transport_io};
+    Cursor cursor{reply.value().body};
+    const auto owned = cursor.read_u32();
+    if (!owned || owned.value() > 1 || !cursor.done())
+        return Error{ErrorCode::transport_malformed_frame};
+    return owned.value() == 1;
 }
 
 core::Result<std::uint32_t> BusConnection::get_connection_unix_uid(const BusName& name) {
