@@ -311,7 +311,39 @@ def main() -> int:
                 "presented_ns": start + offset + SINK_NS, "playback_slot_absence": None}))
         assert (parser.audio_writes == len(records)) == expected_all, (name, parser.audio_writes)
 
-    # Wired records (no playout_offset_ns) keep their meaning.
+    # Wired default playout (#228): 60 ms buffer with video held to match passes
+    # both cap and soak_rate; without video hold the contract sees the 60 ms lag.
+    wired_depth = 60_000_000
+    wired_playout_audio = [
+        {"event": "audio_write_completed",
+         "scheduled_ns": START_NS + k * CHUNK_NS,
+         "scheduled_end_ns": START_NS + (k + 1) * CHUNK_NS,
+         "playout_offset_ns": wired_depth,
+         "completed_ns": START_NS + k * CHUNK_NS + wired_depth - 20_000_000,
+         "presented_ns": START_NS + k * CHUNK_NS + wired_depth + SINK_NS,
+         "playback_slot_absence": None}
+        for k in range(70 * 1_000_000_000 // CHUNK_NS)
+    ]
+    wired_matched_video = [
+        {"event": "video_presented",
+         "scheduled_ns": START_NS + n * FRAME_NS,
+         "completed_ns": START_NS + n * FRAME_NS + wired_depth + PAINT_NS}
+        for n in range(66 * 1_000_000_000 // FRAME_NS)
+    ]
+    for clause in ("cap", "soak_rate"):
+        res = judge(smoke, contract, wired_playout_audio, wired_matched_video, clause)
+        assert res["passed"], ("wired_playout", clause, res)
+        assert abs(res["signed_p50_ms"]) < 15, res
+    wired_unheld_video = [
+        {"event": "video_presented",
+         "scheduled_ns": START_NS + n * FRAME_NS,
+         "completed_ns": START_NS + n * FRAME_NS + PAINT_NS}
+        for n in range(66 * 1_000_000_000 // FRAME_NS)
+    ]
+    unheld = judge(smoke, contract, wired_playout_audio, wired_unheld_video, "cap")
+    assert not unheld["passed"] and unheld["signed_p50_ms"] < -40, unheld
+
+    # Legacy arrival-model wired records (--audio-playout-ms 0, no playout_offset_ns) keep their meaning.
     wired = [{"event": "audio_write_completed", "scheduled_ns": START_NS + k * CHUNK_NS,
               "scheduled_end_ns": START_NS + (k + 1) * CHUNK_NS,
               "completed_ns": START_NS + k * CHUNK_NS,

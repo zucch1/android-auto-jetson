@@ -3526,7 +3526,9 @@ TEST(WiredReceiver, WorkerFirstFailureContextFreezesRenderAndSubmitIdentityThrou
     for (const bool negative : {false, true}) {
         SCOPED_TRACE(negative);
         auto gate = std::make_shared<RenderGate>();
-        ConcreteAudioRenderWorker audio{pcm_router_config(), gated_router(gate)};
+        ConcreteAudioRenderWorker audio{
+        pcm_router_config(aa::audio::SinkBackend::pulse, aa::core::Nanoseconds{0}),
+        gated_router(gate)};
         ASSERT_TRUE(audio.ready());
         const auto role = aa::protocol::ChannelRole::media_audio;
         const std::vector<std::byte> pcm(960, std::byte{1});
@@ -3664,7 +3666,9 @@ TEST(WiredReceiver, WorkerRenderFailureMatchesFullHeaderAndOmitsAmbiguousDispatc
     for (const bool ambiguous : {false, true}) {
         SCOPED_TRACE(ambiguous);
         auto gate = std::make_shared<RenderGate>();
-        ConcreteAudioRenderWorker audio{pcm_router_config(), gated_router(gate)};
+        ConcreteAudioRenderWorker audio{
+        pcm_router_config(aa::audio::SinkBackend::pulse, aa::core::Nanoseconds{0}),
+        gated_router(gate)};
         ASSERT_TRUE(audio.ready());
         const auto role = aa::protocol::ChannelRole::media_audio;
         const std::vector<std::byte> pcm(960, std::byte{1});
@@ -3825,14 +3829,17 @@ TEST(WiredReceiver, ActualMainTransientStallIndependentCadenceAndWorstCaseBurst)
         EXPECT_EQ(result.output.find("\"event\":\"audio_credit_deferred\"") != std::string::npos,
                   deferred) << result.output;
         if (source.burst) {
-            // Credit pacing holds the queue, but an unpaced source places its
-            // chunks ever further behind their arrival. Phones do burst like
-            // this after a sink stall (#154, live), so the catch-up drops the
-            // part more than 90 ms behind arrival instead of letting a later
-            // chunk fail the 200 ms late-arrival cap and end the session.
+            // #228: default wired playout (60 ms, catch-up off) plays the
+            // burst back to back without trimming any audio or ending late.
             EXPECT_EQ(result.code, 0) << result.output;
             EXPECT_EQ(result.output.find("\"event\":\"err\""), std::string::npos) << result.output;
-            EXPECT_NE(result.output.find("{\"event\":\"audio_catch_up\",\"frames\":"),
+            EXPECT_EQ(result.output.find("{\"event\":\"audio_catch_up\","),
+                      std::string::npos) << result.output;
+            EXPECT_NE(result.output.find("\"event\":\"wired_media_policy\",\"audio_playout_ms\":60,"
+                                         "\"audio_max_unacked\":1,\"video_hold\":\"match\","
+                                         "\"video_delay_ms\":60"),
+                      std::string::npos) << result.output;
+            EXPECT_NE(result.output.find("\"frames_trimmed\":0,"),
                       std::string::npos) << result.output;
             EXPECT_EQ(source.acks.size(), source.arrivals.size()) << result.output;
             std::cout << "STALL_RESULT mode=worst_case_burst stall_ms=" << std::abs(stall_ms)
@@ -3932,7 +3939,9 @@ TEST(WiredReceiver, StallBypassCountsInFlightRenderedParentAsRendered) {
     ReceiverLogScope logging{g_running};
     auto gate = std::make_shared<RenderGate>();
     gate->first_write_delay = std::chrono::milliseconds{3000}; // released explicitly below
-    ConcreteAudioRenderWorker audio{pcm_router_config(), gated_router(gate)};
+    ConcreteAudioRenderWorker audio{
+        pcm_router_config(aa::audio::SinkBackend::pulse, aa::core::Nanoseconds{0}),
+        gated_router(gate)};
     ASSERT_TRUE(audio.ready());
     capture_receiver_stdout();
     const auto role = aa::protocol::ChannelRole::media_audio;
@@ -6130,7 +6139,9 @@ TEST(WiredReceiver, WorkerSinkStallPastScheduledEndSkipsElapsedGapInsteadOfFaili
     StdoutCaptureGuard capture;
     auto gate = std::make_shared<RenderGate>();
     gate->first_write_delay = std::chrono::milliseconds{600};
-    ConcreteAudioRenderWorker audio{pcm_router_config(), gated_router(gate)};
+    ConcreteAudioRenderWorker audio{
+        pcm_router_config(aa::audio::SinkBackend::pulse, aa::core::Nanoseconds{0}),
+        gated_router(gate)};
     ASSERT_TRUE(audio.ready());
     const auto role = aa::protocol::ChannelRole::media_audio;
     const std::vector<std::byte> pcm(960, std::byte{1});
@@ -6179,7 +6190,10 @@ TEST(WiredReceiver, WorkerStallBurstCatchesUpInsteadOfEndingTheSession) {
     StdoutCaptureGuard capture;
     auto gate = std::make_shared<RenderGate>();
     gate->release();
-    ConcreteAudioRenderWorker audio{pcm_router_config(), gated_router(gate)};
+    ConcreteAudioRenderWorker audio{
+        pcm_router_config(aa::audio::SinkBackend::pulse, aa::core::Nanoseconds{0},
+                          aa::core::Nanoseconds{90'000'000}),
+        gated_router(gate)};
     ASSERT_TRUE(audio.ready());
     const auto role = aa::protocol::ChannelRole::media_audio;
     const std::vector<std::byte> pcm(8192, std::byte{1}); // one 42.67 ms phone chunk
@@ -6234,7 +6248,8 @@ TEST(WiredReceiver, WorkerGuidanceStallBurstInProductionFormatCatchesUp) {
     StdoutCaptureGuard capture;
     auto gate = std::make_shared<RenderGate>();
     gate->release();
-    const auto config = pcm_router_config();
+    const auto config = pcm_router_config(aa::audio::SinkBackend::pulse, aa::core::Nanoseconds{0},
+                                          aa::core::Nanoseconds{90'000'000});
     const auto guidance_format =
         config.roles[aa::audio::role_index(aa::audio::Role::guidance)].input_format;
     ASSERT_EQ(guidance_format, (aa::audio::AudioFormat{16000, 1, 16}));
@@ -6376,7 +6391,10 @@ TEST(WiredReceiver, WorkerMaxSizeGuidanceBurstSurvivesTheLateCap) {
                       config, std::make_unique<GatedRenderSink>(gate), scripted_resampler(schedule));
               }}
             : gated_router(gate);
-        ConcreteAudioRenderWorker audio{pcm_router_config(), std::move(open)};
+        ConcreteAudioRenderWorker audio{
+            pcm_router_config(aa::audio::SinkBackend::pulse, aa::core::Nanoseconds{0},
+                              aa::core::Nanoseconds{90'000'000}),
+            std::move(open)};
         ASSERT_TRUE(audio.ready());
         const auto role = aa::protocol::ChannelRole::guidance_audio;
         const std::vector<std::byte> pcm(6400, std::byte{1}); // the admitted maximum: 200 ms
@@ -6399,6 +6417,279 @@ TEST(WiredReceiver, WorkerMaxSizeGuidanceBurstSurvivesTheLateCap) {
         EXPECT_FALSE(report->render_failure);
         EXPECT_GT(report->stats.frames_caught_up, 0U);
     }
+}
+
+// #228: default wired config uses the playout clock (60 ms, catch-up off,
+// stop-and-wait max_unacked 1) and emits wired_media_policy + playout_offset_ns.
+TEST(WiredReceiver, WiredDefaultPlayoutConfigAndPolicy) {
+    const auto cfg = pcm_router_config();
+    EXPECT_TRUE(cfg.live_pcm_drift.enabled);
+    EXPECT_EQ(cfg.live_pcm_drift.catch_up_watermark, aa::core::Nanoseconds{0});
+    EXPECT_TRUE(cfg.playout.enabled);
+    EXPECT_EQ(cfg.playout.depth, aa::audio::kWiredPlayoutDepth);
+
+    auto gate = std::make_shared<RenderGate>();
+    gate->release();
+    CadencedPcmSource source;
+    source.chunks = 4;
+    runtime_send_audio = true;
+    runtime_pcm_source = &source;
+    runtime_sink_override = [gate] { return std::make_unique<GatedRenderSink>(gate); };
+    const auto result = run_runtime(false, 400, true);
+    runtime_sink_override = {};
+    runtime_pcm_source = nullptr;
+    runtime_send_audio = false;
+
+    EXPECT_EQ(result.code, 0) << result.output;
+    EXPECT_NE(result.output.find("\"event\":\"wired_media_policy\",\"audio_playout_ms\":60,"
+                                 "\"audio_max_unacked\":1,\"video_hold\":\"match\","
+                                 "\"video_delay_ms\":60"),
+              std::string::npos) << result.output;
+    EXPECT_NE(result.output.find("\"playout_offset_ns\":"), std::string::npos) << result.output;
+    EXPECT_NE(result.output.find("\"playout_target_ms\":60,"), std::string::npos) << result.output;
+    EXPECT_NE(result.output.find("\"frames_trimmed\":0,"), std::string::npos) << result.output;
+    EXPECT_EQ(result.output.find("\"event\":\"audio_catch_up\""), std::string::npos) << result.output;
+}
+
+// #228: wired default playout keeps frames_trimmed == 0 for media AND guidance
+// in steady state, post-stall bursts, an on-time resampler-split guidance
+// parent over media, a 2x200 ms prompt, and a >1 s prompt over media; silence
+// is filled only on a real underrun.
+TEST(WiredReceiver, WiredPlayoutMediaAndGuidanceBurstsAndPromptsAreLossless) {
+    ReceiverLogScope logging{g_running};
+    constexpr std::int64_t kMediaChunkNs = 2048LL * 1'000'000'000LL / 48000LL; // 42.67 ms
+    constexpr std::int64_t kGuidanceChunkNs = 200'000'000LL;
+    const std::vector<std::byte> media_pcm(8192, std::byte{1});
+    const std::vector<std::byte> guidance_pcm(6400, std::byte{2}); // 200 ms @ 16 kHz mono
+
+    // 1. Post-stall burst for media (16 chunks at one arrival + resumed chunk).
+    {
+        StdoutCaptureGuard capture;
+        auto gate = std::make_shared<RenderGate>();
+        gate->release();
+        ConcreteAudioRenderWorker audio{pcm_router_config(), gated_router(gate)};
+        ASSERT_TRUE(audio.ready());
+        const auto role = aa::protocol::ChannelRole::media_audio;
+        const auto arrival = steady_ns();
+        for (std::uint64_t seq = 1; seq <= 16; ++seq) {
+            ASSERT_TRUE(audio.submit({{role, seq, {arrival}}, media_pcm}, {role, 0, seq, 7}));
+            ASSERT_TRUE(audio.wait_idle(std::chrono::steady_clock::now() + std::chrono::seconds{2}));
+            ASSERT_FALSE(audio.failure()) << seq;
+        }
+        ASSERT_TRUE(audio.submit({{role, 17, {arrival + 100'000'000}}, media_pcm}, {role, 0, 17, 7}));
+        ASSERT_TRUE(audio.wait_idle(std::chrono::steady_clock::now() + std::chrono::seconds{2}));
+        ASSERT_TRUE(audio.finish());
+        const auto output = capture.release();
+        const auto report = audio.final_report();
+        ASSERT_TRUE(report);
+        EXPECT_EQ(report->stats.frames_trimmed, 0U) << output;
+        EXPECT_EQ(report->stats.frames_caught_up, 0U) << output;
+        EXPECT_EQ(report->stats.frames_silence, 0U) << output;
+        EXPECT_EQ(report->stats.playout_underruns, 0U) << output;
+    }
+
+    // 2. Post-stall burst for guidance (8 x 200 ms chunks, Sol's 96+19098 split).
+    {
+        StdoutCaptureGuard capture;
+        auto gate = std::make_shared<RenderGate>();
+        gate->release();
+        auto open = ConcreteAudioRenderWorker::OpenRouter{[gate](const auto &config) {
+            return aa::audio::detail::open_router_with_decoder_for_test(
+                config, std::make_unique<GatedRenderSink>(gate),
+                scripted_resampler([](std::size_t call, std::size_t buffered) {
+                    return call == 0 ? std::size_t{96} : call == 1 ? std::size_t{19098} : buffered;
+                }));
+        }};
+        ConcreteAudioRenderWorker audio{pcm_router_config(), std::move(open)};
+        ASSERT_TRUE(audio.ready());
+        const auto role = aa::protocol::ChannelRole::guidance_audio;
+        const auto arrival = steady_ns();
+        std::uint64_t seq = 1;
+        for (const std::int64_t offset_ms : {0, 1, 10, 12, 12, 13, 20, 20}) {
+            ASSERT_TRUE(audio.submit({{role, seq, {arrival + offset_ms * 1'000'000}}, guidance_pcm},
+                                     {role, 0, seq, 7}));
+            ASSERT_TRUE(audio.wait_idle(std::chrono::steady_clock::now() + std::chrono::seconds{2}));
+            ASSERT_FALSE(audio.failure()) << seq;
+            ++seq;
+        }
+        ASSERT_TRUE(audio.finish());
+        const auto output = capture.release();
+        const auto report = audio.final_report();
+        ASSERT_TRUE(report);
+        EXPECT_EQ(report->stats.frames_trimmed, 0U) << output;
+        EXPECT_EQ(report->stats.frames_caught_up, 0U) << output;
+        EXPECT_EQ(report->stats.frames_silence, 0U) << output;
+    }
+
+    // 3. On-time 96+19098 resampler-split guidance over concurrent media:
+    //    2 x 200 ms prompt AND > 1 s (6 x 200 ms = 1.2 s) prompt.
+    for (const std::uint64_t prompt_chunks : {std::uint64_t{2}, std::uint64_t{6}}) {
+        SCOPED_TRACE(prompt_chunks);
+        StdoutCaptureGuard capture;
+        auto gate = std::make_shared<RenderGate>();
+        gate->release();
+        auto open = ConcreteAudioRenderWorker::OpenRouter{[gate](const auto &config) {
+            return aa::audio::detail::open_router_with_decoder_for_test(
+                config, std::make_unique<GatedRenderSink>(gate),
+                scripted_resampler([](std::size_t call, std::size_t buffered) {
+                    return call == 0 ? std::size_t{96} : call == 1 ? std::size_t{19098} : buffered;
+                }));
+        }};
+        ConcreteAudioRenderWorker audio{pcm_router_config(), std::move(open)};
+        ASSERT_TRUE(audio.ready());
+        const auto arrival = steady_ns();
+        std::uint64_t mseq = 1;
+        std::uint64_t gseq = 1;
+        const int media_chunks = prompt_chunks == 2 ? 20 : 45;
+        for (int k = 0; k < media_chunks; ++k) {
+            const std::int64_t t = arrival + k * kMediaChunkNs;
+            ASSERT_TRUE(audio.submit({{aa::protocol::ChannelRole::media_audio, mseq, {t}}, media_pcm},
+                                     {aa::protocol::ChannelRole::media_audio, 0, mseq, 7}));
+            ++mseq;
+            const std::int64_t next_t = t + kMediaChunkNs;
+            while (gseq <= prompt_chunks &&
+                   arrival + 120'000'000LL + static_cast<std::int64_t>(gseq - 1) * kGuidanceChunkNs < next_t) {
+                const std::int64_t gt = arrival + 120'000'000LL +
+                    static_cast<std::int64_t>(gseq - 1) * kGuidanceChunkNs;
+                ASSERT_TRUE(audio.submit(
+                    {{aa::protocol::ChannelRole::guidance_audio, gseq, {gt}}, guidance_pcm},
+                    {aa::protocol::ChannelRole::guidance_audio, 0, gseq, 7}));
+                ++gseq;
+            }
+            ASSERT_TRUE(audio.wait_idle(std::chrono::steady_clock::now() + std::chrono::seconds{2}));
+            ASSERT_FALSE(audio.failure()) << k;
+        }
+        ASSERT_TRUE(audio.finish());
+        const auto output = capture.release();
+        const auto report = audio.final_report();
+        ASSERT_TRUE(report);
+        EXPECT_EQ(gseq, prompt_chunks + 1U);
+        EXPECT_EQ(report->stats.frames_trimmed, 0U) << output;
+        EXPECT_EQ(report->stats.frames_caught_up, 0U) << output;
+        EXPECT_EQ(report->stats.frames_silence, 0U) << output;
+        EXPECT_EQ(report->stats.playout_underruns, 0U) << output;
+    }
+
+    // 4. Silence fill happens only on a real underrun (drought > 60 ms depth).
+    {
+        StdoutCaptureGuard capture;
+        auto gate = std::make_shared<RenderGate>();
+        gate->release();
+        ConcreteAudioRenderWorker audio{pcm_router_config(), gated_router(gate)};
+        ASSERT_TRUE(audio.ready());
+        const auto role = aa::protocol::ChannelRole::media_audio;
+        const auto arrival = steady_ns();
+        ASSERT_TRUE(audio.submit({{role, 1, {arrival}}, media_pcm}, {role, 0, 1, 7}));
+        ASSERT_TRUE(audio.wait_idle(std::chrono::steady_clock::now() + std::chrono::seconds{2}));
+        // Chunk 2 arrives 30 ms late (inside the 60 ms buffer): no underrun, no silence.
+        ASSERT_TRUE(audio.submit({{role, 2, {arrival + kMediaChunkNs + 30'000'000}}, media_pcm},
+                                 {role, 0, 2, 7}));
+        ASSERT_TRUE(audio.wait_idle(std::chrono::steady_clock::now() + std::chrono::seconds{2}));
+        // Chunk 3 arrives 180 ms past its slot (> 60 ms depth): real underrun fills silence.
+        ASSERT_TRUE(audio.submit({{role, 3, {arrival + 2 * kMediaChunkNs + 240'000'000}}, media_pcm},
+                                 {role, 0, 3, 7}));
+        ASSERT_TRUE(audio.wait_idle(std::chrono::steady_clock::now() + std::chrono::seconds{2}));
+        ASSERT_TRUE(audio.finish());
+        const auto output = capture.release();
+        const auto report = audio.final_report();
+        ASSERT_TRUE(report);
+        EXPECT_EQ(report->stats.playout_underruns, 1U) << output;
+        EXPECT_GT(report->stats.frames_silence, 0U) << output;
+        EXPECT_EQ(report->stats.frames_trimmed, 0U) << output;
+        EXPECT_NE(output.find("\"event\":\"audio_playout_underrun\""), std::string::npos) << output;
+    }
+}
+
+// #228 / #173: CLI validation for --audio-playout-ms, --video-delay-ms, and
+// --audio-catch-up-watermark-ms, plus --audio-playout-ms 0 arrival opt-out.
+TEST(WiredReceiver, WiredPlayoutCliOptionsAndArrivalModelOptOut) {
+    // 1. Arrival-model opt-out (--audio-playout-ms 0) disables playout and video hold.
+    {
+        auto gate = std::make_shared<RenderGate>();
+        gate->release();
+        runtime_extra_args = {"--audio-playout-ms", "0"};
+        runtime_sink_override = [gate] { return std::make_unique<GatedRenderSink>(gate); };
+        const auto result = run_runtime(false, 120, true);
+        runtime_sink_override = {};
+        runtime_extra_args.clear();
+        EXPECT_EQ(result.code, 0) << result.output;
+        EXPECT_NE(result.output.find("\"event\":\"wired_media_policy\",\"audio_playout_ms\":0,"
+                                     "\"audio_max_unacked\":1,\"video_hold\":\"fixed\","
+                                     "\"video_delay_ms\":0"),
+                  std::string::npos) << result.output;
+    }
+
+    // 2. Arrival-model opt-out with --audio-catch-up-watermark-ms 90 restores catch-up.
+    {
+        auto gate = std::make_shared<RenderGate>();
+        gate->release();
+        CadencedPcmSource source;
+        source.burst = true;
+        source.chunks = 16;
+        runtime_send_audio = true;
+        runtime_pcm_source = &source;
+        runtime_extra_args = {"--audio-playout-ms", "0", "--audio-catch-up-watermark-ms", "90"};
+        runtime_sink_override = [gate] { return std::make_unique<GatedRenderSink>(gate); };
+        const auto result = run_runtime(false, 450, true);
+        runtime_sink_override = {};
+        runtime_pcm_source = nullptr;
+        runtime_send_audio = false;
+        runtime_extra_args.clear();
+        EXPECT_EQ(result.code, 0) << result.output;
+        EXPECT_NE(result.output.find("{\"event\":\"audio_catch_up\",\"frames\":"),
+                  std::string::npos) << result.output;
+    }
+
+    // 3. Invalid flag combinations exit 2 (usage error).
+    const std::vector<std::vector<std::string>> bad_cases{
+        {"--audio-catch-up-watermark-ms", "90"},                      // conflicts with default playout 60
+        {"--audio-playout-ms", "0", "--audio-catch-up-watermark-ms", "1"},
+        {"--audio-playout-ms", "0", "--audio-catch-up-watermark-ms", "19"},
+        {"--audio-playout-ms", "0", "--audio-catch-up-watermark-ms", "201"},
+        {"--audio-playout-ms", "0", "--audio-catch-up-watermark-ms", "1000"},
+        {"--audio-playout-ms", "0", "--video-delay-ms", "60"},        // fixed video hold needs playout > 0
+        {"--audio-playout-ms", "181"},                                // exceeds max 180
+        {"--video-delay-ms", "181"},
+    };
+    for (const auto &extra : bad_cases) {
+        runtime_extra_args = extra;
+        const auto result = run_runtime(false, 50, true);
+        runtime_extra_args.clear();
+        EXPECT_EQ(result.code, 2) << extra.front();
+    }
+}
+
+// #228: wired video hold (--video-delay-ms match) follows the audio playout offset.
+TEST(WiredReceiver, WiredVideoHoldFollowsAudioPlayoutOffset) {
+    ReceiverLogScope logging{g_running};
+    StdoutCaptureGuard capture;
+    auto gate = std::make_shared<RenderGate>();
+    gate->release();
+    ConcreteAudioRenderWorker audio{pcm_router_config(), gated_router(gate)};
+    ASSERT_TRUE(audio.ready());
+    VideoOutlet outlet{log_line_nonblocking, log_media};
+    const aa::tools::PlayoutOptions opts{aa::audio::kWiredPlayoutDepth.count / 1'000'000, 0, std::nullopt};
+    std::chrono::milliseconds hold{};
+    bool follow = false;
+    aa::tools::configure_video_hold(outlet, audio, opts, follow, hold);
+    EXPECT_TRUE(follow);
+    EXPECT_EQ(hold, std::chrono::milliseconds{60});
+    const auto arrival = steady_ns();
+    // Before first audio write, fallback is the configured 60 ms depth.
+    EXPECT_EQ(outlet.presentation_delay_for({arrival}), std::chrono::milliseconds{60});
+    // Submit a 3-chunk burst so the audio playout offset rises above 60 ms,
+    // and verify the video hold follows the reported audio offset.
+    const std::vector<std::byte> pcm(8192, std::byte{1});
+    const auto role = aa::protocol::ChannelRole::media_audio;
+    for (std::uint64_t seq = 1; seq <= 3; ++seq) {
+        ASSERT_TRUE(audio.submit({{role, seq, {arrival}}, pcm}, {role, 0, seq, 7}));
+        ASSERT_TRUE(audio.wait_idle(std::chrono::steady_clock::now() + std::chrono::seconds{2}));
+    }
+    const auto audio_offset = audio.playout_offset_at({arrival + 50'000'000});
+    EXPECT_GT(audio_offset, std::chrono::milliseconds{60});
+    EXPECT_EQ(outlet.presentation_delay_for({arrival + 50'000'000}), audio_offset);
+    ASSERT_TRUE(audio.finish());
+    (void)capture.release();
 }
 
 TEST(WiredReceiver, WorkerStartupInflightAndOtherRolePendingNeverAuthorizeIdle) {
@@ -6516,7 +6807,9 @@ TEST(WiredReceiver, WorkerCapacityChargesReservationsUntilRenderAndRejectsOverfl
     for (const int scenario : {0, 1, 2}) {
         SCOPED_TRACE(scenario);
         auto gate = std::make_shared<RenderGate>();
-        ConcreteAudioRenderWorker audio{pcm_router_config(), gated_router(gate)};
+        ConcreteAudioRenderWorker audio{
+        pcm_router_config(aa::audio::SinkBackend::pulse, aa::core::Nanoseconds{0}),
+        gated_router(gate)};
         ASSERT_TRUE(audio.ready());
         const std::vector<std::byte> first(scenario == 0 ? 4U : 19200U, std::byte{1});
         const auto base = steady_ns();
@@ -6620,7 +6913,9 @@ TEST(WiredReceiver, WorkerCapacityChargesReservationsUntilRenderAndRejectsOverfl
 TEST(WiredReceiver, WorkerCopiesQueuedPcmAndHeaderAndDiscardsOnlyStaleRole) {
     ReceiverLogScope logging{g_running};
     auto gate = std::make_shared<RenderGate>();
-    ConcreteAudioRenderWorker audio{pcm_router_config(), gated_router(gate)};
+    ConcreteAudioRenderWorker audio{
+        pcm_router_config(aa::audio::SinkBackend::pulse, aa::core::Nanoseconds{0}),
+        gated_router(gate)};
     ASSERT_TRUE(audio.ready());
     using aa::protocol::ChannelRole;
     const auto base = steady_ns();
@@ -6663,7 +6958,9 @@ TEST(WiredReceiver, WorkerCopiesQueuedPcmAndHeaderAndDiscardsOnlyStaleRole) {
 TEST(WiredReceiver, WorkerInvalidationReleasesUndrainedReservationsWithoutEvictionOfNewGeneration) {
     ReceiverLogScope logging{g_running};
     auto gate = std::make_shared<RenderGate>();
-    ConcreteAudioRenderWorker audio{pcm_router_config(), gated_router(gate)};
+    ConcreteAudioRenderWorker audio{
+        pcm_router_config(aa::audio::SinkBackend::pulse, aa::core::Nanoseconds{0}),
+        gated_router(gate)};
     ASSERT_TRUE(audio.ready());
     const auto role = aa::protocol::ChannelRole::media_audio;
     const std::vector<std::byte> pcm(4, std::byte{1});
@@ -6701,7 +6998,9 @@ TEST(WiredReceiver, WorkerTerminalStopDiscardsQueuedTailAndFinalDrainFailureIsLa
     for (const bool fail_drain : {false, true}) {
         auto gate = std::make_shared<RenderGate>();
         gate->fail_drain = fail_drain;
-        ConcreteAudioRenderWorker audio{pcm_router_config(), gated_router(gate)};
+        ConcreteAudioRenderWorker audio{
+        pcm_router_config(aa::audio::SinkBackend::pulse, aa::core::Nanoseconds{0}),
+        gated_router(gate)};
         ASSERT_TRUE(audio.ready());
         const auto role = aa::protocol::ChannelRole::media_audio;
         const auto pcm = wiredtest::pcm_unit();
@@ -6745,7 +7044,9 @@ TEST(WiredReceiver, WorkerTimeoutHonoringAdapterStopsWithoutRenderingQueuedTail)
     ReceiverLogScope logging{g_running};
     auto gate = std::make_shared<RenderGate>();
     gate->write_timeout = std::chrono::milliseconds{30};
-    ConcreteAudioRenderWorker audio{pcm_router_config(), gated_router(gate)};
+    ConcreteAudioRenderWorker audio{
+        pcm_router_config(aa::audio::SinkBackend::pulse, aa::core::Nanoseconds{0}),
+        gated_router(gate)};
     ASSERT_TRUE(audio.ready());
     const auto role = aa::protocol::ChannelRole::media_audio;
     const auto pcm = wiredtest::pcm_unit();
@@ -7770,7 +8071,9 @@ TEST(WiredReceiver, RuntimeDiagnosticsAndAudioReopenKeepTimingOnStalledStdout) {
     auto gate = std::make_shared<RenderGate>();
     gate->first_write_delay = std::chrono::milliseconds{0};
     gate->fail_first_write = true;
-    ConcreteAudioRenderWorker audio{pcm_router_config(), gated_router(gate)};
+    ConcreteAudioRenderWorker audio{
+        pcm_router_config(aa::audio::SinkBackend::pulse, aa::core::Nanoseconds{0}),
+        gated_router(gate)};
     ASSERT_TRUE(audio.ready());
 
     const auto role = aa::protocol::ChannelRole::media_audio;

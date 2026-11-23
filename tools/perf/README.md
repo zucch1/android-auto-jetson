@@ -239,10 +239,12 @@ diagnostic information only.
 life (`sink_reopens` counts the routes a reopen replaced): `frames_decoded`,
 `frames_trimmed` (drift trims, catch-up included), `frames_caught_up` (the
 catch-up part), `frames_silence` (synthesized gap frames), `frames_skipped`
-(elapsed time advanced without a write: withheld credit or a wireless playout
+(elapsed time advanced without a write: withheld credit or a playout
 underrun's hole) and `frames_idle_skipped` (settled all-role idle), all in
-48 kHz output frames. The wireless receiver adds its playout buffer and
-credit window (owner decision 2026-11-20): `playout_target_ms` (the configured depth),
+48 kHz output frames. When the playout clock is enabled (default on both
+wireless, `120` ms, owner decision 2026-11-20, and wired, `60` ms, owner
+decision 2026-11-23 / #228), `media_timing` adds the playout buffer and
+credit window fields: `playout_target_ms` (the configured depth),
 `playout_depth_ms` (the latest chunk's slot minus its arrival),
 `playout_depth_min_ms` / `playout_depth_max_ms` (that depth's range, anchors
 excluded; `null` before the first steady chunk), `playout_offset_ms` (the
@@ -285,16 +287,18 @@ a timer that threw or could not start. `playout_reported_offset_ms` keeps its
 last value when the stream stops; only the history the video lookup uses is
 cleared.
 
-On the wireless playout clock `audio_write_completed.scheduled_ns` and
+On the playout clock (default on both wired and wireless) `audio_write_completed.scheduled_ns` and
 `scheduled_end_ns` are the content's arrival-clock times and the additive
 `playout_offset_ns` is how much later the piece was scheduled (the content
 interval never starts before the previous one ended, so after an offset
 increase the end offset briefly exceeds it while content advances at half
 rate), so
 `presented_ns - scheduled_ns` includes the playout buffer and the A/V pairing
-matches a video frame with the audio that arrived with it. The wireless
-receiver holds video for the reported offset (`--video-delay-ms match`), so the
-signed A/V contract is unchanged. Wired records never carry the field. `av_sync_ms` is computed only
+matches a video frame with the audio that arrived with it. Both receivers
+hold video for the reported offset (`--video-delay-ms match`), so the
+signed A/V contract is unchanged (`aa-wired-receiver` logs `wired_media_policy`
+and `aa-wireless-receiver` logs `wireless_media_policy` at startup). Records on
+the legacy arrival model (`--audio-playout-ms 0`) never carry the field. `av_sync_ms` is computed only
 from the cross-stream consumer completion events: the video's retained common
 monotonic timestamp must lie in the audio write's half-open scheduled interval.
 For each pair, skew is `(video completed - video scheduled) - (audio write

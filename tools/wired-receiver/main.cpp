@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "../json_stdout.hpp"
+#include "../media_playout_options.hpp"
 #include "../video_capabilities.hpp"
 //
 // Wired end-to-end receiver entry point (task 30 phase-B harness driver): the
@@ -238,8 +239,10 @@ class InputQueue final {
 // the default and only supported real-time route (automatic also selects
 // pulsesink; explicit pipewire is refused at startup).
 aa::audio::RouterConfig pcm_router_config(
-    aa::audio::SinkBackend backend = aa::audio::SinkBackend::pulse) {
-    return aa::audio::pcm_router_config(backend, wired_telemetry());
+    aa::audio::SinkBackend backend = aa::audio::SinkBackend::pulse,
+    aa::core::Nanoseconds playout_depth = aa::audio::kWiredPlayoutDepth,
+    aa::core::Nanoseconds catch_up_watermark = aa::core::Nanoseconds{0}) {
+    return aa::audio::pcm_router_config(backend, wired_telemetry(), playout_depth, catch_up_watermark);
 }
 
 // Backend-supported video profiles, preferred first. The first is the primary
@@ -371,6 +374,8 @@ const char *const kUsage =
     "                         [--require-video-consumer] [--wired-enrolment]\n"
     "                         [--screen-<field> N]... [--screen-experimental-geometry]\n"
     "                         [--audio-sink pulse|pipewire|automatic]\n"
+    "                         [--audio-playout-ms N] [--video-delay-ms N|match]\n"
+    "                         [--audio-catch-up-watermark-ms N]\n"
     "                         [--require-usb-serial SERIAL]\n"
     "  runs the wired session over USB/AOA with TrustStore admission;\n"
     "  the approved-phones store must already contain the phone (fail closed).\n"
@@ -389,6 +394,15 @@ const char *const kUsage =
     "  pipewire-pulse; automatic: pulsesink; pipewire: refused because\n"
     "  pipewiresink has no rate control on PipeWire 1.0.5 / Ubuntu noble and\n"
     "  degrades after 1.5-2.3 h; use pulse).\n"
+    "  --audio-playout-ms N: wired audio playout buffer in ms: chunks play back\n"
+    "  to back N ms after the arrival that anchored the stream (default 60, max\n"
+    "  180; 0 = legacy arrival-time model).\n"
+    "  --video-delay-ms N|match: hold video before forwarding it so it stays\n"
+    "  aligned with audio (default match: follow the audio playout offset,\n"
+    "  starting at --audio-playout-ms; N: fixed 0..180, needs --audio-playout-ms\n"
+    "  > 0 when N > 0).\n"
+    "  --audio-catch-up-watermark-ms N: post-stall catch-up watermark in ms\n"
+    "  (0 disables catch-up, default 0; else 20..200; needs --audio-playout-ms 0).\n"
     "  --screen-<field> N describes the panel in service discovery. Fields:\n"
     "  density (120|160|240|320|480|640), real-density, pixel-aspect-ratio-e4,\n"
     "  decoder-additional-depth, theme (0|1|2), width-margin, height-margin,\n"
@@ -422,6 +436,8 @@ int receiver_main(int argc, char **argv) {
     bool wired_enrolment = false;
     std::string required_usb_serial;
     aa::audio::SinkBackend audio_backend = aa::audio::SinkBackend::pulse;
+    aa::tools::PlayoutOptions playout{
+        aa::audio::kWiredPlayoutDepth.count / 1'000'000, 0, std::nullopt};
     for (int index = 1; index < argc; ++index) {
         if (std::strcmp(argv[index], "--port") == 0 && index + 1 < argc) {
             port = argv[++index];
@@ -481,12 +497,30 @@ int receiver_main(int argc, char **argv) {
                 std::fputs(kUsage, stderr);
                 return 2;
             }
+        } else if (std::strcmp(argv[index], "--audio-playout-ms") == 0 && index + 1 < argc) {
+            if (!aa::tools::parse_audio_playout_ms(argv[++index], playout.audio_playout_ms)) {
+                std::fputs(kUsage, stderr);
+                return 2;
+            }
+        } else if (std::strcmp(argv[index], "--audio-catch-up-watermark-ms") == 0 &&
+                   index + 1 < argc) {
+            if (!aa::tools::parse_audio_catch_up_watermark_ms(
+                    argv[++index], playout.audio_catch_up_watermark_ms)) {
+                std::fputs(kUsage, stderr);
+                return 2;
+            }
+        } else if (std::strcmp(argv[index], "--video-delay-ms") == 0 && index + 1 < argc) {
+            if (!aa::tools::parse_video_delay_ms(argv[++index], playout.video_delay_ms)) {
+                std::fputs(kUsage, stderr);
+                return 2;
+            }
         } else {
             std::fputs(kUsage, stderr);
             return 2;
         }
     }
-    if (port.empty() || duration_ms < 0 || (wired_enrolment && no_bus)) {
+    if (port.empty() || duration_ms < 0 || (wired_enrolment && no_bus) ||
+        !aa::tools::validate_playout_options(playout)) {
         std::fputs(kUsage, stderr);
         return 2;
     }
@@ -551,7 +585,10 @@ int receiver_main(int argc, char **argv) {
     aa::session::SteadyClock clock{};
     aa::input::CapabilityDescriptor input = aa::input::CapabilityDescriptor::bench_defaults();
 
-    aa::audio::RouterConfig audio_config = pcm_router_config(audio_backend);
+    aa::audio::RouterConfig audio_config = pcm_router_config(
+        audio_backend,
+        aa::core::Nanoseconds{playout.audio_playout_ms * 1'000'000LL},
+        aa::core::Nanoseconds{playout.audio_catch_up_watermark_ms * 1'000'000LL});
     ConcreteAudioRenderWorker audio_sink{audio_config};
     const auto opened = audio_sink.ready();
     // Run provenance (#60, #80): log the sink selection (including any refusal
@@ -617,6 +654,21 @@ int receiver_main(int argc, char **argv) {
         return 1;
     }
     VideoOutlet video_outlet{log_line_nonblocking, log_media};
+    std::chrono::milliseconds video_hold{};
+    bool follow_audio_playout = false;
+    aa::tools::configure_video_hold(video_outlet, audio_sink, playout, follow_audio_playout,
+                                    video_hold);
+    if (follow_audio_playout || video_hold.count() > 0) {
+        try {
+            video_outlet.start_release_timer();
+        } catch (const std::system_error &) {
+            log_line("{\"event\":\"video_release_timer_error\",\"reason\":\"start_failed\"}");
+            return 3;
+        }
+    }
+    log_line(aa::tools::media_policy_json("wired_media_policy", playout,
+                                          audio_sink.credit_window(), follow_audio_playout,
+                                          video_hold));
     video_outlet.set_idr_recovery({
         [&session] { return session.video_projecting(); },
         [&session] { return session.request_video_idr(); },
@@ -766,7 +818,7 @@ int receiver_main(int argc, char **argv) {
     bool in_video_recovery = false;
     bool in_receive_poll = false;
     auto service_video_recovery = [&]() -> bool {
-        if (in_video_recovery || session.outbound_in_progress()) {
+        if (in_video_recovery) {
             return true;
         }
         in_video_recovery = true;
@@ -774,6 +826,20 @@ int receiver_main(int argc, char **argv) {
             bool &active;
             ~Guard() { active = false; }
         } guard{in_video_recovery};
+        // Held video leaves on time even while the session is mid-send:
+        // release_held() needs no session I/O (IDR requests wait for service_pending).
+        if (auto held = video_outlet.release_held(); !held) {
+            session_failed.store(true);
+            g_running.store(false);
+            log_line_nonblocking(poll_error_json(held.error().code(), session, audio_sink));
+            if (!session.failure()) {
+                (void)session.fail(held.error());
+            }
+            return false;
+        }
+        if (session.outbound_in_progress()) {
+            return true;
+        }
         if (!video_outlet.idr_dispatching()) {
             if (auto flushed = video_outlet.service_pending(); !flushed) {
                 session_failed.store(true);

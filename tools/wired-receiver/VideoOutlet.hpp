@@ -232,13 +232,13 @@ public:
 
     // Window 14: the owner thread's checkpoint is not a clock. It went
     // 35-90 ms without running, every ~2 s, so held frames due in that time
-    // left late (video_release_late, ~270 in 480 s). The wireless receiver
-    // therefore also releases held frames on a thread of its own that sleeps
-    // until the front frame's due (re-checking at least every
+    // left late (video_release_late, ~270 in 480 s). Receivers with video hold
+    // enabled therefore also release held frames on a thread of their own that
+    // sleeps until the front frame's due (re-checking at least every
     // kReleaseTimerSlice, since the hold source can move a due earlier). Like
     // release_held() it needs no session I/O: an IDR request it triggers
     // waits for service_pending(), and a delivery error is returned from the
-    // next release_held(). Wired never starts it.
+    // next release_held().
     void start_release_timer() {
         std::lock_guard lock(mutex_);
         if (release_thread_.joinable()) { return; }

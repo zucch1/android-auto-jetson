@@ -168,14 +168,12 @@ int receiver_main(int argc, char **argv) {
         return 3;
     }
     Media media{audio_sink};
-    const auto video_hold = video_delay(options->video_delay_ms, options->audio_playout_ms);
-    const bool follow = !options->video_delay_ms && options->audio_playout_ms > 0;
-    if (follow) {
-        // match: follow the audio playout offset, starting at the depth.
-        media.match_video_to_audio(video_hold);
-    } else {
-        media.video.set_presentation_delay(video_hold);
-    }
+    const aa::tools::PlayoutOptions playout_options{options->audio_playout_ms,
+                                                    options->audio_catch_up_watermark_ms,
+                                                    options->video_delay_ms};
+    std::chrono::milliseconds video_hold{};
+    bool follow = false;
+    aa::tools::configure_video_hold(media.video, media.audio, playout_options, follow, video_hold);
     // Held frames leave at their due on the outlet's own timer, not only
     // when the owner thread next reaches a checkpoint (window 14).
     if (follow || video_hold.count() > 0) {
@@ -190,11 +188,8 @@ int receiver_main(int argc, char **argv) {
     }
     // video_delay_ms is always a number: the fixed hold, or the hold used
     // until the first playout write when video_hold is "match".
-    log_line("{\"event\":\"wireless_media_policy\",\"audio_playout_ms\":" +
-             std::to_string(options->audio_playout_ms) +
-             ",\"audio_max_unacked\":" + std::to_string(options->audio_max_unacked) +
-             ",\"video_hold\":\"" + (follow ? "match" : "fixed") +
-             "\",\"video_delay_ms\":" + std::to_string(video_hold.count()) + "}");
+    log_line(aa::tools::media_policy_json("wireless_media_policy", playout_options,
+                                          options->audio_max_unacked, follow, video_hold));
     // Receiver precedes ControlService so its confirmation observer is valid
     // throughout bus dispatch and the bus's final owner teardown.
     auto link_config = media.config(options->video_profiles);

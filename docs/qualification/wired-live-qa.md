@@ -142,6 +142,17 @@ Task 9 is reduced-scope (owner-signed): the decode p95 latency budget (<=33 ms a
 Phase B must not claim them. A/V-sync and audio-latency budgets are measured in
 task 32.
 
+## Wired audio playout policy and added latency (#228)
+
+`aa-wired-receiver` uses the no-loss playout clock by default (`--audio-playout-ms`
+default `60` ms, max `180` ms; stop-and-wait `max_unacked 1`; catch-up off) with
+video held to match (`--video-delay-ms match`, following `audio_write_completed`'s
+`playout_offset_ns`). This adds ~`60` ms of latency to wired audio, video,
+touch-to-photon, and IDR recovery (leaving ~`940` ms of the `1.0` s
+`waiting_idr_max` budget) while keeping A/V lip-sync unchanged and keeping
+`frames_trimmed` at `0` through steady state, bursts, and guidance prompts over
+media. `--audio-playout-ms 0` restores the legacy arrival-time model.
+
 ## Privacy
 
 Device serials/MACs/IPs/host names are never written to committed content or

@@ -234,6 +234,17 @@ them prescribes a p99, a rolling mean or a coverage rule.
   speaker output. The physical offset, and even its sign, are unmeasured until
   #58. Keep the bounds symmetric until then; #58 may justify an asymmetric
   window.
+- **Wired playout latency (#228):** `aa-wired-receiver` runs the no-loss
+  playout clock by default (`--audio-playout-ms 60`, `--video-delay-ms match`,
+  stop-and-wait `max_unacked 1`, catch-up off). Both audio
+  (`presented_ns - scheduled_ns`) and held video (`completed_ns - scheduled_ns`)
+  include the playout offset (starting at `60` ms, half of wireless's `120` ms),
+  so the signed A/V contract is unchanged while touch-to-photon and each
+  `waiting_idr` recovery episode gain ~`60` ms (leaving ~`940` ms of the `1.0` s
+  `waiting_idr_max` budget). `--audio-playout-ms 0` restores the legacy
+  arrival-time model. Live wired verification checks `media_timing`
+  `frames_trimmed` and `frames_silence` over a long hold with navigation
+  prompts over music.
 
 Re-analysis of the 2026-11-16 evidence under this contract:
 

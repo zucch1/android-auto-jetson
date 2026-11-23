@@ -414,7 +414,9 @@ std::string audio_rejection_json(const AudioRejectionSnapshot& value) {
         ",\"pending_completions_by_role\":" + role_counts_json(value.pending_completions_by_role) + "}";
 }
 
-RouterConfig pcm_router_config(AudioTelemetryCallbacks telemetry, SinkBackend backend) {
+RouterConfig pcm_router_config(AudioTelemetryCallbacks telemetry, SinkBackend backend,
+                               core::Nanoseconds playout_depth,
+                               core::Nanoseconds catch_up_watermark) {
     RouterConfig config;
     config.backend = backend;
     config.output_format = AudioFormat{48000, 2, 16};
@@ -427,21 +429,15 @@ RouterConfig pcm_router_config(AudioTelemetryCallbacks telemetry, SinkBackend ba
     // media clock disagrees with the output clock (~100-200 ppm); without
     // bounded head trims the preserved backlog grows without bound.
     config.live_pcm_drift.enabled = true;
-    // #154: after a sink stall the phone bursts its withheld backlog, which is
-    // placed after the cursor far behind its arrival. A run placed more than
-    // 90 ms (the A/V excursion bound) behind its arrival is trimmed from its
-    // head down to the 15 ms drift target at once instead of 5 ms per chunk
-    // (resampler carryover at a run's head counts at its older source time),
-    // and the router's 200 ms late cap judges such a caught-up run by the end
-    // of its parent's own PTS range against the committed source-time frontier.
-    // A stall's burst - including 200 ms guidance parents stamped milliseconds
-    // apart, however the resampler splits them - is therefore trimmed rather
-    // than ending the session as audio_sink_failure; a parent whose PCM ends
-    // over 200 ms behind recent source audio still fails late. The dropped
-    // audio is logged as audio_catch_up. Wired uses this 90 ms default;
-    // wireless overrides it via audio_config() (configurable, default off = 0)
-    // until a wireless-safe policy for TCP coalescing is decided.
-    config.live_pcm_drift.catch_up_watermark = core::Nanoseconds{90'000'000};
+    // #228 / #182: both wired (default 60 ms) and wireless (default 120 ms)
+    // use the no-loss playout clock by default, with catch-up off (0). Passing
+    // playout_depth = 0 restores the legacy arrival model, where an explicit
+    // catch_up_watermark (e.g. 90 ms) remains available behind its flag.
+    config.live_pcm_drift.catch_up_watermark = catch_up_watermark;
+    config.playout.enabled = playout_depth.count > 0;
+    if (config.playout.enabled) {
+        config.playout.depth = playout_depth;
+    }
     config.on_write_completed = [log_media = std::move(telemetry.log_media)](const WriteCompletion& completion) {
         if (log_media) {
             log_media("audio_write_completed", audio_write_completed_json(completion));
@@ -450,8 +446,10 @@ RouterConfig pcm_router_config(AudioTelemetryCallbacks telemetry, SinkBackend ba
     return config;
 }
 
-RouterConfig pcm_router_config(SinkBackend backend, AudioTelemetryCallbacks telemetry) {
-    return pcm_router_config(std::move(telemetry), backend);
+RouterConfig pcm_router_config(SinkBackend backend, AudioTelemetryCallbacks telemetry,
+                               core::Nanoseconds playout_depth,
+                               core::Nanoseconds catch_up_watermark) {
+    return pcm_router_config(std::move(telemetry), backend, playout_depth, catch_up_watermark);
 }
 
 } // namespace aa::audio

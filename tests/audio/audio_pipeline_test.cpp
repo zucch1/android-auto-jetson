@@ -6202,3 +6202,175 @@ TEST_F(AudioPipelineRoute, IncrementalDefaultQuantumWritesOneObservedMediaParent
     for (const auto& write : observed->writes) { frames.push_back(write.size() / 4); }
     EXPECT_EQ(frames, (std::vector<std::size_t>{2048}));
 }
+
+// #173 P3: cancel_pending must retire the cancelled role's unplayed global
+// source_frontier_frames so a subsequent chunk is not falsely rejected late.
+TEST_F(AudioPipelineRoute, CancellationRetiresTheUnplayedSourceFrontier) {
+    auto config = pcm_router_config();
+    config.live_pcm_drift.enabled = true;
+    config.live_pcm_drift.catch_up_watermark = aa::core::Nanoseconds{90'000'000};
+    auto opened = aa::audio::detail::open_router_with_sink_for_test(
+        config, std::make_unique<RecordingAudioSink>());
+    ASSERT_TRUE(opened);
+    auto& route = opened.value();
+    // Play a 200 ms guidance chunk (advances cursor to 50 ms on step 1, while
+    // source_frontier_frames jumps to 200 ms), then cancel before it finishes.
+    ASSERT_TRUE(route.submit(make_message(guidance, 1, base, constant_pcm({1000, 9600}))));
+    ASSERT_TRUE(route.render_step());
+    route.cancel_pending(guidance);
+    // Submit a media chunk at base + 50 ms (the cursor): if global
+    // source_frontier_frames stayed raised at 200 ms, a short chunk could be
+    // judged against the retired 200 ms frontier instead of 50 ms.
+    ASSERT_TRUE(route.submit(make_message(
+        media, 2, aa::core::Nanoseconds{base.count + 50'000'000}, constant_pcm({2000, 480}))));
+    for (int i = 0; i < 8; ++i) {
+        auto stepped = route.render_step();
+        ASSERT_TRUE(stepped);
+        if (!stepped.value().pending) { break; }
+    }
+    EXPECT_FALSE(route.report().render_failure);
+}
+
+// #173 P3: reset_session_timeline clears both global and per-role source frontiers.
+TEST_F(AudioPipelineRoute, SessionResetClearsTheSourceFrontiers) {
+    auto config = pcm_router_config();
+    config.live_pcm_drift.enabled = true;
+    config.live_pcm_drift.catch_up_watermark = aa::core::Nanoseconds{90'000'000};
+    auto opened = aa::audio::detail::open_router_with_sink_for_test(
+        config, std::make_unique<RecordingAudioSink>());
+    ASSERT_TRUE(opened);
+    auto& route = opened.value();
+    ASSERT_TRUE(route.submit(make_message(guidance, 1, base, constant_pcm({1000, 9600}))));
+    ASSERT_TRUE(route.render_step());
+    route.reset_session_timeline();
+    // Fresh session starts cleanly at an earlier timestamp with no stale frontier.
+    const aa::core::Nanoseconds fresh_base{base.count + 10'000'000};
+    ASSERT_TRUE(route.submit(make_message(guidance, 2, fresh_base, constant_pcm({2000, 480}))));
+    for (int i = 0; i < 8; ++i) {
+        auto stepped = route.render_step();
+        ASSERT_TRUE(stepped);
+        if (!stepped.value().pending) { break; }
+    }
+    EXPECT_FALSE(route.report().render_failure);
+    EXPECT_EQ(route.report().stats.frames_trimmed, 0U);
+}
+
+// #228: wired playout (60 ms default, catch-up off) keeps frames_trimmed == 0
+// for media and guidance in steady state, post-stall bursts, a resampler-split
+// guidance parent over media, a 2x200 ms prompt, and a >1 s prompt over media,
+// and fills silence only on a real underrun.
+TEST_F(AudioPipelineRoute, WiredPlayoutIsLosslessAcrossSteadyBurstsAndGuidanceOverMedia) {
+    constexpr std::int64_t kMediaChunkNs = 2048LL * 1'000'000'000LL / 48000LL; // 42.67 ms
+    constexpr std::int64_t kGuidanceChunkNs = 200'000'000LL;                   // 200 ms
+    const auto wired_config = [] {
+        auto config = pcm_router_config();
+        config.roles[aa::audio::role_index(aa::audio::Role::guidance)].input_format = {16000, 1, 16};
+        config.live_pcm_drift.enabled = true;
+        config.live_pcm_drift.catch_up_watermark = aa::core::Nanoseconds{0};
+        config.playout.enabled = true;
+        config.playout.depth = aa::audio::kWiredPlayoutDepth;
+        return config;
+    };
+    const auto drain = [](aa::audio::AudioRouter& route) {
+        for (int i = 0; i < 512; ++i) {
+            auto stepped = route.render_step();
+            if (!stepped) { return false; }
+            if (!stepped.value().pending) { return true; }
+        }
+        return false;
+    };
+    const auto guidance_pcm_200ms = [] {
+        std::vector<std::byte> bytes(6400, std::byte{0}); // 3200 samples @ 16 kHz mono = 200 ms
+        for (std::size_t i = 0; i < bytes.size(); i += 2) {
+            const std::int16_t s = 1200;
+            std::memcpy(bytes.data() + i, &s, sizeof(s));
+        }
+        return bytes;
+    }();
+    const auto media_pcm = constant_pcm({kMediaLevel, 2048});
+
+    // 1. Steady state + >1 s guidance prompt (6 x 200 ms = 1.2 s) over media +
+    //    on-time resampler split (96 + 19098 frames) while media plays.
+    {
+        struct SplitState {
+            std::deque<std::int16_t> buffered;
+            std::size_t calls{};
+        };
+        auto split = std::make_shared<SplitState>();
+        auto decoder = [split](const aa::audio::EncodedChunk& chunk)
+            -> aa::core::Result<std::vector<std::byte>> {
+            if (chunk.input_format.sample_rate_hz == 48000) {
+                return std::vector<std::byte>(chunk.payload.begin(), chunk.payload.end());
+            }
+            for (std::size_t i = 0; i + 1 < chunk.payload.size(); i += 2) {
+                std::int16_t s = 0;
+                std::memcpy(&s, chunk.payload.data() + i, sizeof(s));
+                split->buffered.insert(split->buffered.end(), 3, s);
+            }
+            const std::size_t take = split->calls == 0 ? 96U
+                : split->calls == 1 ? std::min<std::size_t>(19098U, split->buffered.size())
+                : split->buffered.size();
+            ++split->calls;
+            std::vector<std::byte> out(take * 4);
+            for (std::size_t f = 0; f < take; ++f) {
+                const auto v = split->buffered.front();
+                split->buffered.pop_front();
+                std::memcpy(out.data() + f * 4, &v, sizeof(v));
+                std::memcpy(out.data() + f * 4 + 2, &v, sizeof(v));
+            }
+            return out;
+        };
+        auto opened = aa::audio::detail::open_router_with_decoder_for_test(
+            wired_config(), std::make_unique<RecordingAudioSink>(), std::move(decoder));
+        ASSERT_TRUE(opened);
+        auto& route = opened.value();
+        std::uint64_t media_seq = 1;
+        std::uint64_t guidance_seq = 1;
+        // 2.0 s of media (~47 chunks); at t = 200 ms start a 6 x 200 ms (1.2 s)
+        // guidance prompt whose first two parents split 96 + 19098 frames.
+        for (int k = 0; k < 47; ++k) {
+            const std::int64_t t = base.count + k * kMediaChunkNs;
+            ASSERT_TRUE(route.submit(make_message(media, media_seq++, {t}, media_pcm)));
+            const std::int64_t next_t = t + kMediaChunkNs;
+            while (guidance_seq <= 6 &&
+                   base.count + 200'000'000LL + static_cast<std::int64_t>(guidance_seq - 1) * kGuidanceChunkNs < next_t) {
+                const std::int64_t gt = base.count + 200'000'000LL +
+                    static_cast<std::int64_t>(guidance_seq - 1) * kGuidanceChunkNs;
+                ASSERT_TRUE(route.submit(make_message(guidance, guidance_seq++, {gt}, guidance_pcm_200ms)));
+            }
+            ASSERT_TRUE(drain(route));
+        }
+        EXPECT_EQ(guidance_seq, 7U);
+        EXPECT_EQ(route.report().stats.frames_trimmed, 0U);
+        EXPECT_EQ(route.report().stats.frames_caught_up, 0U);
+        EXPECT_EQ(route.report().stats.frames_silence, 0U);
+        EXPECT_EQ(route.report().stats.playout_underruns, 0U);
+    }
+
+    // 2. Post-stall burst (media and guidance) stays lossless, and silence is
+    //    filled only on a real underrun (> 60 ms drought).
+    {
+        auto opened = aa::audio::detail::open_router_with_sink_for_test(
+            wired_config(), std::make_unique<RecordingAudioSink>());
+        ASSERT_TRUE(opened);
+        auto& route = opened.value();
+        // 8-chunk media burst stamped 1 ms apart after a stall.
+        for (std::uint64_t seq = 1; seq <= 8; ++seq) {
+            ASSERT_TRUE(route.submit(make_message(
+                media, seq, {base.count + static_cast<std::int64_t>(seq) * 1'000'000LL}, media_pcm)));
+            ASSERT_TRUE(drain(route));
+        }
+        EXPECT_EQ(route.report().stats.frames_trimmed, 0U);
+        EXPECT_EQ(route.report().stats.frames_caught_up, 0U);
+        EXPECT_EQ(route.report().stats.frames_silence, 0U);
+        EXPECT_EQ(route.report().stats.playout_underruns, 0U);
+
+        // Real underrun: media goes silent 150 ms past its last slot (> 60 ms depth).
+        const std::int64_t underrun_at = base.count + 8 * kMediaChunkNs + 250'000'000LL;
+        ASSERT_TRUE(route.submit(make_message(media, 9, {underrun_at}, media_pcm)));
+        ASSERT_TRUE(drain(route));
+        EXPECT_EQ(route.report().stats.playout_underruns, 1U);
+        EXPECT_GT(route.report().stats.frames_silence, 0U);
+        EXPECT_EQ(route.report().stats.frames_trimmed, 0U);
+    }
+}

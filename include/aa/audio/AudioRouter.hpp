@@ -303,11 +303,20 @@ struct PlayoutPolicy final {
                                                    const PlayoutPolicy&) noexcept = default;
 };
 
-// Wireless defaults, with the reasoning in docs/qualification/wireless-recovery-qa.md.
-// 120 ms of playout buffer rides out a one-way delay excursion of 120 ms (a
-// round trip spike to ~250 ms) and keeps the pulsesink ring (200 ms) able to
-// take a whole 42.67 ms chunk ahead of it without blocking the worker.
+// Playout defaults, with the reasoning in docs/qualification/wireless-recovery-qa.md
+// and docs/qualification/wired-perf-runbook.md.
+// Wireless: 120 ms of playout buffer rides out a one-way delay excursion of
+// 120 ms (a round trip spike to ~250 ms) and keeps the pulsesink ring (200 ms)
+// able to take a whole 42.67 ms chunk ahead of it without blocking the worker.
 inline constexpr core::Nanoseconds kWirelessPlayoutDepth{120'000'000};
+// Wired (#228): USB/AOA has far less jitter than Wi-Fi (a few ms vs 10-120 ms)
+// and keeps stop-and-wait (max_unacked 1). 60 ms (half the wireless buffer)
+// puts the drift pad floor (depth / 4) at 15 ms, leaving 45 ms of zero-pad,
+// zero-underrun margin - more than one full 42.67 ms A26 media chunk - while
+// keeping 60 + 42.67 = 102.67 ms well inside the 200 ms pulsesink ring and
+// keeping the shed threshold (min(depth + 230 ms, 350 ms) = 290 ms) above a
+// 200 ms guidance resampler split.
+inline constexpr core::Nanoseconds kWiredPlayoutDepth{60'000'000};
 // Wireless audio credit window (AudioCreditPolicy, max_unacked): 4 x 42.67 ms
 // A26 media chunks = 170 ms of credit, more than the 150 ms round-trip spike
 // the replay tests cover and twice window 9's 83 ms spike second.

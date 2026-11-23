@@ -1425,6 +1425,12 @@ void AudioRouter::cancel_pending(protocol::ChannelRole role) {
     }
     impl_->role_end_frames[role_index(*index)] = impl_->playback_cursor_frames;
     impl_->role_source_frontier_frames[role_index(*index)] = 0;
+    const auto remaining_frontier = *std::max_element(
+        impl_->role_source_frontier_frames.begin(),
+        impl_->role_source_frontier_frames.end());
+    impl_->source_frontier_frames = std::min(
+        impl_->source_frontier_frames,
+        std::max(impl_->playback_cursor_frames, remaining_frontier));
     ++impl_->generations[role_index(*index)];
 }
 
