@@ -12,7 +12,7 @@ from pathlib import Path
 
 from check_privacy import scan
 from common import EvidenceError, artifact, load, package_file, require
-from results import load_performance, performance, projection, provenance, recovery
+from results import check_performance_runs, load_performance, performance, projection, provenance, recovery
 
 
 def check(manifest: Path) -> None:
@@ -27,8 +27,7 @@ def check(manifest: Path) -> None:
         ('phone', {'model', 'android_version', 'android_auto_version'}),
         ('usb_topology', {'controller', 'port', 'hub', 'cable'}),
     ):
-        child = doc.child(section)
-        child.keys(fields)
+        child = doc.child(section, fields=fields)
         for field in fields:
             child.text(field)
     limitations = doc.array('limitations')
@@ -46,22 +45,11 @@ def check(manifest: Path) -> None:
         result.equal('port', doc.child('usb_topology').text('port'))
     projection(projection_result)
     recovery(recovery_result)
-    for name, seconds in (('perf_30m', 1800), ('soak_2h', 7200)):
-        result = load_performance(paths[name])
-        performance(result, seconds)
-        require(result.child('provenance').values == doc.child('provenance').values,
-                'PROVENANCE_MISMATCH')
-        if 'thermal_scope' in result.child('measurement_coverage').values:
-            model = result.child('measurement_coverage').child('thermal_scope').child('policy').text('model')
-            require(model == doc.child('target').text('model'), 'THERMAL_POLICY_TARGET_MISMATCH')
-    short = load(paths['perf_30m'])
-    long = load(paths['soak_2h'])
-    require(short.text('generated_at_utc') != long.text('generated_at_utc'),
-            'PERF_RUNS_MUST_BE_DISTINCT')
-    policies = [result.child('measurement_coverage').child('thermal_scope').child('policy').values
-                if 'thermal_scope' in result.child('measurement_coverage').values else None
-                for result in (short, long)]
-    require(policies[0] == policies[1], 'THERMAL_POLICY_RUN_MISMATCH')
+    short = load_performance(paths['perf_30m'])
+    long = load_performance(paths['soak_2h'])
+    performance(short, 1800)
+    performance(long, 7200)
+    check_performance_runs(short, long, doc)
 
 
 def main() -> int:

@@ -13,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'perf'))
 import aa_perf_schema
 from aa_measurement_coverage import CoverageError, coverage_gaps, parse_coverage
 from aa_moving_map import MAX_DRAG_GAP_S, MIN_DRAG_RATE_HZ
+from aa_projection_collect import max_wireless_startup_timeout_seconds
 import aa_av_contract
 
 RECOVERY: Final = {
@@ -121,6 +122,23 @@ def load_performance(path: Path) -> Document:
     return doc
 
 
+def check_performance_runs(short: Document, long: Document, manifest: Document) -> None:
+    require(short.text('generated_at_utc') != long.text('generated_at_utc'),
+            'PERF_RUNS_MUST_BE_DISTINCT')
+    expected_provenance = manifest.child('provenance').values
+    target_model = manifest.child('target').text('model')
+    policies = []
+    for result in (short, long):
+        require(result.child('provenance').values == expected_provenance, 'PROVENANCE_MISMATCH')
+        coverage = result.child('measurement_coverage')
+        policy = None
+        if 'thermal_scope' in coverage.values:
+            policy = coverage.child('thermal_scope').child('policy')
+            policy.equal('model', target_model)
+        policies.append(policy)
+    require(policies[0] == policies[1], 'THERMAL_POLICY_RUN_MISMATCH')
+
+
 def performance(doc: Document, seconds: int, *, mode: str = 'wired') -> None:
     doc.equal('task', '32. Measure wired performance and two-hour soak')
     require('capture' not in doc.values, 'RAW_CAPTURE_REFERENCE')
@@ -155,9 +173,8 @@ def performance(doc: Document, seconds: int, *, mode: str = 'wired') -> None:
     except CoverageError as error:
         raise EvidenceError('INVALID_PERF_COVERAGE') from error
     require(not gaps, 'INCOMPLETE_PERF_COVERAGE')
-    startup_wait = run.number('startup_wait_seconds')
-    require(startup_wait >= 0 and (mode == 'wireless' or startup_wait <= 60),
-            'PERF_STARTUP_GRACE')
+    startup_limit = max_wireless_startup_timeout_seconds(seconds) if mode == 'wireless' else 60
+    require(0 <= run.number('startup_wait_seconds') <= startup_limit, 'PERF_STARTUP_GRACE')
     require(run.integer('startup_ms') >= 0, 'PERF_STARTUP')
     for name in ('video_units', 'audio_chunks'):
         require(run.integer(name) > 0, 'MISSING_MEDIA_PROGRESS')
@@ -205,6 +222,31 @@ def performance(doc: Document, seconds: int, *, mode: str = 'wired') -> None:
     provenance(doc.child('provenance'))
 
 
+def excursion_pairs(contract: Document, active: float) -> None:
+    """Check every exported over-90 ms pair against the native soak summary."""
+    pairs = contract.array('excursion_pairs')
+    contract.equal('excursion_pairs_truncated', False)
+    contract.equal('excursions', len(pairs))
+    require(len(pairs) <= contract.integer('pairs'), 'AV_EXCURSION_COUNT')
+    maximum = contract.number('abs_max_ms')
+    require(0 <= contract.number('abs_p99_ms') <= maximum, 'AV_MAX_P99')
+    magnitudes: list[float] = []
+    previous = -1.0
+    for raw in pairs:
+        pair = Document.parse(raw)
+        offset = pair.number('offset_s')
+        require(0 <= offset < active and offset >= previous, 'AV_EXCURSION_TIMING')
+        previous = offset
+        magnitude = abs(pair.number('skew_ms'))
+        require(aa_av_contract.AV_SOAK_EXCURSION_MS < magnitude <=
+                aa_av_contract.AV_SOAK_HARD_CAP_MS, 'AV_EXCURSION_MAGNITUDE')
+        magnitudes.append(magnitude)
+    if magnitudes:
+        require(maximum == max(magnitudes), 'AV_EXCURSION_MAX')
+    else:
+        require(maximum <= aa_av_contract.AV_SOAK_EXCURSION_MS, 'AV_EXCURSION_MISSING')
+
+
 def signed_av(doc: Document, metrics: Document) -> None:
     """v3: coverage floor, the passed contract block, and the moving-map workload."""
     coverage = metrics.child('av_coverage_pct')
@@ -238,8 +280,7 @@ def signed_av(doc: Document, metrics: Document) -> None:
     excursions.equal('unit', 'pairs')
     require(excursions.number('budget_max') == allowance, 'PERF_METRIC_BUDGET')
     require(0 <= excursions.number('value') <= allowance, 'PERF_BUDGET:av_excursions')
-    require(contract.integer('excursions') == len(contract.array('excursion_pairs'))
-            or contract.get('excursion_pairs_truncated') is True, 'PERF_AV_EXCURSIONS')
+    excursion_pairs(contract, active_s)
     cap = metrics.child('av_hard_cap_pairs')
     cap.equal('gated', True)
     cap.equal('status', 'PASS')

@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import unittest
 
-from fixture import PackageTest, binding, rebind, write
+from fixture import WIRELESS_PRIVACY_CONTROLS, PackageTest, binding, rebind, write
 from common import load
 
 
@@ -123,6 +123,41 @@ class PrivacyTests(PackageTest):
                 for result in results:
                     self.assertEqual(result.returncode, 1, result.stdout)
                     self.assertNotIn(value, result.stdout + result.stderr)
+
+    def test_wireless_stack_output_fails_both_clis(self) -> None:
+        path = self.root / 'sanitized.log'
+        for index, (control, marker) in enumerate(WIRELESS_PRIVACY_CONTROLS):
+            with self.subTest(format=index):
+                path.write_text(control + '\n', encoding='utf-8')
+                rebind(self.manifest, 'redacted_log')
+                for tool in ('check_privacy.py', 'check_wired.py'):
+                    result = self.cli(tool)
+                    self.assertEqual(result.returncode, 1)
+                    self.assertNotIn(marker, result.stdout + result.stderr)
+
+    def test_wireless_identifiers_in_filenames_are_rejected(self) -> None:
+        for name in ('receipt_dev_02_11_22_33_44_55.log', 'receipt_AA-0123456789abcdef.log'):
+            path = self.root / name
+            path.write_text('Synthetic sanitized output', encoding='utf-8')
+            result = self.cli('check_privacy.py')
+            self.assertEqual(result.returncode, 1)
+            self.assertNotIn(name, result.stdout + result.stderr)
+            path.unlink()
+
+    def test_decoded_wireless_log_lines_are_checked(self) -> None:
+        path = self.root / 'session.jsonl'
+        for control in ('\tssid TESTONLY_RAW', '[ro.serialno]: [TESTONLY_RAW]',
+                        'wpa_psk=TESTONLY_RAW'):
+            write(path, {'nested': [{'log': 'header\n' + control + '\nfooter'}]})
+            rebind(self.manifest, 'session_trace')
+            result = self.cli('check_privacy.py')
+            self.assertEqual(result.returncode, 1)
+            self.assertNotIn('TESTONLY_RAW', result.stdout + result.stderr)
+
+        write(path, {'nested': [{'log': '\tssid [REDACTED]\n[ro.serialno]: [[REDACTED]]\n'
+                                    'wpa_psk=[REDACTED]'}]})
+        rebind(self.manifest, 'session_trace')
+        self.assertEqual(self.cli('check_privacy.py').returncode, 0)
 
     def test_unreferenced_capture_files_fail(self) -> None:
         # Given: raw material must fail even outside manifest references.

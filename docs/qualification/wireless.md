@@ -32,11 +32,24 @@ Every listed field is required. Objects have exactly the listed keys except the 
 | `limitations` | A nonempty array of objects with text `claim` and `detail`. State the specific claim, its scope or missing evidence, and a relevant issue URL if available. Limitations do not waive qualification gates. |
 | `provenance` | Copy the native report's provenance object. Both reports must carry the same object, including SHA-256 source/build/config digests, service definitions and digests, dependency versions and target hardware state. The hardware model must match `target.model`. `package_digest` is null and `equivalence_status` is `provisional` for this run; installed package equivalence is tracked in #191. |
 
-Each reference is an object with exactly `path` and `sha256` strings. The path is relative to the manifest directory, and the unprefixed lowercase SHA-256 is calculated after sanitization. Use distinct nonempty regular files for all references. The AP, enrolment, session and recovery receipts should identify the evaluated source/build/config and support the corresponding reported observations. For each performance receipt, identify the paired native result and show helper RSS sampling, crash monitoring and one continuous AP uptime interval spanning the same active window. The native report currently leaves its helper RSS field null, so retain the helper measurement in the receipt and manifest.
+Each reference is an object with exactly `path` and `sha256` strings. The path is relative to the manifest directory, and the unprefixed lowercase SHA-256 is calculated after sanitization. Use distinct nonempty regular files for all references. The AP, enrolment, session and recovery receipts should identify the evaluated source/build/config and support the corresponding reported observations.
+
+## Per-run receipt
+
+Each performance `receipt` is a separate JSON file with these four fields.
+
+| Field | Required shape and acceptance |
+| --- | --- |
+| `generated_at_utc` | Text matching the paired native result. |
+| `ap_before`, `ap_after` | Use null when the corresponding native phone Wi-Fi snapshot contains both channel and frequency. If either reading or the whole snapshot is missing, supply an object with integer `channel` equal to 36, integer `frequency_mhz` equal to 5180, text `source` equal to `target-radio` or `phone-wifi`, and text `evidence` recording the independent observation. |
+| `resource_observations` | Sanitized text showing helper peak RSS sampling, crash monitoring, and a continuous AP uptime interval spanning the same active window. The native report currently leaves its helper RSS field null. |
+
+The checker compares every available phone-side reading with channel 36 and 5180 MHz. Record fallback readings at the corresponding boundaries of the same run. Use the active radio's observed channel and frequency or a separate phone Wi-Fi status reading. Include the time, source and sanitized readings in `evidence`. Operator configuration alone cannot corroborate a missing reading, and an available contradictory reading fails even when the receipt claims channel 36.
+
 
 ## Performance gates
 
-Retain the native `aa-projection-perf/3` result from each `aa-projection-perf.sh --mode wireless` run. Remove its optional raw capture pointer before export. Use the native live results for the 30m and 2h durations (or the soak chain’s equivalent second values), with complete active measurement coverage, distinct timestamps, a verified Release build, and AP settings matching the manifest. Wireless-only evidence includes bound ADB and clean host USB readings before, during and after. The native report also supplies the thermal samples, moving-map workload and zero receiver crashes.
+Retain the native `aa-projection-perf/3` result from each `aa-projection-perf.sh --mode wireless` run. Remove its optional raw capture pointer before export. Use the native live results for the 30m and 2h durations (or the soak chain’s equivalent second values), with complete active measurement coverage, distinct timestamps, a verified Release build, and AP settings matching the manifest. Wireless-only evidence includes bound ADB and clean host USB readings before, during and after. The native report also supplies the thermal samples, moving-map workload and zero receiver crashes. Use the same thermal policy for both runs. Wireless startup wait must be nonnegative and within the collector’s duration-dependent startup ceiling, which reserves the active window and preparation headroom within the receiver lifetime.
 
 - Receiver RSS peak at most 250 MB, RSS growth strictly below 10%, sustained receiver CPU at most 50% of one core.
 - Audio path latency at most 200 ms.

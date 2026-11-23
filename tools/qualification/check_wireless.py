@@ -8,28 +8,28 @@ from __future__ import annotations
 
 import argparse
 import re
+import sys
 from pathlib import Path
 
 from check_privacy import scan
 from common import Document, EvidenceError, artifact, load, package_file, require
-from results import aa_av_contract, load_performance, performance, provenance
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'perf'))
 from aa_transport import link_gap, valid_interface
 
+from results import check_performance_runs, load_performance, performance, provenance
+
 SCHEMA = 'aa-wireless-qualification/1'
+AP_CHANNEL = 36
+AP_FREQUENCY_MHZ = 5180
 DURATIONS = {'perf_30m': (1800, '30m'), 'soak_2h': (7200, '2h')}
 
 
-def checked_section(doc: Document, name: str, fields: set[str]) -> Document:
-    section = doc.child(name)
-    section.keys(fields)
-    return section
-
-
 def access_point(doc: Document) -> Document:
-    ap = checked_section(doc, 'ap', {'interface', 'channel', 'regulatory_domain',
-                                    'confirmed_jurisdiction', 'startup_ms', 'receipt'})
+    ap = doc.child('ap', fields={'interface', 'channel', 'regulatory_domain',
+                                'confirmed_jurisdiction', 'startup_ms', 'receipt'})
     require(valid_interface(ap.get('interface')), 'AP_INTERFACE')
-    ap.equal('channel', 36)
+    ap.equal('channel', AP_CHANNEL)
     country = ap.text('confirmed_jurisdiction')
     require(re.fullmatch('[A-Z]{2}', country) is not None, 'AP_JURISDICTION')
     ap.equal('regulatory_domain', country)
@@ -38,10 +38,10 @@ def access_point(doc: Document) -> Document:
 
 
 def session(doc: Document) -> Document:
-    section = checked_section(doc, 'session', {'rfcomm_channel', 'bootstrap_completed',
-                                               'aap_tls_authenticated', 'confirmed_active',
-                                               'video_frames', 'audio_writes', 'inputs_forwarded',
-                                               'receipt'})
+    section = doc.child('session', fields={'rfcomm_channel', 'bootstrap_completed',
+                                           'aap_tls_authenticated', 'confirmed_active',
+                                           'video_frames', 'audio_writes', 'inputs_forwarded',
+                                           'receipt'})
     section.equal('rfcomm_channel', 8)
     for field in ('bootstrap_completed', 'aap_tls_authenticated', 'confirmed_active'):
         section.equal(field, True)
@@ -51,10 +51,10 @@ def session(doc: Document) -> Document:
 
 
 def recovery(doc: Document) -> Document:
-    section = checked_section(doc, 'recovery', {'receiver_restart', 'session_reconnect', 'receipt'})
+    section = doc.child('recovery', fields={'receiver_restart', 'session_reconnect', 'receipt'})
     for name, deadline in (('receiver_restart', 60000), ('session_reconnect', 15000)):
-        attempt = checked_section(section, name, {'elapsed_ms', 'confirmed_active', 'video_resumed',
-                                                  'audio_resumed', 'input_resumed', 'fresh_pairing'})
+        attempt = section.child(name, fields={'elapsed_ms', 'confirmed_active', 'video_resumed',
+                                              'audio_resumed', 'input_resumed', 'fresh_pairing'})
         require(0 <= attempt.number('elapsed_ms') <= deadline, 'RECOVERY_DEADLINE:' + name)
         for field in ('confirmed_active', 'video_resumed', 'audio_resumed', 'input_resumed'):
             attempt.equal(field, True)
@@ -62,34 +62,35 @@ def recovery(doc: Document) -> Document:
     return section
 
 
-def excursion_pairs(result: Document, active: float) -> None:
-    """Check every exported over-90 ms pair against the native soak summary."""
-    contract = result.child('av_contract')
-    pairs = contract.array('excursion_pairs')
-    contract.equal('excursion_pairs_truncated', False)
-    contract.equal('excursions', len(pairs))
-    require(len(pairs) <= contract.integer('pairs'), 'AV_EXCURSION_COUNT')
-    maximum = contract.number('abs_max_ms')
-    require(0 <= contract.number('abs_p99_ms') <= maximum, 'AV_MAX_P99')
-    magnitudes: list[float] = []
-    previous = -1.0
-    for raw in pairs:
-        pair = Document.parse(raw)
-        offset = pair.number('offset_s')
-        require(0 <= offset < active and offset >= previous, 'AV_EXCURSION_TIMING')
-        previous = offset
-        magnitude = abs(pair.number('skew_ms'))
-        require(aa_av_contract.AV_SOAK_EXCURSION_MS < magnitude <=
-                aa_av_contract.AV_SOAK_HARD_CAP_MS, 'AV_EXCURSION_MAGNITUDE')
-        magnitudes.append(magnitude)
-    if magnitudes:
-        require(maximum == max(magnitudes), 'AV_EXCURSION_MAX')
-    else:
-        require(maximum <= aa_av_contract.AV_SOAK_EXCURSION_MS, 'AV_EXCURSION_MISSING')
+def check_ap_observations(result: Document, receipt: Document) -> None:
+    receipt.keys({'generated_at_utc', 'ap_before', 'ap_after', 'resource_observations'})
+    receipt.equal('generated_at_utc', result.text('generated_at_utc'))
+    receipt.text('resource_observations')
+    link = result.child('link')
+    expected = {'channel': AP_CHANNEL, 'frequency_mhz': AP_FREQUENCY_MHZ}
+    for moment in ('before', 'after'):
+        wifi = link.child(moment).child('wifi').values if link.get(moment) is not None else {}
+        missing = False
+        for field, value in expected.items():
+            actual = wifi.get(field)
+            if actual is None:
+                missing = True
+            else:
+                require(actual == value, 'PHONE_AP_OBSERVATION:' + moment + ':' + field)
+        key = 'ap_' + moment
+        if missing:
+            require(receipt.get(key) is not None, 'AP_CORROBORATION_MISSING:' + moment)
+        if receipt.get(key) is not None:
+            corroboration = receipt.child(key, fields=set(expected) | {'source', 'evidence'})
+            for field, value in expected.items():
+                corroboration.equal(field, value)
+            require(corroboration.text('source') in ('target-radio', 'phone-wifi'),
+                    'AP_CORROBORATION_SOURCE')
+            corroboration.text('evidence')
 
 
-def check_run(result: Document, stage: Document, ap: Document,
-              evidence_provenance: Document, seconds: int, duration: str) -> None:
+def check_run(result: Document, stage: Document, ap: Document, receipt: Document,
+              seconds: int, duration: str) -> None:
     performance(result, seconds, mode='wireless')
     require(result.get('duration_requested') in (duration, f'{seconds}s'),
             'PERF_REQUESTED_DURATION')
@@ -97,7 +98,7 @@ def check_run(result: Document, stage: Document, ap: Document,
     result.equal('ap_channel', ap.integer('channel'))
     result.equal('ap_interface', ap.text('interface'))
     require(link_gap(result.get('link')) is None, 'WIRELESS_LINK')
-    result.equal('provenance', evidence_provenance.values)
+    check_ap_observations(result, receipt)
     build = result.child('build')
     build.equal('build_type', 'Release')
     require(build.get('verified_on') in ('target', 'host'), 'UNVERIFIED_RELEASE')
@@ -109,10 +110,10 @@ def check_run(result: Document, stage: Document, ap: Document,
     # auxiliary measurement covers the same active window as the native result.
     require(0 < stage.number('helper_rss_peak_mb') <= 32, 'HELPER_RSS')
     stage.equal('helper_crashes', 0)
-    excursion_pairs(result, active)
 
 
 def check(manifest: Path) -> None:
+    require(manifest.suffix.lower() == '.json', 'MANIFEST_MUST_BE_JSON')
     root = manifest.absolute().parent
     scan(root)
     doc = load(package_file(root, manifest.name))
@@ -124,14 +125,14 @@ def check(manifest: Path) -> None:
         ('target', {'model', 'jetpack_version', 'l4t_version', 'kernel_version'}),
         ('phone', {'model', 'android_version', 'android_auto_version'}),
     ):
-        section = checked_section(doc, name, fields)
+        section = doc.child(name, fields=fields)
         for field in fields:
             section.text(field)
     doc.child('phone').equal('model', 'Samsung Galaxy A26')
     ap = access_point(doc)
-    bluez = checked_section(doc, 'bluez', {'version', 'numeric_comparison_accepted',
-                                          'helper_bond_acknowledged', 'approval_persisted',
-                                          'approved_bond_reused', 'receipt'})
+    bluez = doc.child('bluez', fields={'version', 'numeric_comparison_accepted',
+                                      'helper_bond_acknowledged', 'approval_persisted',
+                                      'approved_bond_reused', 'receipt'})
     bluez.text('version')
     for field in ('numeric_comparison_accepted', 'helper_bond_acknowledged',
                   'approval_persisted', 'approved_bond_reused'):
@@ -152,20 +153,22 @@ def check(manifest: Path) -> None:
     receipts = {artifact(root, section.child('receipt')) for section in sections}
     require(len(receipts) == len(sections), 'RECEIPTS_MUST_BE_SEPARATE')
 
-    stages = checked_section(doc, 'performance', set(DURATIONS))
-    timestamps: set[str] = set()
+    stages = doc.child('performance', fields=set(DURATIONS))
+    results = []
     for name, (seconds, duration) in DURATIONS.items():
-        stage = checked_section(stages, name, {'result', 'receipt', 'ap_uptime_seconds',
-                                               'helper_rss_peak_mb', 'helper_crashes'})
+        stage = stages.child(name, fields={'result', 'receipt', 'ap_uptime_seconds',
+                                          'helper_rss_peak_mb', 'helper_crashes'})
         result_path = artifact(root, stage.child('result'))
         receipt_path = artifact(root, stage.child('receipt'))
+        require(result_path.suffix.lower() == receipt_path.suffix.lower() == '.json',
+                'RUN_EVIDENCE_MUST_BE_JSON')
         require(result_path != receipt_path and not receipts & {result_path, receipt_path},
                 'RECEIPTS_MUST_BE_SEPARATE')
         receipts.update((result_path, receipt_path))
         result = load_performance(result_path)
-        check_run(result, stage, ap, evidence_provenance, seconds, duration)
-        timestamps.add(result.text('generated_at_utc'))
-    require(len(timestamps) == len(DURATIONS), 'PERF_RUNS_MUST_BE_DISTINCT')
+        check_run(result, stage, ap, load(receipt_path), seconds, duration)
+        results.append(result)
+    check_performance_runs(*results, doc)
 
 
 def main() -> int:
