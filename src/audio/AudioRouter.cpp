@@ -84,6 +84,7 @@ constexpr std::int64_t kDepthBucketNs = 10'000'000;
 // A write that started this long after its slot on the sink's clock played late
 // (below it, the slot query's jitter).
 constexpr std::int64_t kLatePlaybackNs = 20'000'000;
+constexpr std::int64_t kSameInstantNs = 1'000;
 // A frame another playing role may still contribute to is mixed no earlier
 // than this before its slot (half the depth when that is smaller). Wired
 // arrival scheduling wrote a median 15 ms ahead of the slot with the sink on
@@ -508,6 +509,14 @@ struct AudioRouter::Impl final {
     bool draining{};
     // The render_step() in progress has just retimed the timeline.
     bool retimed{};
+    // Used when the sink cannot distinguish a stopped read cursor from a
+    // dry late write. The write can begin and block ahead of its own slot.
+    struct LastWrite {
+        std::int64_t slot_end;
+        std::int64_t entered;
+        std::int64_t returned;
+    };
+    std::optional<LastWrite> last_write{};
     // Newest arrival submitted on any role.
     std::int64_t newest_arrival{INT64_MIN};
 
@@ -2052,6 +2061,7 @@ void AudioRouter::cancel_pending(protocol::ChannelRole role) {
         // The next stream re-anchors; the stat keeps the last reported value
         // (a stop no longer reads as a 0 ms offset in the final media_timing).
         impl_->last_reported.reset();
+        impl_->last_write.reset();
     }
     impl_->role_end_frames[role_index(*index)] = impl_->playback_cursor_frames;
     impl_->role_source_frontier_frames[role_index(*index)] = 0;
@@ -2138,6 +2148,7 @@ void AudioRouter::reset_session_timeline() {
     impl_->timeline_base.reset();
     impl_->newest_arrival = INT64_MIN;
     impl_->last_reported.reset();
+    impl_->last_write.reset();
     impl_->report.stats.playout_reported_offset = {};
     impl_->playback_cursor_frames = 0;
     impl_->role_end_frames.fill(0);
@@ -2586,9 +2597,27 @@ core::Result<RenderStep> AudioRouter::render_step() {
         if (impl_->timeline_base && impl_->frame_time(cursor, base->count, slot_ns) && slot_ns < now_ns
             && now_ns - slot_ns <= impl_->config.playout.emergency_backlog.count) {
             const auto late = now_ns - slot_ns;
-            // The observed sink adjustments were applied before planning.
-            // A remaining late slot needs a later timestamp on both clocks.
-            impl_->retime(late + lead);
+            // While the preceding write was blocked past its slot, the ring
+            // had no space for its successor. Keep that part of the shift
+            // (and its share of the refill lead) out of the sink timestamps.
+            const auto shift = late + lead;
+            std::int64_t held = 0;
+            std::int64_t extra_wait = 0;
+            if (const auto& write = impl_->last_write;
+                write && std::abs(write->slot_end - slot_ns) <= kSameInstantNs) {
+                const auto blocked = std::clamp(write->returned - slot_ns, std::int64_t{0}, late);
+                held = blocked + lead * blocked / late;
+                if (held > 0) {
+                    // A long write can start ahead of its slot and already
+                    // be blocked there. Count that wait too, so draining the
+                    // queue doesn't run into the same pause a second time.
+                    const auto waited = std::min(write->returned - write->entered,
+                                                 impl_->config.playout.emergency_backlog.count);
+                    extra_wait = std::max<std::int64_t>(0, waited - held);
+                }
+            }
+            const bool kept = held > 0 && impl_->sink->hold_stream(core::Nanoseconds{held + extra_wait});
+            impl_->retime(shift + (kept ? extra_wait : 0), kept ? held + extra_wait : 0);
             impl_->retimed = true;
             lock.unlock();
             auto again = render_step();
@@ -2829,6 +2858,7 @@ core::Result<RenderStep> AudioRouter::render_step() {
     } else {
         lock.unlock();
     }
+    const auto write_entered = impl_->lossless() ? impl_->now_ns() : 0;
     const auto written = impl_->sink->write(MixedChunk{
         impl_->config.output_format, core::Nanoseconds{scheduled_ns}, output});
     const auto done = steady_now_ns();
@@ -2903,6 +2933,10 @@ core::Result<RenderStep> AudioRouter::render_step() {
         }
     } else { stats.frames_silence += frames; }
     lock.lock();
+    if (impl_->lossless() && std::any_of(impl_->playout.begin(), impl_->playout.end(),
+            [](const auto& state) { return state.anchored; })) {
+        impl_->last_write = Impl::LastWrite{end_ns, write_entered, impl_->config.clock ? impl_->now_ns() : done};
+    }
     std::erase_if(result.completed, [&](const auto& header) {
         const auto role = role_of(header.channel);
         return role && generations[role_index(*role)] != impl_->generations[role_index(*role)];

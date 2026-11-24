@@ -124,6 +124,8 @@ struct SinkOpenRequest final {
     // drops or repeats samples to put its stopped clock right) and honours
     // hold_stream(). The router's rate correction owns the timing.
     bool contiguous_stream{false};
+    // Tests can exercise the write-lateness fallback on an unslaved Pulse ring.
+    bool disable_pulse_read_clock_for_test{false};
 };
 
 struct SinkOpenOutcome final {

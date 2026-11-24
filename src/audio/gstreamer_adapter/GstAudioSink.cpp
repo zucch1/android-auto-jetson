@@ -134,6 +134,8 @@ struct HandoffTracker final {
     WriteProgress* progress{};
     detail::PulseReadClock* pulse_clock{};
     std::int64_t pulse_bytes_per_frame{};
+    std::atomic<std::uint64_t> pulse_request_lines{};
+    std::atomic<std::uint64_t> pulse_flush_lines{};
     std::uint64_t observation_sequence{};
 };
 
@@ -172,31 +174,34 @@ void handoff_log_observer(GstDebugCategory*, GstDebugLevel, const gchar*, const 
     constexpr std::string_view submit_prefix{"flushing "};
     const bool pulse_requested = std::strcmp(function, "gst_pulsering_stream_request_cb") == 0
         && line.starts_with(request_prefix);
+    constexpr std::string_view offset_prefix{" samples at offset "};
     const bool pulse_submitted = line.starts_with(submit_prefix)
+        && line.find(offset_prefix) != std::string_view::npos
         && (std::strcmp(function, "gst_pulseringbuffer_commit") == 0
             || std::strcmp(function, "gst_pulsering_flush") == 0);
     if (object != nullptr && (pulse_requested || pulse_submitted)) {
         const auto now = observation_time().count;
-        const auto amount = line.substr(pulse_requested ? request_prefix.size() : submit_prefix.size());
-        std::int64_t count = 0;
-        const auto parsed = std::from_chars(amount.data(), amount.data() + amount.size(), count);
-        if (parsed.ec == std::errc{} && count > 0) {
-            std::lock_guard lock(g_trackers_mutex);
-            const auto entry = g_trackers.find(GST_OBJECT(object));
-            if (entry != g_trackers.end() && entry->second->pulse_clock != nullptr) {
-                const auto* tracker = entry->second;
+        std::lock_guard lock(g_trackers_mutex);
+        const auto entry = g_trackers.find(GST_OBJECT(object));
+        if (entry != g_trackers.end() && entry->second->pulse_clock != nullptr) {
+            auto& tracker = *entry->second;
+            auto& matched = pulse_requested ? tracker.pulse_request_lines : tracker.pulse_flush_lines;
+            matched.fetch_add(1, std::memory_order_relaxed);
+            const auto amount = line.substr(pulse_requested ? request_prefix.size() : submit_prefix.size());
+            std::int64_t count = 0;
+            const auto parsed = std::from_chars(amount.data(), amount.data() + amount.size(), count);
+            if (parsed.ec == std::errc{} && count > 0) {
                 if (pulse_requested) {
-                    tracker->pulse_clock->requested(count, now);
+                    tracker.pulse_clock->requested(count, now);
                 } else {
-                    constexpr std::string_view offset_prefix{" samples at offset "};
                     const std::string_view tail{parsed.ptr, amount.data() + amount.size()};
                     if (tail.starts_with(offset_prefix)) {
                         const auto position = tail.substr(offset_prefix.size());
                         std::int64_t offset{};
                         const auto at = std::from_chars(position.data(), position.data() + position.size(), offset);
                         if (at.ec == std::errc{} && offset >= 0
-                            && count <= (INT64_MAX - offset) / tracker->pulse_bytes_per_frame) {
-                            tracker->pulse_clock->submitted(offset + count * tracker->pulse_bytes_per_frame);
+                            && count <= (INT64_MAX - offset) / tracker.pulse_bytes_per_frame) {
+                            tracker.pulse_clock->submitted(offset + count * tracker.pulse_bytes_per_frame);
                         }
                     }
                 }
@@ -317,12 +322,15 @@ void quiet_default_log_handler(GstDebugCategory* category, GstDebugLevel level, 
     }
 }
 
+std::atomic<bool> g_handoff_observer_installed{};
+
 void install_handoff_observer() {
     static std::once_flag flag;
     std::call_once(flag, [] {
         gst_debug_remove_log_function(gst_debug_log_default);
         gst_debug_add_log_function(quiet_default_log_handler, nullptr, nullptr);
         gst_debug_add_log_function(handoff_log_observer, nullptr, nullptr);
+        g_handoff_observer_installed.store(true, std::memory_order_release);
     });
 }
 
@@ -677,13 +685,14 @@ class GstSink final : public detail::ObservedAudioSink {
 public:
     GstSink(SinkElements elements, AudioFormat format, core::Milliseconds write_timeout,
             GstElement* sink_element, bool drop_nonempty, bool drop_after_window,
-            std::function<void(const SinkWriteProgress&)> publish, bool contiguous_stream = false)
+            std::function<void(const SinkWriteProgress&)> publish, bool contiguous_stream,
+            bool observe_read_clock)
         : pipeline_(elements.pipeline), appsrc_(elements.appsrc), sink_element_(sink_element),
           format_(format), write_timeout_(write_timeout),
-          progress_(std::move(publish)), probe_(&handoff_, false, false) {
+          progress_(std::move(publish)), probe_(&handoff_, false, false),
+          contiguous_stream_(contiguous_stream), observe_read_clock_(observe_read_clock) {
         handoff_.progress = &progress_;
-        read_clock_enabled_ = contiguous_stream;
-        if (read_clock_enabled_) {
+        if (observe_read_clock_) {
             handoff_.pulse_clock = &pulse_clock_;
             handoff_.pulse_bytes_per_frame = static_cast<std::int64_t>(format_.channels) * 2;
         }
@@ -704,7 +713,7 @@ public:
         }
         probe_id_ = gst_pad_add_probe(pad_, GST_PAD_PROBE_TYPE_BUFFER, pad_probe_trampoline,
                                       &probe_, nullptr);
-        if (read_clock_enabled_) {
+        if (observe_read_clock_) {
             original_chain_ = GST_PAD_CHAINFUNC(pad_);
             if (original_chain_ == nullptr) { return false; }
             g_object_set_qdata(G_OBJECT(pad_), chain_owner_key(), this);
@@ -740,8 +749,8 @@ public:
         if (!readiness_probe && write_limit_) { deadline = std::min(deadline, *write_limit_); }
         playback_slot_ = {};
         read_clock_slot_ = false;
-        if (read_clock_enabled_) {
-            timing_ = {};
+        timing_ = {};
+        if (observe_read_clock_) {
             ingress_move_ns_ = 0;
             ingress_schedule_ns_ = readiness_probe ? 0 : chunk.timestamp.count;
         }
@@ -883,6 +892,14 @@ public:
         }
         GST_BUFFER_PTS(buffer) = clock_mapped ? chunk_pts(chunk.timestamp) : 0;
         const GstClockTime data_pts = GST_BUFFER_PTS(buffer);
+        if (observe_read_clock_ && !readiness_probe
+            && (!first_audio_at_ || (GST_CLOCK_TIME_IS_VALID(last_media_end_)
+                && data_pts > last_media_end_ && data_pts - last_media_end_ > 200 * GST_MSECOND))) {
+            // Keep the Pulse byte indices and the existing PTS hold. The
+            // first real write or a new stream after a gap needs a fresh
+            // phase. Readiness and idle credit cannot seed that phase.
+            reset_read_clock();
+        }
         last_buffer_pts_ = data_pts;
         progress_.update(observation_sequence, [&](auto& value) {
             value.pts_ns = GST_BUFFER_PTS(buffer);
@@ -967,29 +984,50 @@ public:
         // worker or credit settlement. An unanswered slot is reported absent.
         const auto slot_until =
             std::min(deadline, std::chrono::steady_clock::now() + kPlaybackSlotWait);
-        if (read_clock_enabled_ && !readiness_probe) {
+        if (observe_read_clock_ && !readiness_probe) {
+            const auto rendered_at = std::chrono::steady_clock::now();
+            if (!first_audio_at_) { first_audio_at_ = rendered_at; }
+            const auto since_first_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                rendered_at - *first_audio_at_).count();
+            const auto duration = gst_util_uint64_scale(
+                data_bytes / frame_bytes, GST_SECOND, format_.sample_rate_hz);
+            const auto moved = ingress_move_ns_.load();
+            last_media_end_ = data_pts + static_cast<GstClockTime>(moved) + duration;
             // Keep feeding contiguous PCM while requests confirm a phase
             // step. Waiting for credits here can starve the ring of writes.
-            timing_ = pulse_clock_.take_adjustment();
-            timing_.moved.count = ingress_move_ns_.load();
-            if (!pulse_clock_.ready()) {
-                // Use media written so an idle route does not time out while
-                // waiting for the first real stream.
-                const auto frame_bytes = static_cast<std::size_t>(handoff_.pulse_bytes_per_frame);
-                warmup_frames_ += chunk.pcm.size() / frame_bytes;
-                if (warmup_frames_ >= format_.sample_rate_hz) {
-                    read_clock_enabled_ = false;
-                    gst_util_set_object_arg(G_OBJECT(sink_element_), "slave-method", "skew");
-                    g_warning("audio_read_clock_unavailable: pulsesink read progress did not warm up; "
-                              "restored slave-method=skew");
+            const auto adjustment = pulse_clock_.take_adjustment();
+            if (read_clock_active_) { timing_ = adjustment; }
+            timing_.moved.count = moved;
+            // A write that just blocked still needs to reach the router's
+            // lateness fallback before the observer takes over.
+            if (!read_clock_active_ && pulse_clock_.ready() && observation_time(rendered_at).count
+                    <= chunk.timestamp.count + static_cast<std::int64_t>(duration)) {
+                read_clock_active_ = true;
+                if (warned_unavailable_) {
+                    g_message("audio_read_clock_available: pulsesink read progress warmed up "
+                              "since_first_audio_ms=%" G_GINT64_FORMAT, static_cast<gint64>(since_first_ms));
                 }
             }
-            if (read_clock_enabled_ && pulse_clock_.ready()) {
+            if (read_clock_active_) {
                 playback_slot_ = {core::Nanoseconds{chunk.timestamp.count
                     + timing_.moved.count + timing_.held.count + timing_.drift.count},
                     PlaybackSlotAbsence::none};
                 read_clock_slot_ = true;
                 return outcome;
+            }
+            if (!warned_unavailable_ && since_first_ms >= 1'000) {
+                warned_unavailable_ = true;
+                GstDebugCategory* category = nullptr;
+                GST_DEBUG_CATEGORY_GET(category, "pulse");
+                const auto level = category ? gst_debug_category_get_threshold(category) : GST_LEVEL_NONE;
+                g_warning("audio_read_clock_unavailable: using write lateness while pulsesink warms up "
+                          "request_lines=%" G_GUINT64_FORMAT " flush_lines=%" G_GUINT64_FORMAT
+                          " hook_installed=%d gst_debug_active=%d pulse_debug_level=%d since_first_audio_ms=%" G_GINT64_FORMAT,
+                          static_cast<guint64>(handoff_.pulse_request_lines.load()),
+                          static_cast<guint64>(handoff_.pulse_flush_lines.load()),
+                          static_cast<int>(g_handoff_observer_installed.load(std::memory_order_acquire)),
+                          static_cast<int>(gst_debug_is_active()), static_cast<int>(level),
+                          static_cast<gint64>(since_first_ms));
             }
         }
         playback_slot_ = request_playback_slot(data_pts, slot_until);
@@ -998,7 +1036,7 @@ public:
 
     [[nodiscard]] detail::SinkTimingAdjustment take_timing_adjustment() override {
         auto timing = std::exchange(timing_, {});
-        if (read_clock_enabled_) {
+        if (read_clock_active_) {
             // A request can finish confirming the step between writes.
             const auto pending = pulse_clock_.take_adjustment();
             timing.held.count += pending.held.count;
@@ -1008,11 +1046,11 @@ public:
     }
 
     [[nodiscard]] bool handles_late_slots() const override {
-        return read_clock_enabled_;
+        return read_clock_active_;
     }
 
     [[nodiscard]] double read_clock_skew_ppm() const override {
-        return read_clock_enabled_ ? pulse_clock_.skew_ppm() : 0.0;
+        return read_clock_active_ ? pulse_clock_.skew_ppm() : 0.0;
     }
 
     [[nodiscard]] bool last_slot_from_read_clock() const override {
@@ -1020,7 +1058,7 @@ public:
     }
 
     [[nodiscard]] bool hold_stream(core::Nanoseconds by) override {
-        if (!read_clock_enabled_ || released_ || by.count == 0) { return false; }
+        if (!contiguous_stream_ || released_ || by.count == 0) { return false; }
         pts_hold_ns_ += by.count;
         return true;
     }
@@ -1337,10 +1375,7 @@ public:
         // A new epoch (re-PLAY, new clock) recalibrates the element's clock to
         // the pipeline's: nothing it held before still applies.
         pts_hold_ns_ = 0;
-        if (read_clock_enabled_) {
-            pulse_clock_.reset(handoff_.pulse_bytes_per_frame * format_.sample_rate_hz);
-            warmup_frames_ = 0;
-        }
+        if (observe_read_clock_) { reset_read_clock(); }
         const auto before = observation_time().count;
         const auto clock_now = gst_clock_get_time(clock);
         const auto after = observation_time().count;
@@ -1363,6 +1398,16 @@ public:
     }
 
 private:
+    void reset_read_clock() {
+        read_clock_active_ = false;
+        pulse_clock_.reset(handoff_.pulse_bytes_per_frame * format_.sample_rate_hz);
+        handoff_.pulse_request_lines = 0;
+        handoff_.pulse_flush_lines = 0;
+        first_audio_at_.reset();
+        last_media_end_ = GST_CLOCK_TIME_NONE;
+        warned_unavailable_ = false;
+    }
+
     [[nodiscard]] static GQuark chain_owner_key() {
         return g_quark_from_static_string("aa-audio-clocked-chain");
     }
@@ -1377,11 +1422,11 @@ private:
             / static_cast<std::size_t>(self.handoff_.pulse_bytes_per_frame);
         const auto duration = gst_util_uint64_scale(frames, GST_SECOND, self.format_.sample_rate_hz);
         const auto schedule = self.ingress_schedule_ns_.load();
-        if (self.read_clock_enabled_ && schedule != 0 && GST_CLOCK_TIME_IS_VALID(pts)) {
+        if (self.observe_read_clock_ && schedule != 0 && GST_CLOCK_TIME_IS_VALID(pts)) {
             std::int64_t move = 0;
             const auto now = observation_time().count;
             const auto late = now - schedule;
-            if (late > 5'000'000 && self.pulse_clock_.is_playing(now)) {
+            if (self.read_clock_active_ && late > 5'000'000 && self.pulse_clock_.is_playing(now)) {
                 // Pulse maps PTS to its ring in segments. Allow the 42.7 ms
                 // credit cadence (two 1,024-frame quanta at 48 kHz) plus
                 // margin, so the in-flight refill is beyond the read cursor.
@@ -1594,8 +1639,12 @@ private:
     GstClockTime last_buffer_pts_{0};
     // The measured read-clock phase steps already reflected in the router's
     // schedule. Subtract them from future stamps to preserve ring continuity.
-    std::atomic<bool> read_clock_enabled_{false};
-    std::size_t warmup_frames_{};
+    const bool contiguous_stream_;
+    const bool observe_read_clock_;
+    std::atomic<bool> read_clock_active_{false};
+    std::optional<std::chrono::steady_clock::time_point> first_audio_at_{};
+    GstClockTime last_media_end_{GST_CLOCK_TIME_NONE};
+    bool warned_unavailable_{};
     std::int64_t pts_hold_ns_{0};
     detail::PulseReadClock pulse_clock_{};
     detail::SinkTimingAdjustment timing_{};
@@ -2168,7 +2217,8 @@ static SinkOpenOutcome open_sink(const SinkOpenRequest& request, bool native_qua
                                             request.drop_nonempty_at_ingress,
                                             request.drop_nonempty_after_window,
                                             request.on_write_progress,
-                                            contiguous_pulse);
+                                            contiguous_pulse,
+                                            contiguous_pulse && !request.disable_pulse_read_clock_for_test);
     if (!handle->attach_probe()) {
         handle->release();
         outcome.report.usable = false;

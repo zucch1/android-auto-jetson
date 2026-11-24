@@ -1356,6 +1356,7 @@ struct CadencedPcmSource {
     bool burst = false;
     std::size_t chunks = 8;
     Clock::time_point epoch{};
+    std::chrono::milliseconds start_delay{};
     std::vector<std::int64_t> arrivals;
     std::vector<std::int64_t> acks;
     std::vector<std::size_t> held_chunks; // Due chunk indices held for credit.
@@ -1559,7 +1560,7 @@ class RuntimeTransport final : public aa::transport::Transport {
         if (runtime_pcm_source && runtime_pcm_source->arrivals.size() < runtime_pcm_source->chunks) {
             auto &source = *runtime_pcm_source;
             if (source.epoch == CadencedPcmSource::Clock::time_point{}) {
-                source.epoch = CadencedPcmSource::Clock::now();
+                source.epoch = CadencedPcmSource::Clock::now() + source.start_delay;
             }
             std::mutex mutex;
             std::condition_variable_any cv;
@@ -8934,6 +8935,7 @@ struct SustainedRun {
     std::int64_t phone_lag = 0;
     std::int64_t tail_sink_lag = 0;      // max lateness over the final half
     std::size_t tail_slots_without_read_clock = 0;
+    std::size_t final_slots_without_read_clock = 0;
     std::size_t slots_missing = 0;       // successful writes without a playback slot
     std::int64_t tail_presented_lag = 0; // max(handoff, slot) - scheduled, final half
     bool presented_logged = false;
@@ -8942,9 +8944,11 @@ struct SustainedRun {
 
 constexpr std::int64_t kSustainChunkNs = 8192LL * 1'000'000'000LL / 192000;
 
-SustainedRun run_sustained(std::size_t chunks, int hold_ms, std::size_t hold_after_writes) { // NOLINT(bugprone-easily-swappable-parameters): chunk count, hold milliseconds, and write index have distinct units
+SustainedRun run_sustained(std::size_t chunks, int hold_ms, std::size_t hold_after_writes,
+                          std::chrono::milliseconds start_delay = {}) { // NOLINT(bugprone-easily-swappable-parameters)
     CadencedPcmSource source;
     source.chunks = chunks;
+    source.start_delay = start_delay;
     CadencedGstObservation observed;
     runtime_send_audio = true;
     runtime_pcm_source = &source;
@@ -8958,7 +8962,8 @@ SustainedRun run_sustained(std::size_t chunks, int hold_ms, std::size_t hold_aft
         }
         return outcome;
     };
-    const auto result = run_runtime(false, 4500 + static_cast<int>(chunks) * 43, true);
+    const auto result = run_runtime(false, 4500 + static_cast<int>(start_delay.count())
+                                    + static_cast<int>(chunks) * 43, true);
     runtime_sink_request_override = {};
     runtime_pcm_source = nullptr;
     runtime_send_audio = false;
@@ -8981,7 +8986,10 @@ SustainedRun run_sustained(std::size_t chunks, int hold_ms, std::size_t hold_aft
         if (i >= run.writes / 2) { run.tail_sink_lag = std::max(run.tail_sink_lag, lag); }
         const auto &slot = observed.playback_slot_at[i];
         if (observed.succeeded[i] && !slot) { ++run.slots_missing; }
-        if (i >= run.writes / 2 && !observed.read_clock_slot[i]) { ++run.tail_slots_without_read_clock; }
+        if (!observed.read_clock_slot[i]) {
+            if (i >= run.writes / 2) { ++run.tail_slots_without_read_clock; }
+            if (run.writes - i <= 15) { ++run.final_slots_without_read_clock; }
+        }
         if (slot && i >= run.writes / 2) {
             run.tail_presented_lag = std::max(run.tail_presented_lag,
                 std::max(*slot, observed.returned_at[i]) - observed.scheduled_at[i]);
@@ -9016,6 +9024,16 @@ TEST(WiredReceiver, RealGstSustainedCadenceKeepsPhoneAndSinkRealTime) {
     EXPECT_EQ(run.tail_slots_without_read_clock, 0U);
     EXPECT_TRUE(run.presented_logged);
     EXPECT_LE(run.tail_presented_lag, 100'000'000);
+}
+
+TEST(WiredReceiver, RealGstReadClockWarmsAfterSixSecondsWithoutAudio) {
+    // Idle credits can suppress request callbacks for several more seconds
+    // after PCM starts. The observer must still take over once they resume.
+    const auto run = run_sustained(210, 0, 0, std::chrono::seconds{6});
+    if (!run.opened) { GTEST_SKIP() << "real host GStreamer route unavailable"; }
+    ASSERT_GE(run.writes, 210U);
+    EXPECT_EQ(run.slots_missing, 0U);
+    EXPECT_EQ(run.final_slots_without_read_clock, 0U);
 }
 
 // Issue 60 (Jetson perf-1800 v4): one transient downstream stall left a

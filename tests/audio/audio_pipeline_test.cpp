@@ -7102,6 +7102,7 @@ TEST_F(AudioPipelineRoute, WiredDefaultsRetimeBehindABlockedWrite) {
 struct PausingSink final {
     std::int64_t* clock;
     bool holds{true};                  // honours hold_stream()
+    bool observes_read_clock{true};
     std::int64_t lag{};                // how long its clock stood still
     std::int64_t held{};               // hold_stream() total
     std::optional<std::int64_t> end{}; // its stream time after the last sample
@@ -7125,7 +7126,7 @@ struct PausingSink final {
             confirm_after = pause_started + step + confirmation_delay;
         }
         if (unconfirmed_hold != 0 && *clock >= confirm_after) {
-            if (holds) { state.timing.held.count += unconfirmed_hold; }
+            if (holds && observes_read_clock) { state.timing.held.count += unconfirmed_hold; }
             unconfirmed_hold = 0;
         }
     }
@@ -7228,9 +7229,7 @@ TEST_F(AudioPipelineRoute, WiredDefaultsPlayOnThroughASinkThatStoodStill) {
     }
 }
 
-// A blocked handoff can return before the request callbacks have provided
-// enough read progress to measure the pause. Keep its successors contiguous.
-TEST_F(AudioPipelineRoute, WiredDefaultsDrainThreePausesWithDelayedClockConfirmation) {
+void expect_three_pause_recovery(bool observes_read_clock) {
     std::int64_t clock = 0;
     WiredRoute route{{}, [&clock](aa::audio::RouterConfig& config) {
         config.clock = [&clock] { return aa::core::Nanoseconds{clock}; };
@@ -7238,7 +7237,12 @@ TEST_F(AudioPipelineRoute, WiredDefaultsDrainThreePausesWithDelayedClockConfirma
     ASSERT_TRUE(route.router);
     PausingSink sink{&clock};
     sink.confirmation_delay = 180 * kMs;
-    route.sink->handles_late_slots = true;
+    sink.observes_read_clock = observes_read_clock;
+    if (!observes_read_clock) {
+        // Match the approximately 117 ms Pulse tlength in the private replay.
+        sink.capacity = 117 * kMs;
+    }
+    route.sink->handles_late_slots = observes_read_clock;
     sink.attach(*route.sink);
     std::int64_t next = 0;
     const auto run_to = [&](std::int64_t chunk) {
@@ -7258,8 +7262,14 @@ TEST_F(AudioPipelineRoute, WiredDefaultsDrainThreePausesWithDelayedClockConfirma
         const auto events = route.router->take_playout_events();
         ASSERT_EQ(events.size(), 1U);
         EXPECT_EQ(events.front().kind, aa::audio::PlayoutEvent::Kind::retime);
-        EXPECT_EQ(events.front().late.count, pause_ms * kMs);
-        EXPECT_EQ(events.front().held.count, pause_ms * kMs);
+        if (observes_read_clock) {
+            EXPECT_EQ(events.front().held.count, pause_ms * kMs);
+        } else {
+            // Some writes fit in the ring before backpressure becomes visible.
+            EXPECT_NEAR(static_cast<double>(events.front().held.count) / 1e6,
+                        static_cast<double>(pause_ms), 100.0);
+        }
+        EXPECT_EQ(events.front().late.count, events.front().held.count);
         EXPECT_NEAR(static_cast<double>(route.stats().playout_depth.count) / 1e6, 60.0, 12.0);
     }
     expect_nothing_lost(route);
@@ -7268,6 +7278,16 @@ TEST_F(AudioPipelineRoute, WiredDefaultsDrainThreePausesWithDelayedClockConfirma
     EXPECT_EQ(route.stats().playout_overflows, 0U);
     EXPECT_EQ(route.stats().playout_underruns, 0U);
     expect_whole_tone(route, 0);
+}
+
+// A blocked handoff can return before the request callbacks have provided
+// enough read progress to measure the pause. Keep its successors contiguous.
+TEST_F(AudioPipelineRoute, WiredDefaultsDrainThreePausesWithDelayedClockConfirmation) {
+    expect_three_pause_recovery(true);
+}
+
+TEST_F(AudioPipelineRoute, WiredDefaultsDrainThreePausesWithoutAReadClock) {
+    expect_three_pause_recovery(false);
 }
 
 TEST_F(AudioPipelineRoute, WiredDefaultsApplyAForwardReadStepWithContiguousSinkStamps) {
