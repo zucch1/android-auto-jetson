@@ -25,6 +25,12 @@ namespace aa::audio::detail {
 // Test-only scripted decode (open_router_with_decoder_for_test).
 using TestDecodeFn = std::function<core::Result<std::vector<std::byte>>(const EncodedChunk&)>;
 
+struct SinkTimingAdjustment final {
+    core::Nanoseconds held{};  // read clock fell behind while PCM remained queued
+    core::Nanoseconds moved{}; // the current buffer was rescheduled at ingress
+    core::Nanoseconds drift{}; // small signed correction to the clock mapping
+};
+
 // The routed output sink (gate r2 F1 semantics).
 //
 // write() returns only once the mixed chunk has reached the RENDERER'S
@@ -69,21 +75,26 @@ public:
     [[nodiscard]] virtual SinkProbeStats probe_stats() const = 0;
     [[nodiscard]] virtual RenderBarrierStats render_stats() const = 0;
     // #60 playback endpoint of the last acknowledged write: the steady-clock
-    // time its first sample is due on the sink's own clock, read from the
-    // element's position query right after the handoff. Absent when the
-    // element did not answer (or for sinks without a clock, e.g. test fakes).
+    // time its first sample is due on the sink's clock. Wired Pulse derives
+    // this from read progress. Other routes use a position query after handoff.
+    // Absent when the sink cannot supply a timing observation.
     [[nodiscard]] virtual std::optional<core::Nanoseconds> last_playback_slot() const {
         return std::nullopt;
     }
     [[nodiscard]] virtual PlaybackSlotAbsence last_playback_slot_absence() const {
         return last_playback_slot() ? PlaybackSlotAbsence::none : PlaybackSlotAbsence::unavailable;
     }
-    // Lossless playout (#228): the output stood still for `by` while a write
-    // blocked (a ring buffer is only full while nothing drains it), so its own
-    // clock stopped too and it plays on from where it was. Every later chunk is
-    // stamped `by` earlier on the sink's clock, so what it is handed stays
-    // contiguous with what it holds: a later stamp is a gap it would wait out
-    // in silence. False when the sink cannot (the stamps then move on).
+    // Lossless routes can report a read-clock phase step or an ingress
+    // reschedule once, after the acknowledged write. Other sinks use the
+    // router's ordinary late-slot recovery.
+    [[nodiscard]] virtual SinkTimingAdjustment take_timing_adjustment() { return {}; }
+    // Positive ppm means the sink reads slower than monotonic time.
+    [[nodiscard]] virtual double read_clock_skew_ppm() const { return 0.0; }
+    // A read-clock slot includes any phase step and late-ingress correction.
+    [[nodiscard]] virtual bool last_slot_from_read_clock() const { return false; }
+    // Subtract the signed read-clock correction from future sink stamps.
+    // The router shifts the wall-clock timeline by the same amount so the PCM
+    // stays contiguous on the sink clock. False for unsupported sinks.
     [[nodiscard]] virtual bool hold_stream(core::Nanoseconds by) {
         (void)by;
         return false;

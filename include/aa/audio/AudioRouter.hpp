@@ -107,11 +107,10 @@ struct WriteCompletion final {
     core::Nanoseconds scheduled{};
     core::Nanoseconds scheduled_end{};
     core::Nanoseconds completed{};
-    // #60: when the chunk starts playing, max(completed, playback slot on the
-    // sink's clock). A sample cannot play before its handoff, and with
-    // sync=true it does not play before its slot; pulsesink hands off early
-    // (ring-buffer commit), pipewiresink near the slot. Absent when the sink
-    // reported no position.
+    // #60: when the chunk starts playing. Wired Pulse uses the schedule
+    // adjusted by read-clock phase and late ingress. Other routes use the
+    // position-based slot bounded by write completion. Absent when the sink
+    // could not report a slot.
     std::optional<core::Nanoseconds> presented{};
     PlaybackSlotAbsence playback_slot_absence{PlaybackSlotAbsence::unavailable};
     // Wireless playout (PlayoutPolicy): how far after its content time this
@@ -546,9 +545,9 @@ struct PlayoutEvent final {
     // Depth the role was re-anchored with; retime: the offset it left.
     core::Nanoseconds depth{};
     Role role{Role::media};
-    // retime: the part of `late` the sink took into its own stream because its
-    // clock stood still while a write blocked (ObservedAudioSink::hold_stream):
-    // it plays on contiguously instead of waiting that out in silence.
+    // retime: the part of `late` measured as a pause in sink read progress
+    // (ObservedAudioSink::hold_stream). Only the wall-clock timeline moves;
+    // the stamps stay contiguous on the sink clock.
     core::Nanoseconds held{};
 };
 

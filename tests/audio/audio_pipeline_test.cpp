@@ -2642,6 +2642,7 @@ struct RecordingSinkState final {
     // Sees every chunk before it is recorded; on_hold answers hold_stream().
     std::function<void(const aa::audio::MixedChunk&)> on_write{};
     std::function<bool(aa::core::Nanoseconds)> on_hold{};
+    aa::audio::detail::SinkTimingAdjustment timing{};
     std::optional<aa::core::Nanoseconds> playback_slot{};
     aa::audio::PlaybackSlotAbsence slot_absence{aa::audio::PlaybackSlotAbsence::unavailable};
 };
@@ -2677,6 +2678,9 @@ public:
     }
     aa::audio::PlaybackSlotAbsence last_playback_slot_absence() const override {
         return state->playback_slot ? aa::audio::PlaybackSlotAbsence::none : state->slot_absence;
+    }
+    aa::audio::detail::SinkTimingAdjustment take_timing_adjustment() override {
+        return std::exchange(state->timing, {});
     }
     bool hold_stream(aa::core::Nanoseconds by) override {
         return state->on_hold ? state->on_hold(by) : false;
@@ -7089,20 +7093,31 @@ TEST_F(AudioPipelineRoute, WiredDefaultsRetimeBehindABlockedWrite) {
 // on by a retime were a gap it waited out in silence. Each later write blocked
 // 0.6-0.85 s, was taken for a new stall and retimed on top of the last one:
 // 28 retimes, depth 2.75 s, 6.3 s cut by the 2 s bound. This fake is that
-// sink (as measured with a private pipewire-pulse): its clock stands still
-// through the pause, it waits out 90% of a forward jump in its stamps (live,
-// its clock slaving took the rest back, so each block decayed), and drops
-// what is stamped behind its read position.
+// sink: its read clock stands still through the pause, while the writer
+// can fill a 200 ms ring. It waits out gaps between stamps and drops
+// samples written behind its read position.
 struct PausingSink final {
     std::int64_t* clock;
     bool holds{true};                  // honours hold_stream()
     std::int64_t lag{};                // how long its clock stood still
     std::int64_t held{};               // hold_stream() total
     std::optional<std::int64_t> end{}; // its stream time after the last sample
-    std::int64_t pause_next{};         // stands still this long in the next write
+    std::int64_t pause_next{};
+    std::int64_t dry_next{};
+    std::int64_t pause_started{};
+    std::int64_t pause_ends{};
+    std::int64_t capacity{200 * kMs};
     std::int64_t waited{};             // silence waited out for jumps
     std::int64_t dropped{};            // stream time written behind its read position
     std::int64_t longest_block{};      // after the pause: longest write past its start
+
+    void update_read_clock(RecordingSinkState& state) {
+        if (pause_ends != 0 && *clock >= pause_ends) {
+            const auto step = std::exchange(pause_ends, 0) - pause_started;
+            lag += step;
+            if (holds) { state.timing.held.count += step; }
+        }
+    }
 
     void attach(RecordingSinkState& state) {
         state.on_hold = [this](aa::core::Nanoseconds by) {
@@ -7110,26 +7125,37 @@ struct PausingSink final {
             held += by.count;
             return true;
         };
-        state.on_write = [this](const aa::audio::MixedChunk& chunk) {
+        state.on_write = [this, &state](const aa::audio::MixedChunk& chunk) {
             const auto length = static_cast<std::int64_t>(chunk.pcm.size() / 4) * 1'000'000'000 / 48'000;
-            const auto pts = chunk.timestamp.count - held;
-            if (!end) { end = pts; }
-            // Dry: what it plays now moved on in silence.
-            const auto reading = *clock - lag;
-            dropped += std::clamp<std::int64_t>(reading - pts, 0, length);
-            end = std::max(*end, reading);
-            auto start = *end;
-            if (const auto jump = pts - *end; jump > 40 * kMs) {
-                waited += jump * 9 / 10;
-                start += jump * 9 / 10;
+            auto pts = chunk.timestamp.count - held;
+            if (dry_next != 0) {
+                *clock += std::exchange(dry_next, 0);
+                const auto move = std::max<std::int64_t>(0, *clock - chunk.timestamp.count + 60 * kMs);
+                pts += move;
+                state.timing.moved.count = move;
             }
-            const bool paused = pause_next != 0;
-            lag += std::exchange(pause_next, 0);
-            end = start + length;
-            // It takes the write when its read position reaches the write's start.
-            const auto taken = std::max(*clock, start + lag);
-            if (!paused && lag != 0) { longest_block = std::max(longest_block, taken - *clock); }
-            *clock = taken;
+            update_read_clock(state);
+            if (pause_next != 0) {
+                pause_started = *clock;
+                pause_ends = *clock + std::exchange(pause_next, 0);
+            }
+            // The writer can get a ring ahead of the reader, even when the
+            // reader stands still. The reader advances through dry slots.
+            const auto reading = (pause_ends ? pause_started : *clock) - lag;
+            dropped += std::clamp<std::int64_t>(reading - pts, 0, length);
+            // Compare with the live read position once the old queue has
+            // run dry. A refill lead of 20 ms is ordinary pacing.
+            const auto gap = end ? pts - std::max(*end, reading) : 0;
+            if (gap > 40 * kMs && state.timing.moved.count == 0) { waited += gap; }
+            end = std::max(pts, reading) + length;
+            const bool paused = pause_ends != 0;
+            if (*end - reading > capacity) {
+                const auto resume_lag = lag + (paused ? pause_ends - pause_started : 0);
+                const auto taken = std::max(*clock, *end + resume_lag - capacity);
+                if (!paused && lag != 0) { longest_block = std::max(longest_block, taken - *clock); }
+                *clock = taken;
+            }
+            update_read_clock(state);
         };
     }
 };
@@ -7172,11 +7198,13 @@ TEST_F(AudioPipelineRoute, WiredDefaultsPlayOnThroughASinkThatStoodStill) {
         const auto events = route.router->take_playout_events();
         ASSERT_EQ(events.size(), 2U);
         EXPECT_EQ(events[1].kind, aa::audio::PlayoutEvent::Kind::retime);
-        EXPECT_EQ(events[1].held, events[1].late);
-        EXPECT_EQ(sink.held, events[1].late.count);
-        // The offset carries what the sink plays with: about the pause.
+        // The model's read clock measures the pause independently of
+        // the blocked write (several writes fit after the freeze begins).
+        EXPECT_EQ(events[1].held.count, sink.lag);
+        EXPECT_EQ(events[1].late.count, sink.lag);
+        EXPECT_EQ(sink.held, sink.lag);
         EXPECT_NEAR(static_cast<double>(route.largest_offset()),
-                    static_cast<double>((60 + pause_ms) * kMs), 45.0e6);
+                    static_cast<double>(60 * kMs + sink.lag), 10.0e6);
         // It drains by the rate correction, about 10 ms/s.
         const auto after = route.stats().playout_depth.count;
         run_to(101 + 70'000 / 42); // 60 s more
@@ -7202,6 +7230,7 @@ TEST_F(AudioPipelineRoute, WiredDefaultsCutAWholeQueueBehindASinkThatCannotHold)
     ASSERT_TRUE(route.router);
     PausingSink sink{&clock};
     sink.holds = false;
+    sink.capacity = kA26ChunkNs;
     sink.attach(*route.sink);
     std::int64_t next = 0;
     const auto run_to = [&](std::int64_t chunk) {
@@ -7261,6 +7290,32 @@ TEST_F(AudioPipelineRoute, WiredDefaultsMoveTheStampsOfASinkThatPlayedOnDry) {
         ASSERT_EQ(events.size(), 2U);
         EXPECT_EQ(events[1].held.count, 0);
     }
+}
+
+TEST_F(AudioPipelineRoute, WiredDefaultsRestampTheWriteDelayedWhileTheSinkPlayed) {
+    std::int64_t clock = 0;
+    WiredRoute route{{}, [&clock](aa::audio::RouterConfig& config) {
+        config.clock = [&clock] { return aa::core::Nanoseconds{clock}; };
+    }};
+    ASSERT_TRUE(route.router);
+    PausingSink sink{&clock};
+    sink.attach(*route.sink);
+    for (std::int64_t next = 0; next < 160;) {
+        clock = std::max(clock, route.start + next * kA26ChunkNs);
+        if (next == 100) { sink.dry_next = 300 * kMs; }
+        do { ASSERT_TRUE(route.submit_media(next * kA26ChunkNs)); }
+        while (++next < 160 && route.start + next * kA26ChunkNs <= clock);
+        ASSERT_TRUE(route.drain());
+    }
+    expect_nothing_lost(route);
+    EXPECT_EQ(sink.lag, 0);
+    EXPECT_EQ(sink.held, 0);
+    EXPECT_EQ(sink.dropped, 0);
+    EXPECT_EQ(route.stats().playout_retimes, 1U);
+    const auto events = route.router->take_playout_events();
+    ASSERT_EQ(events.size(), 2U);
+    EXPECT_EQ(events[1].held.count, 0);
+    EXPECT_NEAR(static_cast<double>(events[1].late.count), 300.0e6, 2.0e6);
 }
 
 // What on_write_completed says the piece really plays with: the blocked piece

@@ -5388,6 +5388,9 @@ class CadencedRealGstSink final : public aa::audio::detail::ObservedAudioSink {
         observation_.playback_slot_at.push_back(slot ? std::optional{slot->count} : std::nullopt);
         return result;
     }
+    void set_write_deadline(std::chrono::steady_clock::time_point until) override {
+        sink_->set_write_deadline(until);
+    }
     aa::core::Result<void> drain(Milliseconds timeout) override {
         auto result = sink_->drain(timeout);
         observation_.drained = result.has_value();
@@ -5398,6 +5401,15 @@ class CadencedRealGstSink final : public aa::audio::detail::ObservedAudioSink {
     std::optional<aa::core::Nanoseconds> last_playback_slot() const override {
         return sink_->last_playback_slot();
     }
+    aa::audio::PlaybackSlotAbsence last_playback_slot_absence() const override {
+        return sink_->last_playback_slot_absence();
+    }
+    aa::audio::detail::SinkTimingAdjustment take_timing_adjustment() override {
+        return sink_->take_timing_adjustment();
+    }
+    double read_clock_skew_ppm() const override { return sink_->read_clock_skew_ppm(); }
+    bool last_slot_from_read_clock() const override { return sink_->last_slot_from_read_clock(); }
+    bool hold_stream(aa::core::Nanoseconds by) override { return sink_->hold_stream(by); }
   private:
     std::unique_ptr<aa::audio::detail::ObservedAudioSink> sink_;
     CadencedGstObservation &observation_;
