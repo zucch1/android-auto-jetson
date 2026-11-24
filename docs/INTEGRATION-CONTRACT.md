@@ -2,7 +2,7 @@
 # Android Auto Infotainment Integration Contract
 
 - **Contract version:** `1.0.0`
-- **Receiver D-Bus contract:** `org.custom.AndroidAutoReceiver1` (`1.1.0`)
+- **Receiver D-Bus contract:** `org.custom.AndroidAutoReceiver1` (`1.2.0`)
 - **System helper D-Bus contract:** `org.custom.AndroidAutoSystemHelper1` (`1.5.0`)
 - **Video socket ABI:** `AF_UNIX` `SOCK_SEQPACKET`, protocol version `1` (data header v1 / v2 profile-bearing)
 - **Input socket ABI:** `AF_UNIX` `SOCK_SEQPACKET`, protocol version `1`
@@ -45,7 +45,7 @@ Control and status only. Audio, video, and every other high-rate stream stay off
 | Service name | `org.custom.AndroidAutoReceiver` |
 | Object path | `/org/custom/AndroidAutoReceiver` |
 | Interface | `org.custom.AndroidAutoReceiver1` |
-| Contract SemVer | `1.1.0` |
+| Contract SemVer | `1.2.0` |
 | Authority XML | `docs/dbus/org.custom.AndroidAutoReceiver1.xml` |
 | Schema validator | `tools/ipc/dbus_contract.py` (`tools/ipc/dbus_contract_schema.py`) |
 | Max message bytes | `65536` (`64 KiB`, `kMaxMessageBytes` in `src/ipc/dbus_adapter/BusWire.hpp`) |
@@ -62,7 +62,7 @@ Control and status only. Audio, video, and every other high-rate stream stay off
 ### Versioning Rules
 
 - The **major** version is encoded in the interface name (`org.custom.AndroidAutoReceiver1`, `kContractMajor = 1` in `include/aa/ipc/Contract.hpp`). Any unsupported major (e.g., `org.custom.AndroidAutoReceiver2`) fails closed with `org.custom.AndroidAutoReceiver1.Error.UnsupportedContractMajor`.
-- The **minor** version grows for backwards-compatible additions (methods, typed errors, capability keys). `1.1.0` added `GetPairingCandidate`, `Error.NotWiredCandidate`, and `Error.NotDurable`. Consumers feature-detect by reading the `ContractSemVer` property (or `contract.semver` in `GetCapabilities`) before calling `1.1.0+` methods.
+- The **minor** version grows for backwards-compatible additions (methods, signals, typed errors, capability keys). `1.1.0` added `GetPairingCandidate`, `Error.NotWiredCandidate`, and `Error.NotDurable`. `1.2.0` added `ListPhones`, `GetPairingOutcome`, `PairingCompleted`, and capability keys `phones.list` / `pairing.outcomes`. Consumers feature-detect by reading the `ContractSemVer` property (or `contract.semver` and feature keys in `GetCapabilities`) before calling `1.1.0+` / `1.2.0+` methods.
 - The **patch** version fixes behavior or wording without changing wire shape.
 
 ### Receiver Methods
@@ -78,13 +78,15 @@ Control and status only. Audio, video, and every other high-rate stream stay off
 | `CancelPhonePairing` | `t` | `` | Cancels pending request or closes open pairing window without persisting approval. |
 | `ForgetPhone` | `t` | `` | Forgets paired `phone_id`. Wireless: also rotates shared AP credentials and demotes the bond to `revoked-bonds` without removing the BlueZ pairing; on the wired control service (no helper backend) it is a local-store revocation only. See partial-outcome semantics below. |
 | `GetState` | `` | `st` | Available before registration. Returns `projection_state` (`"stopped"` or `"projecting"`) and active `consumer_id` (`0` if none). |
-| `GetCapabilities` | `` | `a{ss}` | Available before registration. Static capability map: `contract.interface`, `contract.semver`, `consumer.exclusive`, `pairing.one_time_request_ids`, `display.viewport`, `diagnostics.events`. |
+| `GetCapabilities` | `` | `a{ss}` | Available before registration. Static capability map: `contract.interface`, `contract.semver`, `consumer.exclusive`, `pairing.one_time_request_ids`, `pairing.outcomes`, `phones.list`, `display.viewport`, `diagnostics.events`. |
 | `SetDisplayViewport` | `uuu` | `` | Validates and stores consumer-reported `width` (`1..8192`), `height` (`1..8192`), `dpi` (`1..2000`). Does not negotiate stream or input geometry (see Section 3). |
 | `Ping` | `` | `t` | Available before registration. Liveness probe returning receiver monotonic clock in nanoseconds. |
 | `GetPairingComparison` | `t` | `a{ss}` | Consumer-only retrieval during an **open** wireless enrolment window (after `ConfirmPhonePairing` / `PairingOpened`): `challenge_id`, `comparison` (6 digits), `address`, `adapter`. Never broadcast. |
 | `RespondPairingComparison` | `ttb` | `` | Explicit human accept/reject for `request_id` and `challenge_id`. One-use. Acknowledges the answer; bond verification and durable approval can complete afterwards. |
 | `GetPairingCandidate` | `t` | `a{ss}` | Consumer-only wired candidate description (`1.1.0`, `docs/wired-enrolment.md`): `transport` (`"wired"`), `label` (per-process pseudonym, no persistent `phone_id`), `strength`. Fails `Error.NotWiredCandidate` on wireless requests. |
 | `RequestIdrRecovery` | `` | `` | Requests a fresh H.264/video IDR keyframe from the active phone session while projecting. |
+| `ListPhones` | `` | `aa{ss}` | Consumer-only redacted list of approved phones (`1.2.0`, `phones.list`). Each entry contains `phone_id` (decimal `uint64` for `ForgetPhone`), `label` (per-process pseudonym, never raw addresses/serials/ports), `transport` (`"wired"`, `"wireless"`, `"opaque"`), and `strength` (`last_seen` omitted under store schema v3). |
+| `GetPairingOutcome` | `t` | `s` | Consumer-only outcome query for `request_id` (`1.2.0`, `pairing.outcomes`), reporting whether the approval/retraction was durable. Outcome records are in-memory, scoped to the issuing registration, and live only for the receiver's lifetime (bounded to 64 entries; lost on restart). Returns `"pending"`, `"approved"`, `"approved_commit_failed"`, `"not_durable"`, `"retracted"`, `"retraction_failed"`, `"rejected"`, `"cancelled"`, `"expired"`, or `"failed"`. Fails `Error.MalformedRequest` on zero/unknown `request_id` and `Error.PeerUnauthorized` on a `request_id` issued to a different registration. |
 
 ### Enrolment Sequences and `ForgetPhone` Semantics
 
@@ -99,9 +101,12 @@ Both enrolment flows keep all user-facing prompts in infotainment. Neither flow 
 5. **Present to human:** Display the comparison in infotainment's UI and obtain an explicit accept or reject decision (keep raw `address`/`adapter`/`comparison` out of logs and telemetry).
 6. **Respond with both IDs:** Call `RespondPairingComparison(request_id, challenge_id, accept)`. A successful return acknowledges the human answer and can return **before** bond verification (`PairingBondConfirmedV1`, `PairingBondAcknowledgedV1`) and durable approval (`PairingBondCommittedV1`) finish; subsequent reconciliation/commit runs asynchronously in `advance_enrolment()`.
 7. **Commit outcomes differ by durability (`advance_enrolment()`, `src/ipc/ControlComparison.cpp`):**
-   - **Durable trust write, helper commit fails:** the approval is **kept**, although the receiver still emits `pairing_commit_failed` for the helper step. It ends the pairing window and schedules bond reconciliation, which brings the helper in line with the stored approval. The phone is approved; do not send the owner through enrolment again.
-   - **Trust write committed but not durable:** the receiver emits `pairing_commit_failed` and performs a best-effort retraction (store forget -> tracked revocation -> bond reconciliation). If the retracting write also fails, the approval can remain in the store and reconciliation keeps the helper consistent with it.
-   - Receiver interface `1.1.0` gives the consumer no call that reports whether an approval persisted: `GetState` reports projection/consumer state and `GetPairingComparison` a live challenge. Until a status API exists (blocked on the same API decision as the approved-phone list), the UI must show a non-final "pairing finished; confirming" state and treat the next successful wireless admission of that phone as the confirmation, never render a stopped spinner as "approved" or as "failed".
+   - **Durable trust write, helper commit fails:** the approval is **kept**, although the receiver still emits `pairing_commit_failed` for the helper step. It ends the pairing window, records outcome `"approved_commit_failed"` (`PairingCompleted` / `GetPairingOutcome`), and schedules bond reconciliation, which brings the helper in line with the stored approval. The phone is approved; do not send the owner through enrolment again.
+   - **Trust write committed but not durable:** the receiver emits `pairing_commit_failed` and performs a best-effort retraction (store forget -> tracked revocation -> bond reconciliation). Local retraction durability is tracked separately from helper cleanup:
+     - `"retracted"` when the local store removal is confirmed durable (even if helper cleanup legs remain pending and tracked);
+     - `"not_durable"` when the removal rename landed in the store but its directory `fsync` failed (crash durability of the removal remains unconfirmed);
+     - `"retraction_failed"` when the retracting write could not be written (the approval remains in the store, the helper source is retired through the tracked cleanup path before dropping the receiver window, and reconciliation keeps the helper consistent with the retained record).
+   - **Pairing outcome lifetime and registration boundary (`1.2.0+`):** Consumers detect `pairing.outcomes` in `GetCapabilities` (or `ContractSemVer >= 1.2.0`) and learn the final outcome either via the `PairingCompleted(request_id, outcome)` signal or by polling `GetPairingOutcome(request_id)`. The closed set of outcome strings is `"pending"`, `"approved"`, `"approved_commit_failed"`, `"not_durable"`, `"retracted"`, `"retraction_failed"`, `"rejected"`, `"cancelled"`, `"expired"`, and `"failed"`. The outcome reports whether the trust-store change was durable; the outcome record itself lives in memory in the receiver process, belongs to the issuing registration, and lasts only as long as the receiver (a restart loses the record). Querying a `request_id` from a previous/foreign registration returns `Error.PeerUnauthorized`; a zero or unknown `request_id` returns `Error.MalformedRequest`. Once a request reaches a terminal outcome, subsequent window cleanup (`CancelPhonePairing` or window timeout) never overwrites it. Legacy `1.1.0` receivers lack this API and require showing a non-final "pairing finished; confirming" state.
 
 #### Wired enrolment sequence (`docs/wired-enrolment.md`)
 
@@ -109,7 +114,7 @@ Both enrolment flows keep all user-facing prompts in infotainment. Neither flow 
 2. **Request:** Registered consumer calls `RequestAddPhone()` -> receives one-time `request_id` and `PairingRequest(request_id)`. The request itself is fresh for 60 s (`PairingPolicy::kConfirmWindow`): the confirmation must land inside it or the request is spent.
 3. **Inspect candidate:** Consumer calls `GetPairingCandidate(request_id)` (`1.1.0+`) -> receives `transport` (`"wired"`), `label` (per-process pseudonym matching `phone_id` in the refusal log, not a persistent `phone_id`), and `strength` (`"serial-backed"`). Confirming before calling `GetPairingCandidate` is refused and closes the request.
 4. **Present to human:** Show `label` in infotainment's UI and obtain an explicit yes/no.
-5. **Confirm or decline:** Call `ConfirmPhonePairing(request_id)` to approve durably (emits `PairingOpened`), or `CancelPhonePairing(request_id)` to decline without writing. If directory `fsync` fails after bounded retries, `ConfirmPhonePairing` returns `Error.NotDurable` and closes the request — never report approval as succeeded. A durable confirm *is* the completed enrolment: `WiredEnrolment::pairing_confirmed` sets its completion result while handling the call, and the receiver's enrolment loop then closes the bus and exits (`wired_enrolment_approved`, exit 0). Do **not** call `CancelPhonePairing` after a durable confirm — the receiver can exit before serving it and the approval needs no closing (it stays).
+5. **Confirm or decline:** Subscribe to `PairingCompleted` *before* calling `ConfirmPhonePairing` on the wired path. Call `ConfirmPhonePairing(request_id)` to approve durably (emits `PairingOpened` and `PairingCompleted(request_id, "approved")`), or `CancelPhonePairing(request_id)` to decline without writing (`"cancelled"`). If directory `fsync` fails after bounded retries, `ConfirmPhonePairing` returns `Error.NotDurable` and closes the request (`"not_durable"`) — never report approval as succeeded. A durable confirm *is* the completed enrolment: `WiredEnrolment::pairing_confirmed` sets its completion result while handling the call, and the receiver's enrolment loop then closes the bus and exits (`wired_enrolment_approved`, exit 0). Because the receiver exits immediately after a durable confirm, polling `GetPairingOutcome` afterwards can lose the service even though `PairingCompleted` was already emitted; wired consumers must take the final result from the `ConfirmPhonePairing` reply or the `PairingCompleted` terminal signal. Do **not** call `CancelPhonePairing` after a durable confirm — the receiver can exit before serving it and the approval needs no closing (it stays; if called before exit, it does not overwrite `"approved"`).
 6. **Restart the receiver:** Restart `aa-wired-receiver` after approval for a fresh admission check. If the phone is still in accessory mode, the receiver issues a targeted USB reset and waits for phone mode so it can check the full approved identity on the selected port.
 
 #### Timing limits
@@ -120,7 +125,7 @@ Both enrolment flows keep all user-facing prompts in infotainment. Neither flow 
 
 #### `ForgetPhone` partial outcomes and approved-phone listing
 
-- **No list API:** `org.custom.AndroidAutoReceiver1` (`1.1.0`) provides `ForgetPhone(t)` but no method to list approved phones or their `PhoneId` values, and `GetPairingCandidate` does not expose a persistent `phone_id`. Consumers must **never** read `approved-phones.json` directly (that violates the ownership and privacy boundary); approved-phone list UI is blocked on a future contract API decision.
+- **Approved-phone listing (`1.2.0+`):** `org.custom.AndroidAutoReceiver1` (`1.2.0`, capability `phones.list`) provides `ListPhones() -> aa{ss}` for the active registered consumer only. Each entry returns `phone_id` (the decimal `uint64` passed to `ForgetPhone`), `label` (per-process pseudonym `id-<hex>`), `transport` (`"wired"`, `"wireless"`, or `"opaque"`), and `strength` (`"serial-backed"`, `"port-only"`, `"bond-backed"`, `"opaque"`). Trust-store schema v3 records no timestamps, so `last_seen` / `approved_at` is omitted; `aa{ss}` allows adding optional keys in future minor versions. Consumers must still **never** read `approved-phones.json` directly (that violates the ownership and privacy boundary), and `GetPairingCandidate` still exposes no persistent `phone_id`.
 - **Partial outcomes and retry scope (`src/ipc/ControlPairing.cpp`, `src/ipc/ControlRevocation.cpp`, `src/ipc/ControlService.cpp`):** `ForgetPhone(phone_id)` removes the phone from the local trust store first and then executes, **on the wireless path only**, the helper AP rotation (`RevokeAP1`) and bond demotion (`RevokePeerV1` / reconciliation).
   - **The background refresh loop does not retry AP rotation.** `ControlService::refresh_consumer_owner` skips every pending revocation record with a nonzero phone id (`if (record.snapshot.phone || record.next_attempt > attempt_now) continue;`) — that loop only retires source records. An AP leg that failed stays pending until the consumer calls `ForgetPhone(phone_id)` again: `revoke_phone` finds the existing record for that phone and runs `attempt_revocation` on it directly. Do not assume "eventually consistent" AP rotation without that explicit retry.
   - **Bond reconciliation can settle the bond leg by itself.** A successful `ReconcileBondsV1` cycle marks a pending bond leg complete once the store no longer approves that identity (the helper demoted the bond and keeps it refused, `#136`), so it clears without a `ForgetPhone` retry and emits `phone_revocation_external_complete`. Only the AP leg (and source retirement) needs the explicit retry.
@@ -134,6 +139,7 @@ Both enrolment flows keep all user-facing prompts in infotainment. Neither flow 
 | `PairingRequest` | `t` | One-time `request_id` awaiting `ConfirmPhonePairing`. |
 | `PairingOpened` | `t` | Pairing window opened (or wired approval committed) for `request_id`. |
 | `PairingClosed` | `t` | Pending request or open window closed for `request_id`. |
+| `PairingCompleted` | `ts` | Terminal outcome for `request_id` (`1.2.0`, `pairing.outcomes`): `"approved"`, `"approved_commit_failed"`, `"not_durable"`, `"retracted"`, `"retraction_failed"`, `"rejected"`, `"cancelled"`, `"expired"`, or `"failed"`. Never carries identifiers or secrets. |
 | `StateChanged` | `st` | Mirrors `GetState`: `projection_state`, `consumer_id`. |
 | `DiagnosticEvent` | `sst` | Low-rate structured diagnostic: `severity` (`"info"`, `"warning"`, `"error"`), `event`, numeric `subject_id`. Never carries identifiers or secrets. |
 
@@ -145,7 +151,7 @@ the wired lifecycle reports `failed` and the receiver exits.
 
 | Property | Type | Access | Value |
 | --- | --- | --- | --- |
-| `ContractSemVer` | `s` | `read` | `1.1.0` |
+| `ContractSemVer` | `s` | `read` | `1.2.0` |
 
 ### Receiver Errors
 
@@ -154,9 +160,9 @@ Custom contract errors defined in `src/ipc/dbus_adapter/DispatchReply.hpp`:
 | Error | Meaning |
 | --- | --- |
 | `org.custom.AndroidAutoReceiver1.Error.UnsupportedContractMajor` | Caller addressed an unsupported `org.custom.AndroidAutoReceiverN` major version. |
-| `org.custom.AndroidAutoReceiver1.Error.PeerUnauthorized` | Caller UID mismatch, unowned consumer name, or not the active consumer. |
+| `org.custom.AndroidAutoReceiver1.Error.PeerUnauthorized` | Caller UID mismatch, unowned consumer name, not the active consumer, or `GetPairingOutcome` queried with a `request_id` issued to a different registration. |
 | `org.custom.AndroidAutoReceiver1.Error.ConsumerRejected` | Another consumer is already registered, no consumer is registered, or pairing request/window already open or spent. |
-| `org.custom.AndroidAutoReceiver1.Error.MalformedRequest` | Zero or unknown `request_id` in `PairingGate` (`src/ipc/PairingGate.cpp`). Not used for D-Bus signature or viewport-bounds errors. |
+| `org.custom.AndroidAutoReceiver1.Error.MalformedRequest` | Zero or unknown `request_id` in `PairingGate` (`src/ipc/PairingGate.cpp`) or `GetPairingOutcome`. Not used for D-Bus signature or viewport-bounds errors. |
 | `org.custom.AndroidAutoReceiver1.Error.QueueFull` | Pending pairing table full (`8`), tracked revocation queue full (`256`), or gate-lifetime request budget spent (`64`; restart required). |
 | `org.custom.AndroidAutoReceiver1.Error.IllegalTransition` | Invalid state transition (e.g., `StartProjection` while projecting, `RequestIdrRecovery` while stopped or with no active session). |
 | `org.custom.AndroidAutoReceiver1.Error.NotWiredCandidate` | `GetPairingCandidate` called on a request with no wired candidate (e.g., wireless request). Request stays pending. |
@@ -428,7 +434,7 @@ The following data must **never** be logged, exported in diagnostics/evidence, b
 
 **Enforcement scope:** `tools/qualification/check_privacy.py` is a conservative export-time check that requires explicit manual review (`known export checks only; manual review required`), not a universal secret detector or runtime anonymizer.
 
-Permitted telemetry: opaque per-process pseudonyms (`label` from `GetPairingCandidate`, `aa::diagnostics::redact_identifier` values), numeric `PhoneId`/`request_id`/`subject_id`, and consumer-only (never broadcast) responses to `GetPairingComparison` and `GetPairingCandidate` during active explicit enrolment.
+Permitted telemetry: opaque per-process pseudonyms (`label` from `GetPairingCandidate` and `ListPhones`, `aa::diagnostics::redact_identifier` values), numeric `request_id`/`subject_id`, and consumer-only (never broadcast) responses to `GetPairingComparison`, `GetPairingCandidate`, `ListPhones`, and `GetPairingOutcome`. Qualification exports must strip or redact `phone_id` (for example `"[REDACTED]"` or an `id-<16 hex>` pseudonym) rather than copying raw decimal `phone_id` values from `ListPhones`; `tools/qualification/check_privacy.py` conservatively rejects unredacted `phone_id` values with `PRIVACY_SENSITIVE_VALUE`.
 
 ---
 
@@ -438,10 +444,10 @@ Exact amendments required in `zucch1/infotainment` when integrating Android Auto
 
 ### Settings
 
-- [ ] Add an Android Auto settings page behind `AppState` (QML declarative only): show AA availability/degraded state when `org.custom.AndroidAutoReceiver` is absent (and note that bus-name presence alone does not prove projection readiness if the unit is running `--pairing-only`), and drive explicit enrolment separately for wireless (exactly one visible public BR/EDR candidate established *first*, then `RequestAddPhone` -> `ConfirmPhonePairing` to open window / `PairingOpened` -> poll `GetPairingComparison` -> human modal -> `RespondPairingComparison(request_id, challenge_id, accept)`; a non-durable approval is retracted best-effort) and wired (refused candidate under `--wired-enrolment` -> `RequestAddPhone` -> `GetPairingCandidate` -> human modal -> `ConfirmPhonePairing` / `CancelPhonePairing` -> restart receiver; after a durable confirm go straight to receiver restart, never a post-confirm `CancelPhonePairing`).
-- [ ] Approved-phone list / forget UI: **blocked on an API decision** — `org.custom.AndroidAutoReceiver1` (`1.1.0`) provides `ForgetPhone(t)` with no list API, and `GetPairingCandidate` exposes no persistent `phone_id`. Do **not** read `approved-phones.json` directly. When `ForgetPhone` is wired: handle partial outcomes (local revocation can land while helper AP/bond legs remain pending and return an error), never announce a completed forget from the call's return, and retry the whole `ForgetPhone(phone_id)` explicitly for a pending AP leg — the receiver's refresh loop does not, while bond reconciliation may settle its own leg. The AP/BlueZ legs exist only on the wireless receiver.
+- [ ] Add an Android Auto settings page behind `AppState` (QML declarative only): show AA availability/degraded state when `org.custom.AndroidAutoReceiver` is absent (and note that bus-name presence alone does not prove projection readiness if the unit is running `--pairing-only`), and drive explicit enrolment separately for wireless (exactly one visible public BR/EDR candidate established *first*, then `RequestAddPhone` -> `ConfirmPhonePairing` to open window / `PairingOpened` -> poll `GetPairingComparison` -> human modal -> `RespondPairingComparison(request_id, challenge_id, accept)` -> observe `PairingCompleted` / `GetPairingOutcome` for `"approved"`, `"approved_commit_failed"` (kept), `"not_durable"`, `"retracted"`, or `"retraction_failed"`) and wired (refused candidate under `--wired-enrolment` -> `RequestAddPhone` -> `GetPairingCandidate` -> human modal -> subscribe to `PairingCompleted` -> `ConfirmPhonePairing` / `CancelPhonePairing` -> take final result from the confirm reply or `PairingCompleted` -> restart receiver; after a durable confirm go straight to receiver restart, never a post-confirm `CancelPhonePairing`).
+- [ ] Approved-phone list / forget UI (unblocked in `1.2.0`): feature-detect `phones.list` in `GetCapabilities` (or `ContractSemVer >= 1.2.0`), call `ListPhones()` to render approved phones (`phone_id`, redacted `label`, `transport`, `strength`), and drive `ForgetPhone(phone_id)` from the list. Still do **not** read `approved-phones.json` directly. When `ForgetPhone` is wired: handle partial outcomes (local revocation can land while helper AP/bond legs remain pending and return an error), never announce a completed forget from the call's return, and retry the whole `ForgetPhone(phone_id)` explicitly for a pending AP leg — the receiver's refresh loop does not, while bond reconciliation may settle its own leg. The AP/BlueZ legs exist only on the wireless receiver.
 - [ ] Keep Bluetooth/HFP pairing and unpairing under infotainment Settings so the owner can connect HFP (`#160`) and unpair a forgotten phone before re-enrolment (`#136`).
-- [ ] Feature-detect receiver contract `1.1.0` via `ContractSemVer` / `GetCapabilities` before calling `GetPairingCandidate`, and handle `Error.NotDurable` by never reporting an unconfirmed wired approval as succeeded.
+- [ ] Feature-detect receiver contract `1.1.0` (`GetPairingCandidate`, `Error.NotDurable`) and `1.2.0` (`phones.list` / `ListPhones`, `pairing.outcomes` / `GetPairingOutcome` / `PairingCompleted`) via `ContractSemVer` / `GetCapabilities`, and handle `Error.NotDurable` by never reporting an unconfirmed wired approval as succeeded.
 
 ### App-Host
 

@@ -68,6 +68,15 @@ TEST(ControlFlow, ApproveOnceThenReconnectAndForget) {
 
     const auto& phones = f.store.phones();
     ASSERT_EQ(phones.size(), 1U);
+    const auto listed = f.service.list_phones(connection);
+    ASSERT_TRUE(listed.has_value());
+    ASSERT_EQ(listed.value().size(), 1U);
+    EXPECT_EQ(listed.value()[0].at("phone_id"), std::to_string(phones[0].phone_id.value));
+    EXPECT_EQ(listed.value()[0].at("transport"), "wired");
+    EXPECT_EQ(listed.value()[0].at("strength"), "serial-backed");
+    EXPECT_TRUE(listed.value()[0].at("label").starts_with("id-"));
+    EXPECT_EQ(listed.value()[0].at("label").find(test::kWired.usb_serial), std::string::npos);
+    EXPECT_EQ(listed.value()[0].at("label").find(test::kWired.port_context), std::string::npos);
     const auto forgotten = f.service.forget_phone(connection, phones[0].phone_id);
     ASSERT_FALSE(forgotten); EXPECT_EQ(forgotten.error().code(), ErrorCode::helper_unavailable);
     EXPECT_EQ(f.service.pending_revocations(), 1U);
@@ -466,6 +475,47 @@ TEST(ControlFlow, BoundDeadlineCheckedBeforeAndAfterHelperRpc) {
             return std::holds_alternative<aa::ipc::PairingClosed>(event);
         }), 1);
     }
+}
+
+TEST(ControlFlow, ListApprovedPhonesRedactsAllTransportsAndFailsClosedOnUnusableStore) {
+    test::TempStoreDir dir;
+    trust::ApprovedPhoneStore unloaded{dir.file()};
+    const auto unusable = trust::list_approved_phones(unloaded);
+    ASSERT_FALSE(unusable.has_value());
+    EXPECT_EQ(unusable.error().code(), ErrorCode::trust_store_io);
+
+    trust::ApprovedPhoneStore store{dir.file()};
+    ASSERT_TRUE(store.load());
+    const auto wired_id = store.approve(trust::TransportIdentity{test::kWired});
+    const auto wireless_id = store.approve(trust::TransportIdentity{test::kWireless});
+    const auto opaque_id = store.approve(trust::TransportIdentity{trust::OpaqueIdentity{"legacy-secret-key"}});
+    ASSERT_TRUE(wired_id.has_value());
+    ASSERT_TRUE(wireless_id.has_value());
+    ASSERT_TRUE(opaque_id.has_value());
+
+    const auto listed = trust::list_approved_phones(store);
+    ASSERT_TRUE(listed.has_value());
+    ASSERT_EQ(listed.value().size(), 3U);
+
+    EXPECT_EQ(listed.value()[0].at("phone_id"), std::to_string(wired_id.value().value));
+    EXPECT_EQ(listed.value()[0].at("transport"), "wired");
+    EXPECT_EQ(listed.value()[0].at("strength"), "serial-backed");
+    EXPECT_TRUE(listed.value()[0].at("label").starts_with("id-"));
+    EXPECT_EQ(listed.value()[0].at("label").find(test::kWired.usb_serial), std::string::npos);
+    EXPECT_EQ(listed.value()[0].at("label").find(test::kWired.port_context), std::string::npos);
+
+    EXPECT_EQ(listed.value()[1].at("phone_id"), std::to_string(wireless_id.value().value));
+    EXPECT_EQ(listed.value()[1].at("transport"), "wireless");
+    EXPECT_EQ(listed.value()[1].at("strength"), "bond-backed");
+    EXPECT_TRUE(listed.value()[1].at("label").starts_with("id-"));
+    EXPECT_EQ(listed.value()[1].at("label").find(test::kWireless.bond_address), std::string::npos);
+    EXPECT_EQ(listed.value()[1].at("label").find(test::kWireless.adapter), std::string::npos);
+
+    EXPECT_EQ(listed.value()[2].at("phone_id"), std::to_string(opaque_id.value().value));
+    EXPECT_EQ(listed.value()[2].at("transport"), "opaque");
+    EXPECT_EQ(listed.value()[2].at("strength"), "opaque");
+    EXPECT_TRUE(listed.value()[2].at("label").starts_with("id-"));
+    EXPECT_EQ(listed.value()[2].at("label").find("legacy-secret-key"), std::string::npos);
 }
 
 } // namespace

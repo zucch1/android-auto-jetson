@@ -298,6 +298,8 @@ int display_main(int argc, char** argv) {
     widget.set_telemetry_writer(&telemetry);
     widget.set_status(DisplayState::unavailable);
 
+    bool contract_phones_list = false;
+    bool contract_pairing_outcomes = false;
     aa::display::DecodeLossTelemetry decode_loss;
     auto factory = [errors, decoder_backend, &decode_loss, &telemetry,
                     inner = aa::display::helper_decode_sessions()](
@@ -369,7 +371,7 @@ int display_main(int argc, char** argv) {
         if (client_disconnected || !owner.value()) {
             return;
         }
-        auto connected = ControlBusClient::connect(ControlBusClient::Signals::ignore);
+        auto connected = ControlBusClient::connect(ControlBusClient::Signals::pairing_results);
         if (!connected.has_value()) {
             errors->report("attach", connected.error().code());
             return;
@@ -389,6 +391,25 @@ int display_main(int argc, char** argv) {
         }
         client = std::move(candidate);
         controller.emplace(std::move(attached.value()));
+        // Feature-detect contract 1.2.0 capabilities; fall back cleanly to 1.1.0 when absent.
+        contract_phones_list = false;
+        contract_pairing_outcomes = false;
+        if (const auto caps = client->get_capabilities(); caps.has_value()) {
+            const auto has_cap = [&caps](const char* key) {
+                const auto it = caps.value().find(key);
+                return it != caps.value().end() && it->second == "true";
+            };
+            contract_phones_list = has_cap("phones.list");
+            contract_pairing_outcomes = has_cap("pairing.outcomes");
+            if (contract_phones_list) {
+                if (const auto phones = client->list_phones(); phones.has_value()) {
+                    // Keep phone_id out of telemetry/evidence exports; emit only the count.
+                    static_cast<void>(telemetry.enqueue(
+                        "{\"event\":\"phones_listed\",\"count\":" +
+                        std::to_string(phones.value().size()) + "}"));
+                }
+            }
+        }
         errors->begin_attempt();
         widget.set_status(controller->state());
         widget.set_error({});
@@ -407,7 +428,8 @@ int display_main(int argc, char** argv) {
     widget.set_projection_control(&controls);
 
     QObject::connect(&pump_timer, &QTimer::timeout,
-                     [errors, &telemetry, &widget, &decode_loss, &controller,
+                     [errors, &telemetry, &widget, &decode_loss, &controller, &client,
+                      &contract_pairing_outcomes,
                       telemetry_reported = false]() mutable {
         // A full queue or failed write loses measurement events: show it once.
         // Only on screen: a stream write here could block on the same stdout
@@ -417,6 +439,28 @@ int display_main(int argc, char** argv) {
             widget.set_error("telemetry failure: events undelivered");
         }
         if (controller.has_value()) {
+            if (client && controller->state() != DisplayState::unavailable) {
+                for (int drained = 0; drained < 8; ++drained) {
+                    const auto sig = client->wait_signal(aa::core::Milliseconds{0});
+                    if (!sig.has_value()) {
+                        break;
+                    }
+                    if (contract_pairing_outcomes && sig.value().member == "PairingCompleted") {
+                        static_cast<void>(telemetry.enqueue(
+                            "{\"event\":\"pairing_completed\",\"request_id\":" +
+                            std::to_string(sig.value().request.value) + ",\"outcome\":\"" +
+                            sig.value().outcome + "\"}"));
+                    } else if (!contract_pairing_outcomes &&
+                               sig.value().member == "PairingClosed") {
+                        // 1.1.0 has no terminal outcome. A 1.2.0 receiver sends it
+                        // in PairingCompleted, so the pump never makes a blocking call.
+                        static_cast<void>(telemetry.enqueue(
+                            "{\"event\":\"pairing_outcome\",\"request_id\":" +
+                            std::to_string(sig.value().request.value) +
+                            ",\"outcome\":\"confirming\"}"));
+                    }
+                }
+            }
             const auto pumped = controller->pump(aa::core::Milliseconds{0});
             if (!pumped.has_value()) {
                 const auto code = pumped.error().code();

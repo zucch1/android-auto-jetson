@@ -34,6 +34,7 @@ void ControlService::teardown(std::string_view reason, DiagnosticSeverity severi
     for (const auto request : gate_.close_all()) {
         phones_.pairing_cancelled(request);
         events_.emit(PairingClosed{request});
+        finalize_pairing_outcome(request, "cancelled");
     }
     registered_.reset();
     open_pairing_.reset();
@@ -99,6 +100,7 @@ void ControlService::refresh_consumer_owner() {
         retire_failed_pairing(registered_->consumer, request, peer);
         (void)gate_.cancel({registered_->consumer, registered_->name}, request);
         events_.emit(PairingClosed{request});
+        finalize_pairing_outcome(request, "expired");
     }
     const auto owner = credentials_.name_owner(registered_->name);
     if (!owner.has_value() || !(owner.value() == registered_->connection)) {
@@ -113,6 +115,7 @@ void ControlService::refresh_consumer_owner() {
             (void)gate_.cancel({registered_->consumer, registered_->name}, request);
             if (open_pairing_ && open_pairing_->request == request) open_pairing_.reset();
             events_.emit(PairingClosed{request});
+            finalize_pairing_outcome(request, "expired");
             events_.emit(DiagnosticEmitted{DiagnosticSeverity::warning, "pairing_expired", request.value});
         }
     }
@@ -251,9 +254,73 @@ std::map<std::string, std::string> ControlService::capabilities() const {
         {"contract.semver", std::string{contract_semver()}},
         {"consumer.exclusive", "true"},
         {"pairing.one_time_request_ids", "true"},
+        {"pairing.outcomes", "true"},
+        {"phones.list", "true"},
         {"display.viewport", "true"},
         {"diagnostics.events", "true"},
     };
+}
+
+core::Result<std::vector<std::map<std::string, std::string>>> ControlService::list_phones(
+    const BusName& caller) {
+    const auto active = require_consumer();
+    if (!active.has_value()) {
+        return active.error();
+    }
+    const auto admitted = admit(caller, active.value());
+    if (!admitted.has_value()) {
+        return admitted.error();
+    }
+    return phones_.list_phones();
+}
+
+core::Result<std::string> ControlService::pairing_outcome(const BusName& caller,
+                                                          core::PairingRequestId request) {
+    const auto active = require_consumer();
+    if (!active.has_value()) {
+        return active.error();
+    }
+    const auto admitted = admit(caller, active.value());
+    if (!admitted.has_value()) {
+        return admitted.error();
+    }
+    if (!request) {
+        return Error{ErrorCode::ipc_malformed_request};
+    }
+    for (const auto& record : pairing_outcomes_) {
+        if (record.request != request) {
+            continue;
+        }
+        if (record.consumer != active.value().consumer) {
+            return Error{ErrorCode::ipc_peer_unauthorized};
+        }
+        return record.outcome;
+    }
+    return Error{ErrorCode::ipc_malformed_request};
+}
+
+void ControlService::record_pairing_pending(core::PairingRequestId request,
+                                            core::ConsumerId consumer) {
+    if (pairing_outcomes_.size() >= PairingGate::kIssuedBudget) {
+        pairing_outcomes_.erase(pairing_outcomes_.begin());
+    }
+    pairing_outcomes_.push_back(PairingOutcomeRecord{request, consumer, "pending", false});
+}
+
+void ControlService::finalize_pairing_outcome(core::PairingRequestId request,
+                                              std::string_view outcome) {
+    for (auto& record : pairing_outcomes_) {
+        if (record.request != request) {
+            continue;
+        }
+        if (record.terminal) {
+            return;
+        }
+        record.outcome = std::string{outcome};
+        record.terminal = true;
+        events_.emit(PairingCompleted{request, record.outcome});
+        return;
+    }
 }
 
 std::uint64_t ControlService::ping() const noexcept {

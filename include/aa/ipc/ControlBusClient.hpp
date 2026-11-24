@@ -12,6 +12,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace aa::ipc {
 
@@ -28,7 +29,7 @@ namespace aa::ipc {
 // wait_signal(), so interleaved signals are never lost.
 class ControlBusClient final {
 public:
-    // One declared contract signal as received on the wire (the five members
+    // One declared contract signal as received on the wire (the six members
     // of the contract; per-member fields carry that member's arguments).
     struct ContractSignal final {
         std::string member{};
@@ -38,9 +39,13 @@ public:
         DiagnosticSeverity severity{};
         std::string event{};
         std::uint64_t subject{};
+        std::string outcome{};
     };
 
-    enum class Signals { subscribe, ignore };
+    // subscribe: every contract signal. pairing_results: only PairingClosed and
+    // PairingCompleted broadcast by the contract name's owner, so the daemon
+    // never queues other broadcasts to this client. ignore: no subscription.
+    enum class Signals { subscribe, pairing_results, ignore };
 
     // Connects to the session bus (DBUS_SESSION_BUS_ADDRESS). Clients that
     // only make method calls can skip the contract signal subscription.
@@ -68,18 +73,24 @@ public:
     [[nodiscard]] core::Result<void> request_idr_recovery();
     [[nodiscard]] core::Result<void> set_display_viewport(Viewport viewport);
     [[nodiscard]] core::Result<StateSnapshot> get_state();
+    [[nodiscard]] core::Result<std::map<std::string, std::string>> get_capabilities();
     [[nodiscard]] core::Result<std::uint64_t> ping();
 
-    // Enrolment (RequestAddPhone / GetPairingCandidate / ConfirmPhonePairing /
-    // CancelPhonePairing): the consumer side of the add-phone flow (#133).
+    // Enrolment / approved-phone management (contract 1.1.0+ / 1.2.0+).
+    [[nodiscard]] core::Result<std::vector<std::map<std::string, std::string>>> list_phones();
+    [[nodiscard]] core::Result<std::string> pairing_outcome(core::PairingRequestId request);
     [[nodiscard]] core::Result<core::PairingRequestId> request_add_phone();
     [[nodiscard]] core::Result<std::map<std::string, std::string>> pairing_candidate(
         core::PairingRequestId request);
     [[nodiscard]] core::Result<void> confirm_phone_pairing(core::PairingRequestId request);
     [[nodiscard]] core::Result<void> cancel_phone_pairing(core::PairingRequestId request);
+    [[nodiscard]] core::Result<void> forget_phone(core::PhoneId phone);
 
     // Waits for the next declared contract signal (parked ones first). An
-    // expired wait is the typed error `timeout`.
+    // expired wait is the typed error `timeout`; a negative timeout never
+    // expires. A zero timeout never blocks and does bounded work: it reads
+    // frames already on the socket, examining at most 16 per call, and keeps a
+    // partial frame for the next call. Frames left over are read by later calls.
     [[nodiscard]] core::Result<ContractSignal> wait_signal(core::Milliseconds timeout);
 
     [[nodiscard]] const BusName& unique_name() const noexcept;

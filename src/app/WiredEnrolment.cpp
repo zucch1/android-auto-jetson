@@ -41,6 +41,10 @@ core::Result<void> WiredEnrolment::forget(core::PhoneId phone) {
     return forgotten;
 }
 
+core::Result<std::vector<std::map<std::string, std::string>>> WiredEnrolment::list_phones() const {
+    return open_ ? trust::list_approved_phones(store_) : after_.list_phones();
+}
+
 std::optional<helper::RevocationV1> WiredEnrolment::take_revocation_v1() {
     return open_ ? policy_.take_revocation_v1() : after_.take_revocation_v1();
 }

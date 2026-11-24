@@ -187,6 +187,27 @@ constexpr std::string_view kPropertiesInterface = "org.freedesktop.DBus.Properti
         }
         return from_void(service.request_idr_recovery(sender));
     }
+    case 16: {
+        if (!body_consumed(cursor)) {
+            return error_reply("org.freedesktop.DBus.Error.InvalidArgs", "malformed arguments");
+        }
+        const auto listed = service.list_phones(sender);
+        if (!listed) {
+            return error_reply(error_name_for(listed.error().code()), listed.error().message());
+        }
+        return ok(listed.value());
+    }
+    case 17: {
+        const auto id = cursor.read_u64();
+        if (!id || !body_consumed(cursor)) {
+            return error_reply("org.freedesktop.DBus.Error.InvalidArgs", "malformed arguments");
+        }
+        const auto outcome = service.pairing_outcome(sender, core::PairingRequestId{id.value()});
+        if (!outcome) {
+            return error_reply(error_name_for(outcome.error().code()), outcome.error().message());
+        }
+        return ok(outcome.value());
+    }
     default: return error_reply("org.freedesktop.DBus.Error.UnknownMethod", "unknown member");
     }
 }

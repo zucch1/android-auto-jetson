@@ -14,11 +14,14 @@
 #include "BusOwner.hpp"
 #include "BusWire.hpp"
 
+#include <array>
+#include <cstddef>
 #include <cstdint>
 #include <chrono>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace aa::ipc::dbus_adapter {
 
@@ -70,7 +73,18 @@ public:
     // drained oversize/big-endian frame returns transport_message_dropped;
     // callers must continue rather than treating that result as bus loss.
     // Malformed or incomplete framing closes the connection before returning.
+    // Resumes a frame that try_read_message() left incomplete.
     [[nodiscard]] core::Result<ParsedMessage> read_message(bool sensitive = false);
+
+    // Non-blocking read_message(): consumes only bytes already on the socket,
+    // at most kMaxMessageBytes per call. Empty means no complete frame is
+    // available yet; a partial frame is kept and resumed by the next read of
+    // either kind. A partial frame that gains no byte for the I/O timeout
+    // closes the connection, as it does for the blocking read.
+    [[nodiscard]] core::Result<std::optional<ParsedMessage>> try_read_message();
+
+    // True while a partial frame is buffered between reads.
+    [[nodiscard]] bool frame_pending() const noexcept { return inbound_.head_filled != 0; }
 
     // Per-connection diagnostic count of complete frames drained and dropped.
     [[nodiscard]] std::uint64_t dropped_messages() const noexcept { return dropped_messages_; }
@@ -95,6 +109,20 @@ public:
                                                 const OutboundReply& reply);
 
 private:
+    // One frame in progress, kept across reads so a non-blocking read can stop
+    // at any byte. `bytes` holds the whole frame once the fixed header is in;
+    // a frame being dropped only counts the bytes still to drain.
+    struct Inbound final {
+        std::array<std::uint8_t, 16> head{};
+        std::size_t head_filled{0};
+        bool framed{false};
+        bool dropping{false};
+        std::size_t drain_remaining{0};
+        std::vector<std::uint8_t> bytes{};
+        std::size_t filled{0};
+        std::chrono::steady_clock::time_point last_progress{};
+    };
+
     BusConnection() = default;
 
     // Sends one method call to the bus daemon and returns its reply.
@@ -103,6 +131,9 @@ private:
                                                    MessageWriter body);
     [[nodiscard]] core::Result<void> authenticate(std::string_view expected_guid);
     [[nodiscard]] core::Result<std::string> read_line();
+    // Advances the current frame; empty only when `blocking` is false.
+    [[nodiscard]] core::Result<std::optional<ParsedMessage>> next_message(bool blocking);
+    void reset_inbound() noexcept;
     void close_connection() noexcept;
 
     int fd_{-1};
@@ -113,6 +144,7 @@ private:
     // Opt-in survives timeout, skipped/malformed replies and serial reuse. Only
     // closing this connection proves no late sensitive reply can remain.
     bool sensitive_receive_{};
+    Inbound inbound_{};
 };
 
 // Maps a daemon-delivered message to the dispatch boundary input. The caller
