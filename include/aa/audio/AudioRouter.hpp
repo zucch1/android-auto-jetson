@@ -327,7 +327,8 @@ private:
 //   shorter or longer by). Proportional, at most 0.5% (under 9 cents), up to
 //   1% only while the excess is over 100 ms; the rate moves by at most 0.1%
 //   per A26 chunk. A 300 ms arrival backlog is back under 15 ms in about 45 s.
-//   A confirmed sink hold can use up to 4% until the backlog drains;
+//   After a confirmed sink hold media can use up to 2% until the backlog
+//   drains (guidance and system voice keep 1%);
 // - a short run (any packet size down to a third of a millisecond) takes the
 //   whole frame its predecessors' fractions add up to. It is placed and cut on its
 //   own, and written together with those that follow it without a gap;
@@ -525,6 +526,13 @@ struct RouterStats final {
     // written at slots that had passed, and by how much in total.
     std::uint64_t playout_retimes{};
     core::Nanoseconds playout_retimed{};
+    // Lossless playout on a read-clocked sink: times its reader ran past
+    // audio still scheduled to play (that audio is lost; the timeline is moved
+    // onto the reader), the total it ran ahead by, and server suspends of the
+    // sink stream (each can lose what the server had buffered).
+    std::uint64_t playout_sink_starvations{};
+    core::Nanoseconds playout_sink_starved{};
+    std::uint64_t playout_sink_suspends{};
     // Committed offset above the shedding threshold, even when the buffer
     // minimum prevents additional shedding.
     std::uint64_t playout_shed_residual_chunks{};

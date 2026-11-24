@@ -282,7 +282,12 @@ clock against monotonic time. This part moves the router timeline while keeping
 the sink stamps contiguous. Time lost while the sink kept reading instead
 moves its stamps. The 2 s emergency bound applies. Verify the heard shift and
 check for missing audio with numbered markers recorded on the sink monitor.)
-and `playout_retimed_ms` (their sum). A stopped stream plays out; `audio_stop_discarded` (`role`, `null`
+and `playout_retimed_ms` (their sum), `playout_sink_starvations` and
+`playout_sink_starved_ms` (times the Pulse reader passed audio still scheduled,
+which is lost, and how far it ran ahead in total; each also logs
+`audio_sink_starved` and moves the schedule onto the reader) and
+`playout_sink_suspends` (server suspends of the sink stream, which can lose what
+the server had buffered). A stopped stream plays out; `audio_stop_discarded` (`role`, `null`
 at shutdown, and `chunks`; at shutdown also `frames`, 48 kHz output frames of all
 roles, where a decoder tail alone is one chunk) reports accepted audio a stop had
 to cancel, or lost to a write that failed during it, including decoder tails whose

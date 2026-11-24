@@ -164,11 +164,23 @@ for a stream start, a resume or a real underrun; the cost is latency:
   delayed while the sink keeps playing, a late buffer is rescheduled at the
   sink's ingress and the next buffers follow it. The retime records that shift
   with `held_ms` zero. During Pulse phase confirmation, the receiver keeps
-  writing contiguous timestamps. Confirmed holds can temporarily compress PCM
-  by up to 4% to drain a 1.6 s backlog before another pause a minute later.
-  Recovery tapers near the target depth and uses the same rate slew as normal
-  playout. A negative `held_ms` records a forward step in the server's read
-  position, for example on a sink move.
+  writing contiguous timestamps. A confirmed hold lets media compress by up
+  to 2% (about a third of a semitone) until the backlog drains: back to the
+  ~60 ms depth about 17 s after a 300 ms pause, 52 s after 1 s and 82 s after
+  1.6 s. Guidance and system voice keep the ordinary 1% ceiling. Recovery
+  tapers near the target depth and uses the same rate slew as normal playout.
+  A negative `held_ms` records a forward step in the server's read position,
+  for example on a sink move.
+- the read clock takes over from write lateness once Pulse grants credit again
+  after audio starts (7-9 s live; `audio_read_clock_warming_up` at 1 s is
+  routine, `audio_read_clock_available` marks the hand-over). A pause before
+  that is held once by the write-lateness fallback; the read clock moves its
+  baseline by that hold and, eight credit requests later, hands the
+  fallback's estimation error back as an unlogged drift correction, so the
+  same pause is never held twice (#229). With no read progress before the
+  pause (Pulse sends its first credit request about 0.5 s after audio starts
+  in the private replay, 7-9 s live) the fallback's estimate stands: -13 ms
+  and +13 ms for 300 ms and 1 s pauses there, -45 to +24 ms in earlier runs.
 - video is held with the audio up to `700` ms (wireless `400`): a 16-chunk burst
   or a stall of about `600` ms, leaving ~`300` ms of the `1.0` s budget. Deeper,
   the hold is clipped (`video_hold_capped`) and A/V parts by the rest until it
@@ -188,16 +200,39 @@ for a stream start, a resume or a real underrun; the cost is latency:
 - A/V stays within the gates only while the offset stays under the wired hold cap:
   stalls up to about `600` ms (`700` ms less the normal `60` ms depth). Beyond,
   video leads audio by the rest until the buffer has drained back under the cap
-  (up to about 40 ms/s for a confirmed hold). A 1 s hold initially places the
+  (up to about 20 ms/s for a confirmed hold). A 1 s hold initially places the
   audio about 300 ms beyond the cap.
 - Wired Pulse uses `slave-method=none` to keep queued samples contiguous
   across a pause. The router estimates sink skew from Pulse read progress
   against the monotonic clock and limits its contribution to rate correction
   to ±500 ppm. This correction is separate from the phone clock and backlog
-  correction. After one second of written PCM without a usable read clock,
-  `audio_read_clock_unavailable` is logged and Pulse switches to
-  `slave-method=skew`. Heard playback across pauses needs requalification
-  when this warning appears.
+  correction. If the read clock has not warmed up after 20 s of written PCM,
+  `audio_read_clock_unavailable` is logged with a `cause`
+  (`no_matched_lines`, `no_request_lines`, `no_flush_lines`: the GStreamer
+  trace is broken, for example renamed by an update; `no_stable_phase`: lines
+  arrive but never settle). The sink stays unslaved: `slave-method=skew`
+  would drop or wait out every pause (the pre-#228 cascade). Drift is instead
+  measured from the pulsesink's own clock (`pa_stream_get_time`) over 15 s
+  windows without a hold and fed to the same ±500 ppm correction. Pauses are
+  then held by write lateness only, with the fallback's error. Heard playback
+  across pauses needs requalification when this warning appears.
+- If the Pulse reader ever passes audio the router still schedules (more
+  credit than the negotiated `tlength` while the router keeps writing),
+  `audio_sink_starved` is logged, the media timing record counts
+  `playout_sink_starvations` and `playout_sink_starved_ms`, and the schedule
+  is moved onto the reader (a negative `audio_playout_retime`); the sink's
+  ingress move then puts the next buffer ahead of the reader. The audio the
+  reader passed is lost and up to about a chunk of A/V error can remain, so a
+  run with a nonzero count fails qualification. No starvation should occur.
+- A server suspend of the sink (`pactl suspend-sink`) flushes what the server
+  had buffered downstream of Pulse's credit accounting: one chunk was lost
+  and audio played about 40 ms early afterwards in the review's private
+  replay, with no phase change the read clock could measure. A Pulse
+  `stream suspended` notification is counted as `playout_sink_suspends`, but
+  pipewire-pulse 1.0.5 sent none for `pactl suspend-sink` (the counter stayed
+  `0` in the #229 private replay), so this case is still unseen: no retime, a
+  lost chunk and about -40 ms of A/V. A sink move (`move-sink-input`) is
+  measured and applied as a negative step.
 
 Where latency ends and loss begins:
 

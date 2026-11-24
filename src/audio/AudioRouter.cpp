@@ -69,8 +69,11 @@ constexpr double kRatePpm = 5'000.0;
 constexpr double kDeepExcessMs = 100.0;
 constexpr double kDeepRatePpmPerMs = 50.0;
 // A measured stopped reader can add much more backlog than an arrival burst.
-// Up to 4% drains a 1.6 s hold within 60 s, including the proportional tail.
-constexpr unsigned kHoldRecoveryPercent = 4;
+// Media drains it at up to 2% (about a third of a semitone while resampled):
+// 300 ms in about 15 s, 1.6 s in about 80 s. Guidance and system voice keep
+// the ordinary 1% ceiling: pitch moves are easier to hear on speech. The
+// wireless video hold cap (#232) covers the longer A/V drain.
+constexpr unsigned kHoldRecoveryPercent = 2;
 constexpr double kHoldRecoveryPpm = kHoldRecoveryPercent * 10'000.0;
 constexpr double kHoldRecoveryDeadBandMs = 2.0;
 constexpr double kHoldRecoveryPpmPerMs = 400.0;
@@ -859,8 +862,8 @@ struct AudioRouter::Impl final {
     void retime(std::int64_t by, std::int64_t held = 0) {
         shift_timeline(by, by > 0);
         if (held > 0) {
-            for (auto& state : playout) {
-                if (state.anchored) { state.recovering_from_hold = true; }
+            if (auto& media = playout[role_index(Role::media)]; media.anchored) {
+                media.recovering_from_hold = true;
             }
         }
         auto& stats = report.stats;
@@ -2201,6 +2204,9 @@ core::Result<RenderStep> AudioRouter::render_step() {
     bool retimed = std::exchange(impl_->retimed, false);
     if (impl_->lossless()) {
         const auto timing = impl_->sink->take_timing_adjustment();
+        impl_->report.stats.playout_sink_starvations += timing.starvations;
+        impl_->report.stats.playout_sink_starved.count += timing.starved.count;
+        impl_->report.stats.playout_sink_suspends += timing.suspends;
         const auto held = timing.held.count != 0 && impl_->sink->hold_stream(timing.held)
             ? timing.held.count : 0;
         const bool have_timeline = impl_->timeline_base

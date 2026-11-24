@@ -19,6 +19,7 @@
 #include "PulseReadClock.hpp"
 
 #include <gst/app/gstappsrc.h>
+#include <gst/audio/gstaudiobasesink.h>
 #include <gst/gst.h>
 
 #include <algorithm>
@@ -136,6 +137,7 @@ struct HandoffTracker final {
     std::int64_t pulse_bytes_per_frame{};
     std::atomic<std::uint64_t> pulse_request_lines{};
     std::atomic<std::uint64_t> pulse_flush_lines{};
+    std::atomic<std::uint64_t> pulse_suspends{};
     std::uint64_t observation_sequence{};
 };
 
@@ -179,6 +181,29 @@ void handoff_log_observer(GstDebugCategory*, GstDebugLevel, const gchar*, const 
         && line.find(offset_prefix) != std::string_view::npos
         && (std::strcmp(function, "gst_pulseringbuffer_commit") == 0
             || std::strcmp(function, "gst_pulsering_flush") == 0);
+    // Stream setup logs the wanted and then the negotiated tlength.
+    constexpr std::string_view target_prefix{"tlength:"};
+    const bool pulse_target = std::strcmp(function, "gst_pulseringbuffer_acquire") == 0
+        && line.starts_with(target_prefix);
+    const bool pulse_suspended = std::strcmp(function, "gst_pulsering_stream_suspended_cb") == 0
+        && line.starts_with("stream suspended");
+    if (object != nullptr && (pulse_target || pulse_suspended)) {
+        std::lock_guard lock(g_trackers_mutex);
+        const auto entry = g_trackers.find(GST_OBJECT(object));
+        if (entry != g_trackers.end() && entry->second->pulse_clock != nullptr) {
+            auto& tracker = *entry->second;
+            if (pulse_suspended) {
+                tracker.pulse_suspends.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                auto amount = line.substr(target_prefix.size());
+                amount.remove_prefix(std::min(amount.find_first_not_of(' '), amount.size()));
+                std::int64_t bytes = 0;
+                const auto parsed = std::from_chars(amount.data(), amount.data() + amount.size(), bytes);
+                if (parsed.ec == std::errc{} && bytes > 0) { tracker.pulse_clock->set_target_length(bytes); }
+            }
+        }
+        return;
+    }
     if (object != nullptr && (pulse_requested || pulse_submitted)) {
         const auto now = observation_time().count;
         std::lock_guard lock(g_trackers_mutex);
@@ -706,6 +731,15 @@ public:
 
     ~GstSink() override { release(); }
 
+    void configure_read_clock_for_test(bool ignore_trace, std::optional<core::Milliseconds> broken_after) {
+        if (!observe_read_clock_) { return; }
+        if (ignore_trace) {
+            std::lock_guard lock(g_trackers_mutex);
+            handoff_.pulse_clock = nullptr;
+        }
+        if (broken_after) { read_clock_broken_after_ms_ = broken_after->count; }
+    }
+
     [[nodiscard]] bool attach_probe() {
         pad_ = gst_element_get_static_pad(sink_element_, "sink");
         if (pad_ == nullptr) {
@@ -993,21 +1027,26 @@ public:
                 data_bytes / frame_bytes, GST_SECOND, format_.sample_rate_hz);
             const auto moved = ingress_move_ns_.load();
             last_media_end_ = data_pts + static_cast<GstClockTime>(moved) + duration;
-            // Keep feeding contiguous PCM while requests confirm a phase
-            // step. Waiting for credits here can starve the ring of writes.
-            const auto adjustment = pulse_clock_.take_adjustment();
-            if (read_clock_active_) { timing_ = adjustment; }
-            timing_.moved.count = moved;
             // A write that just blocked still needs to reach the router's
-            // lateness fallback before the observer takes over.
-            if (!read_clock_active_ && pulse_clock_.ready() && observation_time(rendered_at).count
-                    <= chunk.timestamp.count + static_cast<std::int64_t>(duration)) {
-                read_clock_active_ = true;
-                if (warned_unavailable_) {
+            // lateness fallback before the observer takes over. Until then
+            // the clock keeps what it measures (a hold the fallback did not
+            // apply, the fallback's error, drift) and hands it over here.
+            const bool was_active = read_clock_active_;
+            read_clock_active_ = pulse_clock_.activate(observation_time(rendered_at).count
+                <= chunk.timestamp.count + static_cast<std::int64_t>(duration));
+            if (!was_active && read_clock_active_) {
+                read_clock_broken_ = false;
+                if (warned_warming_) {
                     g_message("audio_read_clock_available: pulsesink read progress warmed up "
                               "since_first_audio_ms=%" G_GINT64_FORMAT, static_cast<gint64>(since_first_ms));
                 }
             }
+            // Keep feeding contiguous PCM while requests confirm a phase
+            // step. Waiting for credits here can starve the ring of writes.
+            timing_ = pulse_clock_.take_adjustment();
+            timing_.moved.count = moved;
+            pulse_clock_.scheduled(chunk.timestamp.count + moved + timing_.held.count
+                + timing_.drift.count + static_cast<std::int64_t>(duration));
             if (read_clock_active_) {
                 playback_slot_ = {core::Nanoseconds{chunk.timestamp.count
                     + timing_.moved.count + timing_.held.count + timing_.drift.count},
@@ -1015,20 +1054,39 @@ public:
                 read_clock_slot_ = true;
                 return outcome;
             }
-            if (!warned_unavailable_ && since_first_ms >= 1'000) {
-                warned_unavailable_ = true;
+            if (!warned_warming_ && since_first_ms >= 1'000) {
+                // Routine: Pulse often grants no credit for several seconds
+                // after audio starts (7-9 s live).
+                warned_warming_ = true;
+                g_message("audio_read_clock_warming_up: using write lateness until pulsesink "
+                          "read progress warms up request_lines=%" G_GUINT64_FORMAT
+                          " since_first_audio_ms=%" G_GINT64_FORMAT,
+                          static_cast<guint64>(handoff_.pulse_request_lines.load()),
+                          static_cast<gint64>(since_first_ms));
+            }
+            if (!read_clock_broken_ && since_first_ms >= read_clock_broken_after_ms_) {
+                read_clock_broken_ = true;
+                device_rate_.reset();
                 GstDebugCategory* category = nullptr;
                 GST_DEBUG_CATEGORY_GET(category, "pulse");
                 const auto level = category ? gst_debug_category_get_threshold(category) : GST_LEVEL_NONE;
-                g_warning("audio_read_clock_unavailable: using write lateness while pulsesink warms up "
-                          "request_lines=%" G_GUINT64_FORMAT " flush_lines=%" G_GUINT64_FORMAT
-                          " hook_installed=%d gst_debug_active=%d pulse_debug_level=%d since_first_audio_ms=%" G_GINT64_FORMAT,
-                          static_cast<guint64>(handoff_.pulse_request_lines.load()),
-                          static_cast<guint64>(handoff_.pulse_flush_lines.load()),
+                const auto requests = handoff_.pulse_request_lines.load();
+                const auto flushes = handoff_.pulse_flush_lines.load();
+                g_warning("audio_read_clock_unavailable: pulsesink read progress trace %s after "
+                          "%" G_GINT64_FORMAT " ms of audio; using write lateness and the sink "
+                          "clock's skew cause=%s request_lines=%" G_GUINT64_FORMAT
+                          " flush_lines=%" G_GUINT64_FORMAT " hook_installed=%d gst_debug_active=%d "
+                          "pulse_debug_level=%d",
+                          requests == 0 || flushes == 0 ? "broken" : "not settling",
+                          static_cast<gint64>(since_first_ms),
+                          requests == 0 && flushes == 0 ? "no_matched_lines"
+                              : requests == 0 ? "no_request_lines"
+                              : flushes == 0 ? "no_flush_lines" : "no_stable_phase",
+                          static_cast<guint64>(requests), static_cast<guint64>(flushes),
                           static_cast<int>(g_handoff_observer_installed.load(std::memory_order_acquire)),
-                          static_cast<int>(gst_debug_is_active()), static_cast<int>(level),
-                          static_cast<gint64>(since_first_ms));
+                          static_cast<int>(gst_debug_is_active()), static_cast<int>(level));
             }
+            if (read_clock_broken_) { sample_device_rate(); }
         }
         playback_slot_ = request_playback_slot(data_pts, slot_until);
         return outcome;
@@ -1036,11 +1094,19 @@ public:
 
     [[nodiscard]] detail::SinkTimingAdjustment take_timing_adjustment() override {
         auto timing = std::exchange(timing_, {});
-        if (read_clock_active_) {
+        if (observe_read_clock_) {
             // A request can finish confirming the step between writes.
             const auto pending = pulse_clock_.take_adjustment();
             timing.held.count += pending.held.count;
             timing.drift.count += pending.drift.count;
+            const auto [starvations, starved] = pulse_clock_.take_starvation();
+            timing.starvations = starvations;
+            timing.starved.count = starved;
+            timing.suspends = handoff_.pulse_suspends.exchange(0);
+            if (starvations != 0) {
+                g_warning("audio_sink_starved: pulsesink read past the newest written audio by "
+                          "%.1f ms; the schedule moves onto the reader", static_cast<double>(starved) / 1e6);
+            }
         }
         return timing;
     }
@@ -1050,7 +1116,8 @@ public:
     }
 
     [[nodiscard]] double read_clock_skew_ppm() const override {
-        return read_clock_active_ ? pulse_clock_.skew_ppm() : 0.0;
+        if (read_clock_active_) { return pulse_clock_.skew_ppm(); }
+        return read_clock_broken_ ? device_rate_.ppm() : 0.0;
     }
 
     [[nodiscard]] bool last_slot_from_read_clock() const override {
@@ -1060,6 +1127,12 @@ public:
     [[nodiscard]] bool hold_stream(core::Nanoseconds by) override {
         if (!contiguous_stream_ || released_ || by.count == 0) { return false; }
         pts_hold_ns_ += by.count;
+        if (observe_read_clock_ && !read_clock_active_) {
+            // Only the router's write-lateness fallback holds while the read
+            // clock is inactive: the clock hands nothing over until then.
+            pulse_clock_.fallback_held(by.count);
+            device_rate_.restart();
+        }
         return true;
     }
 
@@ -1405,7 +1478,29 @@ private:
         handoff_.pulse_flush_lines = 0;
         first_audio_at_.reset();
         last_media_end_ = GST_CLOCK_TIME_NONE;
-        warned_unavailable_ = false;
+        warned_warming_ = false;
+        // A broken trace stays broken across streams; only activation clears it.
+        device_rate_.restart();
+    }
+
+    // Permanent fallback: follow the device rate through the pulsesink's own
+    // clock (pa_stream_get_time), which it keeps even with provide-clock off.
+    void sample_device_rate() {
+        // observe_read_clock_ implies the element is a pulsesink, which
+        // derives from GstAudioBaseSink.
+        if (sink_element_ != nullptr) {
+            auto* base = reinterpret_cast<GstAudioBaseSink*>(sink_element_);
+            GstClock* clock = nullptr;
+            GST_OBJECT_LOCK(sink_element_);
+            if (base->provided_clock != nullptr) { clock = GST_CLOCK(gst_object_ref(base->provided_clock)); }
+            GST_OBJECT_UNLOCK(sink_element_);
+            if (clock == nullptr) { return; }
+            const auto device = gst_clock_get_time(clock);
+            gst_object_unref(clock);
+            if (GST_CLOCK_TIME_IS_VALID(device) && device > 0) {
+                device_rate_.sample(observation_time().count, static_cast<std::int64_t>(device));
+            }
+        }
     }
 
     [[nodiscard]] static GQuark chain_owner_key() {
@@ -1644,7 +1739,11 @@ private:
     std::atomic<bool> read_clock_active_{false};
     std::optional<std::chrono::steady_clock::time_point> first_audio_at_{};
     GstClockTime last_media_end_{GST_CLOCK_TIME_NONE};
-    bool warned_unavailable_{};
+    bool warned_warming_{};
+    // No usable read progress after read_clock_broken_after_ms_ of audio.
+    bool read_clock_broken_{};
+    std::int64_t read_clock_broken_after_ms_{20'000};
+    detail::DeviceRateEstimate device_rate_{};
     std::int64_t pts_hold_ns_{0};
     detail::PulseReadClock pulse_clock_{};
     detail::SinkTimingAdjustment timing_{};
@@ -2219,6 +2318,8 @@ static SinkOpenOutcome open_sink(const SinkOpenRequest& request, bool native_qua
                                             request.on_write_progress,
                                             contiguous_pulse,
                                             contiguous_pulse && !request.disable_pulse_read_clock_for_test);
+    handle->configure_read_clock_for_test(request.ignore_pulse_read_trace_for_test,
+                                          request.pulse_read_clock_broken_after_for_test);
     if (!handle->attach_probe()) {
         handle->release();
         outcome.report.usable = false;

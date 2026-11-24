@@ -29,6 +29,13 @@ struct SinkTimingAdjustment final {
     core::Nanoseconds held{};  // signed read-clock phase step
     core::Nanoseconds moved{}; // the current buffer was rescheduled at ingress
     core::Nanoseconds drift{}; // small signed correction to the clock mapping
+    // The reader passed audio the router still planned to play (its schedule
+    // is moved onto the reader through `held`), and for how long in total.
+    std::uint64_t starvations{};
+    core::Nanoseconds starved{};
+    // The server suspended the stream; what it had buffered downstream of the
+    // credit accounting is gone and cannot be measured here.
+    std::uint64_t suspends{};
 };
 
 // The routed output sink (gate r2 F1 semantics).
@@ -126,6 +133,10 @@ struct SinkOpenRequest final {
     bool contiguous_stream{false};
     // Tests can exercise the write-lateness fallback on an unslaved Pulse ring.
     bool disable_pulse_read_clock_for_test{false};
+    // Tests can drop the read-progress trace (as a renamed GStreamer log line
+    // would) and shorten how long warm-up may take before it is declared broken.
+    bool ignore_pulse_read_trace_for_test{false};
+    std::optional<core::Milliseconds> pulse_read_clock_broken_after_for_test{};
 };
 
 struct SinkOpenOutcome final {
