@@ -84,6 +84,8 @@ constexpr std::int64_t kLatePlaybackNs = 20'000'000;
 // time (presented == scheduled at p99 in the 1800 s A26 runs of 2026-11-17), so
 // 20 ms is enough.
 constexpr std::int64_t kHoldLeadNs = 20'000'000;
+// Two output-clock times computed from the same frame and base.
+constexpr std::int64_t kSameInstantNs = 1'000;
 // How much is mixed at a time once such a role is late.
 constexpr std::int64_t kHoldQuantumNs = 10'000'000;
 // A role silent this long no longer holds the others.
@@ -539,6 +541,8 @@ struct AudioRouter::Impl final {
     // End (output clock) and end offset of the last reported write
     // (WriteCompletion): the reported offset is slewed from it.
     std::optional<std::pair<std::int64_t, std::int64_t>> last_reported{};
+    // Lossless: end (output clock) of the last write and when it returned.
+    std::optional<std::pair<std::int64_t, std::int64_t>> last_write{};
 
     void reset_playout(std::size_t role) noexcept {
         playout[role] = PlayoutRole{};
@@ -758,7 +762,7 @@ struct AudioRouter::Impl final {
     // slot, or the worker was held up), so every frame that is still to come
     // plays that much later. Moves the timeline rather than writing the rest
     // at times that have passed, which a ring buffer throws away.
-    void retime(std::int64_t by) {
+    void retime(std::int64_t by, std::int64_t held = 0) {
         timeline_base = core::Nanoseconds{timeline_base->count + by};
         for (std::size_t role = 0; role < kRoleCount; ++role) {
             auto& state = playout[role];
@@ -797,7 +801,7 @@ struct AudioRouter::Impl final {
         stats.playout_offset = core::Nanoseconds{offset};
         if (playout_events.size() < kMaxPlayoutEvents) {
             playout_events.push_back({PlayoutEvent::Kind::retime, core::Nanoseconds{by},
-                                      core::Nanoseconds{offset}, Role::media});
+                                      core::Nanoseconds{offset}, Role::media, core::Nanoseconds{held}});
         }
     }
 
@@ -1312,6 +1316,7 @@ core::Result<AudioRouter> open_router_with(
         request.drop_nonempty_at_ingress = config.drop_nonempty_at_ingress;
         request.drop_nonempty_after_window = config.drop_nonempty_after_window;
         request.on_write_progress = config.on_sink_write_progress;
+        request.contiguous_stream = config.playout.enabled && config.playout.lossless;
         detail::SinkOpenOutcome outcome = opener(request);
 
         impl->report.sink = outcome.report;
@@ -1901,6 +1906,7 @@ void AudioRouter::cancel_pending(protocol::ChannelRole role) {
         // The next stream re-anchors; the stat keeps the last reported value
         // (a stop no longer reads as a 0 ms offset in the final media_timing).
         impl_->last_reported.reset();
+        impl_->last_write.reset();
     }
     impl_->role_end_frames[role_index(*index)] = impl_->playback_cursor_frames;
     impl_->role_source_frontier_frames[role_index(*index)] = 0;
@@ -1987,6 +1993,7 @@ void AudioRouter::reset_session_timeline() {
     impl_->timeline_base.reset();
     impl_->newest_arrival = INT64_MIN;
     impl_->last_reported.reset();
+    impl_->last_write.reset();
     impl_->report.stats.playout_reported_offset = {};
     impl_->playback_cursor_frames = 0;
     impl_->role_end_frames.fill(0);
@@ -2409,7 +2416,26 @@ core::Result<RenderStep> AudioRouter::render_step() {
         const auto lead = std::min(kHoldLeadNs, impl_->config.playout.depth.count / 2);
         if (impl_->timeline_base && impl_->frame_time(cursor, base->count, slot_ns) && slot_ns < now_ns
             && now_ns - slot_ns <= impl_->config.playout.emergency_backlog.count) {
-            impl_->retime(now_ns - slot_ns + lead);
+            const auto late = now_ns - slot_ns;
+            // The part of it the write before this piece spent blocked past its
+            // own end. The output stood still meanwhile (a ring buffer is only
+            // full while nothing drains it), and a sink whose clock stops with
+            // it plays on from where it was: the sink takes that part into its
+            // own stream and its stamps stay contiguous. Moved on, they are a
+            // gap it waits out in silence, the next write blocking about as
+            // long, which retimed again: a 1 s live pause made 28 retimes and
+            // cut 6.3 s (#228). The rest, time that passed between writes, the
+            // sink played through dry, so its stamps move on with the schedule
+            // (or what follows lands behind its read position).
+            std::int64_t stood = 0;
+            if (impl_->last_write && std::abs(impl_->last_write->first - slot_ns) <= kSameInstantNs) {
+                stood = std::clamp<std::int64_t>(impl_->last_write->second - slot_ns, 0, late);
+            }
+            // Its share of the lead too, so the stamps of a sink that stood
+            // still the whole time do not move at all.
+            const auto held = stood + lead * stood / late;
+            const bool kept = held > 0 && impl_->sink && impl_->sink->hold_stream(core::Nanoseconds{held});
+            impl_->retime(late + lead, kept ? held : 0);
             impl_->retimed = true;
             lock.unlock();
             auto again = render_step();
@@ -2718,6 +2744,9 @@ core::Result<RenderStep> AudioRouter::render_step() {
         }
     } else { stats.frames_silence += frames; }
     lock.lock();
+    if (impl_->lossless()) {
+        impl_->last_write = std::pair{end_ns, impl_->config.clock ? impl_->now_ns() : done};
+    }
     std::erase_if(result.completed, [&](const auto& header) {
         const auto role = role_of(header.channel);
         return role && generations[role_index(*role)] != impl_->generations[role_index(*role)];

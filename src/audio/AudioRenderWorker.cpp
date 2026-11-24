@@ -120,9 +120,12 @@ struct AudioRenderWorker::SettlementDiagnostics {
             }
             if (event.kind == PlayoutEvent::Kind::retime) {
                 // The sink fell behind the schedule (a write blocked past its
-                // slot): everything after it plays shifted_ms later.
+                // slot): everything after it plays shifted_ms later. held_ms of
+                // it the sink took into its own stream (its clock stood still);
+                // the rest moved the stamps it is handed.
                 telemetry.log_media("audio_playout_retime",
                     "{\"event\":\"audio_playout_retime\",\"shifted_ms\":" + format_ms(event.late) +
+                    ",\"held_ms\":" + format_ms(event.held) +
                     ",\"offset_ms\":" + format_ms(event.depth) + ",\"retimes_lifetime\":" +
                     std::to_string(entry.lifetime) + "}");
                 continue;

@@ -159,8 +159,13 @@ for a stream start, a resume or a real underrun; the cost is latency:
   a third of a millisecond are corrected (a short run takes the whole frame its
   predecessors' fractions add up to);
 - after a sink stall of `S` ms past a slot: everything later plays ~`S` - 20 ms
-  later (`audio_playout_retime`) and drains the same way. Written on at slots that
-  had passed, it would be lost behind the ring buffer's read position;
+  later (one `audio_playout_retime`) and drains the same way. A sink that stood
+  still (its server paused: the write blocked) plays on from where it was, so its
+  stamps stay where they were (`held_ms` = `shifted_ms`; `pulsesink` runs with
+  `slave-method=none` on wired so it does not drop the pause's worth to catch its
+  clock up). Time lost between writes, which the sink played through dry, moves
+  its stamps instead (`held_ms` 0): written on at slots that had passed, the rest
+  would be lost behind the ring buffer's read position;
 - video is held with the audio up to `700` ms (wireless `400`): a 16-chunk burst
   or a stall of about `600` ms, leaving ~`300` ms of the `1.0` s budget. Deeper,
   the hold is clipped (`video_hold_capped`) and A/V parts by the rest until it
@@ -200,7 +205,9 @@ Check on a long hold with navigation prompts over music, from the last
 `audio_playout_anchor` records; `frames_compressed` / `frames_stretched` follow
 the phone's clock (a few hundred ppm of `frames_decoded`). No
 `audio_stall_bypass` and no `audio_stop_discarded`; `playout_retimes` grows only
-with `audio_playout_retime` records. A provoked stall may be heard as a gap of up
+with `audio_playout_retime` records, and a provoked sink pause makes one, with
+`held_ms` equal to `shifted_ms` (d0c5b41 retimed again behind each one: 28 for a
+1 s `pipewire-pulse` pause, then cut 6.3 s). A provoked stall may be heard as a gap of up
 to ~50 ms besides the stall itself, and one over ~600 ms breaks the A/V gates
 (`#232`). Listen for pitch movement after it: 1% is 17 cents, slid
 in over about half a second. `--audio-playout-ms 0` restores the legacy

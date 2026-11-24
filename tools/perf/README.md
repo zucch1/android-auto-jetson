@@ -277,7 +277,11 @@ inserted), `playout_overflows` (chunks cut by the 2 s emergency bound) and
 as `audio_playout_overflow` with `frames`, `frames_lifetime` and `depth_ms`),
 `playout_retimes` (times everything to come was moved later because a write
 blocked past its slot, each logged as `audio_playout_retime` with `shifted_ms`,
-`offset_ms` and `retimes_lifetime`; nothing after the blocked write is lost while
+`held_ms`, `offset_ms` and `retimes_lifetime`; `held_ms` is the part the sink took
+into its own stream because its clock stood still while the write blocked, so it
+plays on contiguously: a pause of the sink is one retime with `held_ms` equal to
+`shifted_ms`, time lost between writes has `held_ms` 0 and moves the sink's
+stamps; nothing after the blocked write is lost while
 the stall plus the depth before it stay within the 2 s bound, beyond which a retime
 makes late audio overflow; the write itself can lose up to ~50 ms inside the sink,
 which no counter shows, #232)

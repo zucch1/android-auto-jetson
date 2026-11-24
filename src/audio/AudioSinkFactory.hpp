@@ -78,6 +78,16 @@ public:
     [[nodiscard]] virtual PlaybackSlotAbsence last_playback_slot_absence() const {
         return last_playback_slot() ? PlaybackSlotAbsence::none : PlaybackSlotAbsence::unavailable;
     }
+    // Lossless playout (#228): the output stood still for `by` while a write
+    // blocked (a ring buffer is only full while nothing drains it), so its own
+    // clock stopped too and it plays on from where it was. Every later chunk is
+    // stamped `by` earlier on the sink's clock, so what it is handed stays
+    // contiguous with what it holds: a later stamp is a gap it would wait out
+    // in silence. False when the sink cannot (the stamps then move on).
+    [[nodiscard]] virtual bool hold_stream(core::Nanoseconds by) {
+        (void)by;
+        return false;
+    }
 };
 
 struct SinkOpenRequest final {
@@ -95,6 +105,11 @@ struct SinkOpenRequest final {
     bool drop_nonempty_at_ingress{false};
     bool drop_nonempty_after_window{false};
     std::function<void(const SinkWriteProgress&)> on_write_progress{};
+    // Lossless playout (#228): a ring-buffer element keeps its stream
+    // contiguous across a stall it recovers from (slave-method none: it never
+    // drops or repeats samples to put its stopped clock right) and honours
+    // hold_stream(). The router's rate correction owns the timing.
+    bool contiguous_stream{false};
 };
 
 struct SinkOpenOutcome final {

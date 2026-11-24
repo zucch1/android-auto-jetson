@@ -546,6 +546,10 @@ struct PlayoutEvent final {
     // Depth the role was re-anchored with; retime: the offset it left.
     core::Nanoseconds depth{};
     Role role{Role::media};
+    // retime: the part of `late` the sink took into its own stream because its
+    // clock stood still while a write blocked (ObservedAudioSink::hold_stream):
+    // it plays on contiguously instead of waiting that out in silence.
+    core::Nanoseconds held{};
 };
 
 // ELEMENT-INGRESS observations (task-25 gate fix round 2): what entered the
