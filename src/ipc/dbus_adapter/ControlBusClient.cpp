@@ -605,10 +605,10 @@ core::Result<ControlBusClient::ContractSignal> ControlBusClient::wait_signal(
                 std::chrono::duration_cast<std::chrono::milliseconds>(
                     deadline - std::chrono::steady_clock::now())
                     .count();
-            if (remaining <= 0) {
-                return Error{ErrorCode::timeout};
-            }
-            limit = remaining > 2000 ? 2000 : static_cast<int>(remaining);
+            // A zero or expired timeout still polls the socket once without
+            // blocking, so a non-blocking caller (the display pump) can drain
+            // signals that have arrived; poll() returning 0 ends the wait.
+            limit = remaining <= 0 ? 0 : (remaining > 2000 ? 2000 : static_cast<int>(remaining));
         }
         if (impl_->connection->native_handle() < 0) return Error{ErrorCode::transport_closed};
         ::pollfd descriptor{impl_->connection->native_handle(), POLLIN, 0};

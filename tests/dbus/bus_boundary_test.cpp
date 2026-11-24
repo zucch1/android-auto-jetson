@@ -709,11 +709,16 @@ TEST(BusBoundary, ListPhonesAndPairingOutcomeRoundTripOverRealSessionBus) {
     ASSERT_TRUE(approved.has_value());
     EXPECT_EQ(approved.value(), "approved");
 
+    // Drain with a zero timeout only, as the reference display's pump does:
+    // a non-blocking wait must still read signals waiting on the socket.
     bool saw_completed = false;
-    for (int i = 0; i < 8 && !saw_completed; ++i) {
-        const auto sig = client.value().wait_signal(aa::core::Milliseconds{200});
+    const auto drain_deadline = std::chrono::steady_clock::now() + std::chrono::seconds{2};
+    while (!saw_completed && std::chrono::steady_clock::now() < drain_deadline) {
+        const auto sig = client.value().wait_signal(aa::core::Milliseconds{0});
         if (!sig.has_value()) {
-            break;
+            ASSERT_EQ(sig.error().code(), ErrorCode::timeout);
+            std::this_thread::sleep_for(std::chrono::milliseconds{5});
+            continue;
         }
         if (sig.value().member == "PairingCompleted" && sig.value().request == req.value()) {
             EXPECT_EQ(sig.value().outcome, "approved");
