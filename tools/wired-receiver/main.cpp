@@ -55,6 +55,7 @@
 
 #include <array>
 #include <atomic>
+#include <charconv>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -67,6 +68,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <stop_token>
 #include <string>
 #include <system_error>
 #include <thread>
@@ -138,6 +140,22 @@ void log_sink_selected(const aa::audio::SinkReport &selected, std::string_view o
 }
 
 void on_signal(int) { g_running.store(false); }
+
+// The handler only publishes the shutdown flag. A normal thread wakes USB waits,
+// even if the D-Bus dispatcher is inside a synchronous ForgetPhone call.
+std::jthread cancel_open_on_shutdown(aa::core::CancellationSource &source) {
+    return std::jthread([&source](const std::stop_token &stop) {
+        std::mutex mutex;
+        std::condition_variable_any cv;
+        std::unique_lock lock(mutex);
+        while (g_running.load() && !stop.stop_requested()) {
+            cv.wait_for(lock, stop, std::chrono::milliseconds{25}, [] { return false; });
+        }
+        if (!g_running.load()) {
+            source.request_stop();
+        }
+    });
+}
 
 using aa::audio::AudioDispatchObservation;
 using aa::audio::AudioFailureOrigin;
@@ -371,18 +389,20 @@ int run_wired_enrolment(aa::ipc::ControlBusService &bus, aa::app::WiredEnrolment
 const char *const kUsage =
     "usage: aa-wired-receiver --port <usb-port-context> [--store PATH]\n"
     "                         [--video-socket PATH] [--input-socket PATH]\n"
-    "                         [--duration-ms N] [--no-bus]\n"
+    "                         [--duration-ms N] [--reconnect-ms N] [--no-bus]\n"
     "                         [--require-video-consumer] [--wired-enrolment]\n"
     "                         [--screen-<field> N]... [--screen-experimental-geometry]\n"
     "                         [--audio-sink pulse|pipewire|automatic]\n"
     "                         [--require-usb-serial SERIAL]\n"
     "  runs the wired session over USB/AOA with TrustStore admission;\n"
     "  the approved-phones store must already contain the phone (fail closed).\n"
+    "  --reconnect-ms bounds recovery from link loss to active\n"
+    "  (1..120000 ms, default 30000).\n"
     "  --wired-enrolment: when admission refuses the phone, keep the D-Bus\n"
     "  contract up for 120 s so the registered consumer can approve that exact\n"
     "  refused phone (RequestAddPhone, GetPairingCandidate, then\n"
     "  ConfirmPhonePairing = yes or CancelPhonePairing = no; aa-wired-enrol is\n"
-    "  the terminal reference). An approval exits 0 (replug to connect); no\n"
+    "  the terminal reference). An approval exits 0 (restart to connect); no\n"
     "  approval exits 3. Needs the bus (not with --no-bus).\n"
     "  --require-usb-serial pins the run to one physical phone: the first link\n"
     "  and every reconnect must carry this pre-switch USB serial (the adb\n"
@@ -421,6 +441,7 @@ int receiver_main(int argc, char **argv) {
     std::string video_socket = aa::ipc::production_video_socket_path().value;
     std::string input_socket = aa::ipc::production_input_socket_path().value;
     std::int64_t duration_ms = 0;
+    std::int64_t reconnect_ms = 30'000;
     bool no_bus = false;
     bool require_video_consumer = false;
     bool wired_enrolment = false;
@@ -461,6 +482,14 @@ int receiver_main(int argc, char **argv) {
             input_socket = argv[++index];
         } else if (std::strcmp(argv[index], "--duration-ms") == 0 && index + 1 < argc) {
             duration_ms = std::strtoll(argv[++index], nullptr, 10);
+        } else if (std::strcmp(argv[index], "--reconnect-ms") == 0 && index + 1 < argc) {
+            const std::string_view value{argv[++index]};
+            const auto end = value.data() + value.size();
+            const auto [ptr, ec] = std::from_chars(value.data(), end, reconnect_ms);
+            if (ec != std::errc{} || ptr != end || reconnect_ms < 1 || reconnect_ms > 120'000) {
+                std::fputs("invalid --reconnect-ms\n", stderr);
+                return 2;
+            }
         } else if (std::strcmp(argv[index], "--no-bus") == 0) {
             no_bus = true;
         } else if (std::strcmp(argv[index], "--require-video-consumer") == 0) {
@@ -583,6 +612,7 @@ int receiver_main(int argc, char **argv) {
 
     aa::app::WiredSessionConfig session_config{};
     session_config.lifecycle.phases.negotiate = Milliseconds{15'000};
+    session_config.lifecycle.wired_reconnect = Milliseconds{reconnect_ms};
     session_config.input_enabled = true;
     session_config.input = input;
     aa::app::WiredSession session{{store, clock, diagnostics}, session_config};
@@ -646,8 +676,12 @@ int receiver_main(int argc, char **argv) {
     aa::transport::UsbDeviceSelector selector{};
     selector.port_context = port;
     aa::transport::AoaAccessoryInfo accessory{};
-    log_line("{\"event\":\"connecting\",\"port\":\"" +
-             aa::diagnostics::redact_identifier(port) + "\"}");
+    const auto redacted_port = aa::diagnostics::redact_identifier(port);
+    log_line("{\"event\":\"connecting\",\"port\":\"" + redacted_port + "\"}");
+    const auto log_reset = [&](std::string_view status) {
+        log_line_nonblocking("{\"event\":\"diag\",\"detail\":\"aoa_reset\",\"port\":\"" +
+                             redacted_port + "\",\"status\":\"" + std::string{status} + "\"}");
+    };
 
     // Per-link cipher (P1-B/P1-C): the initial attach AND every reconnect build
     // a FRESH cipher bound to the identity the TrustStore admitted for THIS
@@ -674,7 +708,19 @@ int receiver_main(int argc, char **argv) {
         "{\"event\":\"err\",\"detail\":\"link\",\"code\":\"phone_serial_mismatch\"}";
 
     aa::trust::WiredIdentity attempted_identity{};
-    auto first_link = aa::app::open_wired_link(selector, accessory, store, {}, &attempted_identity);
+    auto first_link = [&] {
+        aa::core::CancellationSource startup_stop;
+        auto watch_shutdown = cancel_open_on_shutdown(startup_stop);
+        aa::core::Deadline startup_budget;
+        startup_budget.cancellation = startup_stop.get_token();
+        aa::transport::AoaRecovery startup_recovery;
+        startup_recovery.reset_status = log_reset;
+        return aa::app::open_wired_link(selector, accessory, store, startup_budget,
+                                        &attempted_identity, &startup_recovery);
+    }();
+    if (!g_running.load()) {
+        return 0;
+    }
     if (!first_link.has_value()) {
         // ADDITIVE attribution at admission rejection (item 2): the link-error
         // record names the rejected attempt's identity+port. The identity is
@@ -742,6 +788,9 @@ int receiver_main(int argc, char **argv) {
     std::atomic<bool> admitted{false};
     std::mutex gate_mutex;
     std::condition_variable gate_cv;
+    aa::core::CancellationSource reconnect_stop;
+    aa::transport::AoaRecovery recovery;
+    recovery.reset_status = log_reset;
     bool runtime_failed = false;
 
     auto service_control = [&] {
@@ -843,7 +892,14 @@ int receiver_main(int argc, char **argv) {
             return lost.error();
         }
         video_outlet.reset();
-        const auto budget = session.io_deadline();
+        const auto session_budget = session.io_deadline();
+        aa::core::CancellationSource open_stop;
+        const std::stop_callback cancel_on_session_stop{session_budget.cancellation,
+                                                        [&] { open_stop.request_stop(); }};
+        const std::stop_callback cancel_on_dispatcher_stop{reconnect_stop.get_token(),
+                                                           [&] { open_stop.request_stop(); }};
+        auto watch_shutdown = cancel_open_on_shutdown(open_stop);
+        const aa::core::Deadline budget{session_budget.until, open_stop.get_token()};
         while (g_running.load()) {
             if (service_control()) {
                 return aa::Error{aa::ErrorCode::cancelled};
@@ -852,8 +908,12 @@ int receiver_main(int argc, char **argv) {
                 session.tick();
                 return checked.error();
             }
-            auto relink = aa::app::open_wired_link(selector, accessory, store, budget);
-            if (service_control()) {
+            const aa::core::Deadline slice{
+                std::min(budget.until, aa::core::Deadline::Clock::now() + std::chrono::seconds{1}),
+                budget.cancellation};
+            auto relink = aa::app::open_wired_link(selector, accessory, store, slice,
+                                                  nullptr, &recovery);
+            if (!g_running.load() || service_control()) {
                 return aa::Error{aa::ErrorCode::cancelled};
             }
             if (relink) {
@@ -1043,7 +1103,9 @@ int receiver_main(int argc, char **argv) {
                 }
                 if (session.state() == aa::session::State::negotiating &&
                     session.channel_opens() > 0) {
-                    (void)session.apply(aa::session::Event::negotiation_succeeded);
+                    if (session.apply(aa::session::Event::negotiation_succeeded)) {
+                        recovery.reset_attempted = false;
+                    }
                 }
                 if (session.state() == aa::session::State::active && active_ms.load() < 0) {
                     const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -1155,6 +1217,9 @@ int receiver_main(int argc, char **argv) {
     }
 
     g_running.store(false);
+    // A link open can wait for re-enumeration while the owner holds the mutex.
+    // Wake it before taking the mutex for the ordered session stop.
+    reconnect_stop.request_stop();
 #ifdef AA_WIRED_RECEIVER_SHUTDOWN_TEST
     if (shutdown_observation) {
         shutdown_observation->published_false();

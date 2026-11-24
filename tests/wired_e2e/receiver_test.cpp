@@ -1312,6 +1312,12 @@ std::atomic<int> runtime_connects{0};
 std::atomic<int> runtime_ciphers{0};
 std::atomic<int> runtime_sends{0};
 bool runtime_recovers = false;
+int runtime_wait_on_open_attempt = 0;
+int runtime_fake_usb_from_attempt = 0;
+std::atomic<bool> runtime_open_wait_started{false};
+std::atomic<bool> runtime_open_wait_cancelled{false};
+std::chrono::milliseconds runtime_reenumeration_delay{0};
+std::chrono::steady_clock::time_point runtime_link_lost_at;
 bool runtime_quiet = false;
 std::atomic<bool> runtime_waiting{false};
 std::atomic<bool> runtime_closed{false};
@@ -1680,25 +1686,39 @@ class AdmissionTransport final : public aa::transport::Transport {
 std::shared_ptr<AdmissionState> admission_link_state;
 }
 
+// Redirect only the adapter's dlopen in the fake USB recovery case. AASDK
+// still links its usual libusb dependency at process startup.
+extern "C" void *__real_dlopen(const char *filename, int flags);
+extern "C" void *__wrap_dlopen(const char *filename, int flags) {
+    if (runtime_fake_usb_from_attempt > 0 && filename &&
+        (std::strcmp(filename, "libusb-1.0.so.0") == 0 ||
+         std::strcmp(filename, "libusb-1.0.so") == 0)) {
+        return __real_dlopen(AA_FAKE_LIBUSB_PATH, flags);
+    }
+    return __real_dlopen(filename, flags);
+}
+
 // Link-time seams keep the real CLI/thread loop under test without USB or audio hardware.
 aa::core::Result<aa::app::WiredLink>
 real_open_link(const aa::transport::UsbDeviceSelector &, const aa::transport::AoaAccessoryInfo &,
                const aa::trust::TrustStore &, const aa::core::Deadline &,
-               aa::trust::WiredIdentity *)
-    asm("__real__ZN2aa3app15open_wired_linkERKNS_9transport17UsbDeviceSelectorERKNS1_16AoaAccessoryInfoERKNS_5trust10TrustStoreERKNS_4core8DeadlineEPNS8_13WiredIdentityE");
+               aa::trust::WiredIdentity *, aa::transport::AoaRecovery *)
+    asm("__real__ZN2aa3app15open_wired_linkERKNS_9transport17UsbDeviceSelectorERKNS1_16AoaAccessoryInfoERKNS_5trust10TrustStoreERKNS_4core8DeadlineEPNS8_13WiredIdentityEPNS1_11AoaRecoveryE");
 aa::core::Result<aa::app::WiredLink>
 runtime_open_link(const aa::transport::UsbDeviceSelector &, const aa::transport::AoaAccessoryInfo &,
                   const aa::trust::TrustStore &, const aa::core::Deadline &,
-                  aa::trust::WiredIdentity *)
-    asm("__wrap__ZN2aa3app15open_wired_linkERKNS_9transport17UsbDeviceSelectorERKNS1_16AoaAccessoryInfoERKNS_5trust10TrustStoreERKNS_4core8DeadlineEPNS8_13WiredIdentityE");
+                  aa::trust::WiredIdentity *, aa::transport::AoaRecovery *)
+    asm("__wrap__ZN2aa3app15open_wired_linkERKNS_9transport17UsbDeviceSelectorERKNS1_16AoaAccessoryInfoERKNS_5trust10TrustStoreERKNS_4core8DeadlineEPNS8_13WiredIdentityEPNS1_11AoaRecoveryE");
 aa::core::Result<aa::app::WiredLink>
 runtime_open_link(const aa::transport::UsbDeviceSelector &selector,
                   const aa::transport::AoaAccessoryInfo &info,
                   const aa::trust::TrustStore &store, const aa::core::Deadline &deadline,
-                  aa::trust::WiredIdentity *attempted_identity) {
+                  aa::trust::WiredIdentity *attempted_identity,
+                  aa::transport::AoaRecovery *recovery) {
     const int attempt = ++runtime_connects;
-    if (runtime_real_admission) {
-        return real_open_link(selector, info, store, deadline, attempted_identity);
+    if (runtime_real_admission ||
+        (runtime_fake_usb_from_attempt > 0 && attempt >= runtime_fake_usb_from_attempt)) {
+        return real_open_link(selector, info, store, deadline, attempted_identity, recovery);
     }
     if (admission_link_state) {
         if (attempt != 1) {
@@ -1712,7 +1732,25 @@ runtime_open_link(const aa::transport::UsbDeviceSelector &selector,
         admission_link_state->cv.notify_all();
         return aa::app::WiredLink{std::move(transport), runtime_phone};
     }
-    if (attempt == 1 || (runtime_recovers && attempt >= 4)) {
+    if (attempt == 2) {
+        runtime_link_lost_at = std::chrono::steady_clock::now();
+    }
+    if (attempt == runtime_wait_on_open_attempt) {
+        if (attempt > 1) {
+            EXPECT_LE(deadline.until - aa::core::Deadline::Clock::now(), std::chrono::seconds{1});
+        }
+        std::mutex mutex;
+        std::condition_variable_any cv;
+        std::unique_lock lock(mutex);
+        runtime_open_wait_started.store(true);
+        cv.wait_until(lock, deadline.cancellation, deadline.until, [] { return false; });
+        const bool cancelled = deadline.cancellation.stop_requested();
+        runtime_open_wait_cancelled.store(cancelled);
+        return aa::Error{cancelled ? aa::ErrorCode::cancelled : aa::ErrorCode::timeout};
+    }
+    if (attempt == 1 ||
+        (runtime_recovers && attempt >= 4 &&
+         std::chrono::steady_clock::now() - runtime_link_lost_at >= runtime_reenumeration_delay)) {
         const auto &phone = attempt >= 4 && !runtime_reconnect_phone.key.empty()
                                 ? runtime_reconnect_phone : runtime_phone;
         return aa::app::WiredLink{std::make_unique<RuntimeTransport>(attempt == 1), phone};
@@ -2515,6 +2553,78 @@ TEST(WiredReceiver, TransientLinkLossRetriesUntilFreshSessionRecovers) {
         << result.output;
 }
 
+TEST(WiredReceiver, DefaultReconnectWindowSurvivesSlowUsbReenumeration) {
+    runtime_reenumeration_delay = std::chrono::milliseconds{5'200};
+    const auto result = run_runtime(true, 9'000);
+    runtime_reenumeration_delay = std::chrono::milliseconds{0};
+
+    EXPECT_EQ(result.code, 0) << result.output;
+    EXPECT_EQ(runtime_ciphers.load(), 2);
+    const auto active = result.output.find("\"to_state\":\"active\"");
+    ASSERT_NE(active, std::string::npos) << result.output;
+    EXPECT_NE(result.output.find("\"to_state\":\"active\"", active + 1), std::string::npos)
+        << result.output;
+}
+
+void check_signal_interrupts_link_open(int attempt) {
+    runtime_wait_on_open_attempt = attempt;
+    runtime_open_wait_started.store(false);
+    runtime_open_wait_cancelled.store(false);
+    auto run = std::async(std::launch::async, [] { return run_runtime(false, 3'000); });
+    const auto ready_by = std::chrono::steady_clock::now() + std::chrono::seconds{2};
+    while (!runtime_open_wait_started.load() && std::chrono::steady_clock::now() < ready_by) {
+        std::this_thread::sleep_for(std::chrono::milliseconds{1});
+    }
+    const bool waiting = runtime_open_wait_started.load();
+    const auto sent = std::chrono::steady_clock::now();
+    if (waiting) {
+        EXPECT_EQ(::raise(SIGTERM), 0);
+    }
+    const auto result = run.get();
+    const auto elapsed = std::chrono::steady_clock::now() - sent;
+    runtime_wait_on_open_attempt = 0;
+
+    EXPECT_TRUE(waiting) << result.output;
+    EXPECT_TRUE(runtime_open_wait_cancelled.load()) << result.output;
+    EXPECT_EQ(result.code, 0) << result.output;
+    EXPECT_EQ(runtime_connects.load(), attempt);
+    EXPECT_LT(elapsed, std::chrono::seconds{2});
+}
+
+TEST(WiredReceiver, ShutdownInterruptsAReconnectWaitingForReenumeration) {
+    check_signal_interrupts_link_open(2);
+}
+
+TEST(WiredReceiver, ShutdownInterruptsStartupOpen) {
+    check_signal_interrupts_link_open(1);
+}
+
+TEST(WiredReceiverUsbRecovery, FailedResetIsIssuedOnlyOnceAcrossReconnectAttempts) {
+    char directory[] = "/tmp/wired-usb-reset-XXXXXX";
+    const std::filesystem::path root{::mkdtemp(directory)};
+    const auto log_path = root / "usb.calls";
+    ASSERT_EQ(::setenv("AA_FAKE_LIBUSB_SCENARIO", "reset-fails", 1), 0);
+    ASSERT_EQ(::setenv("AA_FAKE_LIBUSB_LOG", log_path.c_str(), 1), 0);
+    runtime_fake_usb_from_attempt = 2;
+    runtime_extra_args = {"--reconnect-ms", "1500"};
+    const auto result = run_runtime(false, 3'000);
+    runtime_extra_args.clear();
+    runtime_fake_usb_from_attempt = 0;
+    ::unsetenv("AA_FAKE_LIBUSB_LOG");
+    ::unsetenv("AA_FAKE_LIBUSB_SCENARIO");
+
+    std::ifstream log{log_path};
+    const std::string calls{std::istreambuf_iterator<char>{log}, {}};
+    std::filesystem::remove_all(root);
+    EXPECT_EQ(result.code, 1) << result.output;
+    EXPECT_GE(runtime_connects.load(), 4);
+    EXPECT_EQ(count_substr(calls, "libusb_reset_device"), 1U) << calls;
+    EXPECT_EQ(count_substr(result.output, "\"detail\":\"aoa_reset\""), 2U) << result.output;
+    EXPECT_NE(result.output.find("\"status\":\"issued\""), std::string::npos) << result.output;
+    EXPECT_NE(result.output.find("\"status\":\"transport_io\""), std::string::npos) << result.output;
+    EXPECT_EQ(result.output.find("\"port\":\"1-2.1\""), std::string::npos) << result.output;
+}
+
 TEST(WiredReceiver, RequiredUsbSerialAdmitsTheSamePhoneAcrossReconnects) {
     // Given the qualification pin naming the attached phone's USB serial.
     runtime_extra_args = {"--require-usb-serial", "SYNTHETIC"};
@@ -2563,11 +2673,26 @@ TEST(WiredReceiver, RequiredUsbSerialMustNotBeEmpty) {
 }
 
 TEST(WiredReceiver, PermanentLinkLossExitsNonzeroWithinWiredRecoveryBudget) {
-    const auto result = run_runtime(false);
+    runtime_extra_args = {"--reconnect-ms", "300"};
+    const auto result = run_runtime(false, 2'000);
+    runtime_extra_args.clear();
+
     EXPECT_EQ(result.code, 1) << "dead session returned clean success: " << result.output;
-    EXPECT_GE(runtime_connects.load(), 3);
+    EXPECT_GE(runtime_connects.load(), 2);
     EXPECT_EQ(runtime_ciphers.load(), 1);
-    EXPECT_LT(result.elapsed, std::chrono::milliseconds{5500});
+    EXPECT_LT(result.elapsed, std::chrono::seconds{2});
+    EXPECT_NE(result.output.find("\"to_state\":\"failed\""), std::string::npos) << result.output;
+}
+
+TEST(WiredReceiver, InvalidReconnectWindowIsAUsageError) {
+    for (const auto *value : {"0", "-1", "120001", "5000ms", ""}) {
+        SCOPED_TRACE(value);
+        runtime_extra_args = {"--reconnect-ms", value};
+        const auto result = run_runtime(false);
+        runtime_extra_args.clear();
+        EXPECT_EQ(result.code, 2);
+        EXPECT_EQ(runtime_connects.load(), 0);
+    }
 }
 
 TEST(WiredReceiver, ActiveFramesShutdownOrdersStopAndReset) {
@@ -2736,7 +2861,7 @@ TEST(WiredReceiver, ActiveFramesShutdownOrdersStopAndReset) {
     }
 }
 
-TEST(WiredReceiver, ForgetPhoneUsesOwnerQueueAndDisconnectsQuietSession) {
+void check_forget_phone_during_session(bool reconnecting) {
     namespace bus = aa::ipc::dbus_adapter;
     namespace faults = aa::trust::test::faults;
     char directory[] = "/tmp/wired-revoke-runtime-XXXXXX";
@@ -2749,7 +2874,9 @@ TEST(WiredReceiver, ForgetPhoneUsesOwnerQueueAndDisconnectsQuietSession) {
     const auto approved = initial.approve(aa::trust::TransportIdentity{identity});
     ASSERT_TRUE(approved.has_value());
     runtime_phone = aa::app::wired_phone_identity(identity).value();
-    runtime_quiet = true;
+    runtime_quiet = !reconnecting;
+    runtime_wait_on_open_attempt = reconnecting ? 2 : 0;
+    runtime_open_wait_started.store(false);
     runtime_recovers = false;
     runtime_connects.store(0);
     runtime_ciphers.store(0);
@@ -2786,15 +2913,19 @@ TEST(WiredReceiver, ForgetPhoneUsesOwnerQueueAndDisconnectsQuietSession) {
         }
     });
     const auto until = std::chrono::steady_clock::now() + std::chrono::seconds{2};
-    while (!runtime_waiting.load() && std::chrono::steady_clock::now() < until) {
+    const auto waiting = [&] {
+        return reconnecting ? runtime_open_wait_started.load() : runtime_waiting.load();
+    };
+    while (!waiting() && std::chrono::steady_clock::now() < until) {
         std::this_thread::sleep_for(std::chrono::milliseconds{1});
     }
-    const bool was_quiet = runtime_waiting.load();
+    const bool was_waiting = waiting();
     auto client = bus::BusConnection::connect_session();
     aa::core::Result<bus::ParsedMessage> reply{aa::Error{aa::ErrorCode::internal}};
     bool registered = false;
     bool closed_at_reply = false;
-    if (client && was_quiet) {
+    std::chrono::steady_clock::duration forget_elapsed{};
+    if (client && was_waiting) {
         const aa::ipc::BusName consumer{"org.custom.AndroidAutoReceiverTest.Consumer"};
         const aa::ipc::BusName service{"org.custom.AndroidAutoReceiver"};
         auto named = client.value().request_name(consumer);
@@ -2814,9 +2945,11 @@ TEST(WiredReceiver, ForgetPhoneUsesOwnerQueueAndDisconnectsQuietSession) {
                 forget.destination(service.value).path("/org/custom/AndroidAutoReceiver")
                     .interface_name("org.custom.AndroidAutoReceiver1").member("ForgetPhone")
                     .body_signature("t").put_u64(approved.value().value);
+                const auto began = std::chrono::steady_clock::now();
                 auto sent = client.value().send_message(bus::MessageType::method_call, forget);
                 if (sent) {
                     reply = client.value().await_reply(sent.value(), owner.value());
+                    forget_elapsed = std::chrono::steady_clock::now() - began;
                     closed_at_reply = runtime_closed.load();
                 }
             }
@@ -2832,7 +2965,9 @@ TEST(WiredReceiver, ForgetPhoneUsesOwnerQueueAndDisconnectsQuietSession) {
     faults::set_observer({});
     faults::disarm();
     EXPECT_FALSE(watchdog_fired.load()) << output;
-    EXPECT_TRUE(was_quiet);
+    runtime_wait_on_open_attempt = 0;
+    runtime_quiet = false;
+    EXPECT_TRUE(was_waiting);
     EXPECT_TRUE(registered);
     ASSERT_TRUE(reply.has_value()) << output;
     EXPECT_EQ(reply.value().type, bus::MessageType::error_reply);
@@ -2840,10 +2975,17 @@ TEST(WiredReceiver, ForgetPhoneUsesOwnerQueueAndDisconnectsQuietSession) {
     EXPECT_EQ(external_error.read_string().value(), aa::Error{aa::ErrorCode::helper_unavailable}.message());
     EXPECT_TRUE(closed_at_reply);
     EXPECT_EQ(code, 1) << output;
-    EXPECT_EQ(runtime_connects.load(), 1);
+    if (reconnecting) {
+        EXPECT_GE(runtime_connects.load(), 2);
+        EXPECT_LT(forget_elapsed, std::chrono::seconds{2});
+    } else {
+        EXPECT_EQ(runtime_connects.load(), 1);
+    }
     EXPECT_EQ(runtime_ciphers.load(), 1);
     EXPECT_NE(output.find("\"to_state\":\"failed\""), std::string::npos) << output;
-    EXPECT_EQ(output.find("\"detail\":\"poll\""), std::string::npos) << output;
+    if (!reconnecting) {
+        EXPECT_EQ(output.find("\"detail\":\"poll\""), std::string::npos) << output;
+    }
     ASSERT_FALSE(mutations.empty());
     {
         const std::lock_guard lock(runtime_owner_mutex);
@@ -2858,7 +3000,14 @@ TEST(WiredReceiver, ForgetPhoneUsesOwnerQueueAndDisconnectsQuietSession) {
     ASSERT_TRUE(persisted.load().has_value());
     EXPECT_EQ(persisted.lookup(runtime_phone), aa::trust::Decision::unknown);
     std::filesystem::remove_all(root);
-    runtime_quiet = false;
+}
+
+TEST(WiredReceiver, ForgetPhoneUsesOwnerQueueAndDisconnectsQuietSession) {
+    check_forget_phone_during_session(false);
+}
+
+TEST(WiredReceiver, ForgetPhoneCompletesDuringReconnectOpen) {
+    check_forget_phone_during_session(true);
 }
 
 struct RequiredRun {

@@ -61,11 +61,12 @@ outstanding request without writing anything.
   store now admits the phone. A durable approval logs
   `wired_enrolment_approved` and exits 0. An approval that is written but not
   durable (step 7) logs `wired_enrolment_not_durable` and exits 1. After a
-  durable approval the refused
-  link is not reused: the phone is still in accessory mode, so its captured
-  descriptor ids no longer match. Replug the phone (or reset its USB functions)
-  and start the receiver again; the approved phone is then admitted on any port
-  (serial-backed match).
+  durable approval, start the receiver again for a fresh admission check.
+  The receiver resets a phone still in accessory mode and checks its
+  phone-mode identity within the 15-second startup open window. A serial-backed
+  approval works on any selected port. After a live link loss, the receiver allows
+  30 seconds by default to return to active projection. Use `--reconnect-ms` to
+  configure that window (1–120000 ms).
 - With no approval inside the window (or `--duration-ms`), it logs
   `wired_enrolment_closed` and exits 3, as without the flag.
 - If admission succeeds, enrolment closes before the session starts. Pairing
@@ -93,7 +94,7 @@ Owner bring-up:
 ```sh
 aa-wired-receiver --port <port> --wired-enrolment ...   # plug the phone in
 aa-wired-enrol                                          # second terminal: check the label, answer y
-# replug the phone, start the receiver again (without --wired-enrolment if preferred)
+# start the receiver again (without --wired-enrolment if preferred)
 ```
 
 Wireless trust is unchanged. Wireless enrolment keeps its numeric-comparison

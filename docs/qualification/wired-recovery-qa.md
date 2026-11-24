@@ -57,6 +57,17 @@ tools/wired-qa/run-wired-recovery-qa.sh \
     --out      "$CAPTURE_DIR/task-31-wired-recovery.json"
 ```
 
+The receiver allows 30 seconds from link loss to active projection by default.
+Set `aa-wired-receiver --reconnect-ms N` (1–120000 ms) to change that window.
+It retries while the selected device is absent. If the device is already in
+a supported AOA mode on replug or receiver restart, it attempts one targeted
+USB reset per loss or startup. The re-enumeration wait uses one-second slices
+during recovery and has a 15-second startup deadline. The libusb reset call
+is synchronous. The AOA IDs and accessory strings alone cannot identify the
+approved phone. Admission requires a fresh phone-mode snapshot,
+AOA switch and lookup of the full wired identity. If the phone never returns
+to phone mode, the window expires without projection.
+
 The harness exits non-zero with a `BLOCKED` or `FAILED` result (`blocked_on`)
 whenever a prerequisite is unmet or a scenario does not recover within the wired
 `BUDGET_MS` (default 5000 ms). Exit 0 requires the disturbance itself to have
@@ -131,14 +142,9 @@ normal operation.
   on its session thread but has no supervisor restart loop yet. A full
   `receiver_restart` cycle (kill the process, come back, re-project) may record
   `FAILED` against today's binary - the harness fails closed and never masks it.
-- **Single-shot relink** (plan scenarios `usb_unplug_replug`, `phone_aa_restart`
-  and `phone_lock_unlock`): each of these scenarios exercises exactly ONE
-  relink cycle. The receiver's recovery path (`tools/wired-receiver/main.cpp`,
-  the `poll_transport()` error handler) attempts exactly one `open_wired_link`
-  relink per link loss and fails closed - `session.fail(transport_io)` and the
-  session thread exits - when that single relink or its follow-up handshake
-  steps fail. Relink storms, retry/backoff, and multi-cycle recovery are NOT
-  covered and are not claimed here.
+- **One disturbance per scenario**: the unplug/replug, phone Android Auto
+  restart and phone lock/unlock cases each exercise one relink cycle.
+  The receiver may make several link-open attempts during that cycle.
 - **Telemetry evidence coverage**: the current host-side matrix has 20 cases;
   the original six capture-asserting cases include the
   redacted diagnostics capture (the unplug_replug recovery pair

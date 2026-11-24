@@ -137,7 +137,8 @@ core::Result<core::PhoneId> ApprovedPhoneStore::approve_impl(
     if (!usable_) {
         return Error{ErrorCode::trust_store_io};
     }
-    auto key = validated_key(identity);
+    const auto* wired = std::get_if<WiredIdentity>(&identity);
+    auto key = wired ? validated_wired_phone_key(*wired) : validated_key(identity);
     if (!key.has_value()) {
         return Error{ErrorCode::trust_unknown_phone};
     }
