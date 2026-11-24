@@ -95,6 +95,12 @@ public:
     // audio_format_unsupported (with the recorded cause in the report).
     [[nodiscard]] core::Result<PcmChunk> decode(const EncodedChunk& chunk);
     void flush() noexcept;
+    // Returns the output the pipeline still holds (the resampler keeps about
+    // 2 ms of its input) and leaves it as just opened: the next decode() starts
+    // from nothing. Empty when there is none or the pipeline failed.
+    [[nodiscard]] std::vector<std::byte> drain();
+    // Discards what the pipeline still holds; it is as just opened.
+    [[nodiscard]] core::Result<void> restart();
     void close() noexcept;
 
     [[nodiscard]] const DecodeReport& report() const noexcept;

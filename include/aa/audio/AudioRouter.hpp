@@ -122,6 +122,22 @@ struct WriteCompletion final {
     // an offset increase is absorbed (the reported content clock never runs
     // backwards, so it advances at half rate for a while).
     core::Nanoseconds playout_end_offset{};
+    // Lossless playout: the offsets the piece really plays with, which is what
+    // the video hold follows. Above playout_offset when the write blocked past
+    // its slot or the sink's clock lags (and above playout_end_offset when what
+    // follows is retimed); equal to them otherwise.
+    core::Nanoseconds endpoint_offset{};
+    core::Nanoseconds endpoint_end_offset{};
+};
+
+// Lossless playout: one piece about to be handed to the sink, with the offsets
+// on_write_completed will report unless the last stream is cancelled meanwhile.
+// Content from scheduled - playout_offset on is not heard before it returns.
+struct WriteStart final {
+    core::Nanoseconds scheduled{};
+    core::Nanoseconds scheduled_end{};
+    core::Nanoseconds playout_offset{};
+    core::Nanoseconds playout_end_offset{};
 };
 
 struct RenderStep final {
@@ -311,6 +327,16 @@ private:
 //   shorter or longer by). Proportional, at most 0.5% (under 9 cents), up to
 //   1% only while the excess is over 100 ms; the rate moves by at most 0.1%
 //   per A26 chunk. A 300 ms excess is back under 15 ms in about 45 s;
+// - a short run (any packet size down to a third of a millisecond) takes the
+//   whole frame its predecessors' fractions add up to;
+// - retime: a piece whose slot has already passed when it is about to be written
+//   (the write before it blocked, or the render thread was held up) moves the
+//   whole timeline to 20 ms from now first: the depth and the offset grow by
+//   that and drain by the rate correction (audio_playout_retime). Writing on
+//   at slots that had passed would be lossless only on paper: the ring buffer
+//   throws samples behind its read position away. The piece inside the blocked
+//   write is the sink's: how late it plays is endpoint_offset;
+// - stop: what the peer sent before stopping a stream plays out (end_stream);
 // - silence is written only on an anchor, a resume or an underrun. A role
 //   underruns when its own stream (its end plus what a resampler split still
 //   owes) ran out before the arrival, even while another role plays; a stream
@@ -322,9 +348,11 @@ private:
 // - the offset the writes report is media's while media plays;
 // - emergency bound: a chunk placed more than `emergency_backlog` after its
 //   arrival loses the part beyond it (playout_overflows, frames_overflowed,
-//   logged as audio_playout_overflow). It bounds memory and delay. Neither a
-//   phone bursting its 341 ms capture buffer nor a full render worker queue
-//   (1.6 s) reaches the 2 s default.
+//   logged as audio_playout_overflow). It bounds memory and delay, and is the
+//   line between latency and loss: a stalled write the sink recovers from costs
+//   latency as long as the stall and the depth before it stay within it; a sink
+//   that fails its write (RouterConfig::sink_write_timeout, 2 s) drops and
+//   reopens (#60). A phone bursting its 341 ms capture buffer does not reach it.
 struct PlayoutPolicy final {
     bool enabled{false};
     core::Nanoseconds depth{core::Nanoseconds{120'000'000}};
@@ -385,6 +413,9 @@ struct RouterConfig final {
     // remote and prove the degraded typed path against the real element.
     std::string sink_remote{};
     std::function<void(const WriteCompletion&)> on_write_completed{};
+    // Lossless playout only, on the render_step() thread, before every write
+    // (synthesized silence included).
+    std::function<void(const WriteStart&)> on_write_started{};
     // Live-PCM drift correction. Off in a bare RouterConfig; the receivers'
     // pcm_router_config() enables it with catch-up off (a catch-up watermark
     // is an arrival-model opt-in, --audio-playout-ms 0). Lossless playout
@@ -486,20 +517,27 @@ struct RouterStats final {
     std::uint64_t frames_stretched{};
     std::uint64_t playout_overflows{};
     std::uint64_t frames_overflowed{};
+    // Lossless playout: times the sink fell behind the schedule (a write blocked
+    // past its slot) and everything after it was moved later instead of being
+    // written at slots that had passed, and by how much in total.
+    std::uint64_t playout_retimes{};
+    core::Nanoseconds playout_retimed{};
     // Committed offset above the shedding threshold, even when the buffer
     // minimum prevents additional shedding.
     std::uint64_t playout_shed_residual_chunks{};
     core::Nanoseconds playout_shed_residual_peak{};
 };
 
-// One playout re-anchor (stream start, resume, or underrun) of one role,
-// collected for the render worker's log (AudioRouter::take_playout_events).
+// One playout re-anchor (stream start, resume, or underrun) of one role, or one
+// retime of the whole timeline (lossless), collected for the render worker's
+// log (AudioRouter::take_playout_events).
 struct PlayoutEvent final {
-    enum class Kind : std::uint8_t { start, resume, underrun };
+    enum class Kind : std::uint8_t { start, resume, underrun, retime };
     Kind kind{Kind::start};
     // How long after its slot the run arrived: the elapsed time skipped.
+    // retime: how much later everything after it plays.
     core::Nanoseconds late{};
-    // Depth the role was re-anchored with.
+    // Depth the role was re-anchored with; retime: the offset it left.
     core::Nanoseconds depth{};
     Role role{Role::media};
 };
@@ -645,7 +683,16 @@ public:
     // Other operations (including close/move/destruction) require the owner
     // thread; the router must outlive every concurrent cancel_pending call.
     [[nodiscard]] core::Result<RenderStep> render_step();
+    // Drops the role's pending audio. Lossless: what its decoder still holds of
+    // that stream goes with it (the decoder restarts before its next chunk), as
+    // it does on reset_session_timeline().
     void cancel_pending(protocol::ChannelRole role);
+    // Lossless playout, owner thread: the peer stopped the role's stream after
+    // everything submitted so far. That audio plays out (including what the
+    // decoder still holds), nothing waits for the role any more, and its next
+    // chunk starts a new stream. True while the role has audio pending. Without
+    // lossless playout it does nothing and returns false.
+    bool end_stream(protocol::ChannelRole role);
     // Records a steady-clock interval during which the owner withheld peer
     // credit, or a completed sink write exceeded one PCM piece duration and
     // its scheduled end (excluding normal per-piece pacing). render_step()

@@ -90,12 +90,24 @@ public:
     // newest write instead, which pulsesink accepts up to ~200 ms ahead, held
     // frames for future audio's offset (window 12's startup pair, P2-5).
     [[nodiscard]] std::chrono::nanoseconds playout_offset_at(core::Nanoseconds content) const;
+    // Lossless playout: these are the offsets the sink really plays with
+    // (WriteCompletion::endpoint_offset), and while a write is blocked past its
+    // slot the content it holds, and everything after it, is not due before the
+    // write returns: the value then keeps that content's due just ahead of now.
     // The newest write's end offset (0 when none).
     [[nodiscard]] std::chrono::nanoseconds current_playout_offset() const;
+    // Lossless playout (wired): the video hold may follow it further than
+    // wireless's cap (tools/media_playout_options.hpp).
+    [[nodiscard]] bool lossless() const noexcept { return lossless_; }
     [[nodiscard]] SinkReport sink_report();
 
     [[nodiscard]] core::Result<void>
     submit(const protocol::MessageView& message, channels::AvDeliveryId id);
+    // The peer stopped (or restarted) the role's stream. Its unreleased credits
+    // go with it. Its audio: lossless playout plays out everything accepted
+    // before the stop, then starts the next stream (audio that would not leave
+    // room for a new stream's credits is dropped and reported instead, see
+    // kStopReserveScale); otherwise it is cancelled.
     void invalidate(protocol::ChannelRole role, std::uint64_t generation);
     // Resets per-session AV generation and credit state when a new
     // WiredSession binds on reconnect while keeping the opened audio route.
@@ -128,6 +140,9 @@ public:
     [[nodiscard]] AvCreditSnapshot credit_observation_for_test() const;
 
     [[nodiscard]] bool wait_idle(Clock::time_point until);
+    // Accepts nothing more. Lossless playout then plays out what it accepted,
+    // for at most kStopDrain; whatever is left (and everything without lossless
+    // playout) is discarded.
     void stop();
     [[nodiscard]] core::Result<void> finish();
     [[nodiscard]] std::optional<RouterReport> final_report() const;
@@ -148,6 +163,8 @@ private:
         WorkerAdmission admission;
         bool rendered_any{};
         std::uint64_t epoch{1};
+        // First of a stream that follows a stopped one (lossless).
+        bool starts_stream{};
     };
     struct DeferredCredit {
         channels::AvDeliveryId id;
@@ -166,12 +183,19 @@ private:
 
     static constexpr std::size_t kAdvertisedRoles = 3;
     static constexpr std::size_t kRoleSlots = 4;
-    static constexpr std::size_t kMaxSlots =
-        kAdvertisedRoles * kRoleSlots * AudioCreditPolicy::kMaxWindow;
     // Sink-stall survival (#60): once a blocked write has kept a phone credit
     // waiting this long, the phone may send past max_unacked=1 (HU09 did after
     // ~470 ms), so stalled audio is dropped and ACKed instead of ending the
     // session. A timed-out sink is reopened; repeated reopen failures stay fatal.
+    //
+    // Lossless playout (#228) draws the line between latency and loss at the
+    // router's emergency bound (PlayoutPolicy::emergency_backlog, 2 s), which is
+    // also the sink's write deadline: a write that returns within it costs
+    // latency only, so the bypass also needs that one write blocked for the
+    // whole bound. A sink that fails its write (the deadline, or a lost route)
+    // is declared stuck: what is queued is dropped and reported
+    // (audio_stall_bypass, trigger sink_write_error) and the sink reopened, so
+    // the session survives it as on the arrival model.
     static constexpr std::int64_t kStallBypassAfterNs = 250'000'000;
     static constexpr std::size_t kMaxConsecutiveReopens = 3;
 
@@ -182,17 +206,33 @@ private:
         return index == 0 ? Reservation{38400, 38400} : Reservation{6400, 38400};
     }
     static std::optional<std::size_t> audio_index(protocol::ChannelRole role);
-    // Lossless playout (#228) queues up to 8 times the stop-and-wait capacity
-    // (1.6 s of PCM per role) at the same advertised window. The credit is
-    // then granted on receipt while the buffer is deep or the sink blocks for
-    // up to about a second, so the phone never has to hold audio back (its
-    // capture buffer is 341 ms). The stall bypass, which drops audio, needs a
-    // full queue and a single write blocked for kStallBypassAfterNs
-    // (maybe_bypass_locked): a deep buffer alone never looks like a stall.
-    static constexpr std::size_t kLosslessCapacityScale = 8;
-    static_assert(kLosslessCapacityScale <= AudioCreditPolicy::kMaxWindow);
+    // Lossless playout (#228) queues by time, not by packet: every role takes
+    // the deepest buffer the router keeps (emergency_backlog) plus all that can
+    // arrive while one write blocks up to its deadline (sink_write_timeout) plus
+    // 400 ms, 4.4 s by default (under 1.2 MB over the three roles). The
+    // credit is then granted on receipt through any stall the sink recovers
+    // from, whatever the packet size, so the phone never has to hold audio back
+    // (its capture buffer is 341 ms). Packets only count against a memory bound,
+    // one slot per kSlotNs: of shorter ones a full queue withholds the credit,
+    // it never drops.
+    static constexpr std::int64_t kEnvelopeNs = 200'000'000; // one capacity() unit
+    static constexpr std::int64_t kSlotNs = 1'000'000;
+    [[nodiscard]] static std::size_t lossless_scale(const RouterConfig& config) noexcept;
+    // Parents of one role handed to the router at a time (lossless): its
+    // scheduling cost grows with every pending parent, and a 4.4 s queue of 5 ms
+    // packets holds hundreds. The rest waits here, as before its decode.
+    static constexpr std::size_t kRouterParents = 64;
+    // A stopped stream plays out unless that leaves a new one less than this
+    // many envelopes (its largest message); then it is cancelled and reported (audio_stop_discarded).
+    static constexpr std::size_t kStopReserveScale = 2;
+    // Longest stop() lets accepted audio play out: the emergency bound, the
+    // most the router keeps.
+    static constexpr std::chrono::milliseconds kStopDrain{2000};
     // Capacity of one role under the credit window (AudioCreditPolicy).
-    [[nodiscard]] std::size_t role_slot_cap() const noexcept { return kRoleSlots * capacity_scale_; }
+    [[nodiscard]] std::size_t role_slot_cap() const noexcept {
+        return lossless_ ? capacity_scale_ * static_cast<std::size_t>(kEnvelopeNs / kSlotNs)
+                         : kRoleSlots * capacity_scale_;
+    }
     [[nodiscard]] Reservation role_capacity(std::size_t index) const noexcept {
         const auto base = capacity(index);
         return {base.bytes * capacity_scale_, base.units * capacity_scale_};
@@ -236,6 +276,8 @@ private:
     void exit_bypass_locked(const char* outcome);
     void publish_bypass_logs(std::unique_lock<std::mutex>& lock);
     void cancel_all();
+    [[nodiscard]] bool dequeueable_locked(const Job& job) const;
+    [[nodiscard]] bool draining_locked() const;
     void run(RouterConfig config, const OpenRouter& open);
 
     AudioTelemetryCallbacks telemetry_;
@@ -301,10 +343,31 @@ private:
         std::int64_t end_offset;
     };
     static constexpr std::size_t kPlayoutHistory = 256; // ~11 s of A26 chunks
+    // Lossless: 2 ms packets still cover the longest video hold.
+    static constexpr std::size_t kLosslessPlayoutHistory = 1024;
+    // The write the sink holds now (lossless).
+    struct InFlightWrite final {
+        std::int64_t scheduled;
+        std::int64_t content_start;
+    };
+    std::optional<InFlightWrite> write_in_flight_; // under playout_mutex_
+    // How far ahead of now content behind a blocked write is kept due: more
+    // than the video outlet's release slice (5 ms), so a frame is not released
+    // just before the write returns.
+    static constexpr std::int64_t kBlockedWriteLeadNs = 10'000'000;
+    static constexpr std::int64_t kContentRoundingNs = 50'000;
     // Guards playout_writes_ only (never held with mutex_ the other way round).
     mutable std::mutex playout_mutex_;
     std::deque<PlayoutWrite> playout_writes_{};
     const std::int64_t playout_depth_ns_;
+    const std::int64_t emergency_backlog_ns_;
+    // Lossless: a stop whose boundary the router has not been given yet.
+    std::array<bool, 4> stream_end_pending_{};
+    std::array<std::size_t, 4> router_parents_{};
+    std::optional<Clock::time_point> drain_until_;
+    bool router_busy_{};
+    std::uint64_t playout_retimes_logged_{};
+    [[nodiscard]] std::chrono::nanoseconds recorded_offset_locked(core::Nanoseconds content) const;
     void clear_playout_writes();
     std::optional<core::Nanoseconds> step_started_;
     core::Nanoseconds step_entered_{}; // step_started_ on the real monotonic clock

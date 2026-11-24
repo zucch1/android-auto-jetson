@@ -41,7 +41,7 @@ DEPTH_NS = 120_000_000
 SINK_NS = 2_000_000    # sink handoff to playback slot
 PAINT_NS = 9_000_000   # decode + paint after release
 START_NS = 1_000_000_000
-HOLD_CAP_NS = 400_000_000  # VideoOutlet::kMaxPresentationDelay
+HOLD_CAP_NS = 400_000_000  # VideoOutlet::kMaxPresentationDelay (wireless)
 
 
 def one_way_ns(t_ns: int, spike: bool) -> int:
@@ -169,7 +169,15 @@ def offset_at(audio: list[dict], t: int) -> int:
     return audio[-1]["_end_offset"]
 
 
-def outlet_video(seconds: int, audio: list[dict], new_outlet: bool) -> list[dict]:
+def wired_hold_cap(root: Path) -> int:
+    """kLosslessVideoHoldCap: the wired receiver's hold cap."""
+    header = (root / "tools/media_playout_options.hpp").read_text(encoding="utf-8")
+    found = re.search(r"kLosslessVideoHoldCap\{([0-9]+)\}", header)
+    assert found, "kLosslessVideoHoldCap not found"
+    return int(found[1]) * 1_000_000
+
+
+def outlet_video(seconds: int, audio: list[dict], new_outlet: bool, cap: int = HOLD_CAP_NS) -> list[dict]:
     """video_presented records through a model of VideoOutlet's hold queue.
 
     Old outlet: hold read at arrival, due = max(arrival + hold, previous due),
@@ -180,7 +188,7 @@ def outlet_video(seconds: int, audio: list[dict], new_outlet: bool) -> list[dict
     events, previous_due, previous = [], 0, None
     for n in range(seconds * 1_000_000_000 // FRAME_NS):
         arrival = START_NS + n * FRAME_NS + 10_000_000
-        hold = min(HOLD_CAP_NS, offset_at(audio, arrival))
+        hold = min(cap, offset_at(audio, arrival))
         if new_outlet:
             if previous is not None:
                 hold = max(hold, previous[1] - (arrival - previous[0]) // 2)
@@ -388,6 +396,19 @@ def main() -> int:
         res = judge(smoke, contract, deep_audio, outlet_video(66, deep_audio, new_outlet=True), clause)
         assert res["passed"], ("lossless_backlog", clause, res)
         assert res["abs_max_ms"] <= 50.0, res
+    # A 16-chunk burst (re-review of 4a3f49f) is 700 ms deep: in sync under the
+    # wired hold cap, up to 300 ms apart under wireless's.
+    wired_cap = wired_hold_cap(root)
+    burst_audio = lossless_backlog_audio_events(70, wired_depth, burst=16)
+    assert HOLD_CAP_NS < max(a["playout_offset_ns"] for a in burst_audio) <= wired_cap
+    for clause in ("cap", "soak_rate"):
+        res = judge(smoke, contract, burst_audio,
+                    outlet_video(66, burst_audio, new_outlet=True, cap=wired_cap), clause)
+        assert res["passed"], ("sixteen_chunk_burst", clause, res)
+        assert res["abs_max_ms"] <= 50.0, res
+    clipped = judge(smoke, contract, burst_audio, outlet_video(66, burst_audio, new_outlet=True), "cap")
+    assert not clipped["passed"] and clipped["abs_max_ms"] > 150.0, clipped
+
     stuck = judge(smoke, contract, deep_audio, wired_matched_video, "cap")
     assert not stuck["passed"], stuck
     wired_unheld_video = [

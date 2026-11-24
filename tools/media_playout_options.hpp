@@ -20,6 +20,17 @@ inline constexpr std::int64_t kMaxAudioPlayoutMs =
 inline constexpr std::int64_t kMinCatchUpWatermarkMs = 20;
 inline constexpr std::int64_t kMaxCatchUpWatermarkMs = 200;
 
+// The longest video hold behind lossless (wired) audio. Wired audio keeps every
+// sample, so after a burst or a stall the hold has to follow it deeper than
+// wireless's 400 ms cap, or A/V parts by the difference for the half minute the
+// rate correction needs. 700 ms covers a 16-chunk burst (60 ms + 15 x 42.67 ms =
+// 700 ms, twice the phone's 341 ms capture buffer) and a sink stall of up to
+// about 600 ms, and leaves 300 ms of the drive smoke's 1.0 s waiting_idr budget
+// for the keyframe itself (requests are at most 250 ms apart). Deeper than that
+// a lagging touch screen is judged worse than lip sync: the hold is clipped,
+// video_hold_capped says so, and A/V parts by the rest until it drains.
+inline constexpr std::chrono::milliseconds kLosslessVideoHoldCap{700};
+
 struct PlayoutOptions final {
     std::int64_t audio_playout_ms{};
     std::int64_t audio_catch_up_watermark_ms{0};
@@ -119,6 +130,7 @@ inline void configure_video_hold(wired_receiver::VideoOutlet& video,
     video_hold_out = video_delay(options.video_delay_ms, options.audio_playout_ms);
     follow_out = !options.video_delay_ms && options.audio_playout_ms > 0;
     if (follow_out) {
+        if (audio.lossless()) { video.set_max_presentation_delay(kLosslessVideoHoldCap); }
         match_video_to_audio(video, audio, video_hold_out);
     } else {
         video.set_presentation_delay(video_hold_out);

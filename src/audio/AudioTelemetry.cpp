@@ -126,6 +126,8 @@ RouterStats accumulate_router_stats(const RouterStats& lifetime, const RouterSta
     out.frames_stretched += lifetime.frames_stretched;
     out.playout_overflows += lifetime.playout_overflows;
     out.frames_overflowed += lifetime.frames_overflowed;
+    out.playout_retimes += lifetime.playout_retimes;
+    out.playout_retimed.count += lifetime.playout_retimed.count;
     out.playout_shed_residual_chunks += lifetime.playout_shed_residual_chunks;
     out.playout_shed_residual_peak =
         std::max(out.playout_shed_residual_peak, lifetime.playout_shed_residual_peak);
@@ -196,7 +198,10 @@ std::string media_timing_json(const RouterStats& stats, const MediaTimingContext
         json += ",\"frames_compressed\":" + std::to_string(stats.frames_compressed) +
             ",\"frames_stretched\":" + std::to_string(stats.frames_stretched) +
             ",\"playout_overflows\":" + std::to_string(stats.playout_overflows) +
-            ",\"frames_overflowed\":" + std::to_string(stats.frames_overflowed);
+            ",\"frames_overflowed\":" + std::to_string(stats.frames_overflowed) +
+            // Slots moved later behind a stalled sink (latency, nothing lost).
+            ",\"playout_retimes\":" + std::to_string(stats.playout_retimes) +
+            ",\"playout_retimed_ms\":" + format_ms(stats.playout_retimed);
     }
     return json + "}";
 }
