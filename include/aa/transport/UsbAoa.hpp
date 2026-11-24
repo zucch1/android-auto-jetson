@@ -10,6 +10,9 @@
 // port -> AOA switch (GET_PROTOCOL/SEND_STRING x6/START) -> capture the phone's
 // pre-switch and accessory-mode descriptor identities -> admission over the
 // captured WiredIdentity -> claim the accessory bulk pipe (IN 0x81 / OUT 0x01).
+// If the selected device is already in supported AOA mode, reset that device
+// and wait for phone mode before running the same pipeline. AoaRecovery keeps
+// the reset limit and a completed switch across calls with short deadlines.
 //
 // TRUST: AOA enumeration success is NEVER trust. The endpoint is released only
 // for an identity `admit` accepts; every other case fails closed with
@@ -37,6 +40,8 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
+#include <string_view>
 #include <string>
 #include <vector>
 
@@ -103,6 +108,27 @@ struct AoaSwitchReport final {
     int requests{0};
 };
 
+namespace usb_adapter {
+class UsbAoaEndpoint;
+}
+
+// Keep one instance for a startup open or for all attempts on one link loss.
+// Reuse it only with the same selector and accessory setup.
+struct AoaRecovery final {
+    // Receives "issued" before the reset and its result code afterward.
+    std::function<void(std::string_view)> reset_status{};
+    bool reset_attempted{false};
+
+  private:
+    friend class usb_adapter::UsbAoaEndpoint;
+    struct PendingClaim {
+        UsbDeviceSnapshot phone;
+        AoaSwitchReport report;
+        core::Deadline::Clock::time_point until;
+    };
+    std::optional<PendingClaim> pending_claim_;
+};
+
 // Wired identity admission: return true to admit. An identity that is not
 // admitted MUST never receive a usable endpoint (fail closed).
 using WiredAdmission = std::function<bool(const trust::WiredIdentity &)>;
@@ -133,7 +159,8 @@ struct UsbAoaLink final {
                                                        const AoaAccessoryInfo &info,
                                                        const WiredAdmission &admit,
                                                        const core::Deadline &deadline = {},
-                                                       trust::WiredIdentity *attempted_identity = nullptr);
+                                                       trust::WiredIdentity *attempted_identity = nullptr,
+                                                       AoaRecovery *recovery = nullptr);
 
 // ByteEndpoint seam: the returned endpoint performs device discovery, the AOA
 // switch, identity capture + admission and the bulk claim inside open() (the

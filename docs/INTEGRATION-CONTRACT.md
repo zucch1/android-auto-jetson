@@ -110,7 +110,7 @@ Both enrolment flows keep all user-facing prompts in infotainment. Neither flow 
 3. **Inspect candidate:** Consumer calls `GetPairingCandidate(request_id)` (`1.1.0+`) -> receives `transport` (`"wired"`), `label` (per-process pseudonym matching `phone_id` in the refusal log, not a persistent `phone_id`), and `strength` (`"serial-backed"`). Confirming before calling `GetPairingCandidate` is refused and closes the request.
 4. **Present to human:** Show `label` in infotainment's UI and obtain an explicit yes/no.
 5. **Confirm or decline:** Call `ConfirmPhonePairing(request_id)` to approve durably (emits `PairingOpened`), or `CancelPhonePairing(request_id)` to decline without writing. If directory `fsync` fails after bounded retries, `ConfirmPhonePairing` returns `Error.NotDurable` and closes the request — never report approval as succeeded. A durable confirm *is* the completed enrolment: `WiredEnrolment::pairing_confirmed` sets its completion result while handling the call, and the receiver's enrolment loop then closes the bus and exits (`wired_enrolment_approved`, exit 0). Do **not** call `CancelPhonePairing` after a durable confirm — the receiver can exit before serving it and the approval needs no closing (it stays).
-6. **Replug and restart:** The refused USB/AOA link is not reused after approval; replug the phone (or reset its USB functions) and restart `aa-wired-receiver` to admit the approved phone on any USB port.
+6. **Restart the receiver:** Restart `aa-wired-receiver` after approval for a fresh admission check. If the phone is still in accessory mode, the receiver issues a targeted USB reset and waits for phone mode so it can check the full approved identity on the selected port.
 
 #### Timing limits
 
@@ -136,6 +136,10 @@ Both enrolment flows keep all user-facing prompts in infotainment. Neither flow 
 | `PairingClosed` | `t` | Pending request or open window closed for `request_id`. |
 | `StateChanged` | `st` | Mirrors `GetState`: `projection_state`, `consumer_id`. |
 | `DiagnosticEvent` | `sst` | Low-rate structured diagnostic: `severity` (`"info"`, `"warning"`, `"error"`), `event`, numeric `subject_id`. Never carries identifiers or secrets. |
+
+The wired receiver allows 30 seconds by default from link loss to active projection.
+`--reconnect-ms` overrides this window (1–120000 ms). If the window expires,
+the wired lifecycle reports `failed` and the receiver exits.
 
 ### Receiver Properties
 
@@ -434,7 +438,7 @@ Exact amendments required in `zucch1/infotainment` when integrating Android Auto
 
 ### Settings
 
-- [ ] Add an Android Auto settings page behind `AppState` (QML declarative only): show AA availability/degraded state when `org.custom.AndroidAutoReceiver` is absent (and note that bus-name presence alone does not prove projection readiness if the unit is running `--pairing-only`), and drive explicit enrolment separately for wireless (exactly one visible public BR/EDR candidate established *first*, then `RequestAddPhone` -> `ConfirmPhonePairing` to open window / `PairingOpened` -> poll `GetPairingComparison` -> human modal -> `RespondPairingComparison(request_id, challenge_id, accept)`; a non-durable approval is retracted best-effort) and wired (refused candidate under `--wired-enrolment` -> `RequestAddPhone` -> `GetPairingCandidate` -> human modal -> `ConfirmPhonePairing` / `CancelPhonePairing` -> replug/restart; after a durable confirm go straight to replug/restart, never a post-confirm `CancelPhonePairing`).
+- [ ] Add an Android Auto settings page behind `AppState` (QML declarative only): show AA availability/degraded state when `org.custom.AndroidAutoReceiver` is absent (and note that bus-name presence alone does not prove projection readiness if the unit is running `--pairing-only`), and drive explicit enrolment separately for wireless (exactly one visible public BR/EDR candidate established *first*, then `RequestAddPhone` -> `ConfirmPhonePairing` to open window / `PairingOpened` -> poll `GetPairingComparison` -> human modal -> `RespondPairingComparison(request_id, challenge_id, accept)`; a non-durable approval is retracted best-effort) and wired (refused candidate under `--wired-enrolment` -> `RequestAddPhone` -> `GetPairingCandidate` -> human modal -> `ConfirmPhonePairing` / `CancelPhonePairing` -> restart receiver; after a durable confirm go straight to receiver restart, never a post-confirm `CancelPhonePairing`).
 - [ ] Approved-phone list / forget UI: **blocked on an API decision** — `org.custom.AndroidAutoReceiver1` (`1.1.0`) provides `ForgetPhone(t)` with no list API, and `GetPairingCandidate` exposes no persistent `phone_id`. Do **not** read `approved-phones.json` directly. When `ForgetPhone` is wired: handle partial outcomes (local revocation can land while helper AP/bond legs remain pending and return an error), never announce a completed forget from the call's return, and retry the whole `ForgetPhone(phone_id)` explicitly for a pending AP leg — the receiver's refresh loop does not, while bond reconciliation may settle its own leg. The AP/BlueZ legs exist only on the wireless receiver.
 - [ ] Keep Bluetooth/HFP pairing and unpairing under infotainment Settings so the owner can connect HFP (`#160`) and unpair a forgotten phone before re-enrolment (`#136`).
 - [ ] Feature-detect receiver contract `1.1.0` via `ContractSemVer` / `GetCapabilities` before calling `GetPairingCandidate`, and handle `Error.NotDurable` by never reporting an unconfirmed wired approval as succeeded.

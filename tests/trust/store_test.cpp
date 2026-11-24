@@ -196,6 +196,25 @@ TEST(TrustStore, AllocationPastTheCeilingFailsClosed) {
     EXPECT_TRUE(fresh.phones().empty());
 }
 
+TEST(TrustStore, LegacyAccessoryEntryCanBeLoadedAndForgotten) {
+    test::TempStoreDir dir;
+    write_text(dir.file(), R"({"schema_version":2,"next_phone_id":2,"phones":[
+        {"phone_id":1,"identity":{"kind":"wired","usb_vendor_id":"18d1","usb_product_id":"2d00",
+         "usb_serial":"LEGACY","aoa_manufacturer":"Android","aoa_model":"Android Auto",
+         "aoa_serial":"LEGACY","port_context":"1-2.3"}}]})");
+
+    trust::ApprovedPhoneStore store{dir.file()};
+    ASSERT_TRUE(store.load().has_value());
+    ASSERT_EQ(store.phones().size(), 1U);
+    EXPECT_TRUE(store.forget_phone(aa::core::PhoneId{1}).has_value());
+    EXPECT_TRUE(store.approve(trust::TransportIdentity{test::kWired}).has_value());
+
+    const trust::WiredIdentity accessory{"18d1", "2d00", "LEGACY", "", "", "", "1-2.3"};
+    const auto approved = store.approve(trust::TransportIdentity{accessory});
+    ASSERT_FALSE(approved.has_value());
+    EXPECT_EQ(approved.error().code(), ErrorCode::trust_unknown_phone);
+}
+
 TEST(TrustStore, BoundaryFieldRoundTrips) {
     test::TempStoreDir dir;
     trust::ApprovedPhoneStore store{dir.file()};

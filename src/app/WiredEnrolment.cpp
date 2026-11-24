@@ -8,7 +8,7 @@ namespace aa::app {
 
 core::Result<void> WiredEnrolment::note_refused(const trust::WiredIdentity& identity) {
     if (!open_) return Error{ErrorCode::cancelled};
-    if (!trust::validated_key(trust::TransportIdentity{identity})) {
+    if (!trust::validated_wired_phone_key(identity)) {
         return Error{ErrorCode::invalid_argument};
     }
     refused_ = identity;

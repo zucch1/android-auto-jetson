@@ -81,6 +81,17 @@ struct Fixture final {
     }
 };
 
+TEST(WiredEnrolment, AccessoryDescriptorsCannotBecomeACandidate) {
+    Fixture f;
+    auto identity = kPhone;
+    identity.usb_vendor_id = "18d1";
+    identity.usb_product_id = "2d01";
+    const auto noted = f.enrolment.note_refused(identity);
+    ASSERT_FALSE(noted.has_value());
+    EXPECT_EQ(noted.error().code(), ErrorCode::invalid_argument);
+    f.expect_store_untouched();
+}
+
 TEST(WiredEnrolment, RefusedThenRequestThenExplicitYesIsAdmittedDurably) {
     Fixture f;
     ASSERT_FALSE(f.admitted(kPhone));

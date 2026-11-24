@@ -9,6 +9,8 @@
 //   AA_FAKE_LIBUSB_SCENARIO  absent (default) | happy | stall |
 //                            claim-fail-pre | claim-fail-always | replacement |
 //                            stuck-accessory | recovery-swap
+//                            unknown-accessory | persistent-accessory | reset-fails
+//                            unsupported-accessory | delayed-accessory
 //   AA_FAKE_LIBUSB_LOG       call-log file path (appended), one call per line
 //
 // Device model: one device on port path "1-2.1" (bus 1). Phone mode is
@@ -44,6 +46,7 @@ enum class Mode { phone, accessory };
 
 Mode g_mode = Mode::phone;
 std::size_t g_bulk_read_offset = 0;
+int g_enumerations_until_present = 0;
 char g_slots[6][256] = {};
 std::mutex g_mutex;
 
@@ -70,6 +73,13 @@ enum class Scenario {
     claim_fail_always,
     replacement,
     stuck_accessory,
+    unknown_accessory,
+    persistent_accessory,
+    persistent_accessory_new_address,
+    reset_fails,
+    unsupported_accessory,
+    delayed_accessory,
+    accessory_ready,
     recovery_swap
 };
 
@@ -98,6 +108,27 @@ enum class Scenario {
     }
     if (text == "stuck-accessory") {
         return Scenario::stuck_accessory;
+    }
+    if (text == "unknown-accessory") {
+        return Scenario::unknown_accessory;
+    }
+    if (text == "persistent-accessory") {
+        return Scenario::persistent_accessory;
+    }
+    if (text == "persistent-accessory-new-address") {
+        return Scenario::persistent_accessory_new_address;
+    }
+    if (text == "reset-fails") {
+        return Scenario::reset_fails;
+    }
+    if (text == "unsupported-accessory") {
+        return Scenario::unsupported_accessory;
+    }
+    if (text == "delayed-accessory") {
+        return Scenario::delayed_accessory;
+    }
+    if (text == "accessory-ready") {
+        return Scenario::accessory_ready;
     }
     if (text == "recovery-swap") {
         return Scenario::recovery_swap;
@@ -213,6 +244,10 @@ int control_transfer_typed(ua::LibusbDeviceHandle *handle, BmRequestType bm_requ
     }
     if (request_type == ua::kUsbTypeVendor && request == 53) {
         g_mode = Mode::accessory;
+        if (scenario() == Scenario::delayed_accessory) {
+            g_enumerations_until_present = 5;
+            become_scenario("accessory-ready");
+        }
         return 0;
     }
     return ua::kLibusbErrorNotFound;
@@ -225,11 +260,22 @@ extern "C" {
 int libusb_init(ua::LibusbContext **ctx) {
     std::lock_guard lock(g_mutex);
     log_line("libusb_init");
-    g_mode = (scenario() == Scenario::stuck_accessory || scenario() == Scenario::recovery_swap)
+    const auto current = scenario();
+    g_mode = (current == Scenario::stuck_accessory || current == Scenario::unknown_accessory ||
+              current == Scenario::persistent_accessory ||
+              current == Scenario::persistent_accessory_new_address ||
+              current == Scenario::reset_fails || current == Scenario::unsupported_accessory ||
+              current == Scenario::accessory_ready || current == Scenario::recovery_swap)
                  ? Mode::accessory
                  : Mode::phone;
     std::memset(g_slots, 0, sizeof(g_slots));
+    if (g_mode == Mode::accessory) {
+        std::strcpy(g_slots[0], "Android");
+        std::strcpy(g_slots[1], "Android Auto");
+        std::strcpy(g_slots[5], "HU-AAAAAA001");
+    }
     g_bulk_read_offset = 0;
+    g_enumerations_until_present = 0;
     *ctx = reinterpret_cast<ua::LibusbContext *>(&g_device_storage);
     return ua::kLibusbSuccess;
 }
@@ -246,7 +292,8 @@ std::ptrdiff_t libusb_get_device_list(ua::LibusbContext *ctx, ua::LibusbDevice *
     (void)ctx;
     std::lock_guard lock(g_mutex);
     log_line("libusb_get_device_list");
-    if (scenario() == Scenario::absent) {
+    if (scenario() == Scenario::absent || g_enumerations_until_present > 0) {
+        g_enumerations_until_present = std::max(0, g_enumerations_until_present - 1);
         *list = static_cast<ua::LibusbDevice **>(std::calloc(1, sizeof(ua::LibusbDevice *)));
         return 0;
     }
@@ -277,7 +324,7 @@ int libusb_get_device_descriptor(ua::LibusbDevice *dev, ua::LibusbDeviceDescript
         desc->idProduct = 0x5678;
     } else if (g_mode == Mode::accessory) {
         desc->idVendor = 0x18D1;
-        desc->idProduct = 0x2D00;
+        desc->idProduct = scenario() == Scenario::unsupported_accessory ? 0x2D02 : 0x2D00;
     } else {
         desc->idVendor = 0x04E8;
         desc->idProduct = 0x6860;
@@ -292,7 +339,7 @@ std::uint8_t libusb_get_bus_number(ua::LibusbDevice *dev) {
 
 std::uint8_t libusb_get_device_address(ua::LibusbDevice *dev) {
     (void)dev;
-    return 7;
+    return scenario() == Scenario::persistent_accessory_new_address ? 8 : 7;
 }
 
 int libusb_get_port_numbers(ua::LibusbDevice *dev, std::uint8_t *ports, int ports_length) {
@@ -359,7 +406,8 @@ int libusb_get_string_descriptor_ascii(ua::LibusbDeviceHandle *handle, std::uint
             text = "SAMSUNG_Android";
             break;
         case 3:
-            text = "TEST-SERIAL-001";
+            text =
+                scenario() == Scenario::unknown_accessory ? "TEST-SERIAL-OTHER" : "TEST-SERIAL-001";
             break;
         default:
             break;
@@ -495,10 +543,24 @@ int libusb_reset_device(ua::LibusbDeviceHandle *handle) {
     (void)handle;
     log_line("libusb_reset_device");
     std::lock_guard lock(g_mutex);
+    if (scenario() == Scenario::reset_fails) {
+        constexpr int kLibusbErrorOther = -99;
+        return kLibusbErrorOther;
+    }
+    if (scenario() == Scenario::persistent_accessory) {
+        g_enumerations_until_present = 1;
+        become_scenario("persistent-accessory-new-address");
+        return ua::kLibusbSuccess;
+    }
     // A software reset re-enumerates the device in its default (phone) mode.
     g_mode = Mode::phone;
     if (scenario() == Scenario::stuck_accessory) {
+        g_enumerations_until_present = 1;
         become_scenario("happy");
+    }
+    if (scenario() == Scenario::unknown_accessory) {
+        g_enumerations_until_present = 1;
+        return ua::kLibusbErrorNoDevice;
     }
     return ua::kLibusbSuccess;
 }
