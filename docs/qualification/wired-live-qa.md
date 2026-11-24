@@ -147,9 +147,9 @@ task 32.
 `aa-wired-receiver` uses the lossless playout clock by default
 (`--audio-playout-ms` default `60` ms, max `180` ms; stop-and-wait
 `max_unacked 1`; catch-up off) with video held to match (`--video-delay-ms
-match`, following `audio_write_completed`'s `playout_offset_ns`). Wired audio
-drops no sample and inserts silence only for a stream start, a resume or a real
-underrun; the cost is latency:
+match`, following `audio_write_completed`'s `playout_offset_ns`). Up to the sink
+wired audio drops no sample (within the limits below) and inserts silence only
+for a stream start, a resume or a real underrun; the cost is latency:
 
 - steady: ~`60` ms on wired audio, video, touch-to-photon and IDR recovery
   (leaving ~`940` ms of the `1.0` s `waiting_idr_max` budget);
@@ -166,17 +166,32 @@ underrun; the cost is latency:
   the hold is clipped (`video_hold_capped`) and A/V parts by the rest until it
   drains;
 - a stopped stream (`AV_STOP`, a restart, the receiver's own shutdown) plays out
-  what was accepted, so it goes quiet one playout offset later.
+  what was accepted, what only the decoder still holds included, so it goes quiet
+  one playout offset later. A shutdown takes at most `2` s for that and the
+  sink's end of stream together (`400` ms of it kept for the latter); what does
+  not fit is reported.
+
+**Known limits of a sink stall that recovers (`#232`):**
+
+- The write in progress can lose up to ~`50` ms (one piece) inside the sink.
+  Measured at the output with a `300` ms stall before `pulsesink` took the piece:
+  34 to 48 ms of a continuous tone. The router counts those frames as played, so
+  no counter shows it. This path is **not** lossless at the output; only what
+  comes after that piece is kept.
+- A/V stays within the gates only while the offset stays under the wired hold cap:
+  stalls up to about `600` ms (`700` ms less the normal `60` ms depth). Beyond,
+  video leads audio by the rest until the buffer has drained back under the cap
+  (5 to 10 ms/s): after a `1` s stall up to `300` ms, 92 of 100 pairs over 50 ms.
 
 Where latency ends and loss begins:
 
 | Case | Outcome |
 | --- | --- |
-| one write blocked, sink recovers, stall + depth before it within `2` s | nothing lost, nothing withheld from the phone: each role queues `4.4` s by time, whatever the packet size |
-| a chunk would play more than `2` s after its arrival | the part beyond is cut: `audio_playout_overflow`, `playout_overflows`, `frames_overflowed` |
+| one write blocked, sink recovers, stall + depth before it within `2` s | every frame but those in the blocked write is kept, and nothing is withheld from the phone: each role queues `4.4` s by time, whatever the packet size. The blocked write itself can lose up to ~`50` ms inside the sink (`#232`); over ~`600` ms of stall A/V parts as above |
+| audio would play more than `2` s after its content time (its chunk's arrival plus its place in the chunk), also after a stall or in a stream started behind another | the part beyond is cut: `audio_playout_overflow`, `playout_overflows`, `frames_overflowed` |
 | the sink fails its write (`2` s deadline, lost route) | stuck: what is queued is dropped and reported (`audio_stall_bypass`, `sink_write_error`), the sink reopened, the session survives (#60) |
 | one write blocked over `2` s without failing, and a credit withheld for 250 ms (queue full) | the same drop and report, trigger `credit_wait` |
-| a stop whose tail would not leave room for two of the next stream's largest messages (~4 s queued) | cancelled and reported (`audio_stop_discarded`); also what a shutdown could not play out in `2` s |
+| a stop whose tail would not leave room for two of the next stream's largest messages (~4 s queued) | cancelled and reported (`audio_stop_discarded`); also what a shutdown could not play out in its `2` s (no write starts unless the one before it says it will end `400` ms earlier) |
 
 Check on a long hold with navigation prompts over music, from the last
 `media_timing`: `frames_trimmed`, `frames_shed`, `frames_padded`,
@@ -185,7 +200,9 @@ Check on a long hold with navigation prompts over music, from the last
 `audio_playout_anchor` records; `frames_compressed` / `frames_stretched` follow
 the phone's clock (a few hundred ppm of `frames_decoded`). No
 `audio_stall_bypass` and no `audio_stop_discarded`; `playout_retimes` grows only
-with `audio_playout_retime` records. Listen for pitch movement after a provoked stall: 1% is 17 cents, slid
+with `audio_playout_retime` records. A provoked stall may be heard as a gap of up
+to ~50 ms besides the stall itself, and one over ~600 ms breaks the A/V gates
+(`#232`). Listen for pitch movement after it: 1% is 17 cents, slid
 in over about half a second. `--audio-playout-ms 0` restores the legacy
 arrival-time model.
 

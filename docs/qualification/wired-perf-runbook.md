@@ -246,7 +246,9 @@ them prescribes a p99, a rolling mean or a coverage rule.
   and shrink again at 5-10 ms/s. While a write is blocked past its slot, video
   whose audio it holds waits with it; the hold then follows the offset the sink
   really plays with. It is capped at `700` ms (wireless `400`), above which A/V
-  parts by the rest.
+  parts by the rest: A/V holds for sink stalls up to about `600` ms. The write in
+  progress during a stall can also lose up to ~`50` ms inside the sink (both
+  `#232`).
   `--audio-playout-ms 0` restores the legacy arrival-time model. Live wired
   verification: `docs/qualification/wired-live-qa.md`.
 - **Wired playout depth basis (#228):** `audio_write_completed` of 47 wired A26

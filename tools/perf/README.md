@@ -277,8 +277,9 @@ inserted), `playout_overflows` (chunks cut by the 2 s emergency bound) and
 as `audio_playout_overflow` with `frames`, `frames_lifetime` and `depth_ms`),
 `playout_retimes` (times everything to come was moved later because a write
 blocked past its slot, each logged as `audio_playout_retime` with `shifted_ms`,
-`offset_ms` and `retimes_lifetime`; nothing is lost) and `playout_retimed_ms`
-(their sum). A stopped stream plays out; `audio_stop_discarded` (`role`, `null`
+`offset_ms` and `retimes_lifetime`; nothing after the blocked write is lost, the
+write itself can lose up to ~50 ms inside the sink, which no counter shows, #232)
+and `playout_retimed_ms` (their sum). A stopped stream plays out; `audio_stop_discarded` (`role`, `null`
 at shutdown, and `chunks`) reports accepted audio a stop had to cancel.
 There `playout_offset_ms` and `playout_offset_ns` are the media stream's while
 media plays. Each underrun also logs
