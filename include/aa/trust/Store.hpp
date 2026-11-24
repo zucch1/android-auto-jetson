@@ -43,6 +43,7 @@
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -195,5 +196,13 @@ private:
     std::uint64_t mutation_epoch_{}; // bumped by every in-memory mutation
     std::shared_ptr<StoreWriteSequencer> sequencer_ = std::make_shared<StoreWriteSequencer>();
 };
+
+// Consumer-safe redacted approved-phone summary for D-Bus ListPhones (contract
+// 1.2.0): opaque phone_id (decimal uint64 matching ForgetPhone), per-process
+// pseudonymized label, transport ("wired", "wireless", or "opaque"), and
+// strength. Never exposes raw serials, MACs, ports, or legacy keys. Fails
+// closed with trust_store_io when the store is unusable.
+[[nodiscard]] core::Result<std::vector<std::map<std::string, std::string>>> list_approved_phones(
+    const ApprovedPhoneStore& store);
 
 } // namespace aa::trust

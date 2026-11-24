@@ -142,6 +142,10 @@ core::Result<void> PairingPolicy::forget(core::PhoneId phone) {
     return saved;
 }
 
+core::Result<std::vector<std::map<std::string, std::string>>> PairingPolicy::list_phones() const {
+    return list_approved_phones(store_);
+}
+
 std::optional<helper::RevocationV1> PairingPolicy::take_revocation_v1() {
     auto result = std::move(revocation_);
     revocation_.reset();

@@ -123,6 +123,8 @@ public:
     // Unknown phone ids invalidate nothing; the zero id is invalid_argument.
     // The candidate slot is never consulted or cleared here.
     [[nodiscard]] core::Result<void> forget(core::PhoneId phone) override;
+    [[nodiscard]] core::Result<std::vector<std::map<std::string, std::string>>> list_phones()
+        const override;
     std::optional<helper::RevocationV1> take_revocation_v1() override;
     [[nodiscard]] core::Result<void> pairing_requested(core::PairingRequestId request) override;
     [[nodiscard]] core::Result<core::PhoneId> pairing_confirmed(

@@ -33,7 +33,7 @@ core::Result<void> UsbAoaEndpoint::open() {
                                                        std::chrono::milliseconds{kAccessoryWaitMs.count}), {}});
 }
 
-core::Result<void> UsbAoaEndpoint::open(const core::Deadline &deadline) {
+core::Result<void> UsbAoaEndpoint::open(const core::Deadline &deadline, AoaRecovery *recovery) {
     if (opened_) {
         return {};
     }
@@ -50,17 +50,31 @@ core::Result<void> UsbAoaEndpoint::open(const core::Deadline &deadline) {
         terminal_ = true;
         return validated.error();
     }
-    auto switched = factory_->switch_to_accessory(selector_, info_, pre_switch_, switch_report_);
-    if (auto checked = deadline.check(); !checked) {
-        terminal_ = true;
-        return checked.error();
+    AoaRecovery local_recovery;
+    auto &attempt = recovery ? *recovery : local_recovery;
+    auto &claim = attempt.pending_claim_;
+    if (claim && core::Deadline::Clock::now() >= claim->until) {
+        claim.reset();
     }
-    if (!switched) {
-        terminal_ = true;
-        return switched.error();
+    if (!claim) {
+        factory_->set_recovery(&attempt);
+        auto switched = factory_->switch_to_accessory(selector_, info_, pre_switch_, switch_report_);
+        factory_->set_recovery(nullptr);
+        if (!switched) {
+            terminal_ = true;
+            const auto checked = deadline.check();
+            return checked ? switched.error() : checked.error();
+        }
+        // Keep the phone-mode evidence if this slice expires after START.
+        claim.emplace(AoaRecovery::PendingClaim{
+            std::move(pre_switch_), std::move(switch_report_),
+            core::Deadline::Clock::now() + std::chrono::milliseconds{kAccessoryWaitMs.count}});
     }
+    const core::Deadline claim_deadline{std::min(deadline.until, claim->until),
+                                        deadline.cancellation};
+    factory_->set_connect_deadline(claim_deadline);
     auto pipe = factory_->claim_accessory(selector_, post_switch_);
-    if (auto checked = deadline.check(); !checked) {
+    if (auto checked = claim_deadline.check(); !checked) {
         if (pipe) {
             pipe.value()->close();
         }
@@ -68,9 +82,13 @@ core::Result<void> UsbAoaEndpoint::open(const core::Deadline &deadline) {
         return checked.error();
     }
     if (!pipe) {
+        claim.reset();
         terminal_ = true;
         return pipe.error();
     }
+    pre_switch_ = std::move(claim->phone);
+    switch_report_ = std::move(claim->report);
+    claim.reset();
     // AOA enumeration success is never trust: the identity captured from BOTH
     // descriptor observations must pass admission before the pipe is usable.
     identity_ = build_wired_identity(pre_switch_, post_switch_, selector_.port_context);
@@ -266,7 +284,7 @@ trust::WiredIdentity build_wired_identity(const UsbDeviceSnapshot &pre_switch,
 core::Result<void> admit_wired_identity(const trust::WiredIdentity &identity,
                                         const WiredAdmission &admit) {
     // Fail closed on unusable identity material before any trust question.
-    const auto key = trust::validated_key(trust::TransportIdentity{identity});
+    const auto key = trust::validated_wired_phone_key(identity);
     if (!key) {
         return key.error();
     }
@@ -283,7 +301,8 @@ core::Result<UsbAoaLink> connect_aoa(std::unique_ptr<AoaLinkFactory> factory,
                                       const UsbDeviceSelector &selector,
                                       const AoaAccessoryInfo &info, const WiredAdmission &admit,
                                       const core::Deadline &deadline,
-                                      trust::WiredIdentity *attempted_identity) {
+                                      trust::WiredIdentity *attempted_identity,
+                                      AoaRecovery *recovery) {
     // The admission callback is the one seam that sees the CAPTURED identity of
     // a refused attempt: record it there so callers can attribute the rejection
     // (additive out-param; the admission decision itself is unchanged).
@@ -301,7 +320,7 @@ core::Result<UsbAoaLink> connect_aoa(std::unique_ptr<AoaLinkFactory> factory,
     if (!endpoint) {
         return endpoint.error();
     }
-    auto opened = endpoint.value()->open(deadline);
+    auto opened = endpoint.value()->open(deadline, recovery);
     if (!opened) {
         return opened.error();
     }
@@ -318,7 +337,7 @@ core::Result<UsbAoaLink> connect_aoa(std::unique_ptr<AoaLinkFactory> factory,
 
 WiredAdmission admit_via(const trust::TrustStore &store) {
     return [&store](const trust::WiredIdentity &identity) {
-        const auto key = trust::validated_key(trust::TransportIdentity{identity});
+        const auto key = trust::validated_wired_phone_key(identity);
         if (!key) {
             return false;
         }
@@ -330,7 +349,8 @@ core::Result<UsbAoaLink> connect_usb_aoa(const UsbDeviceSelector &selector,
                                           const AoaAccessoryInfo &info,
                                           const WiredAdmission &admit,
                                           const core::Deadline &deadline,
-                                          trust::WiredIdentity *attempted_identity) {
+                                          trust::WiredIdentity *attempted_identity,
+                                          AoaRecovery *recovery) {
     if (auto checked = deadline.check(); !checked) {
         return checked.error();
     }
@@ -339,7 +359,7 @@ core::Result<UsbAoaLink> connect_usb_aoa(const UsbDeviceSelector &selector,
         return world.error();
     }
     return usb_adapter::connect_aoa(std::move(world.value()), selector, info, admit, deadline,
-                                    attempted_identity);
+                                    attempted_identity, recovery);
 }
 
 core::Result<std::unique_ptr<ByteEndpoint>>

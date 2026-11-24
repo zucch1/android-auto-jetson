@@ -7,7 +7,6 @@ namespace {
 
 // Mandated contract budgets. Never caller-overridable; the plan fixes these.
 constexpr core::Milliseconds kPairingBudget{60'000};
-constexpr core::Milliseconds kWiredReconnectBudget{5'000};
 constexpr core::Milliseconds kWirelessReconnectBudget{15'000};
 constexpr core::Milliseconds kConsumerGrace{10'000};
 
@@ -139,7 +138,7 @@ core::Result<State> Lifecycle::enter(State to) {
     // cleared only on active, never reset by connecting/negotiating.
     if (to == State::reconnecting && !reconnect_deadline_) {
         arm_deadline(reconnect_deadline_,
-                     config_.link == LinkKind::wired ? kWiredReconnectBudget
+                     config_.link == LinkKind::wired ? config_.wired_reconnect
                                                      : kWirelessReconnectBudget,
                      at);
     } else if (to == State::active) {

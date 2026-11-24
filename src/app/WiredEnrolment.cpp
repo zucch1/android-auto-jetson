@@ -8,7 +8,7 @@ namespace aa::app {
 
 core::Result<void> WiredEnrolment::note_refused(const trust::WiredIdentity& identity) {
     if (!open_) return Error{ErrorCode::cancelled};
-    if (!trust::validated_key(trust::TransportIdentity{identity})) {
+    if (!trust::validated_wired_phone_key(identity)) {
         return Error{ErrorCode::invalid_argument};
     }
     refused_ = identity;
@@ -39,6 +39,10 @@ core::Result<void> WiredEnrolment::forget(core::PhoneId phone) {
         invalidated_.push_back(request);
     }
     return forgotten;
+}
+
+core::Result<std::vector<std::map<std::string, std::string>>> WiredEnrolment::list_phones() const {
+    return open_ ? trust::list_approved_phones(store_) : after_.list_phones();
 }
 
 std::optional<helper::RevocationV1> WiredEnrolment::take_revocation_v1() {

@@ -70,6 +70,10 @@ struct PairingOpened final {
 struct PairingClosed final {
     core::PairingRequestId request{};
 };
+struct PairingCompleted final {
+    core::PairingRequestId request{};
+    std::string outcome{};
+};
 struct DiagnosticEmitted final {
     DiagnosticSeverity severity{};
     std::string_view event{};  // stable literal name, never dynamic data
@@ -77,7 +81,8 @@ struct DiagnosticEmitted final {
 };
 
 using ControlEvent =
-    std::variant<StateChanged, PairingRequested, PairingOpened, PairingClosed, DiagnosticEmitted>;
+    std::variant<StateChanged, PairingRequested, PairingOpened, PairingClosed, PairingCompleted,
+                 DiagnosticEmitted>;
 
 class ControlEventSink {
 public:
@@ -126,6 +131,9 @@ public:
     PhoneDirectory& operator=(PhoneDirectory&&) = delete;
 
     [[nodiscard]] virtual core::Result<void> forget(core::PhoneId phone) = 0;
+    [[nodiscard]] virtual core::Result<std::vector<std::map<std::string, std::string>>> list_phones() const {
+        return std::vector<std::map<std::string, std::string>>{};
+    }
     virtual std::optional<helper::RevocationV1> take_revocation_v1() { return std::nullopt; }
     [[nodiscard]] virtual core::Result<void> pairing_requested(
         core::PairingRequestId request) = 0;
@@ -245,6 +253,10 @@ public:
     [[nodiscard]] core::Result<void> cancel_phone_pairing(const BusName& caller,
                                                           core::PairingRequestId request);
     [[nodiscard]] core::Result<void> forget_phone(const BusName& caller, core::PhoneId phone);
+    [[nodiscard]] core::Result<std::vector<std::map<std::string, std::string>>> list_phones(
+        const BusName& caller);
+    [[nodiscard]] core::Result<std::string> pairing_outcome(const BusName& caller,
+                                                            core::PairingRequestId request);
     core::Result<std::map<std::string, std::string>> pairing_comparison(const BusName&, core::PairingRequestId);
     // GetPairingCandidate: consumer-only, for a request this consumer holds
     // pending (not yet confirmed). Never broadcast; the reply is redacted.
@@ -292,8 +304,14 @@ private:
     // durable (optional out): false when the approval landed only as a committed-but-not-durable
     // store result (703).
     core::Result<void> persist_pairing(const Registered&, core::PairingRequestId, bool* durable = nullptr);
+    enum class StoreRetraction { failed, not_durable, durable };
+
     // Revokes an approved phone: store forget plus tracked external revocation (ForgetPhone's core).
-    core::Result<void> revoke_phone(const Registered&, core::PhoneId);
+    core::Result<void> revoke_phone(const Registered&, core::PhoneId,
+                                    StoreRetraction* store_retraction = nullptr,
+                                    core::PairingRequestId retracting_request = {});
+    void record_pairing_pending(core::PairingRequestId request, core::ConsumerId consumer);
+    void finalize_pairing_outcome(core::PairingRequestId request, std::string_view outcome);
     void close_enrolment(std::string_view reason, bool bond_recorded = false);
     // Bond reconciliation (docs/enrolment-ordering.md). Paced from refresh_consumer_owner(): due at
     // start, after any helper failure and whenever an enrolment ends without a commit; otherwise a
@@ -351,6 +369,13 @@ private:
         bool accepted{};
     };
     std::optional<OpenPairing> open_pairing_;
+    struct PairingOutcomeRecord final {
+        core::PairingRequestId request{};
+        core::ConsumerId consumer{};
+        std::string outcome{};
+        bool terminal{false};
+    };
+    std::vector<PairingOutcomeRecord> pairing_outcomes_{};
 };
 
 } // namespace aa::ipc

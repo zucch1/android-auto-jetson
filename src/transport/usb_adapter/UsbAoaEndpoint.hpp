@@ -32,7 +32,7 @@ class UsbAoaEndpoint final : public ByteEndpoint {
     ~UsbAoaEndpoint() override;
 
     [[nodiscard]] core::Result<void> open() override;
-    [[nodiscard]] core::Result<void> open(const core::Deadline &deadline);
+    [[nodiscard]] core::Result<void> open(const core::Deadline &deadline, AoaRecovery *recovery = nullptr);
     void set_io_checkpoint(std::function<void()> checkpoint) override {
         checkpoint_ = std::move(checkpoint);
     }
@@ -84,6 +84,7 @@ class UsbAoaEndpoint final : public ByteEndpoint {
                                                    const AoaAccessoryInfo &info,
                                                    const WiredAdmission &admit,
                                                    const core::Deadline &deadline = {},
-                                                   trust::WiredIdentity *attempted_identity = nullptr);
+                                                   trust::WiredIdentity *attempted_identity = nullptr,
+                                                   AoaRecovery *recovery = nullptr);
 
 } // namespace aa::transport::usb_adapter

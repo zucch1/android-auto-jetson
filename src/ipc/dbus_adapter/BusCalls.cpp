@@ -112,6 +112,10 @@ core::Result<void> BusConnection::send_reply(std::uint32_t reply_serial, const B
     case 6:
         writer.body_signature("a{sv}").put_property_dict(std::get<PropertyDictionary>(reply.body).entries);
         break;
+    case 7:
+        writer.body_signature("aa{ss}")
+            .put_string_map_array(std::get<std::vector<std::map<std::string, std::string>>>(reply.body));
+        break;
     default:
         break;
     }

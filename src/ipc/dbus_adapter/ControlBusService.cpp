@@ -59,6 +59,16 @@ public:
         } else if (const auto* closed = std::get_if<PairingClosed>(&event)) {
             member = "PairingClosed";
             request = closed->request.value;
+        } else if (const auto* completed = std::get_if<PairingCompleted>(&event)) {
+            MessageWriter writer;
+            writer.path(kContractObjectPath)
+                .interface_name(kContractInterface)
+                .member("PairingCompleted")
+                .body_signature("ts");
+            writer.put_u64(completed->request.value);
+            writer.put_string(completed->outcome);
+            static_cast<void>(connection_->send_message(MessageType::signal, writer));
+            return;
         } else if (const auto* diagnostic = std::get_if<DiagnosticEmitted>(&event)) {
             MessageWriter writer;
             writer.path(kContractObjectPath)

@@ -31,6 +31,7 @@ from typing import Final
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from dbus_contract_schema import (
+    ALLOWED_MAP_ARRAY_TYPE,
     ALLOWED_MAP_TYPE,
     ALLOWED_SCALAR_TYPES,
     INTERFACE,
@@ -45,7 +46,10 @@ from dbus_contract_schema import (
 )
 
 # One argument must declare exactly one complete D-Bus type from this set.
-ALLOWED_SINGLE_TYPES: Final[frozenset[str]] = ALLOWED_SCALAR_TYPES | {ALLOWED_MAP_TYPE}
+ALLOWED_METHOD_TYPES: Final[frozenset[str]] = (
+    ALLOWED_SCALAR_TYPES | {ALLOWED_MAP_TYPE, ALLOWED_MAP_ARRAY_TYPE}
+)
+ALLOWED_SINGLE_TYPES: Final[frozenset[str]] = ALLOWED_METHOD_TYPES
 
 # XML whitespace is the four XML whitespace characters only; str.isspace()
 # would also accept Unicode whitespace the contract does not permit.
@@ -83,10 +87,9 @@ def interface_major(name: str) -> int | None:
 
 def is_high_rate(type_str: str) -> bool:
     """Bulk, binary or fd payload shapes: byte arrays and any array other than
-    the string map, unix fds, variants, structs and dict entries. The contract
-    allows only one scalar type or the string map per argument, so anything
-    shaped for audio/video/high-rate data lands here."""
-    return (type_str.startswith("a") and type_str != ALLOWED_MAP_TYPE) \
+    the bounded string map / string-map array, unix fds, variants, structs and
+    dict entries."""
+    return (type_str.startswith("a") and type_str not in {ALLOWED_MAP_TYPE, ALLOWED_MAP_ARRAY_TYPE}) \
         or type_str.startswith(("(", "{")) or type_str in {"h", "v"}
 
 
@@ -104,9 +107,12 @@ def check_members(interface: ET.Element) -> list[Violation]:
         if not type_str:
             record("DBUS_CONTRACT_BAD_SIGNATURE", f"{kind} {name} argument without type")
             return
-        if type_str in ALLOWED_SINGLE_TYPES:
+        allowed = ALLOWED_SCALAR_TYPES if kind == "signal" else ALLOWED_SINGLE_TYPES
+        if type_str in allowed:
             return
-        if is_high_rate(type_str):
+        if is_high_rate(type_str) or (
+            kind == "signal" and type_str in {ALLOWED_MAP_TYPE, ALLOWED_MAP_ARRAY_TYPE}
+        ):
             record("DBUS_CONTRACT_HIGH_RATE_PAYLOAD",
                    f"{kind} {name} carries type '{type_str}'")
             return

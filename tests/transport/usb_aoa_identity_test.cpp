@@ -230,6 +230,19 @@ TEST(UsbAoaIdentity, NonPrintableDeviceTextFailsClosed) {
     EXPECT_EQ(link.error().code(), ErrorCode::invalid_argument);
 }
 
+TEST(UsbAoaIdentity, AccessoryDescriptorsCannotIdentifyAPhone) {
+    auto identity = approved_record();
+    for (const auto *vendor : {"18d1", "18D1"}) {
+        for (const auto *product : {"2d00", "2d01", "2D02", "2D03", "2d04", "2d05"}) {
+            identity.usb_vendor_id = vendor;
+            identity.usb_product_id = product;
+            const auto key = aa::trust::validated_wired_phone_key(identity);
+            ASSERT_FALSE(key.has_value());
+            EXPECT_EQ(key.error().code(), ErrorCode::invalid_argument);
+        }
+    }
+}
+
 TEST(UsbAoaIdentity, RedactedLabelNeverContainsRawSerial) {
     const auto identity = approved_record();
     const std::string label = aa::trust::redacted_label(aa::trust::TransportIdentity{identity});

@@ -343,7 +343,11 @@ def case_owner_swap(args):
         assert idle["helper_started"] is False and idle["frames_presented"] == 0, idle
         with replacement.lock:
             calls = [e["member"] for e in replacement.events if e.get("event") == "call"]
-        assert calls == ["RegisterConsumer", "SetDisplayViewport"], calls
+        # Read-only 1.2.0 feature detection after attach (GetCapabilities, and
+        # ListPhones when advertised) is allowed; the control sequence is exact.
+        queries = {"GetCapabilities", "ListPhones"}
+        assert [c for c in calls if c not in queries] == ["RegisterConsumer", "SetDisplayViewport"], calls
+        assert calls.count("GetCapabilities") <= 1, calls
 
         display.send("start")
         replacement.await_output(lambda e: e.get("member") == "StartProjection", timeout=10)

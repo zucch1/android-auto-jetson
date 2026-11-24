@@ -62,6 +62,8 @@ class AoaLinkFactory {
     AoaLinkFactory(const AoaLinkFactory &) = delete;
     AoaLinkFactory &operator=(const AoaLinkFactory &) = delete;
 
+    void set_recovery(AoaRecovery *recovery) noexcept { recovery_ = recovery; }
+
     virtual void set_connect_deadline(const core::Deadline &deadline) { deadline_ = deadline; }
 
     [[nodiscard]] virtual core::Result<void>
@@ -73,6 +75,7 @@ class AoaLinkFactory {
 
   protected:
     core::Deadline deadline_{};
+    AoaRecovery *recovery_{nullptr};
 };
 
 // Port-path syntax gate for every hardware-facing entry point: the kernel's

@@ -73,7 +73,8 @@ struct PropertyDictionary final {
 
 using ReplyBody =
     std::variant<std::monostate, std::uint64_t, std::string, StateSnapshot,
-                 std::map<std::string, std::string>, StringPropertyValue, PropertyDictionary>;
+                 std::map<std::string, std::string>, StringPropertyValue, PropertyDictionary,
+                 std::vector<std::map<std::string, std::string>>>;
 
 struct OutboundReply final {
     bool is_error{false};

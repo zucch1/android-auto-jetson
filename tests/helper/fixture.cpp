@@ -222,7 +222,7 @@ int receiver(const char* address, const std::filesystem::path& store_path, bool 
             std::cout << "phone " << (store.phones().empty() ? 0 : store.phones().front().phone_id.value) << '\n' << std::flush;
             continue;
         } else if (command == "seed-wired") {
-            const auto approved = store.approve(trust::WiredIdentity{"18d1", "2d00", "wired-fixture", "Google", "AA", "wired", "1-2"});
+            const auto approved = store.approve(trust::WiredIdentity{"04e8", "6860", "wired-fixture", "Google", "AA", "wired", "1-2"});
             result = approved ? core::Result<void>{} : core::Result<void>{approved.error()};
         } else if (command == "reload-store") {
             result = store.load();

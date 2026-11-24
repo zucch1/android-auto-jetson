@@ -15,6 +15,12 @@ void ControlService::close_enrolment(std::string_view reason, bool bond_recorded
     (void)gate_.cancel({registered_->consumer, registered_->name}, request);
     open_pairing_.reset();
     events_.emit(PairingClosed{request});
+    const std::string_view outcome =
+        reason == "pairing_expired" ? "expired"
+        : reason == "pairing_comparison_rejected" ? "rejected"
+        : reason == "pairing_snapshot_invalidated" ? "cancelled"
+                                                   : "failed";
+    finalize_pairing_outcome(request, outcome);
     events_.emit(DiagnosticEmitted{DiagnosticSeverity::warning, reason, request.value});
 }
 // Deadline, owner and store/snapshot reconciliation. Before the helper is asked to acknowledge
@@ -67,7 +73,18 @@ void ControlService::advance_enrolment() {
     const auto phone = open_pairing_ ? open_pairing_->phone : core::PhoneId{};
     const auto committed = durable && phone ? confirmation_->bond_committed(registered_->consumer, request) :
                                               core::Result<void>{Error{ErrorCode::trust_store_not_durable}};
-    if (committed || !registered_) return;
+    if (committed) {
+        finalize_pairing_outcome(request, "approved");
+        return;
+    }
+    if (!registered_) {
+        if (durable && confirmation_->reconciles()) {
+            finalize_pairing_outcome(request, "approved_commit_failed");
+        } else {
+            finalize_pairing_outcome(request, "retraction_failed");
+        }
+        return;
+    }
     events_.emit(DiagnosticEmitted{DiagnosticSeverity::warning, "pairing_commit_failed", request.value});
     const auto active = *registered_;
     if (durable && confirmation_->reconciles()) {
@@ -79,13 +96,30 @@ void ControlService::advance_enrolment() {
         retire_failed_pairing(active.consumer, request, peer);
         (void)gate_.cancel({active.consumer, active.name}, request);
         events_.emit(PairingClosed{request});
+        finalize_pairing_outcome(request, "approved_commit_failed");
         request_reconcile();
         return;
     }
     // A non-durable (703) approval is retracted: the store forget and the tracked revocation, then
-    // reconciliation. If the retraction cannot be written either, the approval remains in the store
-    // and reconciliation keeps the helper consistent with it.
-    if (phone) (void)revoke_phone(active, phone);
+    // reconciliation. Local retraction durability is tracked separately from helper cleanup:
+    // confirmed durable removal reports "retracted", an unconfirmed directory sync reports
+    // "not_durable", and a pre-replacement write failure reports "retraction_failed" after retiring
+    // the helper source through the tracked cleanup path so reconciliation keeps the helper
+    // consistent with the retained approval.
+    auto retraction = StoreRetraction::failed;
+    if (phone) (void)revoke_phone(active, phone, &retraction, request);
+    if (retraction == StoreRetraction::failed && open_pairing_ && open_pairing_->request == request) {
+        const auto peer = open_pairing_->peer;
+        retire_failed_pairing(active.consumer, request, peer);
+        open_pairing_.reset();
+        (void)gate_.cancel({active.consumer, active.name}, request);
+        events_.emit(PairingClosed{request});
+    }
+    const std::string_view outcome =
+        retraction == StoreRetraction::durable ? "retracted"
+        : retraction == StoreRetraction::not_durable ? "not_durable"
+                                                     : "retraction_failed";
+    finalize_pairing_outcome(request, outcome);
     request_reconcile();
 }
 

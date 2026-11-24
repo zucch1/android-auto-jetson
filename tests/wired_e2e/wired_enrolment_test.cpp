@@ -81,6 +81,17 @@ struct Fixture final {
     }
 };
 
+TEST(WiredEnrolment, AccessoryDescriptorsCannotBecomeACandidate) {
+    Fixture f;
+    auto identity = kPhone;
+    identity.usb_vendor_id = "18d1";
+    identity.usb_product_id = "2d01";
+    const auto noted = f.enrolment.note_refused(identity);
+    ASSERT_FALSE(noted.has_value());
+    EXPECT_EQ(noted.error().code(), ErrorCode::invalid_argument);
+    f.expect_store_untouched();
+}
+
 TEST(WiredEnrolment, RefusedThenRequestThenExplicitYesIsAdmittedDurably) {
     Fixture f;
     ASSERT_FALSE(f.admitted(kPhone));
@@ -335,11 +346,40 @@ TEST(WiredEnrolment, ForgetDuringEnrolmentRevokesAndClosesTheBoundRequest) {
     ASSERT_TRUE(f.service.cancel_phone_pairing(f.consumer, request.value()).has_value());
     ASSERT_TRUE(f.admitted(kPhone));
     const auto phone = f.store.phones()[0].phone_id;
+    const auto listed = f.service.list_phones(f.consumer);
+    ASSERT_TRUE(listed.has_value());
+    ASSERT_EQ(listed.value().size(), 1U);
+    EXPECT_EQ(listed.value()[0].at("phone_id"), std::to_string(phone.value));
+    EXPECT_EQ(listed.value()[0].at("transport"), "wired");
+    EXPECT_EQ(listed.value()[0].at("strength"), "serial-backed");
+    EXPECT_TRUE(listed.value()[0].at("label").starts_with("id-"));
+    EXPECT_EQ(f.service.pairing_outcome(f.consumer, request.value()).value(), "approved");
     const auto forgotten = f.service.forget_phone(f.consumer, phone);
     // Revocation lands in the store even if the external (helper) leg is absent.
     (void)forgotten;
     EXPECT_FALSE(f.admitted(kPhone));
     EXPECT_TRUE(f.after.forgotten.empty());
+    EXPECT_TRUE(f.service.list_phones(f.consumer).value().empty());
+}
+
+TEST(WiredEnrolment, NotDurableConfirmReportsNotDurableOutcome) {
+    Fixture f;
+    // An existing private store directory: the only directory sync is the
+    // one after the rename (no fsync of a newly created ancestor).
+    std::filesystem::create_directories(f.dir.file().parent_path());
+    std::filesystem::permissions(f.dir.file().parent_path(), std::filesystem::perms::owner_all);
+    ASSERT_TRUE(f.refuse(kPhone));
+    const auto request = f.service.request_add_phone(f.consumer);
+    ASSERT_TRUE(request.has_value());
+    ASSERT_TRUE(f.service.pairing_candidate(f.consumer, request.value()).has_value());
+    {
+        const aa::trust::test::faults::ScopedFault fault{
+            aa::trust::test::faults::Fault::dir_fsync};
+        const auto confirm = f.service.confirm_phone_pairing(f.consumer, request.value());
+        ASSERT_FALSE(confirm.has_value());
+        EXPECT_EQ(confirm.error().code(), ErrorCode::trust_store_not_durable);
+    }
+    EXPECT_EQ(f.service.pairing_outcome(f.consumer, request.value()).value(), "not_durable");
 }
 
 } // namespace

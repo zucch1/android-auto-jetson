@@ -137,7 +137,8 @@ core::Result<core::PhoneId> ApprovedPhoneStore::approve_impl(
     if (!usable_) {
         return Error{ErrorCode::trust_store_io};
     }
-    auto key = validated_key(identity);
+    const auto* wired = std::get_if<WiredIdentity>(&identity);
+    auto key = wired ? validated_wired_phone_key(*wired) : validated_key(identity);
     if (!key.has_value()) {
         return Error{ErrorCode::trust_unknown_phone};
     }
@@ -285,6 +286,42 @@ std::string ApprovedPhoneStore::redacted_summary() const {
         out += "]";
     }
     return out;
+}
+
+core::Result<std::vector<std::map<std::string, std::string>>> list_approved_phones(
+    const ApprovedPhoneStore& store) {
+    if (!store.usable()) {
+        return Error{ErrorCode::trust_store_io};
+    }
+    std::vector<std::map<std::string, std::string>> listed;
+    listed.reserve(store.phones().size());
+    for (const ApprovedPhone& phone : store.phones()) {
+        std::string transport = "opaque";
+        switch (kind_of(phone.identity)) {
+        case TransportKind::wired:
+            transport = "wired";
+            break;
+        case TransportKind::wireless:
+            transport = "wireless";
+            break;
+        case TransportKind::opaque: {
+            const auto& key = std::get<OpaqueIdentity>(phone.identity).key;
+            if (classify_wired_key(key) == WiredKeyClass::serial_bound || key.starts_with("w1:")) {
+                transport = "wired";
+            } else if (key.starts_with("b1:")) {
+                transport = "wireless";
+            }
+            break;
+        }
+        }
+        listed.push_back(std::map<std::string, std::string>{
+            {"phone_id", std::to_string(phone.phone_id.value)},
+            {"label", redacted_label(phone.identity)},
+            {"transport", std::move(transport)},
+            {"strength", std::string{strength_name(phone.strength)}},
+        });
+    }
+    return listed;
 }
 
 } // namespace aa::trust

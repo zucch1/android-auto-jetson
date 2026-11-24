@@ -11,7 +11,7 @@
 // the old link can authenticate or seal on the new one.
 //
 //   * USB unplug/replug        -> link_lost + a fresh transport, recovered within
-//                                 the fixed 5 s wired reconnect budget (and a
+//                                 the default library reconnect budget (and a
 //                                 deterministic fail-closed check past the bound);
 //                                 the replugged link re-authenticates from scratch
 //                                 (no stale-cipher resumption, no stale-key sealing).
@@ -142,7 +142,7 @@ class IoFaultTransport final : public tr::Transport {
 
 // ---------------------------------------------------------------------------
 // 1. USB unplug/replug: link loss then a fresh transport recovers within the
-//    fixed 5 s wired reconnect budget; past the bound it fails closed.
+//    default library reconnect budget; past the bound it fails closed.
 // ---------------------------------------------------------------------------
 
 TEST(WiredRecoveryUnplugReplug, FreshTransportRecoversToActiveWithinWiredBudget) {
@@ -170,7 +170,7 @@ TEST(WiredRecoveryUnplugReplug, FreshTransportRecoversToActiveWithinWiredBudget)
     EXPECT_GE(transport.close_calls(), 1); // the retired handle is closed on loss
     EXPECT_FALSE(transport.is_open());
 
-    // The replug supplies a fresh handle and the cycle completes well inside 5 s.
+    // The replug supplies a fresh handle and the cycle completes well inside the configured window.
     clock.advance(aa::core::Milliseconds{250});
     session.attach_transport(&fresh);
     EXPECT_FALSE(session.authenticated()); // the retired link's auth did not survive
@@ -315,7 +315,7 @@ TEST(WiredRecoveryUnplugReplug, RecoveryPastWiredDeadlineFailsClosedWithTypedTim
     session.tick();
     EXPECT_EQ(session.state(), ss::State::reconnecting);
 
-    // At exactly the 5 s bound the cycle fails closed with a typed timeout.
+    // At exactly the default library bound the cycle fails closed with a typed timeout.
     clock.advance(aa::core::Milliseconds{1});
     session.tick();
     EXPECT_EQ(session.state(), ss::State::failed);
@@ -364,7 +364,7 @@ TEST(WiredRecoveryUnplugReplug, ReconnectEmitsAcceptedOnlyAfterSessionReachesAct
 
 // 31 review fix (item 1): WiredSession::tick() used to forward deadline expiry
 // without emitting or counting the recovery failure - a recovery killed by the
-// 5 s wired deadline left NO terminal failed telemetry. The terminal failed
+// wired reconnect deadline left NO terminal failed telemetry. The terminal failed
 // record (and the failure count) must appear when the deadline ends the cycle.
 TEST(WiredRecoveryUnplugReplug, DeadlineExpiryDuringRecoveryEmitsTerminalFailedTelemetry) {
     ss::test::MapTrustStore trust;

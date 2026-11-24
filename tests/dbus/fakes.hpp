@@ -130,6 +130,10 @@ public:
         forgotten.push_back(phone);
         return {};
     }
+    [[nodiscard]] core::Result<std::vector<std::map<std::string, std::string>>> list_phones()
+        const override {
+        return listed_phones;
+    }
 
     [[nodiscard]] core::Result<void> pairing_requested(core::PairingRequestId request) override {
         requested.push_back(request);
@@ -174,6 +178,8 @@ public:
     bool presents{true};
 
     std::vector<core::PhoneId> forgotten{};
+    core::Result<std::vector<std::map<std::string, std::string>>> listed_phones{
+        std::vector<std::map<std::string, std::string>>{}};
     std::vector<core::PairingRequestId> presented{};
     std::optional<std::map<std::string, std::string>> candidate{};
     std::vector<core::PairingRequestId> requested{};
