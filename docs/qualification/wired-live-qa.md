@@ -187,6 +187,10 @@ for a stream start, a resume or a real underrun; the cost is latency:
   stalls up to about `600` ms (`700` ms less the normal `60` ms depth). Beyond,
   video leads audio by the rest until the buffer has drained back under the cap
   (5 to 10 ms/s): after a `1` s stall up to `300` ms, 92 of 100 pairs over 50 ms.
+- With `slave-method=none` the sink no longer corrects its device clock's drift
+  from the system clock. A slower device blocks writes later, which the router
+  takes as a stall it holds and drains; a faster one would run the sink's ring
+  down by the drift. Measured on the Jetson: about 2 ppm (7 ms an hour).
 
 Where latency ends and loss begins:
 
