@@ -11,6 +11,7 @@
 #include <aa/core/Result.hpp>
 #include <aa/core/Time.hpp>
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -58,6 +59,8 @@ public:
     ObservedAudioSink& operator=(ObservedAudioSink&&) = delete;
 
     [[nodiscard]] virtual core::Result<void> write(const MixedChunk& chunk) = 0;
+    // Later writes time out at `until` when that is before their own timeout.
+    virtual void set_write_deadline(std::chrono::steady_clock::time_point until) { (void)until; }
     // Bounded render drain: pushes end-of-stream and waits for the sink to
     // confirm it rendered everything acknowledged (bus EOS round-trip).
     // Terminal for the route (further writes fail typed). Returns the drain

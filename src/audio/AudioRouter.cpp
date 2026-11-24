@@ -142,8 +142,6 @@ struct PlayoutPlan final {
     // Lossless steady: frames the run was shortened (negative) or lengthened
     // by to correct the playback rate; no sample is dropped or inserted.
     std::int64_t warped_frames{};
-    // Lossless steady: trim_frames keeps the backlog under the emergency bound.
-    bool overflow{false};
     // Lossless anchor: only the decoder held the role back; it still owes.
     bool decoder_held{false};
 };
@@ -180,6 +178,9 @@ struct Run final {
     std::uint64_t decoded_frames{};
     // First run of a stream the peer started after a stop (end_stream).
     bool stream_start{};
+    // A decoder tail's content begins this long after `timestamp` (the parent
+    // it belongs to).
+    std::int64_t content_ahead_ns{};
 };
 
 // One run placed on the sample timeline at an effective (non-overlapping)
@@ -211,6 +212,8 @@ struct ScheduledRun final {
     // Playout steady: the pad this placement applies (0 when the slot moved
     // past the planned start).
     std::uint64_t applied_pad_frames{0};
+    // Lossless: part of head_trim_frames cut by the emergency bound.
+    std::uint64_t overflow_frames{0};
 };
 
 // Drift trim of one unplaced run. The catch-up (#154) judges the run by the
@@ -644,15 +647,9 @@ struct AudioRouter::Impl final {
         plan.depth_ns = slot_ns - arrival;
         if (lossless()) {
             // The depth is free to grow and is drained by apply_rate(); only
-            // a backlog beyond the emergency bound is cut.
+            // a backlog beyond the emergency bound is cut (overflow_beyond).
             plan.start_frame = slot_frame;
             plan.slot_frame = slot_frame;
-            const auto bound = config.playout.emergency_backlog.count;
-            if (plan.depth_ns > bound) {
-                plan.trim_frames = std::min(
-                    run.frames, ns_to_frames(core::Nanoseconds{plan.depth_ns - bound}));
-                plan.overflow = plan.trim_frames != 0;
-            }
             return true;
         }
         // Drift acts on sustained error of the buffer the latest arrival had
@@ -703,6 +700,26 @@ struct AudioRouter::Impl final {
         return true;
     }
 
+    // Lossless: how many of `frames` frames of the run, from `content_frame` on,
+    // the emergency bound cuts when the first of them is placed at `start_frame`:
+    // what would play more than emergency_backlog after its content time (the
+    // run's arrival plus the frames before it). Decided for the placement itself,
+    // so it covers every way a run gets there: steady, a fresh stream queued
+    // behind the one before, a retime after the run was planned. False when a
+    // time cannot be represented.
+    [[nodiscard]] bool overflow_beyond(const Run& run, std::uint64_t start_frame, std::int64_t base_ns,
+                                       std::uint64_t content_frame, std::uint64_t frames,
+                                       std::uint64_t& cut) const {
+        std::int64_t start_ns = 0;
+        if (!frame_time(start_frame, base_ns, start_ns)) { return false; }
+        cut = 0;
+        const auto age = start_ns - run.timestamp.count - run.content_ahead_ns
+            - frames_to_ns(content_frame).count;
+        const auto bound = config.playout.emergency_backlog.count;
+        if (age > bound) { cut = std::min(frames, ns_to_frames(core::Nanoseconds{age - bound})); }
+        return true;
+    }
+
     static void shift_depths(PlayoutRole& state, std::int64_t by) noexcept {
         for (auto& entry : state.depths) {
             entry.low += by;
@@ -739,10 +756,25 @@ struct AudioRouter::Impl final {
             shift_depths(state, by);
             state.offset_ns += by;
             for (auto& run : pending[role]) {
-                run.playout_offset_ns += run.placed ? by : 0;
                 if (run.playout && run.playout->mode == PlayoutPlan::Mode::steady) {
                     run.playout->depth_ns += by;
                 }
+                if (!run.placed) { continue; }
+                run.playout_offset_ns += by;
+                // The rest of a run already placed (render_step() decides the
+                // others again).
+                const auto used = run.trimmed + run.consumed;
+                std::uint64_t cut = 0;
+                if (!overflow_beyond(run, *run.placed + run.consumed, timeline_base->count, used,
+                                     run.frames - used, cut) || cut == 0) { continue; }
+                run.trimmed += cut;
+                const auto cut_ns = frames_to_ns(cut).count;
+                run.playout_offset_ns -= cut_ns;
+                shift_depths(state, -cut_ns);
+                state.offset_ns -= cut_ns;
+                report.stats.frames_trimmed += cut;
+                ++report.stats.playout_overflows;
+                report.stats.frames_overflowed += cut;
             }
         }
         auto& stats = report.stats;
@@ -768,6 +800,8 @@ struct AudioRouter::Impl final {
     // next run submitted starts a new one (end_stream).
     std::array<bool, kRoleCount> stream_ended{};
     std::array<std::optional<protocol::MessageHeader>, kRoleCount> last_header{};
+    // Content duration of that parent.
+    std::array<std::int64_t, kRoleCount> last_content_ns{};
 
     // Appends what the role's decoder still holds to the role's pending audio
     // and restarts the decoder. Nothing once the role's own stream has run dry:
@@ -797,6 +831,7 @@ struct AudioRouter::Impl final {
             run.frames = frames;
             run.decoded_frames = frames;
             run.submitted_at_ns = now_ns();
+            run.content_ahead_ns = last_content_ns[role];
             pending[role].push_back(std::move(run));
         }
         report.stats.frames_decoded += frames;
@@ -810,6 +845,12 @@ struct AudioRouter::Impl final {
         auto& stats = report.stats;
         std::int64_t start_ns = 0;
         if (!frame_time(entry.start_frame, base_ns, start_ns)) { start_ns = run.timestamp.count; }
+        // A run cut whole is still noted no deeper than the bound: nothing plays
+        // beyond it.
+        if (entry.overflow_frames != 0) {
+            ++stats.playout_overflows;
+            stats.frames_overflowed += entry.overflow_frames;
+        }
         if (plan.mode == PlayoutPlan::Mode::steady) {
             // How much later than its planned slot the run is placed (its pad,
             // or a cursor another role moved on) shifts every later depth (N7).
@@ -821,13 +862,11 @@ struct AudioRouter::Impl final {
             const auto adjust = frames_to_ns(shifted).count
                 - frames_to_ns(entry.head_trim_frames).count + warped;
             shift_depths(state, adjust);
-            note_depth(state, run, plan.depth_ns + adjust);
+            note_depth(state, run, entry.overflow_frames != 0
+                ? std::min(plan.depth_ns + adjust, config.playout.emergency_backlog.count)
+                : plan.depth_ns + adjust);
             stats.frames_padded += pad;
             if (plan.shed) { stats.frames_shed += entry.head_trim_frames; }
-            if (plan.overflow) {
-                ++stats.playout_overflows;
-                stats.frames_overflowed += entry.head_trim_frames;
-            }
             if (plan.warped_frames < 0) {
                 stats.frames_compressed += static_cast<std::uint64_t>(-plan.warped_frames);
             } else {
@@ -845,7 +884,8 @@ struct AudioRouter::Impl final {
             state.rate_ppm = 0.0;
             state.rate_carry = 0.0;
             state.decoder_owed = owed_after(plan.decoder_held ? state.decoder_owed : 0, run);
-            const auto depth = start_ns - run.timestamp.count;
+            auto depth = start_ns - run.timestamp.count - frames_to_ns(entry.overflow_frames).count;
+            if (entry.overflow_frames != 0) { depth = std::min(depth, config.playout.emergency_backlog.count); }
             state.depths.push_back({run.timestamp.count, depth, depth});
             PlayoutEvent event{PlayoutEvent::Kind::start, core::Nanoseconds{plan.late_ns},
                                core::Nanoseconds{depth}, static_cast<Role>(role)};
@@ -1339,6 +1379,7 @@ core::Result<void> AudioRouter::submit(const protocol::MessageView& message,
 
     run.stream_start = std::exchange(impl_->stream_ended[index], false);
     impl_->last_header[index] = message.header;
+    impl_->last_content_ns[index] = impl_->frames_to_ns(run.content_frames).count;
     impl_->report.stats.frames_decoded += run.frames;
     impl_->newest_arrival = std::max(impl_->newest_arrival, run.timestamp.count);
     {
@@ -1937,7 +1978,7 @@ core::Result<RenderStep> AudioRouter::render_step() {
                     break;
                 } else if (&run == &impl_->pending[role].front()) {
                     if (impl_->lossless() && plan.mode == PlayoutPlan::Mode::steady
-                        && !plan.backward && !plan.overflow) {
+                        && !plan.backward && plan.depth_ns <= impl_->config.playout.emergency_backlog.count) {
                         impl_->apply_rate(role, run, plan);
                     }
                     run.playout = plan;
@@ -1974,6 +2015,16 @@ core::Result<RenderStep> AudioRouter::render_step() {
                         entry.skip_last = std::min(entry.start_frame, static_cast<std::uint64_t>(arrived));
                     }
                     entry.refill_allowance = impl_->ns_to_frames(impl_->config.playout.depth) + 1;
+                }
+                if (impl_->lossless()) {
+                    if (!impl_->overflow_beyond(run, entry.start_frame, base->count, 0, run.frames,
+                                                entry.overflow_frames)) {
+                        diagnostic.time_conversion_frame = entry.start_frame;
+                        fail(RenderFailureReason::placement_time_conversion);
+                        valid = false;
+                        break;
+                    }
+                    entry.head_trim_frames = entry.overflow_frames;
                 }
                 entry.intended = static_cast<std::int64_t>(entry.start_frame);
                 diagnostic.intended = entry.intended;
@@ -2128,14 +2179,19 @@ core::Result<RenderStep> AudioRouter::render_step() {
     std::array<std::optional<ScheduledRun>, kRoleCount> heads{};
     auto end = cursor + quantum;
     bool any = false;
+    // Lossless: roles whose next run waits to be planned as a head of its own.
+    std::array<bool, kRoleCount> replan{};
     for (const auto& head : planned) {
         const auto role = head.role;
-        if (heads[role]) { continue; }
+        if (heads[role] || replan[role]) { continue; }
         auto& queue = impl_->pending[role];
         if (head.start_frame == head.end_frame) {
-            impl_->report.stats.frames_trimmed += head.head_trim_frames;
-            impl_->report.stats.frames_caught_up += head.caught_up_frames;
-            impl_->commit_playout(role, queue.front(), head, base->count);
+            // A placed run ends here when a retime cut its rest: already counted.
+            if (!queue.front().placed) {
+                impl_->report.stats.frames_trimmed += head.head_trim_frames;
+                impl_->report.stats.frames_caught_up += head.caught_up_frames;
+                impl_->commit_playout(role, queue.front(), head, base->count);
+            }
             impl_->role_end_frames[role] = head.end_frame;
             if (head.intended) {
                 const auto run_source_end = source_end_frame(*head.intended, head.run->content_frames);
@@ -2145,12 +2201,20 @@ core::Result<RenderStep> AudioRouter::render_step() {
             }
             result.completed.push_back(queue.front().header);
             queue.pop_front();
+            replan[role] = impl_->lossless() && !queue.empty();
             continue;
         }
         // Never cross an earlier queued head/end to reach a future role.
         end = std::min(end, head.start_frame > cursor ? head.start_frame : head.end_frame);
         heads[role] = head;
         any = true;
+    }
+    if (std::find(replan.begin(), replan.end(), true) != replan.end()) {
+        // What follows a wholly cut run had no playout decision yet (only a head
+        // gets one): the next step makes it, so nothing is placed, cut or
+        // reported without one.
+        result.pending = true;
+        return result;
     }
     if (!any) { return result; }
     if (impl_->lossless() && !std::exchange(impl_->retimed, false)
@@ -2427,7 +2491,7 @@ core::Result<RenderStep> AudioRouter::render_step() {
     return result;
 }
 
-core::Result<void> AudioRouter::flush() {
+core::Result<void> AudioRouter::flush(core::Milliseconds drain_timeout) {
     if (!impl_ || impl_->closed) {
         return Error{ErrorCode::invalid_argument};
     }
@@ -2457,7 +2521,7 @@ core::Result<void> AudioRouter::flush() {
     // drain is the route's single end-of-stream round-trip (gate fix F1) and
     // the route is terminal from this point on - even when the drain fails.
     impl_->flushed = true;
-    auto drained = impl_->sink->drain(core::Milliseconds{2000});
+    auto drained = impl_->sink->drain(drain_timeout);
     impl_->report.sink_probe = impl_->sink->probe_stats();
     impl_->report.render_barrier = impl_->sink->render_stats();
     if (!drained.has_value()) {
@@ -2479,7 +2543,11 @@ void AudioRouter::set_muted(bool muted) noexcept {
     return impl_ ? impl_->mixer.muted() : false;
 }
 
-void AudioRouter::close() noexcept {
+void AudioRouter::set_write_deadline(std::chrono::steady_clock::time_point until) {
+    if (impl_ && impl_->sink) { impl_->sink->set_write_deadline(until); }
+}
+
+void AudioRouter::close(core::Milliseconds drain_timeout) noexcept {
     if (!impl_ || impl_->closed) {
         return;
     }
@@ -2497,7 +2565,7 @@ void AudioRouter::close() noexcept {
         // second one is never sent (and never retried after a failed one).
         if (!impl_->flushed) {
             impl_->flushed = true;
-            (void)impl_->sink->drain(core::Milliseconds{2000});
+            (void)impl_->sink->drain(drain_timeout);
         }
         impl_->report.sink_probe = impl_->sink->probe_stats();
         impl_->report.render_barrier = impl_->sink->render_stats();

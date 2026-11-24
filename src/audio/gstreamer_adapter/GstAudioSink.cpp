@@ -662,6 +662,10 @@ public:
         return outcome.result;
     }
 
+    void set_write_deadline(std::chrono::steady_clock::time_point until) override {
+        write_limit_ = until;
+    }
+
     // Bounded nonblocking enqueue (gate fix 3). ONE absolute deadline is
     // computed at entry and shared by queue admission, chain settlement and
     // the render handoff - never two stacked timeout windows. Capacity for the
@@ -676,7 +680,8 @@ public:
                                                   core::Milliseconds timeout,
                                                   bool readiness_probe) {
         const auto entered = std::chrono::steady_clock::now();
-        const auto deadline = entered + std::chrono::milliseconds(timeout.count);
+        auto deadline = entered + std::chrono::milliseconds(timeout.count);
+        if (!readiness_probe && write_limit_) { deadline = std::min(deadline, *write_limit_); }
         playback_slot_ = {};
         SinkWriteProgress value;
         value.readiness_probe = readiness_probe;
@@ -1409,6 +1414,8 @@ private:
     gulong probe_id_{0};
     AudioFormat format_{};
     core::Milliseconds write_timeout_{2000};
+    // Earlier end of every later write (set_write_deadline).
+    std::optional<std::chrono::steady_clock::time_point> write_limit_{};
     WriteProgress progress_;
     mutable HandoffTracker handoff_{};
     PadProbe probe_;

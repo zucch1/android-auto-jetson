@@ -10,6 +10,7 @@
 #include <aa/diagnostics/QueueRejection.hpp>
 
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -335,7 +336,8 @@ private:
 //   that and drain by the rate correction (audio_playout_retime). Writing on
 //   at slots that had passed would be lossless only on paper: the ring buffer
 //   throws samples behind its read position away. The piece inside the blocked
-//   write is the sink's: how late it plays is endpoint_offset;
+//   write is the sink's: how late it plays is endpoint_offset, and up to all of
+//   it (50 ms) can still be lost there, unseen here (#232);
 // - stop: what the peer sent before stopping a stream plays out (end_stream);
 // - silence is written only on an anchor, a resume or an underrun. A role
 //   underruns when its own stream (its end plus what a resampler split still
@@ -346,13 +348,16 @@ private:
 //   not delivered its next chunk: a 200 ms prompt no longer runs the cursor
 //   ahead of 42.67 ms media chunks (RenderStep::wait_until);
 // - the offset the writes report is media's while media plays;
-// - emergency bound: a chunk placed more than `emergency_backlog` after its
-//   arrival loses the part beyond it (playout_overflows, frames_overflowed,
-//   logged as audio_playout_overflow). It bounds memory and delay, and is the
-//   line between latency and loss: a stalled write the sink recovers from costs
-//   latency as long as the stall and the depth before it stay within it; a sink
-//   that fails its write (RouterConfig::sink_write_timeout, 2 s) drops and
-//   reopens (#60). A phone bursting its 341 ms capture buffer does not reach it.
+// - emergency bound: no frame is placed more than `emergency_backlog` after its
+//   content time (its chunk's arrival plus its position in the chunk); the part
+//   of a chunk beyond it is cut (playout_overflows, frames_overflowed, logged as
+//   audio_playout_overflow). It holds however the chunk got there: in a deep
+//   stream, as a new stream queued behind the one before (end_stream), or moved
+//   by a retime. It bounds memory and delay, and is the line between latency and
+//   loss: what follows a stalled write the sink recovers from costs latency as
+//   long as the stall and the depth before it stay within it; a sink that fails
+//   its write (RouterConfig::sink_write_timeout, 2 s) drops and reopens (#60). A
+//   phone bursting its 341 ms capture buffer does not reach it.
 struct PlayoutPolicy final {
     bool enabled{false};
     core::Nanoseconds depth{core::Nanoseconds{120'000'000}};
@@ -734,11 +739,17 @@ public:
     // Repeated flush() is idempotent - it never sends a second EOS - and
     // close() never drains again after flush(). A pump/preflight failure
     // before the EOS drain does NOT mark the route flushed.
-    [[nodiscard]] core::Result<void> flush();
+    [[nodiscard]] core::Result<void> flush(core::Milliseconds drain_timeout = kDrainTimeout);
+
+    // Longest an EOS drain (flush(), close()) waits by default.
+    static constexpr core::Milliseconds kDrainTimeout{2000};
+    // Owner thread: later sink writes time out at `until` when that is before
+    // RouterConfig::sink_write_timeout (a shutdown that has to end by then).
+    void set_write_deadline(std::chrono::steady_clock::time_point until);
 
     void set_muted(bool muted) noexcept;
     [[nodiscard]] bool muted() const noexcept;
-    void close() noexcept;
+    void close(core::Milliseconds drain_timeout = kDrainTimeout) noexcept;
 
     [[nodiscard]] RouterState state() const noexcept;
     [[nodiscard]] const RouterReport& report() const noexcept;

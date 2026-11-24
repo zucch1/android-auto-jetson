@@ -181,7 +181,10 @@ AudioRenderWorker::AudioRenderWorker(RouterConfig config,
                                 : credit_window_),
       playout_depth_ns_(config.playout.enabled ? config.playout.depth.count : 0),
       emergency_backlog_ns_(config.playout.emergency_backlog.count) {
-    for (std::size_t index = 0; index < credits_.size(); ++index) { seed_credits_locked(index); }
+    for (std::size_t index = 0; index < credits_.size(); ++index) {
+        seed_credits_locked(index);
+        pcm_role_[index] = config.roles[index].codec == Codec::pcm;
+    }
     // Started last: every member above is initialized before run() reads it.
     thread_ = std::thread([this, config = std::move(config), open = std::move(open)] {
         run(config, open);
@@ -406,18 +409,21 @@ AudioRenderWorker::submit(const protocol::MessageView& message, channels::AvDeli
         {id, message.header.sequence, message.header.timestamp, receiver_input_at},
         monotonic_now(), idle_since_, idle_disposition(receiver_input_at), queue_observation(),
         last_completion_, last_success_};
-    queued_.push_back(Job{message.header,
-                          {message.payload.begin(), message.payload.end()},
-                          id,
-                          receiver_input_at,
-                          {bytes, units},
-                          {},
-                          admission,
-                          false,
-                          session_epoch_,
-                          std::exchange(stream_end_pending_[*role], false)});
-    ++slots_;
-    ++role_slots_[*role];
+    if (!coalesce_locked(message, id, {bytes, units}, *role)) {
+        queued_.push_back(Job{message.header,
+                              {message.payload.begin(), message.payload.end()},
+                              id,
+                              receiver_input_at,
+                              {bytes, units},
+                              {},
+                              admission,
+                              false,
+                              session_epoch_,
+                              std::exchange(stream_end_pending_[*role], false),
+                              message.header.timestamp});
+        ++slots_;
+        ++role_slots_[*role];
+    }
     bytes_ += bytes;
     units_ += units;
     role_bytes_[*role] += bytes;
@@ -438,6 +444,32 @@ AudioRenderWorker::submit(const protocol::MessageView& message, channels::AvDeli
     return {};
 }
 
+// Lossless: appends a parent shorter than kSlotNs to the role's newest job while
+// that still waits here and is the same stream's PCM right before it.
+bool AudioRenderWorker::coalesce_locked(const protocol::MessageView& message,
+                                        const channels::AvDeliveryId& id,
+                                        Reservation reservation, std::size_t index) {
+    constexpr auto kSlotUnits = kUnitsPerMs * static_cast<std::size_t>(kSlotNs / 1'000'000);
+    constexpr auto kCoalesceUnits = kUnitsPerMs * static_cast<std::size_t>(kCoalesceNs / 1'000'000);
+    const std::size_t frame_bytes = index == 0 ? 4 : 2;
+    if (!lossless_ || !pcm_role_[index] || stream_end_pending_[index] || reservation.bytes == 0
+        || reservation.bytes % frame_bytes != 0 || reservation.units >= kSlotUnits) { return false; }
+    const auto last = std::find_if(queued_.rbegin(), queued_.rend(), [&](const Job& job) {
+        return job.id.role == id.role;
+    });
+    if (last == queued_.rend() || last->dequeued_at || last->epoch != session_epoch_
+        || last->id.generation != id.generation || last->id.session_id != id.session_id
+        || last->reservation.bytes % frame_bytes != 0
+        || last->reservation.units + reservation.units > kCoalesceUnits) { return false; }
+    const auto since = message.header.timestamp.count - last->last_arrival.count;
+    if (since < 0 || since > kCoalesceNs) { return false; }
+    last->pcm.insert(last->pcm.end(), message.payload.begin(), message.payload.end());
+    last->reservation.bytes += reservation.bytes;
+    last->reservation.units += reservation.units;
+    last->last_arrival = message.header.timestamp;
+    return true;
+}
+
 void AudioRenderWorker::invalidate(protocol::ChannelRole role, std::uint64_t generation) {
     SettlementDiagnostics diagnostics{telemetry_};
     std::unique_lock lock(mutex_);
@@ -446,11 +478,14 @@ void AudioRenderWorker::invalidate(protocol::ChannelRole role, std::uint64_t gen
     if (generations_[*index] == generation) { return; }
     // Accepted audio plays out (#228): the phone's credit for it is spent, so a
     // stop right after the final ACK must not take it back.
+    // So must the session's own teardown not, which resets every channel right
+    // after stop(): nothing more is accepted then, so no room is needed.
     const auto room = envelope(*index);
-    const bool play_out = lossless_ && router_ && !stopping_ && !bypass_since_ &&
-        role_slots_[*index] + kStopReserveScale <= role_slot_cap() &&
-        role_bytes_[*index] + kStopReserveScale * room.bytes <= role_capacity(*index).bytes &&
-        role_units_[*index] + kStopReserveScale * room.units <= role_capacity(*index).units;
+    const bool play_out = drain_until_ ||
+        (lossless_ && router_ && !stopping_ && !bypass_since_ &&
+         role_slots_[*index] + kStopReserveScale <= role_slot_cap() &&
+         role_bytes_[*index] + kStopReserveScale * room.bytes <= role_capacity(*index).bytes &&
+         role_units_[*index] + kStopReserveScale * room.units <= role_capacity(*index).units);
     std::optional<std::string> discarded;
     if (play_out) {
         stream_end_pending_[*index] = true;
@@ -663,10 +698,17 @@ bool AudioRenderWorker::wait_idle(Clock::time_point until) {
 
 void AudioRenderWorker::stop() {
     std::lock_guard lock(mutex_);
-    if (lossless_ && !stopping_ && router_ && !failure_ && !bypass_since_
-        && (!queued_.empty() || router_busy_)) {
-        // What was accepted plays out (#228); the worker ends it (draining_locked).
-        drain_until_ = Clock::now() + kStopDrain;
+    if (lossless_ && !stopping_) {
+        stop_until_ = Clock::now() + kStopDrain;
+        if (router_ && !failure_ && !bypass_since_) {
+            // What was accepted plays out (#228), as at the end of any stream: also
+            // what only the decoders still hold of it. The worker ends it
+            // (draining_locked).
+            drain_until_ = *stop_until_ - kStopEosReserve;
+            // Only a write in progress says how long the next may take.
+            if (!in_flight_) { last_write_ = {}; }
+            stream_end_pending_.fill(true);
+        }
     }
     stopping_ = true;
     idle_since_.reset();
@@ -847,6 +889,7 @@ void AudioRenderWorker::latch(Error error, AudioFailureOrigin origin,
         failure_queue_rejection_ = rejection;
     }
     stopping_ = true;
+    if (drain_until_) { drain_discarded_ = queued_.size(); }
     drain_until_.reset();
     idle_since_.reset();
     idle_resume_id_.reset();
@@ -983,8 +1026,18 @@ bool AudioRenderWorker::dequeueable_locked(const Job& job) const {
 
 // stop() with accepted audio still to play (lossless).
 bool AudioRenderWorker::draining_locked() const {
-    return drain_until_ && !failure_ && !bypass_since_ && (!queued_.empty() || router_busy_)
-        && Clock::now() < *drain_until_;
+    return drain_until_ && !failure_ && !bypass_since_
+        && (!queued_.empty() || router_busy_
+            || std::find(stream_end_pending_.begin(), stream_end_pending_.begin() + kAdvertisedRoles, true)
+                != stream_end_pending_.begin() + kAdvertisedRoles)
+        && Clock::now() + last_write_ < *drain_until_;
+}
+
+core::Milliseconds AudioRenderWorker::eos_budget() const {
+    std::lock_guard lock(mutex_);
+    if (!stop_until_) { return AudioRouter::kDrainTimeout; }
+    const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(*stop_until_ - Clock::now());
+    return core::Milliseconds{std::max<std::int64_t>(1, left.count())};
 }
 
 void AudioRenderWorker::run(RouterConfig config, const OpenRouter& open) {
@@ -1035,24 +1088,24 @@ void AudioRenderWorker::run(RouterConfig config, const OpenRouter& open) {
         };
     }
     auto opened = open(config);
-    {
+    if (!opened) {
         std::lock_guard lock(mutex_);
         initialized_ = true;
-        if (!opened) {
-            latch(opened.error(), AudioFailureOrigin::open);
-        } else {
-            sink_report_ = opened.value().report().sink;
-            if (opened.value().state() == RouterState::degraded) {
-                latch(Error{ErrorCode::audio_sink_unavailable}, AudioFailureOrigin::open);
-            }
-        }
+        latch(opened.error(), AudioFailureOrigin::open);
         cv_.notify_all();
+        return;
     }
-    if (!opened) { return; }
     auto local_router = std::move(opened).value();
     {
+        // ready() is also the router's: a stop right after it plays out (lossless).
         std::lock_guard lock(mutex_);
+        initialized_ = true;
+        sink_report_ = local_router.report().sink;
+        if (local_router.state() == RouterState::degraded) {
+            latch(Error{ErrorCode::audio_sink_unavailable}, AudioFailureOrigin::open);
+        }
         router_ = &local_router;
+        cv_.notify_all();
     }
     // Counters of the routes a sink reopen replaced, so media_timing reports
     // the receiver's life rather than the current route.
@@ -1167,6 +1220,7 @@ void AudioRenderWorker::run(RouterConfig config, const OpenRouter& open) {
         }
         if (stopping_ && !draining_locked()) { break; }
         if (queued_.empty() && !router_busy_) { continue; }
+        if (stop_until_) { local_router.set_write_deadline(*stop_until_); }
         active_ = parents.size() == 1 ? std::optional{parents.front().dispatch} : std::nullopt;
         active_step_epoch_ = step_epoch;
         step_write_.reset();
@@ -1180,6 +1234,7 @@ void AudioRenderWorker::run(RouterConfig config, const OpenRouter& open) {
         const auto overflowed_before = local_router.report().stats.frames_overflowed;
         lock.unlock();
         const auto step_started = monotonic_now();
+        const auto step_clock = Clock::now();
         const auto result = local_router.render_step();
         const auto returned_at = monotonic_now();
         held_until = result ? result.value().wait_until : std::nullopt;
@@ -1190,6 +1245,7 @@ void AudioRenderWorker::run(RouterConfig config, const OpenRouter& open) {
             write_in_flight_.reset();
         }
         router_busy_ = lossless_ && result && (result.value().pending || held_until);
+        if (local_router.report().stats.frames_written > before) { last_write_ = Clock::now() - step_clock; }
         const bool same_epoch = (step_epoch == session_epoch_);
         if (same_epoch) {
             diagnostics.completion = step_completion_;
@@ -1436,13 +1492,22 @@ void AudioRenderWorker::run(RouterConfig config, const OpenRouter& open) {
     std::optional<std::string> undrained;
     {
         std::lock_guard lock(mutex_);
-        if (drain_until_) {
-            if (!queued_.empty()) {
-                undrained = "{\"event\":\"audio_stop_discarded\",\"role\":null,\"chunks\":" +
-                    std::to_string(queued_.size()) + "}";
-                cancel_all();
+        auto chunks = drain_discarded_;
+        if (drain_until_ && !failure_) {
+            // Out of time. A decoder tail alone counts as one chunk.
+            bool left = router_busy_;
+            for (const auto role : {protocol::ChannelRole::media_audio,
+                                    protocol::ChannelRole::guidance_audio,
+                                    protocol::ChannelRole::system_audio}) {
+                if (stream_end_pending_[*audio_index(role)]) { left = local_router.end_stream(role) || left; }
             }
+            chunks = std::max<std::size_t>(queued_.size(), left ? 1 : 0);
+            if (chunks != 0) { cancel_all(); }
             discard_if(queued_, [](const auto&) { return true; });
+        }
+        if (chunks != 0) {
+            undrained = "{\"event\":\"audio_stop_discarded\",\"role\":null,\"chunks\":" +
+                std::to_string(chunks) + "}";
         }
         router_ = nullptr;
     }
@@ -1450,12 +1515,12 @@ void AudioRenderWorker::run(RouterConfig config, const OpenRouter& open) {
     // Failed PCM must never be pumped again by flush(). close() only tears
     // down/drains the backend; healthy terminalization commits one EOS.
     if (!failure()) {
-        if (auto flushed = local_router.flush(); !flushed) {
+        if (auto flushed = local_router.flush(eos_budget()); !flushed) {
             std::lock_guard lock(mutex_);
             latch(flushed.error(), AudioFailureOrigin::flush);
         }
     }
-    local_router.close();
+    local_router.close(eos_budget());
     emit_media_timing(local_router.report().stats);
     {
         std::lock_guard lock(mutex_);

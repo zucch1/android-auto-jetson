@@ -141,8 +141,11 @@ public:
 
     [[nodiscard]] bool wait_idle(Clock::time_point until);
     // Accepts nothing more. Lossless playout then plays out what it accepted,
-    // for at most kStopDrain; whatever is left (and everything without lossless
-    // playout) is discarded.
+    // what the decoders still hold included. That and the sink's end of stream
+    // take at most kStopDrain together from here: no write starts that is not
+    // expected to end in time, and one that has started is cut there. What is
+    // left is discarded and reported (audio_stop_discarded). Without lossless
+    // playout everything is discarded.
     void stop();
     [[nodiscard]] core::Result<void> finish();
     [[nodiscard]] std::optional<RouterReport> final_report() const;
@@ -153,6 +156,8 @@ private:
         std::size_t bytes;
         std::size_t units;
     };
+    // One parent, or several short ones sharing a slot (coalesce_locked), which
+    // then go by the first one's header and id.
     struct Job {
         protocol::MessageHeader header;
         std::vector<std::byte> pcm;
@@ -165,6 +170,8 @@ private:
         std::uint64_t epoch{1};
         // First of a stream that follows a stopped one (lossless).
         bool starts_stream{};
+        // Arrival of the last parent in it.
+        core::Nanoseconds last_arrival{};
     };
     struct DeferredCredit {
         channels::AvDeliveryId id;
@@ -190,12 +197,12 @@ private:
     //
     // Lossless playout (#228) draws the line between latency and loss at the
     // router's emergency bound (PlayoutPolicy::emergency_backlog, 2 s), which is
-    // also the sink's write deadline: a write that returns within it costs
-    // latency only, so the bypass also needs that one write blocked for the
-    // whole bound. A sink that fails its write (the deadline, or a lost route)
-    // is declared stuck: what is queued is dropped and reported
-    // (audio_stall_bypass, trigger sink_write_error) and the sink reopened, so
-    // the session survives it as on the arrival model.
+    // also the sink's write deadline: a write that returns within it costs no
+    // queued audio (its own piece can be lost in the sink, #232), so the bypass
+    // also needs that one write blocked for the whole bound. A sink that fails its
+    // write (the deadline, or a lost route) is declared stuck: what is queued is
+    // dropped and reported (audio_stall_bypass, trigger sink_write_error) and the
+    // sink reopened, so the session survives it as on the arrival model.
     static constexpr std::int64_t kStallBypassAfterNs = 250'000'000;
     static constexpr std::size_t kMaxConsecutiveReopens = 3;
 
@@ -209,14 +216,29 @@ private:
     // Lossless playout (#228) queues by time, not by packet: every role takes
     // the deepest buffer the router keeps (emergency_backlog) plus all that can
     // arrive while one write blocks up to its deadline (sink_write_timeout) plus
-    // 400 ms, 4.4 s by default (under 1.2 MB over the three roles). The
-    // credit is then granted on receipt through any stall the sink recovers
-    // from, whatever the packet size, so the phone never has to hold audio back
-    // (its capture buffer is 341 ms). Packets only count against a memory bound,
-    // one slot per kSlotNs: of shorter ones a full queue withholds the credit,
-    // it never drops.
+    // 400 ms, 4.4 s by default. The credit is then granted on receipt through any
+    // stall the sink recovers from, whatever the packet size, so the phone never
+    // has to hold audio back (its capture buffer is 341 ms).
+    //
+    // Memory is bounded by one slot (job) per kSlotNs of that time, 4,400 a role.
+    // Packets shorter than kSlotNs share one while they wait here (coalesce_locked:
+    // up to kCoalesceNs of PCM, arrivals at most that far apart), so the slots
+    // last as long as the time does: a job shorter than kSlotNs only opens behind
+    // one too full to take the packet (over 3 ms), or behind one the router
+    // already has (at most kRouterParents, which the envelope a credit reserves
+    // covers).
+    //
+    // A job is 784 bytes without its PCM, mostly the failure forensics of its
+    // admission. At all three roles' slot limits (4.4 s of 1 ms packets on each)
+    // the job records are 13,200 x 784 bytes = 9.9 MiB, plus 1.1 MB of PCM and its
+    // heap allocations. A26 media (42.67 ms packets) takes 104 jobs, 80 KiB, and
+    // 0.8 MB. What the router has decoded (at most kRouterParents parents a role)
+    // and the piece being written come on top.
     static constexpr std::int64_t kEnvelopeNs = 200'000'000; // one capacity() unit
     static constexpr std::int64_t kSlotNs = 1'000'000;
+    static constexpr std::int64_t kCoalesceNs = 4'000'000;
+    static_assert(sizeof(Job) <= 800);
+    static constexpr std::size_t kUnitsPerMs = 192; // see submit()
     [[nodiscard]] static std::size_t lossless_scale(const RouterConfig& config) noexcept;
     // Parents of one role handed to the router at a time (lossless): its
     // scheduling cost grows with every pending parent, and a 4.4 s queue of 5 ms
@@ -225,9 +247,11 @@ private:
     // A stopped stream plays out unless that leaves a new one less than this
     // many envelopes (its largest message); then it is cancelled and reported (audio_stop_discarded).
     static constexpr std::size_t kStopReserveScale = 2;
-    // Longest stop() lets accepted audio play out: the emergency bound, the
-    // most the router keeps.
+    // Longest a lossless stop takes: writes and the sink's end of stream together.
     static constexpr std::chrono::milliseconds kStopDrain{2000};
+    // The last part of it, kept for the end of stream: what the sink took but has
+    // not played yet (a pulsesink ring of 200 ms).
+    static constexpr std::chrono::milliseconds kStopEosReserve{400};
     // Capacity of one role under the credit window (AudioCreditPolicy).
     [[nodiscard]] std::size_t role_slot_cap() const noexcept {
         return lossless_ ? capacity_scale_ * static_cast<std::size_t>(kEnvelopeNs / kSlotNs)
@@ -278,6 +302,11 @@ private:
     void cancel_all();
     [[nodiscard]] bool dequeueable_locked(const Job& job) const;
     [[nodiscard]] bool draining_locked() const;
+    [[nodiscard]] bool coalesce_locked(const protocol::MessageView& message,
+                                       const channels::AvDeliveryId& id,
+                                       Reservation reservation, std::size_t index);
+    // What stop() leaves the sink's end of stream.
+    [[nodiscard]] core::Milliseconds eos_budget() const;
     void run(RouterConfig config, const OpenRouter& open);
 
     AudioTelemetryCallbacks telemetry_;
@@ -364,7 +393,14 @@ private:
     // Lossless: a stop whose boundary the router has not been given yet.
     std::array<bool, 4> stream_end_pending_{};
     std::array<std::size_t, 4> router_parents_{};
+    // stop(): no write starts unless it is expected to end by drain_until_ (set
+    // while accepted audio plays out), and all is over at stop_until_ (lossless).
     std::optional<Clock::time_point> drain_until_;
+    std::optional<Clock::time_point> stop_until_;
+    Clock::duration last_write_{};
+    // Jobs a failure during that drain took with it.
+    std::size_t drain_discarded_{};
+    std::array<bool, 4> pcm_role_{};
     bool router_busy_{};
     std::uint64_t playout_retimes_logged_{};
     [[nodiscard]] std::chrono::nanoseconds recorded_offset_locked(core::Nanoseconds content) const;
