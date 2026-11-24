@@ -5339,6 +5339,7 @@ struct CadencedGstObservation {
     std::vector<std::int64_t> returned_at;
     std::vector<bool> succeeded;
     std::vector<std::optional<std::int64_t>> playback_slot_at;
+    std::vector<bool> read_clock_slot;
 };
 
 class CadencedRealGstSink final : public aa::audio::detail::ObservedAudioSink {
@@ -5386,6 +5387,7 @@ class CadencedRealGstSink final : public aa::audio::detail::ObservedAudioSink {
         observation_.succeeded.push_back(result.has_value());
         const auto slot = sink_->last_playback_slot();
         observation_.playback_slot_at.push_back(slot ? std::optional{slot->count} : std::nullopt);
+        observation_.read_clock_slot.push_back(sink_->last_slot_from_read_clock());
         return result;
     }
     void set_write_deadline(std::chrono::steady_clock::time_point until) override {
@@ -5407,6 +5409,7 @@ class CadencedRealGstSink final : public aa::audio::detail::ObservedAudioSink {
     aa::audio::detail::SinkTimingAdjustment take_timing_adjustment() override {
         return sink_->take_timing_adjustment();
     }
+    bool handles_late_slots() const override { return sink_->handles_late_slots(); }
     double read_clock_skew_ppm() const override { return sink_->read_clock_skew_ppm(); }
     bool last_slot_from_read_clock() const override { return sink_->last_slot_from_read_clock(); }
     bool hold_stream(aa::core::Nanoseconds by) override { return sink_->hold_stream(by); }
@@ -8930,6 +8933,7 @@ struct SustainedRun {
     std::size_t late_after_recovery = 0; // writes > 50 ms late once 2 s past the hold
     std::int64_t phone_lag = 0;
     std::int64_t tail_sink_lag = 0;      // max lateness over the final half
+    std::size_t tail_slots_without_read_clock = 0;
     std::size_t slots_missing = 0;       // successful writes without a playback slot
     std::int64_t tail_presented_lag = 0; // max(handoff, slot) - scheduled, final half
     bool presented_logged = false;
@@ -8977,6 +8981,7 @@ SustainedRun run_sustained(std::size_t chunks, int hold_ms, std::size_t hold_aft
         if (i >= run.writes / 2) { run.tail_sink_lag = std::max(run.tail_sink_lag, lag); }
         const auto &slot = observed.playback_slot_at[i];
         if (observed.succeeded[i] && !slot) { ++run.slots_missing; }
+        if (i >= run.writes / 2 && !observed.read_clock_slot[i]) { ++run.tail_slots_without_read_clock; }
         if (slot && i >= run.writes / 2) {
             run.tail_presented_lag = std::max(run.tail_presented_lag,
                 std::max(*slot, observed.returned_at[i]) - observed.scheduled_at[i]);
@@ -9006,7 +9011,9 @@ TEST(WiredReceiver, RealGstSustainedCadenceKeepsPhoneAndSinkRealTime) {
     EXPECT_LE(run.tail_sink_lag, 100'000'000);
     // #60: every acknowledged real write reports when it plays, the receiver
     // logs it for the A/V gate, and playback stays near the schedule.
+    ASSERT_GT(run.writes, 0U);
     EXPECT_EQ(run.slots_missing, 0U);
+    EXPECT_EQ(run.tail_slots_without_read_clock, 0U);
     EXPECT_TRUE(run.presented_logged);
     EXPECT_LE(run.tail_presented_lag, 100'000'000);
 }

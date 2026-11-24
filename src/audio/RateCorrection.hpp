@@ -16,11 +16,11 @@ namespace aa::audio::detail {
 // correction is carried to a later run.
 inline constexpr std::uint64_t kMinWarpFrames = 16;
 
-// Largest |delta_frames| warp_frames() applies to a run of `frames`: the 1%
-// rate ceiling rounded up to a whole frame, so a run of any size can take the
+// Largest |delta_frames| warp_frames() applies to a run of `frames`: the rate
+// ceiling rounded up to a whole frame, so a run of any size can take the
 // frame its predecessors accumulated and none ever takes a burst of them.
-[[nodiscard]] constexpr std::int64_t max_warp_frames(std::uint64_t frames) noexcept {
-    return frames < kMinWarpFrames ? 0 : static_cast<std::int64_t>((frames + 99) / 100);
+[[nodiscard]] constexpr std::int64_t max_warp_frames(std::uint64_t frames, unsigned percent = 1) noexcept {
+    return frames < kMinWarpFrames ? 0 : static_cast<std::int64_t>((frames * percent + 99) / 100);
 }
 
 // Interleaved s16 PCM of F frames resampled onto F + delta_frames frames with
@@ -31,6 +31,6 @@ inline constexpr std::uint64_t kMinWarpFrames = 16;
 // delta_frames == 0, or beyond max_warp_frames(), returns the input unchanged.
 [[nodiscard]] std::vector<std::byte> warp_frames(std::span<const std::byte> pcm,
                                                  std::size_t channels,
-                                                 std::int64_t delta_frames);
+                                                 std::int64_t delta_frames, unsigned percent = 1);
 
 } // namespace aa::audio::detail

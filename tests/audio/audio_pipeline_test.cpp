@@ -16,6 +16,7 @@
 
 #include "../../src/audio/AudioSinkFactory.hpp"
 #include "../../src/audio/RateCorrection.hpp"
+#include "../../src/audio/gstreamer_adapter/PulseReadClock.hpp"
 
 #include <gtest/gtest.h>
 
@@ -2643,6 +2644,7 @@ struct RecordingSinkState final {
     std::function<void(const aa::audio::MixedChunk&)> on_write{};
     std::function<bool(aa::core::Nanoseconds)> on_hold{};
     aa::audio::detail::SinkTimingAdjustment timing{};
+    bool handles_late_slots{};
     std::optional<aa::core::Nanoseconds> playback_slot{};
     aa::audio::PlaybackSlotAbsence slot_absence{aa::audio::PlaybackSlotAbsence::unavailable};
 };
@@ -2682,6 +2684,7 @@ public:
     aa::audio::detail::SinkTimingAdjustment take_timing_adjustment() override {
         return std::exchange(state->timing, {});
     }
+    bool handles_late_slots() const override { return state->handles_late_slots; }
     bool hold_stream(aa::core::Nanoseconds by) override {
         return state->on_hold ? state->on_hold(by) : false;
     }
@@ -7106,6 +7109,9 @@ struct PausingSink final {
     std::int64_t dry_next{};
     std::int64_t pause_started{};
     std::int64_t pause_ends{};
+    std::int64_t confirm_after{};
+    std::int64_t confirmation_delay{};
+    std::int64_t unconfirmed_hold{};
     std::int64_t capacity{200 * kMs};
     std::int64_t waited{};             // silence waited out for jumps
     std::int64_t dropped{};            // stream time written behind its read position
@@ -7115,7 +7121,12 @@ struct PausingSink final {
         if (pause_ends != 0 && *clock >= pause_ends) {
             const auto step = std::exchange(pause_ends, 0) - pause_started;
             lag += step;
-            if (holds) { state.timing.held.count += step; }
+            unconfirmed_hold = step;
+            confirm_after = pause_started + step + confirmation_delay;
+        }
+        if (unconfirmed_hold != 0 && *clock >= confirm_after) {
+            if (holds) { state.timing.held.count += unconfirmed_hold; }
+            unconfirmed_hold = 0;
         }
     }
 
@@ -7205,10 +7216,8 @@ TEST_F(AudioPipelineRoute, WiredDefaultsPlayOnThroughASinkThatStoodStill) {
         EXPECT_EQ(sink.held, sink.lag);
         EXPECT_NEAR(static_cast<double>(route.largest_offset()),
                     static_cast<double>(60 * kMs + sink.lag), 10.0e6);
-        // It drains by the rate correction, about 10 ms/s.
-        const auto after = route.stats().playout_depth.count;
-        run_to(101 + 70'000 / 42); // 60 s more
-        EXPECT_LT(route.stats().playout_depth.count, std::max(80 * kMs, after - 400 * kMs));
+        run_to(101 + 60'000 / 42); // 60 s total
+        EXPECT_NEAR(static_cast<double>(route.stats().playout_depth.count) / 1e6, 60.0, 12.0);
         EXPECT_EQ(route.stats().playout_retimes, 1U);
         EXPECT_EQ(sink.waited, 0);
         EXPECT_EQ(sink.dropped, 0);
@@ -7217,6 +7226,144 @@ TEST_F(AudioPipelineRoute, WiredDefaultsPlayOnThroughASinkThatStoodStill) {
         EXPECT_EQ(route.stats().frames_decoded + route.stats().frames_stretched,
                   route.stats().frames_retained + route.stats().frames_compressed);
     }
+}
+
+// A blocked handoff can return before the request callbacks have provided
+// enough read progress to measure the pause. Keep its successors contiguous.
+TEST_F(AudioPipelineRoute, WiredDefaultsDrainThreePausesWithDelayedClockConfirmation) {
+    std::int64_t clock = 0;
+    WiredRoute route{{}, [&clock](aa::audio::RouterConfig& config) {
+        config.clock = [&clock] { return aa::core::Nanoseconds{clock}; };
+    }};
+    ASSERT_TRUE(route.router);
+    PausingSink sink{&clock};
+    sink.confirmation_delay = 180 * kMs;
+    route.sink->handles_late_slots = true;
+    sink.attach(*route.sink);
+    std::int64_t next = 0;
+    const auto run_to = [&](std::int64_t chunk) {
+        while (next < chunk) {
+            clock = std::max(clock, route.start + next * kA26ChunkNs);
+            do { ASSERT_TRUE(route.submit_media(next * kA26ChunkNs)); }
+            while (++next < chunk && route.start + next * kA26ChunkNs <= clock);
+            ASSERT_TRUE(route.drain());
+        }
+    };
+    run_to(100);
+    (void)route.router->take_playout_events();
+    for (const auto pause_ms : {300, 1'000, 1'600}) {
+        SCOPED_TRACE(pause_ms);
+        sink.pause_next = pause_ms * kMs;
+        run_to(next + 60'000 * kMs / kA26ChunkNs);
+        const auto events = route.router->take_playout_events();
+        ASSERT_EQ(events.size(), 1U);
+        EXPECT_EQ(events.front().kind, aa::audio::PlayoutEvent::Kind::retime);
+        EXPECT_EQ(events.front().late.count, pause_ms * kMs);
+        EXPECT_EQ(events.front().held.count, pause_ms * kMs);
+        EXPECT_NEAR(static_cast<double>(route.stats().playout_depth.count) / 1e6, 60.0, 12.0);
+    }
+    expect_nothing_lost(route);
+    EXPECT_EQ(sink.dropped, 0);
+    EXPECT_EQ(sink.waited, 0);
+    EXPECT_EQ(route.stats().playout_overflows, 0U);
+    EXPECT_EQ(route.stats().playout_underruns, 0U);
+    expect_whole_tone(route, 0);
+}
+
+TEST_F(AudioPipelineRoute, WiredDefaultsApplyAForwardReadStepWithContiguousSinkStamps) {
+    WiredRoute route;
+    ASSERT_TRUE(route.router);
+    route.sink->handles_late_slots = true;
+    std::int64_t held = 0;
+    route.sink->on_hold = [&](aa::core::Nanoseconds by) {
+        held += by.count;
+        return true;
+    };
+    ASSERT_TRUE(route.media(0));
+    (void)route.router->take_playout_events();
+    route.sink->timing.held.count = -kA26ChunkNs;
+    ASSERT_TRUE(route.media(kA26ChunkNs));
+    ASSERT_EQ(route.sink->write_ns.size(), 2U);
+    EXPECT_NEAR(static_cast<double>(route.sink->write_ns[1] - held - route.sink->write_ns[0]),
+                static_cast<double>(kA26ChunkNs), 1'000.0);
+    const auto events = route.router->take_playout_events();
+    ASSERT_EQ(events.size(), 1U);
+    EXPECT_EQ(events.front().kind, aa::audio::PlayoutEvent::Kind::retime);
+    EXPECT_EQ(events.front().held.count, -kA26ChunkNs);
+    expect_nothing_lost(route);
+}
+
+namespace {
+
+struct PulseClockTrace {
+    aa::audio::detail::PulseReadClock clock;
+    std::int64_t read_ms{};
+
+    PulseClockTrace() { clock.reset(192'000); }
+
+    void request(std::int64_t advance_ms, std::int64_t phase_ns) {
+        read_ms += advance_ms;
+        constexpr auto writable = 4'096;
+        clock.submitted(read_ms * 192 - writable);
+        clock.requested(writable, read_ms * kMs + phase_ns);
+    }
+
+    void warm() {
+        for (int i = 0; i < 8; ++i) { request(40, 0); }
+    }
+};
+
+} // namespace
+
+TEST(AudioPipelineSinkBackend, PulseReadClockRejectsDelayedDispatchAndBatchedCredits) {
+    PulseClockTrace trace;
+    EXPECT_FALSE(trace.clock.ready());
+    trace.warm();
+    ASSERT_TRUE(trace.clock.ready());
+    EXPECT_TRUE(trace.clock.is_playing(trace.read_ms * kMs));
+    EXPECT_FALSE(trace.clock.is_playing((trace.read_ms + 90) * kMs));
+    trace.request(40, 200 * kMs);
+    EXPECT_FALSE(trace.clock.is_playing((trace.read_ms + 200) * kMs));
+    for (int lag_ms : {160, 120, 80, 40, 0}) { trace.request(40, lag_ms * kMs); }
+    EXPECT_EQ(trace.clock.take_adjustment().held.count, 0);
+    EXPECT_TRUE(trace.clock.is_playing(trace.read_ms * kMs));
+}
+
+TEST(AudioPipelineSinkBackend, PulseReadClockMeasuresOneStepAcrossIrregularResumeRequests) {
+    PulseClockTrace trace;
+    trace.warm();
+    trace.request(40, 260 * kMs);
+    EXPECT_EQ(trace.clock.take_adjustment().held.count, 0);
+    trace.request(20, 280 * kMs);
+    trace.request(20, 300 * kMs);
+    trace.request(60, 300 * kMs); // the first write's 110 ms wait would have expired
+    EXPECT_FALSE(trace.clock.is_playing((trace.read_ms + 300) * kMs));
+    EXPECT_EQ(trace.clock.take_adjustment().held.count, 0);
+    trace.request(40, 301 * kMs);
+    EXPECT_EQ(trace.clock.take_adjustment().held.count, 300 * kMs);
+    for (int i = 0; i < 8; ++i) { trace.request(40, 300 * kMs); }
+    EXPECT_EQ(trace.clock.take_adjustment().held.count, 0);
+}
+
+TEST(AudioPipelineSinkBackend, PulseReadClockReportsForwardAndAccumulatedSteps) {
+    PulseClockTrace trace;
+    trace.warm();
+    for (int i = 0; i < 5; ++i) { trace.request(45, -42 * kMs); }
+    EXPECT_EQ(trace.clock.take_adjustment().held.count, -42 * kMs);
+    for (int i = 0; i < 12; ++i) { trace.request(40, -25 * kMs); }
+    EXPECT_EQ(trace.clock.take_adjustment().held.count, 0);
+    for (int i = 0; i < 6; ++i) { trace.request(40, -8 * kMs); }
+    EXPECT_NEAR(static_cast<double>(trace.clock.take_adjustment().held.count), 34.0e6, 0.3e6);
+}
+
+TEST(AudioPipelineSinkBackend, PulseReadClockSlewsForFiftyPpmWithoutSteps) {
+    PulseClockTrace trace;
+    trace.warm();
+    for (int i = 1; i <= 1'600; ++i) { trace.request(40, i * 2'000); }
+    const auto timing = trace.clock.take_adjustment();
+    EXPECT_EQ(timing.held.count, 0);
+    EXPECT_NEAR(static_cast<double>(timing.drift.count), 3.2e6, 0.02e6);
+    EXPECT_NEAR(trace.clock.skew_ppm(), 50.0, 4.0);
 }
 
 // A sink that cannot hold still cascades after a pause (as d0c5b41 did with

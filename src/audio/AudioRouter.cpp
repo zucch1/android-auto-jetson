@@ -68,6 +68,12 @@ constexpr double kRatePpmPerMs = 250.0;
 constexpr double kRatePpm = 5'000.0;
 constexpr double kDeepExcessMs = 100.0;
 constexpr double kDeepRatePpmPerMs = 50.0;
+// A measured stopped reader can add much more backlog than an arrival burst.
+// Up to 4% drains a 1.6 s hold within 60 s, including the proportional tail.
+constexpr unsigned kHoldRecoveryPercent = 4;
+constexpr double kHoldRecoveryPpm = kHoldRecoveryPercent * 10'000.0;
+constexpr double kHoldRecoveryDeadBandMs = 2.0;
+constexpr double kHoldRecoveryPpmPerMs = 400.0;
 // The rate itself moves by at most this much per second (0.1% per A26 chunk).
 constexpr double kRateSlewPpmPerSecond = 25'000.0;
 // Most correction carried from runs too short to take it, in frames.
@@ -477,6 +483,7 @@ struct AudioRouter::Impl final {
         // fraction of a frame not yet applied.
         double rate_ppm{};
         double rate_carry{};
+        bool recovering_from_hold{};
         // Lossless: output of already committed parents the decoder still
         // holds (a resampler split), in output frames.
         std::uint64_t decoder_owed{};
@@ -536,18 +543,28 @@ struct AudioRouter::Impl final {
     void apply_rate(std::size_t role, Run& run, PlayoutPlan& plan) {
         auto& state = playout[role];
         const auto floor = window_floor(role, run.timestamp.count, plan.depth_ns);
-        const double backlog_rate = floor.sustained ? wanted_rate_ppm(floor.low) : 0.0;
+        double backlog_rate = floor.sustained ? wanted_rate_ppm(floor.low) : 0.0;
+        const auto excess_ms = static_cast<double>(floor.low - config.playout.depth.count) / 1e6;
+        if (state.recovering_from_hold && floor.sustained) {
+            if (excess_ms <= kHoldRecoveryDeadBandMs && state.rate_ppm <= 2 * kRatePpm) {
+                state.recovering_from_hold = false;
+            } else {
+                backlog_rate = std::max(backlog_rate, std::clamp(
+                    (excess_ms - kHoldRecoveryDeadBandMs) * kHoldRecoveryPpmPerMs, 0.0, kHoldRecoveryPpm));
+            }
+        }
         const double wanted = backlog_rate + (sink ? sink->read_clock_skew_ppm() : 0.0);
         const double slew = kRateSlewPpmPerSecond * static_cast<double>(run.frames)
             / static_cast<double>(config.output_format.sample_rate_hz);
         state.rate_ppm += std::clamp(wanted - state.rate_ppm, -slew, slew);
         state.rate_carry += static_cast<double>(run.frames) * state.rate_ppm / 1e6;
-        const auto limit = detail::max_warp_frames(run.frames);
+        const unsigned percent = state.recovering_from_hold ? kHoldRecoveryPercent : 1U;
+        const auto limit = detail::max_warp_frames(run.frames, percent);
         const auto removed = std::clamp(static_cast<std::int64_t>(state.rate_carry), -limit, limit);
         state.rate_carry = std::clamp(state.rate_carry - static_cast<double>(removed),
                                       -kMaxRateCarryFrames, kMaxRateCarryFrames);
         if (removed == 0) { return; }
-        run.pcm = detail::warp_frames(run.pcm, config.output_format.channels, -removed);
+        run.pcm = detail::warp_frames(run.pcm, config.output_format.channels, -removed, percent);
         run.frames = static_cast<std::uint64_t>(static_cast<std::int64_t>(run.frames) - removed);
         plan.warped_frames = -removed;
     }
@@ -831,7 +848,12 @@ struct AudioRouter::Impl final {
     }
 
     void retime(std::int64_t by, std::int64_t held = 0) {
-        shift_timeline(by, true);
+        shift_timeline(by, by > 0);
+        if (held > 0) {
+            for (auto& state : playout) {
+                if (state.anchored) { state.recovering_from_hold = true; }
+            }
+        }
         auto& stats = report.stats;
         ++stats.playout_retimes;
         stats.playout_retimed.count += by;
@@ -1099,6 +1121,7 @@ struct AudioRouter::Impl final {
             state.depths.clear();
             state.rate_ppm = 0.0;
             state.rate_carry = 0.0;
+            state.recovering_from_hold = false;
             state.decoder_owed = owed_after(plan.decoder_held ? state.decoder_owed : 0, run);
             auto depth = start_ns - run.timestamp.count - frames_to_ns(entry.overflow_frames).count;
             if (entry.overflow_frames != 0) { depth = std::min(depth, config.playout.emergency_backlog.count); }
@@ -2167,7 +2190,7 @@ core::Result<RenderStep> AudioRouter::render_step() {
     bool retimed = std::exchange(impl_->retimed, false);
     if (impl_->lossless()) {
         const auto timing = impl_->sink->take_timing_adjustment();
-        const auto held = timing.held.count > 0 && impl_->sink->hold_stream(timing.held)
+        const auto held = timing.held.count != 0 && impl_->sink->hold_stream(timing.held)
             ? timing.held.count : 0;
         const bool have_timeline = impl_->timeline_base
             && std::any_of(impl_->playout.begin(), impl_->playout.end(),
@@ -2176,7 +2199,7 @@ core::Result<RenderStep> AudioRouter::render_step() {
             impl_->shift_timeline(timing.drift.count, false);
         }
         const auto shift = held + timing.moved.count;
-        if (shift > 0 && have_timeline) {
+        if (shift != 0 && have_timeline) {
             // A change in the sink's time mapping applies even when the next
             // wall-clock slot is still ahead. Preserve queued PCM's stamps
             // across a phase step. An ingress reschedule has already moved
@@ -2550,7 +2573,7 @@ core::Result<RenderStep> AudioRouter::render_step() {
         return result;
     }
     if (!any) { return result; }
-    if (impl_->lossless() && !retimed
+    if (impl_->lossless() && !retimed && !impl_->sink->handles_late_slots()
         && std::any_of(heads.begin(), heads.end(),
                        [&](const auto& head) { return head && head->start_frame <= cursor; })) {
         // This piece's slot has passed: the sink ran dry while a write blocked

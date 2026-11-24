@@ -163,7 +163,12 @@ for a stream start, a resume or a real underrun; the cost is latency:
   timeline and leaves the sink stamps contiguous. If the streaming thread is
   delayed while the sink keeps playing, a late buffer is rescheduled at the
   sink's ingress and the next buffers follow it. The retime records that shift
-  with `held_ms` zero. Both recoveries drain through the normal rate correction.
+  with `held_ms` zero. During Pulse phase confirmation, the receiver keeps
+  writing contiguous timestamps. Confirmed holds can temporarily compress PCM
+  by up to 4% to drain a 1.6 s backlog before another pause a minute later.
+  Recovery tapers near the target depth and uses the same rate slew as normal
+  playout. A negative `held_ms` records a forward step in the server's read
+  position, for example on a sink move.
 - video is held with the audio up to `700` ms (wireless `400`): a 16-chunk burst
   or a stall of about `600` ms, leaving ~`300` ms of the `1.0` s budget. Deeper,
   the hold is clipped (`video_hold_capped`) and A/V parts by the rest until it
@@ -183,12 +188,16 @@ for a stream start, a resume or a real underrun; the cost is latency:
 - A/V stays within the gates only while the offset stays under the wired hold cap:
   stalls up to about `600` ms (`700` ms less the normal `60` ms depth). Beyond,
   video leads audio by the rest until the buffer has drained back under the cap
-  (5 to 10 ms/s): after a `1` s stall up to `300` ms, 92 of 100 pairs over 50 ms.
+  (up to about 40 ms/s for a confirmed hold). A 1 s hold initially places the
+  audio about 300 ms beyond the cap.
 - Wired Pulse uses `slave-method=none` to keep queued samples contiguous
   across a pause. The router estimates sink skew from Pulse read progress
   against the monotonic clock and limits its contribution to rate correction
   to ±500 ppm. This correction is separate from the phone clock and backlog
-  correction.
+  correction. After one second of written PCM without a usable read clock,
+  `audio_read_clock_unavailable` is logged and Pulse switches to
+  `slave-method=skew`. Heard playback across pauses needs requalification
+  when this warning appears.
 
 Where latency ends and loss begins:
 
@@ -209,13 +218,21 @@ the phone clock, sink clock and backlog. Check for zero `audio_stall_bypass`
 and `audio_stop_discarded`. A provoked sink pause should produce one
 `audio_playout_retime`.
 
+Wired Pulse derives `presented_ns` from the router's schedule and the read-clock
+adjustments it uses. The A/V evaluator checks consistency with that schedule.
+To measure heard A/V in an A26 session, capture an external audio marker and
+align it with the corresponding video event.
+
 For the stall check, feed one numbered click in each input chunk. Record the
 sink monitor and align the click times to the logged schedule using the
 pre-stall clicks. After the first retime and before the backlog has drained,
 compare each surviving click with its scheduled output time
 (`scheduled_ns` plus `playout_offset_ns`) and count missing IDs. Require zero
-missing IDs and a post-stall offset within 10 ms of the pre-stall offset. Repeat with an upstream write delay while the sink keeps
-running. For that case, include the shifted time of the in-flight chunk from
+missing IDs and a post-stall residual within 10 ms of the pre-stall residual.
+In one run, pause Pulse for 300, 1000 and 1600 ms, giving the stream about 60 s
+after each pause. Check for a return to about 60 ms of depth between pauses and
+for zero overflow cuts. Repeat with an upstream write delay while the sink
+keeps running. For that case, include the shifted time of the in-flight chunk from
 `presented_ns` and check its click too. For a physical output without a monitor,
 record the same markers at the speaker. The audio server can pause for longer
 than the wired video hold cap, so apply the separate A/V gate as above.

@@ -16,6 +16,7 @@
 // round-trip on the CHOSEN route before the sink is returned: the route must
 // demonstrably accept and hand off a buffer (a connected, streaming output).
 #include "../AudioSinkFactory.hpp"
+#include "PulseReadClock.hpp"
 
 #include <gst/app/gstappsrc.h>
 #include <gst/gst.h>
@@ -108,144 +109,6 @@ private:
     std::function<void(const SinkWriteProgress&)> publish_;
 };
 
-// A Pulse request renews the writable portion of the stream's ring as the
-// server reads it. The absolute write endpoint plus current writable bytes
-// tracks the read position with a constant origin. Use absolute offsets so
-// writes that seek past a dry interval do not appear to stop the clock. The
-// interpolated GstAudioClock can
-// keep advancing during the pause and take seconds to settle after it.
-class PulseReadClock final {
-public:
-    void reset(std::int64_t bytes_per_second) {
-        std::lock_guard lock(mutex_);
-        bytes_per_second_ = bytes_per_second;
-        write_end_bytes_.reset();
-        phase_count_ = 0;
-        phase_index_ = 0;
-        candidate_count_ = 0;
-        last_request_ = 0;
-        held_ = 0;
-        drift_ = 0;
-        mapped_phase_.reset();
-        rate_reference_.reset();
-        skew_ppm_ = 0.0;
-    }
-
-    void submitted(std::int64_t end) {
-        std::lock_guard lock(mutex_);
-        write_end_bytes_ = end;
-    }
-
-    void requested(std::int64_t writable, std::int64_t now) {
-        std::lock_guard lock(mutex_);
-        if (bytes_per_second_ == 0 || !write_end_bytes_) { return; }
-        const auto bytes = *write_end_bytes_ + writable;
-        const auto read_time = bytes / bytes_per_second_ * 1'000'000'000
-            + bytes % bytes_per_second_ * 1'000'000'000 / bytes_per_second_;
-        const auto phase = now - read_time;
-        const auto elapsed = now - std::exchange(last_request_, now);
-        if (phase_count_ == phases_.size()) {
-            // The socket can deliver a batch of requests late. Compare the
-            // fastest observations on either side and confirm over three
-            // requests, so one delayed dispatch never shifts the timeline.
-            const auto reference = *std::min_element(phases_.begin(), phases_.end());
-            if (phase - reference > kPhaseStepNs) {
-                candidates_[candidate_count_++] = phase;
-                if (candidate_count_ == candidates_.size()) {
-                    // A delayed dispatch can deliver a batch whose implied
-                    // phase quickly falls as the ready socket is drained.
-                    if (std::abs(candidates_[2] - candidates_[1]) > 12'000'000) {
-                        candidates_[0] = candidates_[1];
-                        candidates_[1] = candidates_[2];
-                        --candidate_count_;
-                        return;
-                    }
-                    const auto step = *std::min_element(candidates_.begin(), candidates_.end()) - reference;
-                    held_ += step;
-                    if (mapped_phase_) { *mapped_phase_ += step; }
-                    phase_count_ = 0;
-                    for (const auto value : candidates_) { phases_[phase_count_++] = value; }
-                    phase_index_ = phase_count_;
-                    candidate_count_ = 0;
-                    rate_reference_.reset();
-                    cv_.notify_all();
-                }
-                return;
-            }
-            if (candidate_count_ != 0) {
-                candidate_count_ = 0;
-                cv_.notify_all();
-            }
-            update_rate(now, reference);
-            // Keep the wall-clock mapping on the read clock while the router
-            // changes frame count to match its pace. A small phase adjustment
-            // shifts both mappings together and has no PCM discontinuity.
-            if (!mapped_phase_) { mapped_phase_ = reference; }
-            const auto limit = std::min<std::int64_t>(elapsed, 100'000'000) / 2'000;
-            const auto drift = std::clamp(reference - *mapped_phase_, -limit, limit);
-            *mapped_phase_ += drift;
-            drift_ += drift;
-        }
-        phases_[phase_index_] = phase;
-        phase_index_ = (phase_index_ + 1) % phases_.size();
-        phase_count_ = std::min(phase_count_ + 1, phases_.size());
-    }
-
-    [[nodiscard]] detail::SinkTimingAdjustment take_phase_until(
-        std::chrono::steady_clock::time_point deadline) {
-        std::unique_lock lock(mutex_);
-        if (candidate_count_ != 0) {
-            cv_.wait_until(lock, deadline, [this] { return candidate_count_ == 0; });
-        }
-        return {core::Nanoseconds{std::exchange(held_, 0)}, {}, core::Nanoseconds{std::exchange(drift_, 0)}};
-    }
-
-    [[nodiscard]] bool is_playing(std::int64_t now) const {
-        std::lock_guard lock(mutex_);
-        return phase_count_ == phases_.size() && candidate_count_ == 0
-            && now - last_request_ < 85'000'000;
-    }
-
-    [[nodiscard]] bool ready() const {
-        std::lock_guard lock(mutex_);
-        return phase_count_ == phases_.size();
-    }
-
-    [[nodiscard]] double skew_ppm() const {
-        std::lock_guard lock(mutex_);
-        return skew_ppm_;
-    }
-
-private:
-    void update_rate(std::int64_t now, std::int64_t phase) {
-        if (!rate_reference_) { rate_reference_ = std::pair{now, phase}; }
-        const auto elapsed = now - rate_reference_->first;
-        if (elapsed >= 15'000'000'000) {
-            const auto delta = phase - rate_reference_->second;
-            const double ppm = static_cast<double>(delta) * 1e6 / static_cast<double>(elapsed);
-            skew_ppm_ += (std::clamp(ppm, -500.0, 500.0) - skew_ppm_) / 2.0;
-            rate_reference_ = std::pair{now, phase};
-        }
-    }
-
-    static constexpr std::int64_t kPhaseStepNs = 24'000'000;
-    mutable std::mutex mutex_{};
-    std::condition_variable cv_{};
-    std::int64_t bytes_per_second_{};
-    std::optional<std::int64_t> write_end_bytes_{};
-    std::int64_t last_request_{};
-    std::array<std::int64_t, 8> phases_{};
-    std::size_t phase_count_{};
-    std::size_t phase_index_{};
-    std::array<std::int64_t, 3> candidates_{};
-    std::size_t candidate_count_{};
-    std::int64_t held_{};
-    std::int64_t drift_{};
-    std::optional<std::int64_t> mapped_phase_{};
-    std::optional<std::pair<std::int64_t, std::int64_t>> rate_reference_{};
-    double skew_ppm_{};
-};
-
 // Handoff/stream-state observation per routing element (gate r2 F1/F3). The
 // routing elements log their PipeWire/Pulse handoff inside the render call
 // (`gst_pipewire_sink_render: push buffer`, `gst_pulseringbuffer_commit:
@@ -269,7 +132,7 @@ struct HandoffTracker final {
     std::uint64_t acked_seq{0};
     std::thread::id window_thread{};
     WriteProgress* progress{};
-    PulseReadClock* pulse_clock{};
+    detail::PulseReadClock* pulse_clock{};
     std::int64_t pulse_bytes_per_frame{};
     std::uint64_t observation_sequence{};
 };
@@ -819,8 +682,8 @@ public:
           format_(format), write_timeout_(write_timeout),
           progress_(std::move(publish)), probe_(&handoff_, false, false) {
         handoff_.progress = &progress_;
-        contiguous_stream_ = contiguous_stream;
-        if (contiguous_stream_) {
+        read_clock_enabled_ = contiguous_stream;
+        if (read_clock_enabled_) {
             handoff_.pulse_clock = &pulse_clock_;
             handoff_.pulse_bytes_per_frame = static_cast<std::int64_t>(format_.channels) * 2;
         }
@@ -841,7 +704,7 @@ public:
         }
         probe_id_ = gst_pad_add_probe(pad_, GST_PAD_PROBE_TYPE_BUFFER, pad_probe_trampoline,
                                       &probe_, nullptr);
-        if (contiguous_stream_) {
+        if (read_clock_enabled_) {
             original_chain_ = GST_PAD_CHAINFUNC(pad_);
             if (original_chain_ == nullptr) { return false; }
             g_object_set_qdata(G_OBJECT(pad_), chain_owner_key(), this);
@@ -877,7 +740,7 @@ public:
         if (!readiness_probe && write_limit_) { deadline = std::min(deadline, *write_limit_); }
         playback_slot_ = {};
         read_clock_slot_ = false;
-        if (contiguous_stream_) {
+        if (read_clock_enabled_) {
             timing_ = {};
             ingress_move_ns_ = 0;
             ingress_schedule_ns_ = readiness_probe ? 0 : chunk.timestamp.count;
@@ -1104,11 +967,24 @@ public:
         // worker or credit settlement. An unanswered slot is reported absent.
         const auto slot_until =
             std::min(deadline, std::chrono::steady_clock::now() + kPlaybackSlotWait);
-        if (contiguous_stream_ && !readiness_probe) {
-            timing_ = pulse_clock_.take_phase_until(std::min(
-                deadline, std::chrono::steady_clock::now() + std::chrono::milliseconds{110}));
-            timing_.moved.count = ingress_move_ns_;
-            if (pulse_clock_.ready()) {
+        if (read_clock_enabled_ && !readiness_probe) {
+            // Keep feeding contiguous PCM while requests confirm a phase
+            // step. Waiting for credits here can starve the ring of writes.
+            timing_ = pulse_clock_.take_adjustment();
+            timing_.moved.count = ingress_move_ns_.load();
+            if (!pulse_clock_.ready()) {
+                // Use media written so an idle route does not time out while
+                // waiting for the first real stream.
+                const auto frame_bytes = static_cast<std::size_t>(handoff_.pulse_bytes_per_frame);
+                warmup_frames_ += chunk.pcm.size() / frame_bytes;
+                if (warmup_frames_ >= format_.sample_rate_hz) {
+                    read_clock_enabled_ = false;
+                    gst_util_set_object_arg(G_OBJECT(sink_element_), "slave-method", "skew");
+                    g_warning("audio_read_clock_unavailable: pulsesink read progress did not warm up; "
+                              "restored slave-method=skew");
+                }
+            }
+            if (read_clock_enabled_ && pulse_clock_.ready()) {
                 playback_slot_ = {core::Nanoseconds{chunk.timestamp.count
                     + timing_.moved.count + timing_.held.count + timing_.drift.count},
                     PlaybackSlotAbsence::none};
@@ -1121,11 +997,22 @@ public:
     }
 
     [[nodiscard]] detail::SinkTimingAdjustment take_timing_adjustment() override {
-        return std::exchange(timing_, {});
+        auto timing = std::exchange(timing_, {});
+        if (read_clock_enabled_) {
+            // A request can finish confirming the step between writes.
+            const auto pending = pulse_clock_.take_adjustment();
+            timing.held.count += pending.held.count;
+            timing.drift.count += pending.drift.count;
+        }
+        return timing;
+    }
+
+    [[nodiscard]] bool handles_late_slots() const override {
+        return read_clock_enabled_;
     }
 
     [[nodiscard]] double read_clock_skew_ppm() const override {
-        return contiguous_stream_ ? pulse_clock_.skew_ppm() : 0.0;
+        return read_clock_enabled_ ? pulse_clock_.skew_ppm() : 0.0;
     }
 
     [[nodiscard]] bool last_slot_from_read_clock() const override {
@@ -1133,7 +1020,7 @@ public:
     }
 
     [[nodiscard]] bool hold_stream(core::Nanoseconds by) override {
-        if (!contiguous_stream_ || released_ || by.count == 0) { return false; }
+        if (!read_clock_enabled_ || released_ || by.count == 0) { return false; }
         pts_hold_ns_ += by.count;
         return true;
     }
@@ -1450,8 +1337,9 @@ public:
         // A new epoch (re-PLAY, new clock) recalibrates the element's clock to
         // the pipeline's: nothing it held before still applies.
         pts_hold_ns_ = 0;
-        if (contiguous_stream_) {
+        if (read_clock_enabled_) {
             pulse_clock_.reset(handoff_.pulse_bytes_per_frame * format_.sample_rate_hz);
+            warmup_frames_ = 0;
         }
         const auto before = observation_time().count;
         const auto clock_now = gst_clock_get_time(clock);
@@ -1488,22 +1376,26 @@ private:
         const auto frames = gst_buffer_get_size(buffer)
             / static_cast<std::size_t>(self.handoff_.pulse_bytes_per_frame);
         const auto duration = gst_util_uint64_scale(frames, GST_SECOND, self.format_.sample_rate_hz);
-        if (self.ingress_schedule_ns_ != 0 && GST_CLOCK_TIME_IS_VALID(pts)) {
+        const auto schedule = self.ingress_schedule_ns_.load();
+        if (self.read_clock_enabled_ && schedule != 0 && GST_CLOCK_TIME_IS_VALID(pts)) {
+            std::int64_t move = 0;
             const auto now = observation_time().count;
-            const auto late = now - self.ingress_schedule_ns_;
+            const auto late = now - schedule;
             if (late > 5'000'000 && self.pulse_clock_.is_playing(now)) {
-                // Leave a full output quantum for Pulse's read cursor and
-                // its mapping from timestamps to absolute sample offsets.
+                // Pulse maps PTS to its ring in segments. Allow the 42.7 ms
+                // credit cadence (two 1,024-frame quanta at 48 kHz) plus
+                // margin, so the in-flight refill is beyond the read cursor.
                 constexpr std::int64_t refill_lead_ns = 60'000'000;
-                self.ingress_move_ns_ = late + refill_lead_ns;
-                pts += static_cast<GstClockTime>(self.ingress_move_ns_);
+                move = late + refill_lead_ns;
+                self.ingress_move_ns_ = move;
+                pts += static_cast<GstClockTime>(move);
                 buffer = gst_buffer_make_writable(buffer);
                 GST_BUFFER_PTS(buffer) = pts;
                 self.progress_.update(self.handoff_.observation_sequence, [pts](auto& value) {
                     value.pts_ns = pts;
                 });
             }
-            if (self.ingress_move_ns_ != 0 || (GST_CLOCK_TIME_IS_VALID(self.last_chain_end_)
+            if (move != 0 || (GST_CLOCK_TIME_IS_VALID(self.last_chain_end_)
                 && pts > self.last_chain_end_ + GST_MSECOND)) {
                 buffer = gst_buffer_make_writable(buffer);
                 GST_BUFFER_FLAG_SET(buffer, GST_BUFFER_FLAG_DISCONT);
@@ -1702,15 +1594,16 @@ private:
     GstClockTime last_buffer_pts_{0};
     // The measured read-clock phase steps already reflected in the router's
     // schedule. Subtract them from future stamps to preserve ring continuity.
-    bool contiguous_stream_{false};
+    std::atomic<bool> read_clock_enabled_{false};
+    std::size_t warmup_frames_{};
     std::int64_t pts_hold_ns_{0};
-    PulseReadClock pulse_clock_{};
+    detail::PulseReadClock pulse_clock_{};
     detail::SinkTimingAdjustment timing_{};
     bool read_clock_slot_{};
     GstPadChainFunction original_chain_{nullptr};
     GstClockTime last_chain_end_{GST_CLOCK_TIME_NONE};
-    std::int64_t ingress_schedule_ns_{};
-    std::int64_t ingress_move_ns_{};
+    std::atomic<std::int64_t> ingress_schedule_ns_{};
+    std::atomic<std::int64_t> ingress_move_ns_{};
     GstClock* mapping_clock_{nullptr};
     GstClockTime mapping_base_{GST_CLOCK_TIME_NONE};
     bool pts_origin_set_{false};

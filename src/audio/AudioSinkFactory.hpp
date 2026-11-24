@@ -26,7 +26,7 @@ namespace aa::audio::detail {
 using TestDecodeFn = std::function<core::Result<std::vector<std::byte>>(const EncodedChunk&)>;
 
 struct SinkTimingAdjustment final {
-    core::Nanoseconds held{};  // read clock fell behind while PCM remained queued
+    core::Nanoseconds held{};  // signed read-clock phase step
     core::Nanoseconds moved{}; // the current buffer was rescheduled at ingress
     core::Nanoseconds drift{}; // small signed correction to the clock mapping
 };
@@ -88,6 +88,9 @@ public:
     // reschedule once, after the acknowledged write. Other sinks use the
     // router's ordinary late-slot recovery.
     [[nodiscard]] virtual SinkTimingAdjustment take_timing_adjustment() { return {}; }
+    // A sink observing its own read clock can distinguish a pause from a dry
+    // late buffer. The router must not restamp against wall time while it does.
+    [[nodiscard]] virtual bool handles_late_slots() const { return false; }
     // Positive ppm means the sink reads slower than monotonic time.
     [[nodiscard]] virtual double read_clock_skew_ppm() const { return 0.0; }
     // A read-clock slot includes any phase step and late-ingress correction.

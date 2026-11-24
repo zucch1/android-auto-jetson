@@ -326,18 +326,16 @@ private:
 //   (frames_compressed / frames_stretched: frames the resampled run became
 //   shorter or longer by). Proportional, at most 0.5% (under 9 cents), up to
 //   1% only while the excess is over 100 ms; the rate moves by at most 0.1%
-//   per A26 chunk. A 300 ms excess is back under 15 ms in about 45 s;
+//   per A26 chunk. A 300 ms arrival backlog is back under 15 ms in about 45 s.
+//   A confirmed sink hold can use up to 4% until the backlog drains;
 // - a short run (any packet size down to a third of a millisecond) takes the
 //   whole frame its predecessors' fractions add up to. It is placed and cut on its
 //   own, and written together with those that follow it without a gap;
-// - retime: a piece whose slot has already passed when it is about to be written
-//   (the write before it blocked, or the render thread was held up) moves the
-//   whole timeline to 20 ms from now first: the depth and the offset grow by
-//   that and drain by the rate correction (audio_playout_retime). Writing on
-//   at slots that had passed would be lossless only on paper: the ring buffer
-//   throws samples behind its read position away. The piece inside the blocked
-//   write is the sink's: how late it plays is endpoint_offset, and up to all of
-//   it (50 ms) can still be lost there, unseen here (#232);
+// - retime: a Pulse read-clock phase step shifts the timeline and preserves
+//   contiguous ring timestamps. Pulse can also move a dry buffer before
+//   ingress. Other sinks move a late slot to 20 ms ahead on both clocks.
+//   The resulting depth drains by rate correction (audio_playout_retime).
+//   A server may still discard samples after handoff (#232);
 // - stop: what the peer sent before stopping a stream plays out (end_stream);
 // - silence is written only on an anchor, a resume or an underrun. A role
 //   underruns when its own stream (its end plus what a resampler split still
@@ -540,12 +538,12 @@ struct PlayoutEvent final {
     enum class Kind : std::uint8_t { start, resume, underrun, retime };
     Kind kind{Kind::start};
     // How long after its slot the run arrived: the elapsed time skipped.
-    // retime: how much later everything after it plays.
+    // retime: signed change to when everything after it plays.
     core::Nanoseconds late{};
     // Depth the role was re-anchored with; retime: the offset it left.
     core::Nanoseconds depth{};
     Role role{Role::media};
-    // retime: the part of `late` measured as a pause in sink read progress
+    // retime: the signed part of `late` measured by sink read progress
     // (ObservedAudioSink::hold_stream). Only the wall-clock timeline moves;
     // the stamps stay contiguous on the sink clock.
     core::Nanoseconds held{};
