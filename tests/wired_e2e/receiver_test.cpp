@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Exercise the actual harness adapters, not copies of their logging logic.
 #include <chrono>
+#include <cmath>
 #include <atomic>
 #include <condition_variable>
 #include <future>
@@ -7855,6 +7856,170 @@ TEST(WiredReceiver, LosslessBoundGoesByEachSharedPacketsReceipt) {
         std::int64_t marked = 0;
         for (const auto &piece : gate->pcm) { marked += std::count(piece.begin(), piece.end(), std::byte{3}); }
         EXPECT_EQ(marked / 4, c.marked_frames) << output;
+    }
+}
+
+// Bot review of #229 at 738aac0, P2: resampled voice keeps each source's receipt.
+// 16 kHz guidance or system packets of one frame each, 3 ms apart: `old_packets`
+// of them alone (too short to resample, so retired without output), then the rest
+// behind a blocked sink, in one 64-packet slot or more. 738aac0 gave the first
+// output of a decode to the earliest run that had any, and the audio of parents
+// that had none went by a later receipt: stale audio played past the 2 s bound.
+// Each packet's value says which it was, so every frame that plays is checked
+// against its own packet's receipt.
+TEST(WiredReceiver, LosslessBoundJudgesResampledVoiceByEachSourcesReceipt) {
+    struct Case {
+        aa::protocol::ChannelRole role;
+        double gain;
+        std::uint64_t old_packets;
+        std::uint64_t new_packets;
+        std::int64_t head_ms;
+        std::uint64_t cut_packets;
+    };
+    const auto guidance = aa::protocol::ChannelRole::guidance_audio;
+    const auto system = aa::protocol::ChannelRole::system_audio;
+    for (const Case c : {Case{guidance, 1.0, 20, 44, 2'030, 10}, Case{system, 0.5, 20, 44, 2'030, 10},
+                         Case{guidance, 1.0, 20, 108, 2'030, 10}, Case{guidance, 1.0, 39, 89, 2'090, 30},
+                         Case{guidance, 1.0, 0, 64, 2'100, 34}, Case{guidance, 1.0, 0, 128, 2'100, 34},
+                         Case{guidance, 1.0, 20, 44, 1'950, 0}}) {
+        SCOPED_TRACE(std::to_string(c.old_packets) + "+" + std::to_string(c.new_packets) + " role " +
+                     std::to_string(static_cast<unsigned>(c.role)) + " head " + std::to_string(c.head_ms));
+        ReceiverLogScope logging{g_running};
+        StdoutCaptureGuard capture;
+        auto gate = std::make_shared<RenderGate>();
+        gate->write_timeout = std::chrono::milliseconds{30'000};
+        const auto start = steady_ns();
+        std::atomic<std::int64_t> clock{start};
+        auto config = pcm_router_config();
+        config.clock = [&clock] { return aa::core::Nanoseconds{clock.load()}; };
+        ConcreteAudioRenderWorker audio{config, gated_router(gate)};
+        ASSERT_TRUE(audio.ready());
+        std::uint64_t sequence = 0;
+        const auto submit = [&](aa::protocol::ChannelRole role, std::int64_t at, std::vector<std::byte> payload) {
+            ++sequence;
+            ASSERT_TRUE(audio.submit({{role, sequence, {at}}, std::move(payload)}, {role, 0, sequence, 7}));
+            ASSERT_TRUE(audio.take_completion(std::chrono::steady_clock::now() + std::chrono::milliseconds{100}));
+        };
+        const auto first = start + 10'000'000;
+        const auto packet_at = [&](std::uint64_t k) { return first + static_cast<std::int64_t>(k) * 3'000'000; };
+        // Packet k is one frame of 1,000 + 100 k: a ramp, which resampling keeps.
+        const auto packet = [](std::uint64_t k) {
+            const auto value = static_cast<std::uint16_t>(1'000 + 100 * k);
+            return std::vector<std::byte>{std::byte(value & 0xFF), std::byte(value >> 8)};
+        };
+        for (std::uint64_t k = 0; k < c.old_packets; ++k) {
+            ASSERT_NO_FATAL_FAILURE(submit(c.role, packet_at(k), packet(k)));
+            ASSERT_TRUE(audio.wait_idle(std::chrono::steady_clock::now() + std::chrono::seconds{2})) << k;
+        }
+        EXPECT_EQ(gate->writes, 0U); // none of it has played
+        ASSERT_NO_FATAL_FAILURE(submit(aa::protocol::ChannelRole::media_audio, start, std::vector<std::byte>(8192)));
+        ASSERT_TRUE(gate->wait_writes(1));
+        for (std::uint64_t k = c.old_packets; k < c.old_packets + c.new_packets; ++k) {
+            ASSERT_NO_FATAL_FAILURE(submit(c.role, packet_at(k), packet(k)));
+        }
+        clock = first + (c.head_ms - 20) * 1'000'000; // the retime adds its 20 ms of lead
+        gate->release();
+        ASSERT_TRUE(audio.wait_idle(std::chrono::steady_clock::now() + std::chrono::seconds{5}));
+        EXPECT_FALSE(audio.failure());
+        ASSERT_TRUE(audio.finish());
+        const auto output = capture.release();
+        const auto report = audio.final_report();
+        ASSERT_TRUE(report);
+        const auto &stats = report->stats;
+        EXPECT_EQ(stats.playout_retimes, 1U) << output;
+        EXPECT_EQ(stats.frames_trimmed, stats.frames_overflowed) << output;
+        EXPECT_EQ(stats.frames_decoded, stats.frames_retained + stats.frames_overflowed) << output;
+        // The resampler shifts a frame by under one packet: a packet's age is
+        // known to within 3 ms.
+        EXPECT_NEAR(static_cast<double>(stats.frames_overflowed), static_cast<double>(c.cut_packets * 3), 4.0)
+            << output;
+        std::int64_t oldest_ms = INT64_MIN;
+        std::optional<std::uint64_t> first_packet;
+        std::int64_t played = 0;
+        for (std::size_t piece = 0; piece < gate->pcm.size(); ++piece) {
+            const auto &pcm = gate->pcm[piece];
+            for (std::size_t at = 0; at + 4 <= pcm.size(); at += 4) {
+                const auto sample = static_cast<std::int16_t>(static_cast<std::uint16_t>(pcm[at]) |
+                                                              static_cast<std::uint16_t>(pcm[at + 1]) << 8);
+                const auto level = static_cast<double>(sample) / c.gain;
+                if (level < 950.0) { continue; } // media (silence)
+                const auto k = static_cast<std::uint64_t>(std::max(0.0, std::round((level - 1'000.0) / 100.0)));
+                if (!first_packet) { first_packet = k; }
+                ++played;
+                const auto plays = gate->timestamps[piece].count + static_cast<std::int64_t>(at / 4) * 1'000'000'000 / 48'000;
+                oldest_ms = std::max(oldest_ms, (plays - packet_at(k)) / 1'000'000);
+            }
+        }
+        ASSERT_TRUE(first_packet) << output;
+        // Nothing plays more than the bound after its own packet's receipt, and
+        // only what had to go was cut: playing starts at the first packet inside it.
+        EXPECT_LE(oldest_ms, 2'003) << output;
+        EXPECT_NEAR(static_cast<double>(*first_packet), static_cast<double>(c.cut_packets), 1.0) << output;
+        EXPECT_GE(played + 4, static_cast<std::int64_t>((c.old_packets + c.new_packets - c.cut_packets) * 3 - 2))
+            << output;
+    }
+}
+
+// Bot review of #229 at 738aac0, P2: a fresh voice stream whose packets were all too
+// short to resample still plays when the stop comes after its playout target. 738aac0
+// dropped all of it as a late decoder tail although none of it had played.
+TEST(WiredReceiver, LosslessDelayedStopPlaysAVoiceStreamTooShortToResample) {
+    struct Case {
+        aa::protocol::ChannelRole role;
+        std::uint64_t packets;
+        std::int64_t stop_after_ms;
+        bool after_media;
+    };
+    const auto guidance = aa::protocol::ChannelRole::guidance_audio;
+    for (const Case c : {Case{guidance, 20, 100, false}, Case{aa::protocol::ChannelRole::system_audio, 20, 100, false},
+                         Case{guidance, 39, 500, false}, Case{guidance, 20, 100, true}, Case{guidance, 1, 1'000, true}}) {
+        SCOPED_TRACE(std::to_string(c.packets) + " packets, stop " + std::to_string(c.stop_after_ms) + " ms" +
+                     (c.after_media ? " behind media" : ""));
+        ReceiverLogScope logging{g_running};
+        StdoutCaptureGuard capture;
+        auto gate = std::make_shared<RenderGate>();
+        gate->release();
+        const auto start = steady_ns();
+        std::atomic<std::int64_t> clock{start};
+        auto config = pcm_router_config();
+        config.clock = [&clock] { return aa::core::Nanoseconds{clock.load()}; };
+        ConcreteAudioRenderWorker audio{config, gated_router(gate)};
+        ASSERT_TRUE(audio.ready());
+        std::uint64_t sequence = 0;
+        const auto submit = [&](aa::protocol::ChannelRole role, std::int64_t at, std::size_t bytes) {
+            ++sequence;
+            ASSERT_TRUE(audio.submit({{role, sequence, {at}}, std::vector<std::byte>(bytes, std::byte{2})},
+                                     {role, 0, sequence, 7}));
+            ASSERT_TRUE(audio.take_completion(std::chrono::steady_clock::now() + std::chrono::milliseconds{100}));
+        };
+        if (c.after_media) {
+            ASSERT_NO_FATAL_FAILURE(submit(aa::protocol::ChannelRole::media_audio, start, 8192));
+            ASSERT_TRUE(audio.wait_idle(std::chrono::steady_clock::now() + std::chrono::seconds{2}));
+        }
+        std::int64_t last = start;
+        for (std::uint64_t k = 0; k < c.packets; ++k) {
+            last = start + static_cast<std::int64_t>(k) * 62'500;
+            clock = last;
+            ASSERT_NO_FATAL_FAILURE(submit(c.role, last, 2));
+        }
+        // The worker is idle: nothing of the stream has played.
+        ASSERT_TRUE(audio.wait_idle(std::chrono::steady_clock::now() + std::chrono::seconds{2}));
+        const auto writes = gate->writes;
+        clock = last + c.stop_after_ms * 1'000'000;
+        audio.invalidate(c.role, 1); // AV_STOP
+        EXPECT_TRUE(gate->wait_writes(writes + 1)); // it plays at the stop, not only at shutdown
+        ASSERT_TRUE(audio.wait_idle(std::chrono::steady_clock::now() + std::chrono::seconds{2}));
+        EXPECT_FALSE(audio.failure());
+        ASSERT_TRUE(audio.finish());
+        const auto output = capture.release();
+        const auto report = audio.final_report();
+        ASSERT_TRUE(report);
+        const auto &stats = report->stats;
+        // All of it (the resampler keeps two output frames of every stream).
+        EXPECT_EQ(stats.frames_decoded, (c.after_media ? 2'048U : 0U) + c.packets * 3 - 2) << output;
+        EXPECT_EQ(stats.frames_decoded, stats.frames_retained) << output;
+        EXPECT_EQ(stats.frames_trimmed, 0U) << output;
+        EXPECT_EQ(output.find("audio_stop_discarded"), std::string::npos) << output;
     }
 }
 

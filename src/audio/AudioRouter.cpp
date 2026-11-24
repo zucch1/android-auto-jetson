@@ -154,6 +154,15 @@ struct PlayoutPlan final {
     bool decoder_held{false};
 };
 
+// Lossless, a resampling role: `frames` consecutive output frames whose source
+// audio was received at `at_ns` (the first of them; each later one is one frame
+// of content after it). The decoder returns its input's audio in order, so the
+// role's output stream maps onto these spans in order too.
+struct SourceSpan final {
+    std::uint64_t frames{};
+    std::int64_t at_ns{};
+};
+
 // One decoded run pending on the mix timeline. submitted_at_ns is stamped at
 // submit() BEFORE decode() so the whole decode + mix + write path is inside
 // the recorded latency (gate fix F4).
@@ -191,6 +200,12 @@ struct Run final {
     std::int64_t content_ahead_ns{};
     // Its input waits to be decoded (held_input): no frames yet.
     bool awaiting{};
+    // Lossless, a resampling role: where the source audio of each part of `pcm`
+    // was received, in order. The decoder can return one parent's audio at the
+    // head of a later parent's run, so the run's own timestamp does not say how
+    // old its head is (bot review of #229). Empty: `timestamp` plus
+    // content_ahead_ns is the receipt of all of it.
+    std::vector<SourceSpan> sources{};
 };
 
 // One run placed on the sample timeline at an effective (non-overlapping)
@@ -553,6 +568,7 @@ struct AudioRouter::Impl final {
             last_header[role].reset();
             held_input[role].clear();
             held_content[role] = 0;
+            clear_sources(role);
         }
     }
 
@@ -727,10 +743,35 @@ struct AudioRouter::Impl final {
         std::int64_t start_ns = 0;
         if (!frame_time(start_frame, base_ns, start_ns)) { return false; }
         cut = 0;
-        const auto age = start_ns - run.timestamp.count - run.content_ahead_ns
-            - frames_to_ns(content_frame).count;
         const auto bound = config.playout.emergency_backlog.count;
-        if (age > bound) { cut = std::min(frames, ns_to_frames(core::Nanoseconds{age - bound})); }
+        if (run.sources.empty()) {
+            const auto age = start_ns - run.timestamp.count - run.content_ahead_ns
+                - frames_to_ns(content_frame).count;
+            if (age > bound) { cut = std::min(frames, ns_to_frames(core::Nanoseconds{age - bound})); }
+            return true;
+        }
+        // Each part goes by its own source's receipt: the cut ends at the first
+        // frame received no more than the bound before it plays at start_ns
+        // (cutting a frame moves every later one a frame earlier).
+        if (start_ns < INT64_MIN + bound) { return true; }
+        const auto oldest = start_ns - bound;
+        std::uint64_t at = 0;
+        for (std::size_t i = 0; i < run.sources.size(); ++i) {
+            const auto& span = run.sources[i];
+            const bool last = i + 1 == run.sources.size();
+            const auto end = last ? UINT64_MAX : at + span.frames;
+            if (end > content_frame) {
+                const auto from = std::max(at, content_frame);
+                const auto received = span.at_ns + frames_to_ns(from - at).count;
+                const auto skip = received >= oldest ? 0 : ns_to_frames(core::Nanoseconds{oldest - received});
+                if (skip < end - from) {
+                    cut = std::min(frames, from + skip - content_frame);
+                    return true;
+                }
+            }
+            at = end;
+        }
+        cut = frames;
         return true;
     }
 
@@ -829,6 +870,59 @@ struct AudioRouter::Impl final {
     // frames of the part of it whose runs are done already.
     std::array<std::vector<std::byte>, kRoleCount> held_input{};
     std::array<std::uint64_t, kRoleCount> held_content{};
+    // Lossless, a resampling role: where the content of every parent submitted
+    // and not yet returned by the decoder was received, oldest first (held
+    // input, what the decoder keeps back, and parents retired without output
+    // alike), and the end of the last span handed out (for output beyond them).
+    std::array<std::deque<SourceSpan>, kRoleCount> held_sources{};
+    std::array<std::optional<std::int64_t>, kRoleCount> sources_end{};
+
+    void clear_sources(std::size_t role) noexcept {
+        held_sources[role].clear();
+        sources_end[role].reset();
+    }
+
+    void hold_source(std::size_t role, std::uint64_t frames, std::int64_t at_ns) {
+        if (frames != 0) { held_sources[role].push_back({frames, at_ns}); }
+    }
+
+    // Undoes hold_source for the newest `frames` (their input was refused).
+    void unhold_sources(std::size_t role, std::uint64_t frames) noexcept {
+        auto& held = held_sources[role];
+        while (frames != 0 && !held.empty()) {
+            const auto take = std::min(frames, held.back().frames);
+            held.back().frames -= take;
+            frames -= take;
+            if (held.back().frames == 0) { held.pop_back(); }
+        }
+    }
+
+    // The source spans of the role's next `frames` output frames. Output beyond
+    // what was held (rounding) continues from the last span. Empty for a role
+    // that holds no sources.
+    [[nodiscard]] std::vector<SourceSpan> take_sources(std::size_t role, std::uint64_t frames) {
+        std::vector<SourceSpan> spans;
+        auto& held = held_sources[role];
+        if (frames == 0 || (held.empty() && !sources_end[role])) { return spans; }
+        while (frames != 0 && !held.empty()) {
+            auto& front = held.front();
+            const auto take = std::min(frames, front.frames);
+            spans.push_back({take, front.at_ns});
+            const auto taken_ns = frames_to_ns(take).count;
+            front.at_ns = front.at_ns > INT64_MAX - taken_ns ? INT64_MAX : front.at_ns + taken_ns;
+            sources_end[role] = front.at_ns;
+            front.frames -= take;
+            frames -= take;
+            if (front.frames == 0) { held.pop_front(); }
+        }
+        if (frames != 0) {
+            const auto at = *sources_end[role];
+            spans.push_back({frames, at});
+            const auto taken_ns = frames_to_ns(frames).count;
+            sources_end[role] = at > INT64_MAX - taken_ns ? INT64_MAX : at + taken_ns;
+        }
+        return spans;
+    }
 
     [[nodiscard]] static std::size_t min_decode_frames(const AudioFormat& input) noexcept {
         return std::max(kMinDecodeFrames,
@@ -862,6 +956,9 @@ struct AudioRouter::Impl final {
             const auto part = pcm.subspan(static_cast<std::size_t>(given) * frame_bytes,
                                           static_cast<std::size_t>(run.frames) * frame_bytes);
             run.pcm.assign(part.begin(), part.end());
+            // The output is the held input's audio in order, whichever parent it
+            // lands on: its sources go with it.
+            run.sources = take_sources(role, run.frames);
             given = upto;
             if (run.frames == 0) {
                 unplayed = std::exchange(run.content_frames, 0);
@@ -874,7 +971,8 @@ struct AudioRouter::Impl final {
     }
 
     // Takes a run without output of its own (the decoder has all of it) off the
-    // head of the role's queue.
+    // head of the role's queue. Its receipt stays in held_sources, so the run
+    // that gets its audio later is judged by it.
     void finish_silent_run(std::size_t role) {
         auto& queue = pending[role];
         const bool starts = queue.front().stream_start;
@@ -887,27 +985,42 @@ struct AudioRouter::Impl final {
     // Appends what the role's decoder still holds to the role's pending audio
     // and restarts the decoder. Nothing once the role's own stream has run dry:
     // a resampler tail (about 2 ms) alone after a gap is a click, not sound. Returns
-    // what that drops.
+    // what that drops. Input that was never decoded is not such a tail: it is
+    // audio of its own that has not played (a stream of packets each too short
+    // to resample), placed like any other (bot review of #229).
     AudioRouter::StreamEnd drain_decoder(std::size_t role) {
         auto& state = playout[role];
         state.decoder_owed = 0;
         const auto input = std::exchange(held_input[role], {});
         const bool used = std::exchange(decoder_used[role], false);
-        if (!decoders[role] || decoder_stale[role] || (!used && input.empty())) { return {}; }
+        if (!decoders[role] || decoder_stale[role] || (!used && input.empty())) {
+            clear_sources(role);
+            return {};
+        }
+        const bool unplayed = !input.empty();
         const auto frame_bytes = static_cast<std::size_t>(config.output_format.channels) * sizeof(std::int16_t);
         auto tail = decoders[role]->drain(input);
         const auto frames = static_cast<std::uint64_t>(tail.size() / frame_bytes);
+        // The decoder starts afresh: nothing it held is still to come.
+        const auto finish = [&] { clear_sources(role); };
         if (frames == 0 || !last_header[role]) {
             held_content[role] = 0;
+            finish();
             return {};
         }
         if (!pending[role].empty() && pending[role].back().awaiting) {
             share_output(role, tail);
+            finish();
             return {};
         }
         held_content[role] = 0;
+        auto sources = take_sources(role, frames);
+        finish();
         if (!pending[role].empty()) {
             auto& run = pending[role].back();
+            if (!run.sources.empty()) {
+                run.sources.insert(run.sources.end(), sources.begin(), sources.end());
+            }
             run.pcm.insert(run.pcm.end(), tail.begin(), tail.end());
             run.frames += frames;
             run.decoded_frames += frames;
@@ -921,7 +1034,9 @@ struct AudioRouter::Impl final {
             } else if (!timeline_base || !frame_time(role_end_frames[role], timeline_base->count, end_ns)) {
                 end_ns = INT64_MIN;
             }
-            if (end_ns < now_ns()) { return {false, frames, core::Nanoseconds{end_ns}}; }
+            // Only a residual tail is late here; unplayed audio meets the
+            // emergency bound like the rest, by its own receipt.
+            if (!unplayed && end_ns < now_ns()) { return {false, frames, core::Nanoseconds{end_ns}}; }
             Run run;
             run.header = *last_header[role];
             run.timestamp = run.header.timestamp;
@@ -930,6 +1045,7 @@ struct AudioRouter::Impl final {
             run.decoded_frames = frames;
             run.submitted_at_ns = now_ns();
             run.content_ahead_ns = fresh ? 0 : last_content_ns[role];
+            run.sources = std::move(sources);
             run.stream_start = fresh && std::exchange(stream_ended[role], false);
             pending[role].push_back(std::move(run));
         }
@@ -1446,6 +1562,7 @@ core::Result<void> AudioRouter::submit(const protocol::MessageView& message,
             if (auto restarted = impl_->decoders[index]->restart(); !restarted) {
                 return restarted.error();
             }
+            impl_->clear_sources(index);
         }
         impl_->decoder_stale[index] = false;
         if (!buffered) {
@@ -1487,6 +1604,7 @@ core::Result<void> AudioRouter::submit(const protocol::MessageView& message,
     if (buffered) {
         auto& held = impl_->held_input[index];
         held.insert(held.end(), message.payload.begin(), message.payload.end());
+        impl_->hold_source(index, run.content_frames, run.timestamp.count);
     }
 
     run.stream_start = std::exchange(impl_->stream_ended[index], false);
@@ -1518,7 +1636,12 @@ core::Result<void> AudioRouter::submit(const protocol::MessageView& message,
             auto decoded = impl_->decoders[index]->decode(chunk);
             if (!decoded.has_value()) {
                 auto& queue = impl_->pending[index];
-                while (!queue.empty() && queue.back().awaiting) { queue.pop_back(); }
+                std::uint64_t refused = 0;
+                while (!queue.empty() && queue.back().awaiting) {
+                    refused += queue.back().content_frames;
+                    queue.pop_back();
+                }
+                impl_->unhold_sources(index, refused);
                 return decoded.error();
             }
             impl_->share_output(index, decoded.value().pcm);
