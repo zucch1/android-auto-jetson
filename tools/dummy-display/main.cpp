@@ -371,7 +371,7 @@ int display_main(int argc, char** argv) {
         if (client_disconnected || !owner.value()) {
             return;
         }
-        auto connected = ControlBusClient::connect(ControlBusClient::Signals::subscribe);
+        auto connected = ControlBusClient::connect(ControlBusClient::Signals::pairing_results);
         if (!connected.has_value()) {
             errors->report("attach", connected.error().code());
             return;
@@ -450,18 +450,14 @@ int display_main(int argc, char** argv) {
                             "{\"event\":\"pairing_completed\",\"request_id\":" +
                             std::to_string(sig.value().request.value) + ",\"outcome\":\"" +
                             sig.value().outcome + "\"}"));
-                    } else if (sig.value().member == "PairingClosed") {
-                        std::string outcome = "confirming";
-                        if (contract_pairing_outcomes) {
-                            if (const auto queried = client->pairing_outcome(sig.value().request);
-                                queried.has_value()) {
-                                outcome = queried.value();
-                            }
-                        }
+                    } else if (!contract_pairing_outcomes &&
+                               sig.value().member == "PairingClosed") {
+                        // 1.1.0 has no terminal outcome. A 1.2.0 receiver sends it
+                        // in PairingCompleted, so the pump never makes a blocking call.
                         static_cast<void>(telemetry.enqueue(
                             "{\"event\":\"pairing_outcome\",\"request_id\":" +
-                            std::to_string(sig.value().request.value) + ",\"outcome\":\"" +
-                            outcome + "\"}"));
+                            std::to_string(sig.value().request.value) +
+                            ",\"outcome\":\"confirming\"}"));
                     }
                 }
             }

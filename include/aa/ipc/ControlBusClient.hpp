@@ -42,7 +42,10 @@ public:
         std::string outcome{};
     };
 
-    enum class Signals { subscribe, ignore };
+    // subscribe: every contract signal. pairing_results: only PairingClosed and
+    // PairingCompleted broadcast by the contract name's owner, so the daemon
+    // never queues other broadcasts to this client. ignore: no subscription.
+    enum class Signals { subscribe, pairing_results, ignore };
 
     // Connects to the session bus (DBUS_SESSION_BUS_ADDRESS). Clients that
     // only make method calls can skip the contract signal subscription.
@@ -84,7 +87,10 @@ public:
     [[nodiscard]] core::Result<void> forget_phone(core::PhoneId phone);
 
     // Waits for the next declared contract signal (parked ones first). An
-    // expired wait is the typed error `timeout`.
+    // expired wait is the typed error `timeout`; a negative timeout never
+    // expires. A zero timeout never blocks and does bounded work: it reads
+    // frames already on the socket, examining at most 16 per call, and keeps a
+    // partial frame for the next call. Frames left over are read by later calls.
     [[nodiscard]] core::Result<ContractSignal> wait_signal(core::Milliseconds timeout);
 
     [[nodiscard]] const BusName& unique_name() const noexcept;

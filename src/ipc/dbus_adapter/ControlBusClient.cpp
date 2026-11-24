@@ -6,6 +6,7 @@
 #include "BusConnection.hpp"
 #include "BusWire.hpp"
 
+#include <cerrno>
 #include <chrono>
 #include <optional>
 #include <string>
@@ -24,6 +25,8 @@ using dbus_adapter::MessageType;
 using dbus_adapter::ParsedMessage;
 
 constexpr int kMaxSkippedMessages = 32;
+constexpr int kMaxFramesPerNonBlockingWait = 16;
+constexpr int kPollCapMs = 2000;
 
 [[nodiscard]] ErrorCode error_code_for(std::string_view error_name) {
     if (error_name == "org.custom.AndroidAutoReceiver1.Error.PeerUnauthorized") {
@@ -236,6 +239,19 @@ core::Result<ControlBusClient> ControlBusClient::connect(Signals signals) {
             std::string_view{"type='signal',interface='org.custom.AndroidAutoReceiver1'"});
         if (!matched.has_value()) {
             return matched.error();
+        }
+    } else if (signals == Signals::pairing_results) {
+        // The daemon resolves a well-known sender to its current owner, so
+        // broadcasts from any other connection never reach this socket.
+        for (const std::string_view member : {"PairingClosed", "PairingCompleted"}) {
+            const std::string rule = "type='signal',sender='" + std::string{kContractBusName} +
+                                     "',path='" + std::string{kContractObjectPath} +
+                                     "',interface='" + std::string{kContractInterface} +
+                                     "',member='" + std::string{member} + "'";
+            const auto matched = impl->connection->add_match(rule);
+            if (!matched.has_value()) {
+                return matched.error();
+            }
         }
     }
     return ControlBusClient(std::move(impl));
@@ -591,46 +607,58 @@ core::Result<ControlBusClient::ContractSignal> ControlBusClient::wait_signal(
         return Error{ErrorCode::transport_closed};
     }
     const bool block_forever = timeout.count < 0;
+    const bool non_blocking = timeout.count == 0;
     const auto deadline =
         std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout.count);
-    for (;;) {
+    for (int examined = 0;; ++examined) {
         if (!impl_->pending.empty()) {
             auto signal = std::move(impl_->pending.front());
             impl_->pending.pop_front();
             return signal;
         }
-        int limit = -1;
-        if (!block_forever) {
-            const auto remaining =
-                std::chrono::duration_cast<std::chrono::milliseconds>(
-                    deadline - std::chrono::steady_clock::now())
-                    .count();
-            // A zero or expired timeout still polls the socket once without
-            // blocking, so a non-blocking caller (the display pump) can drain
-            // signals that have arrived; poll() returning 0 ends the wait.
-            limit = remaining <= 0 ? 0 : (remaining > 2000 ? 2000 : static_cast<int>(remaining));
-        }
         if (impl_->connection->native_handle() < 0) return Error{ErrorCode::transport_closed};
+        int limit = 0;
+        if (non_blocking) {
+            // Skipped frames (foreign senders, other traffic, drops) count too:
+            // readable traffic must not hold a non-blocking caller here.
+            if (examined >= kMaxFramesPerNonBlockingWait) return Error{ErrorCode::timeout};
+        } else if (block_forever) {
+            limit = impl_->connection->frame_pending() ? kPollCapMs : -1;
+        } else {
+            const auto remaining = std::chrono::ceil<std::chrono::milliseconds>(
+                                       deadline - std::chrono::steady_clock::now())
+                                       .count();
+            // The deadline ends the wait even while traffic stays readable.
+            if (remaining <= 0) return Error{ErrorCode::timeout};
+            limit = remaining > kPollCapMs ? kPollCapMs : static_cast<int>(remaining);
+        }
         ::pollfd descriptor{impl_->connection->native_handle(), POLLIN, 0};
         const int ready = ::poll(&descriptor, 1, limit);
         if (ready < 0) {
-            continue;
-        }
-        if (ready == 0) {
-            if (block_forever) {
-                continue;
+            if (errno == EINTR) {
+                continue; // the remaining time is recomputed above
             }
-            return Error{ErrorCode::timeout};
+            return Error{ErrorCode::transport_io};
         }
-        auto message = impl_->connection->read_message();
+        // With a partial frame buffered, an idle poll still reads so a peer
+        // stalled mid-frame is detected.
+        if (ready == 0 && !impl_->connection->frame_pending()) {
+            if (non_blocking) return Error{ErrorCode::timeout};
+            continue; // a capped poll may end before the deadline does
+        }
+        auto message = impl_->connection->try_read_message();
         if (!message.has_value()) {
             if (message.error().code() == ErrorCode::transport_message_dropped) {
                 continue;
             }
             return message.error();
         }
-        if (message.value().type == MessageType::signal) {
-            impl_->park_signal(message.value());
+        if (!message.value().has_value()) {
+            if (non_blocking) return Error{ErrorCode::timeout};
+            continue;
+        }
+        if (message.value()->type == MessageType::signal) {
+            impl_->park_signal(*message.value());
         }
     }
 }

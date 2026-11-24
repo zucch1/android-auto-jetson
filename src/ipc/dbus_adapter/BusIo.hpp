@@ -68,6 +68,26 @@ inline int remaining(Deadline until) {
     return {};
 }
 
+// Takes only the bytes the socket already holds: never polls, never waits.
+// Success with filled_out < out.size() means nothing more is available now.
+[[nodiscard]] inline core::Result<void> read_available(int fd, std::span<std::uint8_t> out,
+                                                       std::size_t& filled_out) {
+    filled_out = 0;
+    if (fd < 0) return Error{ErrorCode::transport_closed};
+    while (filled_out < out.size()) {
+        const ssize_t count =
+            ::recv(fd, out.data() + filled_out, out.size() - filled_out, MSG_DONTWAIT);
+        if (count < 0) {
+            if (errno == EINTR) continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) return {};
+            return Error{errno == ECONNRESET ? ErrorCode::transport_closed : ErrorCode::transport_io};
+        }
+        if (count == 0) return Error{ErrorCode::transport_closed};
+        filled_out += static_cast<std::size_t>(count);
+    }
+    return {};
+}
+
 [[nodiscard]] inline core::Result<void> write_full(int fd, std::span<const std::uint8_t> data, Deadline until = deadline()) {
     std::size_t sent = 0;
     if (fd < 0) return Error{ErrorCode::transport_closed};
