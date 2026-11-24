@@ -88,6 +88,12 @@ constexpr std::int64_t kHoldLeadNs = 20'000'000;
 constexpr std::int64_t kHoldQuantumNs = 10'000'000;
 // A role silent this long no longer holds the others.
 constexpr std::int64_t kHoldExpectNs = 1'000'000'000;
+// Runs shorter than this share a write with the ones right behind them.
+constexpr std::int64_t kJoinedWriteNs = 4'000'000;
+// Input a resampler that holds nothing is first given: GStreamer's needs half its
+// 64 taps, and one frame, before it gives any output.
+constexpr std::size_t kMinDecodeFrames = 40;
+constexpr std::uint64_t kMinDecodeNs = 2'500'000U; // a resampler to a lower rate takes more
 
 [[nodiscard]] std::optional<Role> role_of(protocol::ChannelRole channel) {
     switch (channel) {
@@ -181,6 +187,8 @@ struct Run final {
     // A decoder tail's content begins this long after `timestamp` (the parent
     // it belongs to).
     std::int64_t content_ahead_ns{};
+    // Its input waits to be decoded (held_input): no frames yet.
+    bool awaiting{};
 };
 
 // One run placed on the sample timeline at an effective (non-overlapping)
@@ -539,6 +547,8 @@ struct AudioRouter::Impl final {
             decoder_stale[role] = decoder_stale[role] || std::exchange(decoder_used[role], false);
             stream_ended[role] = false;
             last_header[role].reset();
+            held_input[role].clear();
+            held_content[role] = 0;
         }
     }
 
@@ -811,27 +821,103 @@ struct AudioRouter::Impl final {
     // Content duration of that parent.
     std::array<std::int64_t, kRoleCount> last_content_ns{};
 
+    // Lossless, a resampling role: input that is not decoded yet, and the output
+    // frames of the part of it whose runs are done already.
+    std::array<std::vector<std::byte>, kRoleCount> held_input{};
+    std::array<std::uint64_t, kRoleCount> held_content{};
+
+    [[nodiscard]] static std::size_t min_decode_frames(const AudioFormat& input) noexcept {
+        return std::max(kMinDecodeFrames,
+                        static_cast<std::size_t>(kMinDecodeNs * input.sample_rate_hz / 1'000'000'000U));
+    }
+
+    // Gives the runs at the end of the role's queue that wait for their output their
+    // share of it. What the decoder kept back is missing from the first of them, and
+    // what it had kept back before is at the first one's head, as if each had been
+    // decoded alone. A run left without output counts towards the next one's content.
+    void share_output(std::size_t role, std::span<const std::byte> pcm) {
+        auto& queue = pending[role];
+        const auto frame_bytes = static_cast<std::size_t>(config.output_format.channels) * sizeof(std::int16_t);
+        const auto frames = static_cast<std::uint64_t>(pcm.size() / frame_bytes);
+        auto first = queue.size();
+        std::uint64_t content = held_content[role];
+        while (first != 0 && queue[first - 1].awaiting) { content += queue[--first].content_frames; }
+        std::uint64_t due = std::exchange(held_content[role], 0);
+        std::uint64_t given = 0;
+        std::uint64_t unplayed = due;
+        bool starts = false;
+        for (auto i = first; i < queue.size(); ++i) {
+            auto& run = queue[i];
+            due += run.content_frames;
+            const auto upto = due + frames > content ? due + frames - content : 0;
+            run.awaiting = false;
+            run.frames = upto - given;
+            run.decoded_frames = run.frames;
+            run.content_frames += std::exchange(unplayed, 0);
+            run.stream_start = run.stream_start || std::exchange(starts, false);
+            const auto part = pcm.subspan(static_cast<std::size_t>(given) * frame_bytes,
+                                          static_cast<std::size_t>(run.frames) * frame_bytes);
+            run.pcm.assign(part.begin(), part.end());
+            given = upto;
+            if (run.frames == 0) {
+                unplayed = std::exchange(run.content_frames, 0);
+                starts = std::exchange(run.stream_start, false);
+            } else if (run.frames > run.content_frames) {
+                run.carried_ns = frames_to_ns(run.frames - run.content_frames).count;
+            }
+        }
+        report.stats.frames_decoded += frames;
+    }
+
+    // Takes a run without output of its own (the decoder has all of it) off the
+    // head of the role's queue.
+    void finish_silent_run(std::size_t role) {
+        auto& queue = pending[role];
+        const bool starts = queue.front().stream_start;
+        held_content[role] += queue.front().content_frames;
+        queue.pop_front();
+        if (!starts) { return; }
+        if (queue.empty()) { stream_ended[role] = true; } else { queue.front().stream_start = true; }
+    }
+
     // Appends what the role's decoder still holds to the role's pending audio
     // and restarts the decoder. Nothing once the role's own stream has run dry:
-    // a resampler tail (about 2 ms) alone after a gap is a click, not sound.
-    void drain_decoder(std::size_t role) {
+    // a resampler tail (about 2 ms) alone after a gap is a click, not sound. Returns
+    // what that drops.
+    AudioRouter::StreamEnd drain_decoder(std::size_t role) {
         auto& state = playout[role];
         state.decoder_owed = 0;
-        if (!decoders[role] || decoder_stale[role] || !std::exchange(decoder_used[role], false)) { return; }
-        auto tail = decoders[role]->drain();
+        const auto input = std::exchange(held_input[role], {});
+        const bool used = std::exchange(decoder_used[role], false);
+        if (!decoders[role] || decoder_stale[role] || (!used && input.empty())) { return {}; }
         const auto frame_bytes = static_cast<std::size_t>(config.output_format.channels) * sizeof(std::int16_t);
+        auto tail = decoders[role]->drain(input);
         const auto frames = static_cast<std::uint64_t>(tail.size() / frame_bytes);
-        if (frames == 0 || !last_header[role]) { return; }
+        if (frames == 0 || !last_header[role]) {
+            held_content[role] = 0;
+            return {};
+        }
+        if (!pending[role].empty() && pending[role].back().awaiting) {
+            share_output(role, tail);
+            return {};
+        }
+        held_content[role] = 0;
         if (!pending[role].empty()) {
             auto& run = pending[role].back();
             run.pcm.insert(run.pcm.end(), tail.begin(), tail.end());
             run.frames += frames;
             run.decoded_frames += frames;
         } else {
-            std::int64_t end_ns = 0;
-            if (!state.anchored || !timeline_base
-                || !frame_time(role_end_frames[role], timeline_base->count, end_ns)
-                || end_ns < now_ns()) { return; }
+            std::int64_t end_ns = INT64_MAX;
+            // Nothing of the stream is placed: every packet was too short to give output.
+            const bool fresh = !state.anchored || stream_ended[role];
+            if (fresh) {
+                const auto at = last_header[role]->timestamp.count;
+                if (at <= INT64_MAX - config.playout.depth.count) { end_ns = at + config.playout.depth.count; }
+            } else if (!timeline_base || !frame_time(role_end_frames[role], timeline_base->count, end_ns)) {
+                end_ns = INT64_MIN;
+            }
+            if (end_ns < now_ns()) { return {false, frames, core::Nanoseconds{end_ns}}; }
             Run run;
             run.header = *last_header[role];
             run.timestamp = run.header.timestamp;
@@ -839,10 +925,12 @@ struct AudioRouter::Impl final {
             run.frames = frames;
             run.decoded_frames = frames;
             run.submitted_at_ns = now_ns();
-            run.content_ahead_ns = last_content_ns[role];
+            run.content_ahead_ns = fresh ? 0 : last_content_ns[role];
+            run.stream_start = fresh && std::exchange(stream_ended[role], false);
             pending[role].push_back(std::move(run));
         }
         report.stats.frames_decoded += frames;
+        return {};
     }
 
     // Commits a placed run's playout decision: role state, window and stats.
@@ -1282,7 +1370,7 @@ core::Result<void> AudioRouter::submit(const protocol::MessageView& message) {
 }
 
 core::Result<void> AudioRouter::submit(const protocol::MessageView& message,
-                                      core::Nanoseconds receiver_input_at) {
+                                      core::Nanoseconds receiver_input_at, bool more) {
     if (impl_) { impl_->report.queue_rejection.reset(); }
     if (!impl_ || impl_->closed) {
         return Error{ErrorCode::invalid_argument};
@@ -1328,6 +1416,12 @@ core::Result<void> AudioRouter::submit(const protocol::MessageView& message,
     chunk.payload = message.payload;
 
     Run run;
+    const std::uint64_t input_frame_bytes =
+        static_cast<std::uint64_t>(chunk.input_format.channels) * (chunk.input_format.bits_per_sample / 8U);
+    // Lossless: a packet does not have to be long enough to be decoded on its own.
+    const bool buffered = impl_->lossless() && !impl_->test_decode && chunk.codec == Codec::pcm
+        && chunk.input_format != impl_->config.output_format
+        && input_frame_bytes != 0 && chunk.input_format.sample_rate_hz != 0;
     if (impl_->test_decode) {
         auto scripted = impl_->test_decode(chunk);
         if (!scripted.has_value()) {
@@ -1349,12 +1443,14 @@ core::Result<void> AudioRouter::submit(const protocol::MessageView& message,
             }
         }
         impl_->decoder_stale[index] = false;
-        impl_->decoder_used[index] = true;
-        auto decoded = impl_->decoders[index]->decode(chunk);
-        if (!decoded.has_value()) {
-            return decoded.error();
+        if (!buffered) {
+            impl_->decoder_used[index] = true;
+            auto decoded = impl_->decoders[index]->decode(chunk);
+            if (!decoded.has_value()) {
+                return decoded.error();
+            }
+            run.pcm.assign(decoded.value().pcm.begin(), decoded.value().pcm.end());
         }
-        run.pcm.assign(decoded.value().pcm.begin(), decoded.value().pcm.end());
     }
     run.header = message.header;
     run.timestamp = message.header.timestamp;
@@ -1365,8 +1461,6 @@ core::Result<void> AudioRouter::submit(const protocol::MessageView& message,
     run.decoded_frames = run.frames;
     if (chunk.codec == Codec::pcm) {
         const auto& input = chunk.input_format;
-        const std::uint64_t input_frame_bytes =
-            static_cast<std::uint64_t>(input.channels) * (input.bits_per_sample / 8U);
         if (input_frame_bytes != 0 && input.sample_rate_hz != 0) {
             // Bounded by kMaxAudioPayloadBytes: no overflow at any supported rate.
             const std::uint64_t input_frames = message.payload.size() / input_frame_bytes;
@@ -1381,8 +1475,13 @@ core::Result<void> AudioRouter::submit(const protocol::MessageView& message,
             / impl_->config.output_format.sample_rate_hz);
     }
     run.submitted_at_ns = submitted_at_ns;
-    if (run.frames == 0) {
+    run.awaiting = buffered;
+    if (run.frames == 0 && !buffered) {
         return Error{ErrorCode::audio_format_unsupported};
+    }
+    if (buffered) {
+        auto& held = impl_->held_input[index];
+        held.insert(held.end(), message.payload.begin(), message.payload.end());
     }
 
     run.stream_start = std::exchange(impl_->stream_ended[index], false);
@@ -1402,6 +1501,24 @@ core::Result<void> AudioRouter::submit(const protocol::MessageView& message,
     }
     impl_->pending[index].push_back(std::move(run));
     impl_->report.stats.chunks_submitted += 1;
+    if (buffered && !more) {
+        const auto& held = impl_->held_input[index];
+        const auto held_frames = held.size() / input_frame_bytes;
+        // Part of a frame is the decoder's to refuse, like any malformed packet.
+        if (impl_->decoder_used[index] || held_frames >= Impl::min_decode_frames(chunk.input_format)
+            || held.size() % input_frame_bytes != 0) {
+            const auto input = std::exchange(impl_->held_input[index], {});
+            chunk.payload = input;
+            impl_->decoder_used[index] = true;
+            auto decoded = impl_->decoders[index]->decode(chunk);
+            if (!decoded.has_value()) {
+                auto& queue = impl_->pending[index];
+                while (!queue.empty() && queue.back().awaiting) { queue.pop_back(); }
+                return decoded.error();
+            }
+            impl_->share_output(index, decoded.value().pcm);
+        }
+    }
     return {};
 }
 
@@ -1796,16 +1913,17 @@ void AudioRouter::cancel_pending(protocol::ChannelRole role) {
     ++impl_->generations[role_index(*index)];
 }
 
-bool AudioRouter::end_stream(protocol::ChannelRole role) {
-    if (!impl_) { return false; }
+AudioRouter::StreamEnd AudioRouter::end_stream(protocol::ChannelRole role) {
+    if (!impl_) { return {}; }
     const auto index = role_of(role);
-    if (!index || !impl_->lossless()) { return false; }
+    if (!index || !impl_->lossless()) { return {}; }
     std::lock_guard lock(impl_->pending_mutex);
-    if (impl_->closed || impl_->flushed) { return false; }
+    if (impl_->closed || impl_->flushed) { return {}; }
     const auto slot = role_index(*index);
-    impl_->drain_decoder(slot);
+    auto end = impl_->drain_decoder(slot);
     impl_->stream_ended[slot] = true;
-    return !impl_->pending[slot].empty();
+    end.pending = !impl_->pending[slot].empty();
+    return end;
 }
 
 std::uint64_t AudioRouter::pending_frames() const {
@@ -1918,6 +2036,15 @@ core::Result<RenderStep> AudioRouter::render_step() {
     impl_->incremental = true;
     const auto generations = impl_->generations;
     RenderStep result;
+    if (impl_->lossless()) {
+        for (std::size_t role = 0; role < kRoleCount; ++role) {
+            const auto& queue = impl_->pending[role];
+            while (!queue.empty() && queue.front().frames == 0) {
+                result.completed.push_back(queue.front().header);
+                impl_->finish_silent_run(role);
+            }
+        }
+    }
     auto base = impl_->timeline_base;
     if (!base) {
         // A playout stream's timeline starts at its anchor (arrival + depth),
@@ -1942,6 +2069,93 @@ core::Result<RenderStep> AudioRouter::render_step() {
     diagnostic.cap = cap;
     diagnostic.quantum = quantum;
     if (quantum == 0) { fail(RenderFailureReason::zero_quantum); return Error{ErrorCode::audio_format_unsupported}; }
+
+    // Playout: where an unplaced run goes, back to back from the role's stream
+    // (`at`: the cursor when it is its turn), or re-anchored at arrival + depth on a
+    // fresh stream or an underrun. The decision is kept once the run heads its role.
+    const auto place_playout = [&](std::size_t role, Run& run, bool is_head, std::uint64_t at,
+                                   std::uint64_t role_end, bool& anchored, std::uint64_t& decoder_owed,
+                                   ScheduledRun& entry) -> std::optional<RenderFailureReason> {
+        if (run.stream_start) {
+            anchored = false;
+            decoder_owed = 0;
+        }
+        const auto slot_frame = std::max(at, role_end);
+        PlayoutPlan plan;
+        if (run.playout) {
+            plan = *run.playout;
+        } else if (!impl_->plan_playout(role, run, slot_frame, role_end + decoder_owed,
+                                        base->count, anchored, plan)) {
+            diagnostic.time_conversion_frame = slot_frame;
+            return RenderFailureReason::placement_time_conversion;
+        } else if (is_head) {
+            if (impl_->lossless() && plan.mode == PlayoutPlan::Mode::steady
+                && !plan.backward && plan.depth_ns <= impl_->config.playout.emergency_backlog.count) {
+                impl_->apply_rate(role, run, plan);
+            }
+            run.playout = plan;
+        }
+        const bool continues = plan.mode == PlayoutPlan::Mode::steady || plan.decoder_held;
+        decoder_owed = Impl::owed_after(continues ? decoder_owed : 0, run);
+        if (plan.backward) { return RenderFailureReason::late; }
+        if (plan.mode == PlayoutPlan::Mode::steady) {
+            entry.start_frame = std::max(plan.start_frame, slot_frame);
+            // Measured against the planned slot: the pad's own silence
+            // advances the cursor before the run is placed (N7).
+            entry.applied_pad_frames = entry.start_frame - std::min(entry.start_frame, plan.slot_frame);
+            entry.head_trim_frames = std::min(plan.trim_frames, run.frames);
+        } else {
+            std::int64_t target = 0;
+            std::int64_t arrived = 0;
+            if (!impl_->ns_to_frames_signed(core::Nanoseconds{plan.target_ns - base->count}, target)
+                || !impl_->ns_to_frames_signed(
+                       core::Nanoseconds{run.timestamp.count - base->count}, arrived)) {
+                return RenderFailureReason::intended_time_conversion;
+            }
+            entry.start_frame = static_cast<std::uint64_t>(
+                std::max<std::int64_t>(target, static_cast<std::int64_t>(slot_frame)));
+            // The hole up to the arrival has already played out.
+            if (arrived > static_cast<std::int64_t>(slot_frame)) {
+                entry.skip_first = slot_frame;
+                entry.skip_last = std::min(entry.start_frame, static_cast<std::uint64_t>(arrived));
+            }
+            entry.refill_allowance = impl_->ns_to_frames(impl_->config.playout.depth) + 1;
+        }
+        if (impl_->lossless()) {
+            if (!impl_->overflow_beyond(run, entry.start_frame, base->count, 0, run.frames,
+                                        entry.overflow_frames)) {
+                diagnostic.time_conversion_frame = entry.start_frame;
+                return RenderFailureReason::placement_time_conversion;
+            }
+            entry.head_trim_frames = entry.overflow_frames;
+        }
+        entry.intended = static_cast<std::int64_t>(entry.start_frame);
+        anchored = true;
+        return {};
+    };
+    // Lossless: the run at the head of the role's queue, when its turn comes within
+    // this step. False: that is the next step's.
+    const auto place_next = [&](std::size_t role, std::uint64_t at, ScheduledRun& entry) {
+        auto& queue = impl_->pending[role];
+        if (queue.empty() || queue.front().placed || queue.front().frames == 0) { return false; }
+        auto& run = queue.front();
+        entry = ScheduledRun{};
+        entry.role = role;
+        entry.run = &run;
+        entry.role_end_before = impl_->role_end_frames[role];
+        bool anchored = impl_->playout[role].anchored;
+        auto decoder_owed = impl_->playout[role].decoder_owed;
+        if (place_playout(role, run, true, at, entry.role_end_before, anchored, decoder_owed, entry)) {
+            diagnostic.time_conversion_frame.reset();
+            return false;
+        }
+        const auto remaining = run.frames - entry.head_trim_frames;
+        std::int64_t end_ns = 0;
+        if (remaining > UINT64_MAX - entry.start_frame
+            || !impl_->frame_time(entry.start_frame + remaining, base->count, end_ns)) { return false; }
+        entry.end_frame = entry.start_frame + remaining;
+        return true;
+    };
 
     // Preflight all parents, not just the visible heads: splitting a schedule
     // into steps must not evade the existing atomic discontinuity policy.
@@ -1974,76 +2188,15 @@ core::Result<RenderStep> AudioRouter::render_step() {
                 entry.start_frame = *run.placed + run.consumed;
                 entry.head_trim_frames = run.trimmed + run.consumed;
             } else if (impl_->playout_enabled()) {
-                // Playout: back to back from the role's stream, re-anchored
-                // at arrival + depth on a fresh stream or an underrun.
-                if (run.stream_start) {
-                    anchored = false;
-                    decoder_owed = 0;
-                }
-                const auto slot_frame = std::max(cursor, role_end);
-                PlayoutPlan plan;
-                if (run.playout) {
-                    plan = *run.playout;
-                } else if (!impl_->plan_playout(role, run, slot_frame, role_end + decoder_owed,
-                                                base->count, anchored, plan)) {
-                    diagnostic.time_conversion_frame = slot_frame;
-                    fail(RenderFailureReason::placement_time_conversion);
-                    valid = false;
-                    break;
-                } else if (&run == &impl_->pending[role].front()) {
-                    if (impl_->lossless() && plan.mode == PlayoutPlan::Mode::steady
-                        && !plan.backward && plan.depth_ns <= impl_->config.playout.emergency_backlog.count) {
-                        impl_->apply_rate(role, run, plan);
-                    }
-                    run.playout = plan;
-                }
-                const bool continues = plan.mode == PlayoutPlan::Mode::steady || plan.decoder_held;
-                decoder_owed = Impl::owed_after(continues ? decoder_owed : 0, run);
-                if (plan.backward) {
-                    diagnostic.start.reset();
-                    fail(RenderFailureReason::late);
+                if (run.frames == 0) { continue; } // nothing to place (finish_silent_run)
+                if (const auto failed = place_playout(role, run, &run == &impl_->pending[role].front(),
+                                                      cursor, role_end, anchored, decoder_owed, entry)) {
+                    fail(*failed);
                     valid = false;
                     break;
                 }
-                if (plan.mode == PlayoutPlan::Mode::steady) {
-                    entry.start_frame = std::max(plan.start_frame, slot_frame);
-                    // Measured against the planned slot: the pad's own silence
-                    // advances the cursor before the run is placed (N7).
-                    entry.applied_pad_frames = entry.start_frame - std::min(entry.start_frame, plan.slot_frame);
-                    entry.head_trim_frames = std::min(plan.trim_frames, run.frames);
-                } else {
-                    std::int64_t target = 0;
-                    std::int64_t arrived = 0;
-                    if (!impl_->ns_to_frames_signed(core::Nanoseconds{plan.target_ns - base->count}, target)
-                        || !impl_->ns_to_frames_signed(
-                               core::Nanoseconds{run.timestamp.count - base->count}, arrived)) {
-                        fail(RenderFailureReason::intended_time_conversion);
-                        valid = false;
-                        break;
-                    }
-                    entry.start_frame = static_cast<std::uint64_t>(
-                        std::max<std::int64_t>(target, static_cast<std::int64_t>(slot_frame)));
-                    // The hole up to the arrival has already played out.
-                    if (arrived > static_cast<std::int64_t>(slot_frame)) {
-                        entry.skip_first = slot_frame;
-                        entry.skip_last = std::min(entry.start_frame, static_cast<std::uint64_t>(arrived));
-                    }
-                    entry.refill_allowance = impl_->ns_to_frames(impl_->config.playout.depth) + 1;
-                }
-                if (impl_->lossless()) {
-                    if (!impl_->overflow_beyond(run, entry.start_frame, base->count, 0, run.frames,
-                                                entry.overflow_frames)) {
-                        diagnostic.time_conversion_frame = entry.start_frame;
-                        fail(RenderFailureReason::placement_time_conversion);
-                        valid = false;
-                        break;
-                    }
-                    entry.head_trim_frames = entry.overflow_frames;
-                }
-                entry.intended = static_cast<std::int64_t>(entry.start_frame);
                 diagnostic.intended = entry.intended;
                 diagnostic.start = entry.start_frame;
-                anchored = true;
                 role_source_frontier =
                     std::max(role_source_frontier, source_end_frame(*entry.intended, run.content_frames));
             } else {
@@ -2191,8 +2344,30 @@ core::Result<RenderStep> AudioRouter::render_step() {
         for (auto& run : queue) { run.preflighted = true; }
     }
     std::array<std::optional<ScheduledRun>, kRoleCount> heads{};
-    auto end = cursor + quantum;
+    auto limit = cursor + quantum;
+    auto end = limit;
     bool any = false;
+    const auto reach_source_end = [&](const ScheduledRun& head) {
+        if (!head.intended) { return; }
+        const auto run_source_end = source_end_frame(*head.intended, head.run->content_frames);
+        impl_->source_frontier_frames = std::max(impl_->source_frontier_frames, run_source_end);
+        impl_->role_source_frontier_frames[head.role] =
+            std::max(impl_->role_source_frontier_frames[head.role], run_source_end);
+    };
+    // The head of its role's queue, of which nothing is left to play.
+    const auto finish_cut = [&](const ScheduledRun& head) {
+        auto& queue = impl_->pending[head.role];
+        // A placed run ends here when a retime cut its rest: already counted.
+        if (!queue.front().placed) {
+            impl_->report.stats.frames_trimmed += head.head_trim_frames;
+            impl_->report.stats.frames_caught_up += head.caught_up_frames;
+            impl_->commit_playout(head.role, queue.front(), head, base->count);
+        }
+        impl_->role_end_frames[head.role] = head.end_frame;
+        reach_source_end(head);
+        result.completed.push_back(queue.front().header);
+        queue.pop_front();
+    };
     // Lossless: roles whose next run waits to be planned as a head of its own.
     std::array<bool, kRoleCount> replan{};
     for (const auto& head : planned) {
@@ -2200,25 +2375,16 @@ core::Result<RenderStep> AudioRouter::render_step() {
         if (heads[role] || replan[role]) { continue; }
         auto& queue = impl_->pending[role];
         if (head.start_frame == head.end_frame) {
-            // A placed run ends here when a retime cut its rest: already counted.
-            if (!queue.front().placed) {
-                impl_->report.stats.frames_trimmed += head.head_trim_frames;
-                impl_->report.stats.frames_caught_up += head.caught_up_frames;
-                impl_->commit_playout(role, queue.front(), head, base->count);
+            finish_cut(head);
+            if (impl_->lossless()) {
+                ScheduledRun next;
+                while (place_next(role, cursor, next) && next.start_frame == next.end_frame) { finish_cut(next); }
+                replan[role] = !queue.empty();
             }
-            impl_->role_end_frames[role] = head.end_frame;
-            if (head.intended) {
-                const auto run_source_end = source_end_frame(*head.intended, head.run->content_frames);
-                impl_->source_frontier_frames = std::max(impl_->source_frontier_frames, run_source_end);
-                impl_->role_source_frontier_frames[role] =
-                    std::max(impl_->role_source_frontier_frames[role], run_source_end);
-            }
-            result.completed.push_back(queue.front().header);
-            queue.pop_front();
-            replan[role] = impl_->lossless() && !queue.empty();
             continue;
         }
         // Never cross an earlier queued head/end to reach a future role.
+        if (head.start_frame > cursor) { limit = std::min(limit, head.start_frame); }
         end = std::min(end, head.start_frame > cursor ? head.start_frame : head.end_frame);
         heads[role] = head;
         any = true;
@@ -2275,7 +2441,8 @@ core::Result<RenderStep> AudioRouter::render_step() {
         }
         const auto ahead = impl_->ns_to_frames(
             core::Nanoseconds{known_ns - (due_ns - lead) + kHoldQuantumNs});
-        end = std::min(end, cursor + std::max<std::uint64_t>(1, std::min(ahead, quantum)));
+        limit = std::min(limit, cursor + std::max<std::uint64_t>(1, std::min(ahead, quantum)));
+        end = std::min(end, limit);
     }
     const bool silence_only = std::none_of(heads.begin(), heads.end(), [&](const auto& head) {
         return head && head->start_frame <= cursor;
@@ -2318,7 +2485,6 @@ core::Result<RenderStep> AudioRouter::render_step() {
             }
         }
     }
-    const auto frames = end - cursor;
     std::int64_t scheduled_ns = 0;
     std::int64_t end_ns = 0;
     // Interval operands are copied before any parents can be popped/unlocked.
@@ -2340,39 +2506,105 @@ core::Result<RenderStep> AudioRouter::render_step() {
         fail(RenderFailureReason::output_end_time_conversion);
         return Error{ErrorCode::invalid_argument};
     }
-    std::array<PcmChunk, kRoleCount> materialized{};
-    std::array<const PcmChunk*, kRoleCount> pieces{};
+    // One role's share of the write: a run's PCM, or (lossless) that of the short
+    // runs that follow one another, held here once their parents are done.
+    struct RolePiece final {
+        std::span<const std::byte> pcm{};
+        std::vector<std::byte> joined{};
+        std::vector<std::byte> first{}; // keeps `pcm` alive once its run is gone
+        std::int64_t offset_ns{};
+    };
+    std::array<RolePiece, kRoleCount> shares{};
+    std::array<bool, kRoleCount> active{};
     std::optional<std::int64_t> oldest;
-    std::int64_t playout_offset_ns = 0;
     for (std::size_t role = 0; role < kRoleCount; ++role) {
-        if (!heads[role] || heads[role]->start_frame > cursor) { continue; }
-        const auto& head = *heads[role];
-        auto& run = impl_->pending[role].front();
-        if (!run.placed) {
-            run.placed = head.start_frame;
-            run.trimmed = head.head_trim_frames;
-            impl_->report.stats.frames_trimmed += run.trimmed;
-            impl_->report.stats.frames_caught_up += head.caught_up_frames;
-            impl_->commit_playout(role, run, head, base->count);
-            if (head.intended) {
-                const auto run_source_end = source_end_frame(*head.intended, run.content_frames);
-                impl_->source_frontier_frames = std::max(impl_->source_frontier_frames, run_source_end);
-                impl_->role_source_frontier_frames[role] =
-                    std::max(impl_->role_source_frontier_frames[role], run_source_end);
+        active[role] = heads[role] && heads[role]->start_frame <= cursor;
+    }
+    const auto joined = impl_->ns_to_frames(core::Nanoseconds{kJoinedWriteNs});
+    if (impl_->lossless()) { limit = std::min(limit, cursor + joined); }
+    for (auto at = cursor;;) {
+        const auto frames = end - at;
+        for (std::size_t role = 0; role < kRoleCount; ++role) {
+            if (!active[role]) { continue; }
+            const auto& head = *heads[role];
+            auto& share = shares[role];
+            auto& run = impl_->pending[role].front();
+            if (!run.placed) {
+                run.placed = head.start_frame;
+                run.trimmed = head.head_trim_frames;
+                impl_->report.stats.frames_trimmed += run.trimmed;
+                impl_->report.stats.frames_caught_up += head.caught_up_frames;
+                impl_->commit_playout(role, run, head, base->count);
+                reach_source_end(head);
+            }
+            const auto pcm = std::span<const std::byte>{run.pcm}.subspan(
+                static_cast<std::size_t>(run.trimmed + run.consumed) * frame_bytes,
+                static_cast<std::size_t>(frames) * frame_bytes);
+            if (at == cursor) {
+                share.pcm = pcm;
+            } else {
+                if (share.joined.empty()) { share.joined.assign(share.pcm.begin(), share.pcm.end()); }
+                share.joined.insert(share.joined.end(), pcm.begin(), pcm.end());
+            }
+            oldest = oldest ? std::min(*oldest, run.submitted_at_ns) : run.submitted_at_ns;
+            share.offset_ns = run.playout_offset_ns;
+            // Another role's end can split what a run gives this write.
+            if (at == cursor || run.consumed == 0) { result.contributors.push_back(run.header); }
+            impl_->idle.reset();
+            run.consumed += frames;
+            impl_->role_end_frames[role] = end;
+            if (run.trimmed + run.consumed == run.frames) {
+                result.completed.push_back(run.header);
+                result.delivered.push_back(run.header);
+                if (at == cursor) { share.first = std::move(run.pcm); }
+                impl_->pending[role].pop_front();
             }
         }
+        at = end;
+        // Lossless: on into the short runs that go on without a gap.
+        if (!impl_->lossless() || !oldest || at >= limit) { break; }
+        auto next_end = limit;
+        bool more = true;
+        for (std::size_t role = 0; role < kRoleCount && more; ++role) {
+            if (!active[role]) { continue; }
+            auto& queue = impl_->pending[role];
+            ScheduledRun next;
+            if (!queue.empty() && queue.front().placed) {
+                next = *heads[role]; // not done yet
+            } else {
+                do {
+                    more = place_next(role, at, next) && !queue.front().stream_start
+                        && queue.front().frames < joined && next.start_frame == at
+                        && next.skip_first == next.skip_last;
+                    if (more && next.end_frame == at) { finish_cut(next); } else { break; }
+                } while (true);
+                heads[role] = next;
+            }
+            next_end = std::min(next_end, next.end_frame);
+        }
+        if (!more || !impl_->frame_time(next_end, base->count, end_ns)) { break; }
+        end = next_end;
+    }
+    if (!impl_->frame_time(end, base->count, end_ns)) { end_ns = scheduled_ns; } // checked above
+    diagnostic.output_end = end;
+    const auto frames = end - cursor;
+    std::array<PcmChunk, kRoleCount> materialized{};
+    std::array<const PcmChunk*, kRoleCount> pieces{};
+    std::uint64_t role_frames = 0;
+    std::int64_t playout_offset_ns = 0;
+    for (std::size_t role = 0; role < kRoleCount; ++role) {
+        if (!active[role]) { continue; }
+        const auto& share = shares[role];
         materialized[role] = PcmChunk{static_cast<Role>(role), impl_->config.output_format,
-            core::Nanoseconds{scheduled_ns}, std::span<const std::byte>{run.pcm}.subspan(
-                static_cast<std::size_t>(head.head_trim_frames) * frame_bytes,
-                static_cast<std::size_t>(frames) * frame_bytes)};
+            core::Nanoseconds{scheduled_ns},
+            share.joined.empty() ? share.pcm : std::span<const std::byte>{share.joined}};
         pieces[role] = &materialized[role];
-        oldest = oldest ? std::min(*oldest, run.submitted_at_ns) : run.submitted_at_ns;
-        playout_offset_ns = std::max(playout_offset_ns, run.playout_offset_ns);
-        result.contributors.push_back(run.header);
+        role_frames += frames;
+        playout_offset_ns = std::max(playout_offset_ns, share.offset_ns);
     }
     if (const auto media = impl_->media_offset(scheduled_ns)) { playout_offset_ns = *media; }
-    // Materialize before detaching: cancel_pending can now free EVERY parent
-    // remainder while this single, bounded mixed piece is inside sink->write.
+    // Detached: cancel_pending can now free EVERY parent remainder while this
+    // single, bounded mixed piece is inside sink->write.
     std::vector<std::byte> output;
     if (oldest) {
         auto mixed = impl_->mixer.mix(MixFrame{core::Nanoseconds{scheduled_ns}, frames, pieces});
@@ -2380,18 +2612,6 @@ core::Result<RenderStep> AudioRouter::render_step() {
         output.assign(mixed.value().pcm.begin(), mixed.value().pcm.end());
     } else {
         output.assign(static_cast<std::size_t>(frames) * frame_bytes, std::byte{0});
-    }
-    for (std::size_t role = 0; role < kRoleCount; ++role) {
-        if (!pieces[role]) { continue; }
-        impl_->idle.reset();
-        auto& run = impl_->pending[role].front();
-        run.consumed += frames;
-        impl_->role_end_frames[role] = end;
-        if (run.trimmed + run.consumed == run.frames) {
-            result.completed.push_back(run.header);
-            result.delivered.push_back(run.header);
-            impl_->pending[role].pop_front();
-        }
     }
     impl_->timeline_base = base;
     impl_->playback_cursor_frames = end;
@@ -2437,7 +2657,7 @@ core::Result<RenderStep> AudioRouter::render_step() {
     impl_->report.render_barrier = impl_->sink->render_stats();
     if (!written) {
         lock.lock();
-        diagnostic.discarded_frames = frames * result.contributors.size() + impl_->frames_pending();
+        diagnostic.discarded_frames = role_frames + impl_->frames_pending();
         fail(RenderFailureReason::sink_write_error, written.error().code());
         for (auto& queue : impl_->pending) { queue.clear(); }
         impl_->mark_degraded("disabled: routing write failed ("
@@ -2449,7 +2669,7 @@ core::Result<RenderStep> AudioRouter::render_step() {
     ++stats.frames_written;
     stats.samples_written += frames * impl_->config.output_format.channels;
     stats.frames_output += frames;
-    stats.frames_retained += frames * result.contributors.size();
+    stats.frames_retained += role_frames;
     if (oldest) {
         stats.last_path_latency = core::Nanoseconds{done - *oldest};
         stats.max_path_latency = std::max(stats.max_path_latency, stats.last_path_latency);
@@ -2520,7 +2740,7 @@ core::Result<void> AudioRouter::flush(core::Milliseconds drain_timeout) {
     }
     if (impl_->lossless()) {
         std::lock_guard lock(impl_->pending_mutex);
-        for (std::size_t role = 0; role < kRoleCount; ++role) { impl_->drain_decoder(role); }
+        for (std::size_t role = 0; role < kRoleCount; ++role) { (void)impl_->drain_decoder(role); }
     }
     auto pumped = pump();
     if (!pumped.has_value()) {

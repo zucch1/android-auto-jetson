@@ -7280,6 +7280,136 @@ TEST(WiredReceiver, LosslessShutdownReportsWhatAFailedWriteLoses) {
     }
 }
 
+// Sol's delta review of d877a45: a write of another role fails during the stop. A
+// prompt's decoder tail was dropped uncounted once its slot had passed.
+TEST(WiredReceiver, LosslessShutdownReportsALateDecoderTailBehindAFailedWrite) {
+    ReceiverLogScope logging{g_running};
+    for (const auto held : {std::chrono::milliseconds{0}, std::chrono::milliseconds{400}}) {
+        SCOPED_TRACE(held.count());
+        StdoutCaptureGuard capture;
+        auto gate = std::make_shared<RenderGate>();
+        gate->release();
+        ConcreteAudioRenderWorker audio{pcm_router_config(), gated_router(gate)};
+        ASSERT_TRUE(audio.ready());
+        const auto media = aa::protocol::ChannelRole::media_audio;
+        const auto guidance = aa::protocol::ChannelRole::guidance_audio;
+        ASSERT_TRUE(audio.submit({{guidance, 1, {steady_ns()}}, std::vector<std::byte>(6400, std::byte{2})},
+                                 {guidance, 0, 1, 7}));
+        ASSERT_TRUE(audio.wait_idle(std::chrono::steady_clock::now() + std::chrono::seconds{2}));
+        std::size_t before = 0;
+        {
+            std::lock_guard lock(gate->mutex);
+            gate->released = false;
+            gate->fail_write = true;
+            before = gate->writes;
+        }
+        ASSERT_TRUE(audio.submit({{media, 2, {steady_ns()}}, std::vector<std::byte>(8192, std::byte{1})},
+                                 {media, 0, 1, 7}));
+        ASSERT_TRUE(gate->wait_writes(before + 1));
+        audio.stop();
+        std::this_thread::sleep_for(held);
+        gate->release();
+        EXPECT_FALSE(audio.finish());
+        const auto output = capture.release();
+        EXPECT_NE(output.find("{\"event\":\"audio_stop_discarded\",\"role\":null,\"chunks\":1,\"frames\":" +
+                              std::to_string(2'048 + 96)),
+                  std::string::npos) << output;
+    }
+}
+
+// Sol's delta review of d877a45: a resampler needs more than a frame or two before it
+// gives any output. d877a45 decoded the packets of a slot one by one and gave up on the
+// first (timeout after 502 ms, fatal). `alone`: each reaches the router on its own.
+TEST(WiredReceiver, LosslessWorkerPlaysVoicePacketsTooShortToResample) {
+    struct Case {
+        aa::protocol::ChannelRole role;
+        std::uint64_t packets;
+        bool alone;
+    };
+    const auto guidance = aa::protocol::ChannelRole::guidance_audio;
+    for (const Case c : {Case{guidance, 64, false}, Case{aa::protocol::ChannelRole::system_audio, 64, false},
+                         Case{guidance, 20, false}, Case{guidance, 400, false}, Case{guidance, 100, true}}) {
+        SCOPED_TRACE(std::to_string(c.packets) + (c.alone ? " alone" : "") + " role " +
+                     std::to_string(static_cast<unsigned>(c.role)));
+        ReceiverLogScope logging{g_running};
+        StdoutCaptureGuard capture;
+        auto gate = std::make_shared<RenderGate>();
+        gate->write_timeout = std::chrono::milliseconds{30'000};
+        if (c.alone) { gate->release(); }
+        ConcreteAudioRenderWorker audio{pcm_router_config(), gated_router(gate)};
+        ASSERT_TRUE(audio.ready());
+        const auto media = aa::protocol::ChannelRole::media_audio;
+        const auto start = steady_ns();
+        std::uint64_t sequence = 0;
+        if (!c.alone) {
+            ASSERT_TRUE(audio.submit({{media, ++sequence, {start}}, std::vector<std::byte>(8192, std::byte{1})},
+                                     {media, 0, 1, 7}));
+            ASSERT_TRUE(audio.take_completion(std::chrono::steady_clock::now() + std::chrono::milliseconds{100}));
+            ASSERT_TRUE(gate->wait_writes(1));
+        }
+        for (std::uint64_t k = 0; k < c.packets; ++k) {
+            const auto at = start + static_cast<std::int64_t>(k) * 62'500;
+            ASSERT_TRUE(audio.submit({{c.role, ++sequence, {at}}, std::vector<std::byte>(2, std::byte{2})},
+                                     {c.role, 0, 1'000 + k, 7}));
+            const auto done = audio.take_completion(std::chrono::steady_clock::now() + std::chrono::milliseconds{100});
+            ASSERT_TRUE(done);
+            EXPECT_EQ(done->sequence, 1'000 + k);
+            if (c.alone) { ASSERT_TRUE(audio.wait_idle(std::chrono::steady_clock::now() + std::chrono::seconds{2})) << k; }
+        }
+        gate->release();
+        ASSERT_TRUE(audio.wait_idle(std::chrono::steady_clock::now() + std::chrono::seconds{2}));
+        EXPECT_TRUE(audio.finish());
+        const auto output = capture.release();
+        const auto report = audio.final_report();
+        ASSERT_TRUE(report);
+        const auto &stats = report->stats;
+        // The resampler keeps two output frames of every stream.
+        EXPECT_EQ(stats.frames_decoded, (c.alone ? 0U : 2'048U) + c.packets * 3 - 2) << output;
+        EXPECT_EQ(stats.frames_decoded, stats.frames_retained) << output;
+        EXPECT_EQ(output.find("audio_stop_discarded"), std::string::npos) << output;
+        EXPECT_EQ(stats.playout_anchors, c.alone ? 1U : 2U) << output;
+        EXPECT_EQ(stats.playout_underruns, 0U) << output;
+    }
+}
+
+// Sol's delta review of d877a45: only a shared slot's first packet has an admission
+// record, which d877a45 also reported for a later one's failure.
+TEST(WiredReceiver, LosslessSharedPacketsFailureKeepsItsOwnAdmission) {
+    ReceiverLogScope logging{g_running};
+    for (const bool later : {false, true}) {
+        SCOPED_TRACE(later);
+        StdoutCaptureGuard capture;
+        auto gate = std::make_shared<RenderGate>();
+        ConcreteAudioRenderWorker audio{pcm_router_config(), gated_router(gate)};
+        ASSERT_TRUE(audio.ready());
+        const auto role = aa::protocol::ChannelRole::media_audio;
+        const auto start = steady_ns();
+        const auto submit = [&](std::uint64_t sequence, std::int64_t at, std::size_t bytes) {
+            ASSERT_TRUE(audio.submit({{role, sequence, {at}}, std::vector<std::byte>(bytes, std::byte{1})},
+                                     {role, 0, 1'000 + sequence, 7}));
+        };
+        ASSERT_NO_FATAL_FAILURE(submit(1, start, 8192));
+        ASSERT_TRUE(gate->wait_writes(1));
+        ASSERT_NO_FATAL_FAILURE(submit(2, later ? start : -1, 64));
+        ASSERT_NO_FATAL_FAILURE(submit(3, later ? -1 : start, 64));
+        EXPECT_EQ(audio.worker_observation_for_test().queue.queued_by_role[0], 2U); // shared
+        gate->release();
+        EXPECT_FALSE(audio.wait_idle(std::chrono::steady_clock::now() + std::chrono::seconds{2}) && !audio.failure());
+        const auto context = audio.failure_context();
+        ASSERT_TRUE(context);
+        EXPECT_EQ(context->origin, AudioFailureOrigin::router_submit);
+        ASSERT_TRUE(context->parent);
+        EXPECT_EQ(context->parent->message_sequence, later ? 3U : 2U);
+        EXPECT_EQ(context->parent->delivery.sequence, later ? 1'003U : 1'002U);
+        EXPECT_EQ(context->worker.admission.has_value(), !later);
+        if (context->worker.admission) {
+            EXPECT_EQ(context->worker.admission->parent.delivery, context->parent->delivery);
+        }
+        EXPECT_FALSE(audio.finish());
+        (void)capture.release();
+    }
+}
+
 // The receiver's teardown order: the session thread stops the worker, then the
 // session resets every AV channel, then the main thread finishes the worker. That
 // reset is no reason to drop what is playing out (07b82f0 cancelled all of it).
@@ -7383,13 +7513,13 @@ TEST(WiredReceiver, LosslessWorkerGrantsOnReceiptAtAnyPacketSize) {
         std::size_t bytes;
         std::uint64_t packets;
         std::size_t most_jobs;
-        bool plays;
+        std::size_t most_writes;
     };
     // Up to 1.85 s each, in an instant: the sink is blocked throughout. Every packet
-    // keeps its own placement and write, which single frames are too many of to play
-    // in real time: they only count for the credit.
-    for (const Case c : {Case{64, 4'800, 450, true}, Case{4, 24'000, 200, false},
-                         Case{188, 1'880, 600, true}, Case{192, 1'850, 1'850, true}}) {
+    // keeps its own placement, but they are written about 4 ms at a time: d877a45 wrote
+    // each on its own, too many to play in real time (it cut 70% of the 4 B case).
+    for (const Case c : {Case{64, 5'550, 600, 500}, Case{4, 24'000, 200, 150},
+                         Case{188, 1'880, 600, 600}, Case{192, 1'850, 1'850, 500}}) {
         SCOPED_TRACE(c.bytes);
         ReceiverLogScope logging{g_running};
         StdoutCaptureGuard capture;
@@ -7416,9 +7546,6 @@ TEST(WiredReceiver, LosslessWorkerGrantsOnReceiptAtAnyPacketSize) {
         EXPECT_EQ(withheld, 0U) << sent;
         const auto jobs = audio.worker_observation_for_test().queue.queued_by_role[0];
         EXPECT_LE(jobs, c.most_jobs);
-        if (!c.plays) {
-            audio.begin_session(); // drops it
-        }
         gate->release();
         ASSERT_TRUE(audio.wait_idle(std::chrono::steady_clock::now() + std::chrono::seconds{30}));
         EXPECT_FALSE(audio.failure());
@@ -7427,7 +7554,7 @@ TEST(WiredReceiver, LosslessWorkerGrantsOnReceiptAtAnyPacketSize) {
         const auto report = audio.final_report();
         ASSERT_TRUE(report);
         EXPECT_EQ(output.find("audio_stall_bypass"), std::string::npos) << output;
-        if (!c.plays) { continue; }
+        EXPECT_LE(gate->writes, c.most_writes);
         EXPECT_EQ(report->stats.frames_decoded, sent * c.bytes / 4) << output;
         EXPECT_EQ(report->stats.frames_trimmed, 0U) << output;
         EXPECT_EQ(report->stats.frames_decoded + report->stats.frames_stretched,

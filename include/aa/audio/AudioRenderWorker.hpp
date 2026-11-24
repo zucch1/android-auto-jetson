@@ -166,7 +166,7 @@ private:
     };
     // One parent, or several short ones sharing a slot (coalesce_locked). The
     // router gets each of those on its own, with its own receipt; header, id and
-    // admission are the first one's.
+    // admission are the first one's (the others keep no admission record).
     struct Job {
         protocol::MessageHeader header;
         std::vector<std::byte> pcm;
@@ -181,9 +181,12 @@ private:
         bool starts_stream{};
         // Parents the router is done with, of `parts` (empty: just the one).
         std::uint32_t parts_done{};
-        std::vector<Part> parts{};
+        std::shared_ptr<std::vector<Part>> parts{}; // fixed once it is dequeued
         [[nodiscard]] std::size_t chunks() const noexcept {
-            return parts.empty() ? 1 : parts.size() - parts_done;
+            return parts ? parts->size() - parts_done : 1;
+        }
+        [[nodiscard]] std::uint64_t next_sequence() const noexcept {
+            return parts ? (*parts)[parts_done].message_sequence : header.sequence;
         }
     };
     struct DeferredCredit {
@@ -423,6 +426,12 @@ private:
     // frames (the router's and the failed write's, then also those queued here).
     std::size_t drain_discarded_{};
     std::uint64_t drain_lost_frames_{};
+    // Decoder tails that came too late to play out: all of them during that drain,
+    // and those that were not late yet when stop() was called.
+    std::uint64_t drain_late_frames_{};
+    std::uint64_t drain_cut_frames_{};
+    const std::function<core::Nanoseconds()> clock_; // RouterConfig::clock
+    core::Nanoseconds stop_at_{};                    // on that clock
     std::array<bool, 4> pcm_role_{};
     bool router_busy_{};
     std::uint64_t playout_retimes_logged_{};

@@ -284,7 +284,8 @@ which no counter shows, #232)
 and `playout_retimed_ms` (their sum). A stopped stream plays out; `audio_stop_discarded` (`role`, `null`
 at shutdown, and `chunks`; at shutdown also `frames`, 48 kHz output frames of all
 roles, where a decoder tail alone is one chunk) reports accepted audio a stop had
-to cancel, or lost to a write that failed during it.
+to cancel, or lost to a write that failed during it, including decoder tails whose
+slot passed meanwhile.
 There `playout_offset_ms` and `playout_offset_ns` are the media stream's while
 media plays. Each underrun also logs
 `audio_playout_underrun` with `underruns_lifetime`, `late_ms` (how long after

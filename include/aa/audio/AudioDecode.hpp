@@ -97,8 +97,9 @@ public:
     void flush() noexcept;
     // Returns the output the pipeline still holds (the resampler keeps about
     // 2 ms of its input) and leaves it as just opened: the next decode() starts
-    // from nothing. Empty when there is none or the pipeline failed.
-    [[nodiscard]] std::vector<std::byte> drain();
+    // from nothing. Empty when there is none or the pipeline failed. `last`, if
+    // not empty, is input not decoded yet that ends the stream.
+    [[nodiscard]] std::vector<std::byte> drain(std::span<const std::byte> last = {});
     // Discards what the pipeline still holds; it is as just opened.
     [[nodiscard]] core::Result<void> restart();
     void close() noexcept;

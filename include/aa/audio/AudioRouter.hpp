@@ -329,7 +329,8 @@ private:
 //   1% only while the excess is over 100 ms; the rate moves by at most 0.1%
 //   per A26 chunk. A 300 ms excess is back under 15 ms in about 45 s;
 // - a short run (any packet size down to a third of a millisecond) takes the
-//   whole frame its predecessors' fractions add up to;
+//   whole frame its predecessors' fractions add up to. It is placed and cut on its
+//   own, and written together with those that follow it without a gap;
 // - retime: a piece whose slot has already passed when it is about to be written
 //   (the write before it blocked, or the render thread was held up) moves the
 //   whole timeline to 20 ms from now first: the depth and the offset grow by
@@ -667,8 +668,12 @@ public:
     [[nodiscard]] core::Result<void> submit(const protocol::MessageView& message);
     // Owner-captured monotonic receipt, before copying/enqueueing. Only the
     // path-latency origin changes; the message's scheduled timestamp is intact.
+    // Lossless: `more` says the caller's next packet of the role follows at once.
+    // A resampling role decodes them together, and takes a packet too short for the
+    // resampler to give any output for: that plays with the next ones. Every packet
+    // still is a parent of its own.
     [[nodiscard]] core::Result<void> submit(const protocol::MessageView& message,
-                                           core::Nanoseconds receiver_input_at);
+                                           core::Nanoseconds receiver_input_at, bool more = false);
 
     // Mixes and writes every pending frame to the routing element. A write
     // failure (bus error, render-barrier stall, drained route) transitions the
@@ -686,6 +691,8 @@ public:
     [[nodiscard]] core::Result<void> pump();
     // Worker-only incremental seam: one shared-timeline interval, at most
     // RouterConfig::render_quantum including silence. Decode and drift decisions remain parent-scoped.
+    // Lossless: parents shorter than 4 ms share a write with those that follow them
+    // without a gap, up to 4 ms.
     // submit/step are owner-thread operations; cancel_pending may run during
     // the sink write. The detached mixed piece alone survives cancellation.
     // Other operations (including close/move/destruction) require the owner
@@ -698,9 +705,16 @@ public:
     // Lossless playout, owner thread: the peer stopped the role's stream after
     // everything submitted so far. That audio plays out (including what the
     // decoder still holds), nothing waits for the role any more, and its next
-    // chunk starts a new stream. True while the role has audio pending. Without
-    // lossless playout it does nothing and returns false.
-    bool end_stream(protocol::ChannelRole role);
+    // chunk starts a new stream. Without lossless playout it does nothing.
+    struct StreamEnd final {
+        bool pending{}; // the role has audio pending
+        // Frames the decoder still held that come too late to play, and when they
+        // were due.
+        std::uint64_t dropped_frames{};
+        core::Nanoseconds due{};
+        [[nodiscard]] explicit operator bool() const noexcept { return pending; }
+    };
+    StreamEnd end_stream(protocol::ChannelRole role);
     // Decoded frames, over all roles, that are still to be written.
     [[nodiscard]] std::uint64_t pending_frames() const;
     // Records a steady-clock interval during which the owner withheld peer
