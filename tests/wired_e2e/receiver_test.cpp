@@ -7238,6 +7238,48 @@ class SlowRenderSink final : public aa::audio::detail::ObservedAudioSink {
 
 } // namespace
 
+// Sol's delta review of 25df492: the write that fails during a shutdown is all that was
+// left, a decoder tail without a job, and 25df492 lost its 96 frames without a word.
+// So is one with jobs behind it accounted for.
+TEST(WiredReceiver, LosslessShutdownReportsWhatAFailedWriteLoses) {
+    ReceiverLogScope logging{g_running};
+    for (const bool tail_only : {true, false}) {
+        SCOPED_TRACE(tail_only);
+        StdoutCaptureGuard capture;
+        auto gate = std::make_shared<RenderGate>();
+        if (tail_only) { gate->release(); }
+        ConcreteAudioRenderWorker audio{pcm_router_config(), gated_router(gate)};
+        ASSERT_TRUE(audio.ready());
+        const auto role = tail_only ? aa::protocol::ChannelRole::guidance_audio
+                                    : aa::protocol::ChannelRole::media_audio;
+        const auto start = steady_ns();
+        const std::uint64_t parents = tail_only ? 1 : 100; // more than the router takes at once
+        for (std::uint64_t k = 0; k < parents; ++k) {
+            ASSERT_TRUE(audio.submit({{role, k + 1, {start}}, std::vector<std::byte>(tail_only ? 6400 : 1920, std::byte{2})},
+                                     {role, 0, k + 1, 7}));
+        }
+        if (tail_only) { ASSERT_TRUE(audio.wait_idle(std::chrono::steady_clock::now() + std::chrono::seconds{2})); }
+        else { ASSERT_TRUE(gate->wait_writes(1)); }
+        {
+            std::lock_guard lock(gate->mutex);
+            gate->fail_write = true;
+        }
+        audio.stop();
+        gate->release();
+        EXPECT_FALSE(audio.finish());
+        const auto output = capture.release();
+        const auto report = audio.final_report();
+        ASSERT_TRUE(report);
+        // All of it is either retained or in the record.
+        const auto accepted = tail_only ? std::uint64_t{9'598} : 100U * 480U;
+        const auto lost = accepted - report->stats.frames_retained;
+        EXPECT_GT(lost, 0U);
+        EXPECT_NE(output.find("{\"event\":\"audio_stop_discarded\",\"role\":null,\"chunks\":" +
+                              std::to_string(parents) + ",\"frames\":" + std::to_string(lost)),
+                  std::string::npos) << lost << " " << output;
+    }
+}
+
 // The receiver's teardown order: the session thread stops the worker, then the
 // session resets every AV channel, then the main thread finishes the worker. That
 // reset is no reason to drop what is playing out (07b82f0 cancelled all of it).
@@ -7341,9 +7383,13 @@ TEST(WiredReceiver, LosslessWorkerGrantsOnReceiptAtAnyPacketSize) {
         std::size_t bytes;
         std::uint64_t packets;
         std::size_t most_jobs;
+        bool plays;
     };
-    // Up to 1.85 s each, in an instant: the sink is blocked throughout.
-    for (const Case c : {Case{64, 5'550, 600}, Case{4, 24'000, 200}, Case{188, 1'880, 600}, Case{192, 1'850, 1'850}}) {
+    // Up to 1.85 s each, in an instant: the sink is blocked throughout. Every packet
+    // keeps its own placement and write, which single frames are too many of to play
+    // in real time: they only count for the credit.
+    for (const Case c : {Case{64, 4'800, 450, true}, Case{4, 24'000, 200, false},
+                         Case{188, 1'880, 600, true}, Case{192, 1'850, 1'850, true}}) {
         SCOPED_TRACE(c.bytes);
         ReceiverLogScope logging{g_running};
         StdoutCaptureGuard capture;
@@ -7370,6 +7416,9 @@ TEST(WiredReceiver, LosslessWorkerGrantsOnReceiptAtAnyPacketSize) {
         EXPECT_EQ(withheld, 0U) << sent;
         const auto jobs = audio.worker_observation_for_test().queue.queued_by_role[0];
         EXPECT_LE(jobs, c.most_jobs);
+        if (!c.plays) {
+            audio.begin_session(); // drops it
+        }
         gate->release();
         ASSERT_TRUE(audio.wait_idle(std::chrono::steady_clock::now() + std::chrono::seconds{30}));
         EXPECT_FALSE(audio.failure());
@@ -7377,11 +7426,12 @@ TEST(WiredReceiver, LosslessWorkerGrantsOnReceiptAtAnyPacketSize) {
         const auto output = capture.release();
         const auto report = audio.final_report();
         ASSERT_TRUE(report);
+        EXPECT_EQ(output.find("audio_stall_bypass"), std::string::npos) << output;
+        if (!c.plays) { continue; }
         EXPECT_EQ(report->stats.frames_decoded, sent * c.bytes / 4) << output;
         EXPECT_EQ(report->stats.frames_trimmed, 0U) << output;
         EXPECT_EQ(report->stats.frames_decoded + report->stats.frames_stretched,
                   report->stats.frames_retained + report->stats.frames_compressed) << output;
-        EXPECT_EQ(output.find("audio_stall_bypass"), std::string::npos) << output;
     }
 }
 
@@ -7429,6 +7479,107 @@ TEST(WiredReceiver, LosslessWorkerSlotsLastAsLongAsTheTimeBudget) {
     EXPECT_EQ(report->stats.playout_anchors, 2U);
     EXPECT_EQ(report->stats.frames_decoded, bytes / 4);
     (void)capture.release();
+}
+
+// Bot review of #229 at 25df492: packets that share a job keep their receipts, so the
+// 2 s bound cuts by each packet's own. 25df492 took 100 single frames 3 ms apart as
+// one 2.08 ms job with the first one's receipt and cut them all. The sink blocks until the first waiting packet is `head_ms` old.
+TEST(WiredReceiver, LosslessBoundCutsOnlyTheStalePartOfSpacedShortPackets) {
+    struct Case {
+        std::size_t bytes;
+        std::int64_t spacing_ns;
+        std::uint64_t packets;
+        std::int64_t head_ms;
+        double cut_frames;
+        std::size_t most_jobs;
+    };
+    for (const Case c : {Case{4, 3'000'000, 100, 2'100, 34.0, 1},       // from 2,100 to 1,803 ms old
+                         Case{4, 1'500'000, 100, 2'090, 60.0, 1},
+                         Case{64, 333'333, 300, 2'020, 960.0, 25}}) { // contiguous: 4 ms to a job
+        SCOPED_TRACE(std::to_string(c.bytes) + " B, " + std::to_string(c.spacing_ns) + " ns apart");
+        ReceiverLogScope logging{g_running};
+        StdoutCaptureGuard capture;
+        auto gate = std::make_shared<RenderGate>();
+        gate->write_timeout = std::chrono::milliseconds{30'000};
+        const auto start = steady_ns();
+        std::atomic<std::int64_t> clock{start};
+        auto config = pcm_router_config();
+        config.clock = [&clock] { return aa::core::Nanoseconds{clock.load()}; };
+        ConcreteAudioRenderWorker audio{config, gated_router(gate)};
+        ASSERT_TRUE(audio.ready());
+        const auto role = aa::protocol::ChannelRole::media_audio;
+        const auto submit = [&](std::uint64_t sequence, std::int64_t at, std::size_t bytes) {
+            ASSERT_TRUE(audio.submit({{role, sequence, {at}}, std::vector<std::byte>(bytes, std::byte{1})},
+                                     {role, 0, sequence, 7}));
+            ASSERT_TRUE(audio.take_completion(std::chrono::steady_clock::now() + std::chrono::milliseconds{100}));
+        };
+        ASSERT_NO_FATAL_FAILURE(submit(1, start, 8192));
+        ASSERT_TRUE(gate->wait_writes(1));
+        const auto first = start + 10'000'000;
+        for (std::uint64_t k = 0; k < c.packets; ++k) {
+            ASSERT_NO_FATAL_FAILURE(submit(k + 2, first + static_cast<std::int64_t>(k) * c.spacing_ns, c.bytes));
+        }
+        EXPECT_LE(audio.worker_observation_for_test().queue.queued_by_role[0], c.most_jobs + 1);
+        clock = first + (c.head_ms - 20) * 1'000'000; // the retime adds its 20 ms of lead
+        gate->release();
+        ASSERT_TRUE(audio.wait_idle(std::chrono::steady_clock::now() + std::chrono::seconds{5}));
+        EXPECT_FALSE(audio.failure());
+        ASSERT_TRUE(audio.finish());
+        const auto output = capture.release();
+        const auto report = audio.final_report();
+        ASSERT_TRUE(report);
+        EXPECT_EQ(report->stats.playout_retimes, 1U) << output;
+        EXPECT_EQ(report->stats.frames_trimmed, report->stats.frames_overflowed) << output;
+        EXPECT_NEAR(static_cast<double>(report->stats.frames_overflowed), c.cut_frames, 1.0) << output;
+        EXPECT_EQ(report->stats.frames_decoded, report->stats.frames_retained + report->stats.frames_trimmed) << output;
+    }
+}
+
+// Sol's delta review of 25df492: two 47-frame packets behind 20 x 100 ms, around the
+// bound. One job with the first one's receipt kept the second 2,000.99 ms after its
+// own (equal stamps), and cut it 1,999.1 ms after it (57.0 and 60.9 ms).
+TEST(WiredReceiver, LosslessBoundGoesByEachSharedPacketsReceipt) {
+    struct Case {
+        std::int64_t first_us;
+        std::int64_t second_us;
+        double cut_frames;
+        std::int64_t marked_frames;
+    };
+    for (const Case c : {Case{59'050, 59'050, 92.0, 0}, Case{57'000, 60'900, 47.0, 47}}) {
+        SCOPED_TRACE(c.second_us);
+        ReceiverLogScope logging{g_running};
+        StdoutCaptureGuard capture;
+        auto gate = std::make_shared<RenderGate>();
+        gate->write_timeout = std::chrono::milliseconds{30'000};
+        const auto start = steady_ns();
+        auto config = pcm_router_config();
+        config.clock = [start] { return aa::core::Nanoseconds{start}; };
+        ConcreteAudioRenderWorker audio{config, gated_router(gate)};
+        ASSERT_TRUE(audio.ready());
+        const auto role = aa::protocol::ChannelRole::media_audio;
+        const auto submit = [&](std::uint64_t sequence, std::int64_t at, std::size_t bytes, std::byte value) {
+            ASSERT_TRUE(audio.submit({{role, sequence, {at}}, std::vector<std::byte>(bytes, value)},
+                                     {role, 0, sequence, 7}));
+            const auto done = audio.take_completion(std::chrono::steady_clock::now() + std::chrono::milliseconds{100});
+            ASSERT_TRUE(done);
+            EXPECT_EQ(done->sequence, sequence);
+        };
+        for (std::uint64_t k = 0; k < 20; ++k) { ASSERT_NO_FATAL_FAILURE(submit(k + 1, start, 19'200, std::byte{1})); }
+        ASSERT_TRUE(gate->wait_writes(1));
+        ASSERT_NO_FATAL_FAILURE(submit(21, start + c.first_us * 1'000, 188, std::byte{2}));
+        ASSERT_NO_FATAL_FAILURE(submit(22, start + c.second_us * 1'000, 188, std::byte{3}));
+        gate->release();
+        ASSERT_TRUE(audio.wait_idle(std::chrono::steady_clock::now() + std::chrono::seconds{5}));
+        ASSERT_TRUE(audio.finish());
+        const auto output = capture.release();
+        const auto report = audio.final_report();
+        ASSERT_TRUE(report);
+        EXPECT_NEAR(static_cast<double>(report->stats.frames_overflowed), c.cut_frames, 1.0) << output;
+        EXPECT_EQ(report->stats.frames_decoded, report->stats.frames_retained + report->stats.frames_overflowed);
+        std::int64_t marked = 0;
+        for (const auto &piece : gate->pcm) { marked += std::count(piece.begin(), piece.end(), std::byte{3}); }
+        EXPECT_EQ(marked / 4, c.marked_frames) << output;
+    }
 }
 
 // Third review of #229, P2: an AV_STOP/START storm through the production worker.

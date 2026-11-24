@@ -791,6 +791,14 @@ struct AudioRouter::Impl final {
         }
     }
 
+    [[nodiscard]] std::uint64_t frames_pending() const noexcept {
+        std::uint64_t frames = 0;
+        for (const auto& queue : pending) {
+            for (const auto& run : queue) { frames += run.frames - run.trimmed - run.consumed; }
+        }
+        return frames;
+    }
+
     // Decoders whose buffered output belongs to a cancelled stream: restarted
     // before their next decode (lossless; see AudioRouter::cancel_pending).
     std::array<bool, kRoleCount> decoder_stale{};
@@ -1800,6 +1808,12 @@ bool AudioRouter::end_stream(protocol::ChannelRole role) {
     return !impl_->pending[slot].empty();
 }
 
+std::uint64_t AudioRouter::pending_frames() const {
+    if (!impl_) { return 0; }
+    std::lock_guard lock(impl_->pending_mutex);
+    return impl_->frames_pending();
+}
+
 bool AudioRouter::playout_anchored() const {
     if (!impl_) { return false; }
     std::lock_guard lock(impl_->pending_mutex);
@@ -2423,6 +2437,7 @@ core::Result<RenderStep> AudioRouter::render_step() {
     impl_->report.render_barrier = impl_->sink->render_stats();
     if (!written) {
         lock.lock();
+        diagnostic.discarded_frames = frames * result.contributors.size() + impl_->frames_pending();
         fail(RenderFailureReason::sink_write_error, written.error().code());
         for (auto& queue : impl_->pending) { queue.clear(); }
         impl_->mark_degraded("disabled: routing write failed ("

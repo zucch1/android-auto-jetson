@@ -622,6 +622,9 @@ struct RenderFailureSnapshot final {
     std::optional<std::uint64_t> prefix_end{}, stored_idle_prefix{}, output_start{}, output_end{};
     RenderRangeSummary stored_backpressure{}, stored_idle{};
     std::optional<RenderRangeSummary> effective_backpressure{}, effective_idle{};
+    // sink_write_error: decoded frames lost with the write (per contributing role)
+    // and dropped behind it.
+    std::uint64_t discarded_frames{};
 };
 
 struct RouterReport final {
@@ -698,6 +701,8 @@ public:
     // chunk starts a new stream. True while the role has audio pending. Without
     // lossless playout it does nothing and returns false.
     bool end_stream(protocol::ChannelRole role);
+    // Decoded frames, over all roles, that are still to be written.
+    [[nodiscard]] std::uint64_t pending_frames() const;
     // Records a steady-clock interval during which the owner withheld peer
     // credit, or a completed sink write exceeded one PCM piece duration and
     // its scheduled end (excluding normal per-piece pacing). render_step()

@@ -156,8 +156,17 @@ private:
         std::size_t bytes;
         std::size_t units;
     };
-    // One parent, or several short ones sharing a slot (coalesce_locked), which
-    // then go by the first one's header and id.
+    // One of several short parents sharing a job.
+    struct Part {
+        std::uint64_t message_sequence;
+        std::uint64_t delivery_sequence;
+        core::Nanoseconds timestamp;
+        core::Nanoseconds receiver_input_at;
+        std::size_t bytes;
+    };
+    // One parent, or several short ones sharing a slot (coalesce_locked). The
+    // router gets each of those on its own, with its own receipt; header, id and
+    // admission are the first one's.
     struct Job {
         protocol::MessageHeader header;
         std::vector<std::byte> pcm;
@@ -170,8 +179,12 @@ private:
         std::uint64_t epoch{1};
         // First of a stream that follows a stopped one (lossless).
         bool starts_stream{};
-        // Arrival of the last parent in it.
-        core::Nanoseconds last_arrival{};
+        // Parents the router is done with, of `parts` (empty: just the one).
+        std::uint32_t parts_done{};
+        std::vector<Part> parts{};
+        [[nodiscard]] std::size_t chunks() const noexcept {
+            return parts.empty() ? 1 : parts.size() - parts_done;
+        }
     };
     struct DeferredCredit {
         channels::AvDeliveryId id;
@@ -221,26 +234,29 @@ private:
     // has to hold audio back (its capture buffer is 341 ms).
     //
     // Memory is bounded by one slot (job) per kSlotNs of that time, 4,400 a role.
-    // Packets shorter than kSlotNs share one while they wait here (coalesce_locked:
-    // up to kCoalesceNs of PCM, arrivals at most that far apart), so the slots
-    // last as long as the time does: a job shorter than kSlotNs only opens behind
-    // one too full to take the packet (over 3 ms), or behind one the router
-    // already has (at most kRouterParents, which the envelope a credit reserves
-    // covers).
+    // Packets shorter than kSlotNs share one while they wait here (coalesce_locked,
+    // up to kCoalesceNs of PCM), so the slots last as long as the time does: a job
+    // shorter than kSlotNs only opens behind one too full to take the packet (over
+    // 3 ms), or behind one the router already has (about kRouterParents, which the
+    // envelope a credit reserves covers).
     //
-    // A job is 784 bytes without its PCM, mostly the failure forensics of its
+    // A job is 800 bytes without its PCM, mostly the failure forensics of its
     // admission. At all three roles' slot limits (4.4 s of 1 ms packets on each)
-    // the job records are 13,200 x 784 bytes = 9.9 MiB, plus 1.1 MB of PCM and its
-    // heap allocations. A26 media (42.67 ms packets) takes 104 jobs, 80 KiB, and
-    // 0.8 MB. What the router has decoded (at most kRouterParents parents a role)
-    // and the piece being written come on top.
+    // the job records are 13,200 x 800 bytes = 10.1 MiB, plus 1.1 MB of PCM and its
+    // heap allocations. A shared job adds 40 bytes a packet: 0.6 MB a role for 4.4 s
+    // of 64-byte media packets, at the very most (single frames on all three roles)
+    // 14 MB, or twice that while its vector grows. A26 media (42.67 ms packets) takes
+    // 104 jobs, 81 KiB, and 0.8 MB. What the router has decoded (at most
+    // kRouterParents parents a role, and one job's) and the piece being written come
+    // on top.
     static constexpr std::int64_t kEnvelopeNs = 200'000'000; // one capacity() unit
     static constexpr std::int64_t kSlotNs = 1'000'000;
     static constexpr std::int64_t kCoalesceNs = 4'000'000;
     static_assert(sizeof(Job) <= 800);
     static constexpr std::size_t kUnitsPerMs = 192; // see submit()
     [[nodiscard]] static std::size_t lossless_scale(const RouterConfig& config) noexcept;
-    // Parents of one role handed to the router at a time (lossless): its
+    // Parents of one role handed to the router at a time (lossless), less the rest
+    // of the job that reaches it: its
     // scheduling cost grows with every pending parent, and a 4.4 s queue of 5 ms
     // packets holds hundreds. The rest waits here, as before its decode.
     static constexpr std::size_t kRouterParents = 64;
@@ -302,8 +318,13 @@ private:
     void cancel_all();
     [[nodiscard]] bool dequeueable_locked(const Job& job) const;
     [[nodiscard]] bool draining_locked() const;
+    // Parents, and output frames not handed to the router, that are queued (of
+    // one role, or of all).
+    [[nodiscard]] std::size_t queued_chunks_locked(std::optional<protocol::ChannelRole> role = {}) const;
+    [[nodiscard]] std::uint64_t queued_frames_locked() const;
     [[nodiscard]] bool coalesce_locked(const protocol::MessageView& message,
                                        const channels::AvDeliveryId& id,
+                                       core::Nanoseconds receiver_input_at,
                                        Reservation reservation, std::size_t index);
     // What stop() leaves the sink's end of stream.
     [[nodiscard]] core::Milliseconds eos_budget() const;
@@ -398,8 +419,10 @@ private:
     std::optional<Clock::time_point> drain_until_;
     std::optional<Clock::time_point> stop_until_;
     Clock::duration last_write_{};
-    // Jobs a failure during that drain took with it.
+    // What a failure during that drain took with it: parents, and 48 kHz output
+    // frames (the router's and the failed write's, then also those queued here).
     std::size_t drain_discarded_{};
+    std::uint64_t drain_lost_frames_{};
     std::array<bool, 4> pcm_role_{};
     bool router_busy_{};
     std::uint64_t playout_retimes_logged_{};

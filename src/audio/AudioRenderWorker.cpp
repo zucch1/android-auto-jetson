@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <span>
 #include <utility>
 
 namespace aa::audio {
@@ -409,7 +410,7 @@ AudioRenderWorker::submit(const protocol::MessageView& message, channels::AvDeli
         {id, message.header.sequence, message.header.timestamp, receiver_input_at},
         monotonic_now(), idle_since_, idle_disposition(receiver_input_at), queue_observation(),
         last_completion_, last_success_};
-    if (!coalesce_locked(message, id, {bytes, units}, *role)) {
+    if (!coalesce_locked(message, id, receiver_input_at, {bytes, units}, *role)) {
         queued_.push_back(Job{message.header,
                               {message.payload.begin(), message.payload.end()},
                               id,
@@ -419,8 +420,7 @@ AudioRenderWorker::submit(const protocol::MessageView& message, channels::AvDeli
                               admission,
                               false,
                               session_epoch_,
-                              std::exchange(stream_end_pending_[*role], false),
-                              message.header.timestamp});
+                              std::exchange(stream_end_pending_[*role], false)});
         ++slots_;
         ++role_slots_[*role];
     }
@@ -445,9 +445,11 @@ AudioRenderWorker::submit(const protocol::MessageView& message, channels::AvDeli
 }
 
 // Lossless: appends a parent shorter than kSlotNs to the role's newest job while
-// that still waits here and is the same stream's PCM right before it.
+// that still waits here and is the same stream's PCM right before it. It keeps its
+// own receipt, which is what the router places and cuts it by.
 bool AudioRenderWorker::coalesce_locked(const protocol::MessageView& message,
                                         const channels::AvDeliveryId& id,
+                                        core::Nanoseconds receiver_input_at,
                                         Reservation reservation, std::size_t index) {
     constexpr auto kSlotUnits = kUnitsPerMs * static_cast<std::size_t>(kSlotNs / 1'000'000);
     constexpr auto kCoalesceUnits = kUnitsPerMs * static_cast<std::size_t>(kCoalesceNs / 1'000'000);
@@ -459,15 +461,34 @@ bool AudioRenderWorker::coalesce_locked(const protocol::MessageView& message,
     });
     if (last == queued_.rend() || last->dequeued_at || last->epoch != session_epoch_
         || last->id.generation != id.generation || last->id.session_id != id.session_id
-        || last->reservation.bytes % frame_bytes != 0
         || last->reservation.units + reservation.units > kCoalesceUnits) { return false; }
-    const auto since = message.header.timestamp.count - last->last_arrival.count;
-    if (since < 0 || since > kCoalesceNs) { return false; }
+    if (last->parts.empty()) {
+        last->parts.push_back({last->header.sequence, last->id.sequence, last->header.timestamp,
+                               last->receiver_input_at, last->pcm.size()});
+    }
+    last->parts.push_back({message.header.sequence, id.sequence, message.header.timestamp,
+                           receiver_input_at, reservation.bytes});
     last->pcm.insert(last->pcm.end(), message.payload.begin(), message.payload.end());
     last->reservation.bytes += reservation.bytes;
     last->reservation.units += reservation.units;
-    last->last_arrival = message.header.timestamp;
     return true;
+}
+
+std::size_t
+AudioRenderWorker::queued_chunks_locked(std::optional<protocol::ChannelRole> role) const {
+    std::size_t chunks = 0;
+    for (const auto& job : queued_) {
+        if (!role || job.id.role == *role) { chunks += job.chunks(); }
+    }
+    return chunks;
+}
+
+std::uint64_t AudioRenderWorker::queued_frames_locked() const {
+    std::uint64_t units = 0;
+    for (const auto& job : queued_) {
+        if (!job.dequeued_at) { units += job.reservation.units; }
+    }
+    return units * 48 / kUnitsPerMs;
 }
 
 void AudioRenderWorker::invalidate(protocol::ChannelRole role, std::uint64_t generation) {
@@ -496,7 +517,7 @@ void AudioRenderWorker::invalidate(protocol::ChannelRole role, std::uint64_t gen
         if (lossless_ && role_slots_[*index] != 0) {
             discarded = "{\"event\":\"audio_stop_discarded\",\"role\":" +
                 std::to_string(static_cast<unsigned>(role)) + ",\"chunks\":" +
-                std::to_string(role_slots_[*index]) + "}";
+                std::to_string(queued_chunks_locked(role)) + "}";
         }
     }
     seed_credits_locked(*index);
@@ -889,7 +910,10 @@ void AudioRenderWorker::latch(Error error, AudioFailureOrigin origin,
         failure_queue_rejection_ = rejection;
     }
     stopping_ = true;
-    if (drain_until_) { drain_discarded_ = queued_.size(); }
+    if (drain_until_) {
+        drain_discarded_ = queued_chunks_locked();
+        drain_lost_frames_ += queued_frames_locked();
+    }
     drain_until_.reset();
     idle_since_.reset();
     idle_resume_id_.reset();
@@ -922,10 +946,15 @@ void AudioRenderWorker::enter_bypass_locked(const char* trigger) {
     bypass_rendered_ = 0;
     bypass_in_flight_.clear();
     for (const auto& job : queued_) {
-        if (job.dequeued_at) {
+        if (!job.dequeued_at) {
+            bypass_discarded_ += job.chunks();
+        } else if (job.parts.empty()) {
             bypass_in_flight_.push_back({job.header.channel, job.header.sequence, job.rendered_any});
         } else {
-            ++bypass_discarded_;
+            for (std::size_t part = job.parts_done; part < job.parts.size(); ++part) {
+                bypass_in_flight_.push_back({job.header.channel, job.parts[part].message_sequence,
+                                             job.rendered_any && part == job.parts_done});
+            }
         }
     }
     ++bypass_total_;
@@ -1177,36 +1206,65 @@ void AudioRenderWorker::run(RouterConfig config, const OpenRouter& open) {
             protocol::MessageHeader header;
             WorkerAdmission admission;
         };
+        const auto part_dispatch = [](const Job& job, const Part& part) {
+            auto id = job.id;
+            id.sequence = part.delivery_sequence;
+            return AudioDispatchObservation{id, part.message_sequence, part.timestamp,
+                                            part.receiver_input_at, job.dequeued_at};
+        };
         std::vector<Parent> parents;
         for (auto& job : queued_) {
             if (job.epoch != step_epoch) { continue; }
             if (!job.dequeued_at) {
                 if (!dequeueable_locked(job)) { continue; }
                 if (job.starts_stream) { (void)local_router.end_stream(job.id.role); }
-                ++router_parents_[*audio_index(job.id.role)];
+                router_parents_[*audio_index(job.id.role)] += job.chunks();
                 job.dequeued_at = monotonic_now();
                 // Keep decode and insertion in the same transaction as job
                 // admission. Invalidate holds this lock when it cancels a
                 // role's router work, so it cannot race a stale chunk back
                 // into the router during submission (including resampling
                 // guidance and system PCM).
-                const auto submitted = local_router.submit({job.header, job.pcm}, job.receiver_input_at);
+                auto submitted = core::Result<void>{};
+                auto dispatch = AudioDispatchObservation{job.id, job.header.sequence,
+                                                         job.header.timestamp, job.receiver_input_at,
+                                                         job.dequeued_at};
+                if (job.parts.empty()) {
+                    submitted = local_router.submit({job.header, job.pcm}, job.receiver_input_at);
+                }
+                std::size_t offset = 0;
+                for (const auto& part : job.parts) {
+                    if (!submitted) { break; }
+                    dispatch = part_dispatch(job, part);
+                    auto header = job.header;
+                    header.sequence = part.message_sequence;
+                    header.timestamp = part.timestamp;
+                    submitted = local_router.submit(
+                        {header, std::span{job.pcm}.subspan(offset, part.bytes)}, part.receiver_input_at);
+                    offset += part.bytes;
+                }
                 if (!submitted) {
-                    const AudioDispatchObservation parent{job.id, job.header.sequence,
-                                                        job.header.timestamp, job.receiver_input_at,
-                                                        job.dequeued_at};
                     latch(submitted.error(), AudioFailureOrigin::router_submit,
-                          local_router.report().queue_rejection, parent, {}, job.admission);
+                          local_router.report().queue_rejection, dispatch, {}, job.admission);
                     break;
                 }
                 // Decoded storage now belongs to the router; retain only
                 // the parent's identity and logical occupancy charge.
                 std::vector<std::byte>{}.swap(job.pcm);
             }
-            parents.push_back({{job.id, job.header.sequence, job.header.timestamp,
-                                job.receiver_input_at, job.dequeued_at},
-                               job.header,
-                               job.admission});
+            if (job.parts.empty()) {
+                parents.push_back({{job.id, job.header.sequence, job.header.timestamp,
+                                    job.receiver_input_at, job.dequeued_at},
+                                   job.header,
+                                   job.admission});
+                continue;
+            }
+            // The next one: what a step writes of the job.
+            const auto& part = job.parts[job.parts_done];
+            auto header = job.header;
+            header.sequence = part.message_sequence;
+            header.timestamp = part.timestamp;
+            parents.push_back({part_dispatch(job, part), header, job.admission});
         }
         // A stop with everything before it handed over: what the decoder holds
         // joins that audio, and nothing waits for the role.
@@ -1317,13 +1375,25 @@ void AudioRenderWorker::run(RouterConfig config, const OpenRouter& open) {
                     for (auto& job : queued_) {
                         if (job.epoch == step_epoch && job.dequeued_at &&
                             job.header.channel == header.channel &&
-                            job.header.sequence == header.sequence) {
+                            (job.parts.empty() ? job.header.sequence
+                                               : job.parts[job.parts_done].message_sequence)
+                                == header.sequence) {
                             job.rendered_any = true;
                         }
                     }
                 }
                 for (const auto& header : result.value().completed) {
-                    discard_if(queued_, [&](const Job& job) {
+                    discard_if(queued_, [&](Job& job) {
+                        if (!job.parts.empty()) {
+                            // The router finishes them in order.
+                            if (job.epoch != step_epoch || !job.dequeued_at
+                                || job.header.channel != header.channel
+                                || job.parts[job.parts_done].message_sequence != header.sequence) { return false; }
+                            auto& with_router = router_parents_[*audio_index(job.id.role)];
+                            if (with_router != 0) { --with_router; }
+                            job.rendered_any = false;
+                            return ++job.parts_done == job.parts.size();
+                        }
                         const bool done = job.epoch == step_epoch &&
                                job.header.channel == header.channel &&
                                job.header.sequence == header.sequence &&
@@ -1383,6 +1453,15 @@ void AudioRenderWorker::run(RouterConfig config, const OpenRouter& open) {
                     router_ = nullptr; // no concurrent cancel_pending during reopen
                     in_flight_ = true; // wait_idle() covers the reopen
                 } else {
+                    if (drain_until_ && sink_write_error) {
+                        // A stop's tail may be all there was, with no job left for it.
+                        for (const auto role : {protocol::ChannelRole::media_audio,
+                                                protocol::ChannelRole::guidance_audio,
+                                                protocol::ChannelRole::system_audio}) {
+                            if (stream_end_pending_[*audio_index(role)]) { (void)local_router.end_stream(role); }
+                        }
+                        drain_lost_frames_ = snapshot->discarded_frames + local_router.pending_frames();
+                    }
                     latch_render_failure();
                 }
             } else if (bypass_since_ && bypass_epoch_ == step_epoch) {
@@ -1493,21 +1572,23 @@ void AudioRenderWorker::run(RouterConfig config, const OpenRouter& open) {
     {
         std::lock_guard lock(mutex_);
         auto chunks = drain_discarded_;
-        if (drain_until_ && !failure_) {
-            // Out of time. A decoder tail alone counts as one chunk.
-            bool left = router_busy_;
+        auto frames = drain_lost_frames_;
+        if (drain_until_ && !failure_) { // out of time
             for (const auto role : {protocol::ChannelRole::media_audio,
                                     protocol::ChannelRole::guidance_audio,
                                     protocol::ChannelRole::system_audio}) {
-                if (stream_end_pending_[*audio_index(role)]) { left = local_router.end_stream(role) || left; }
+                if (stream_end_pending_[*audio_index(role)]) { (void)local_router.end_stream(role); }
             }
-            chunks = std::max<std::size_t>(queued_.size(), left ? 1 : 0);
-            if (chunks != 0) { cancel_all(); }
+            chunks = queued_chunks_locked();
+            frames = queued_frames_locked() + local_router.pending_frames();
+            if (chunks != 0 || frames != 0) { cancel_all(); }
             discard_if(queued_, [](const auto&) { return true; });
         }
-        if (chunks != 0) {
+        // A decoder tail alone counts as one chunk.
+        if (chunks != 0 || frames != 0) {
             undrained = "{\"event\":\"audio_stop_discarded\",\"role\":null,\"chunks\":" +
-                std::to_string(chunks) + "}";
+                std::to_string(std::max<std::size_t>(1, chunks)) + ",\"frames\":" +
+                std::to_string(frames) + "}";
         }
         router_ = nullptr;
     }
