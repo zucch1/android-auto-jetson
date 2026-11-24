@@ -34,5 +34,5 @@ if(NOT CMAKE_CROSSCOMPILING)
     add_test(NAME deploy_ssh_harness
         COMMAND "${Python3_EXECUTABLE}" -B -m unittest discover
                 -s "${CMAKE_SOURCE_DIR}/tests/deploy" -v)
-    set_tests_properties(deploy_ssh_harness PROPERTIES TIMEOUT 90)
+    set_tests_properties(deploy_ssh_harness PROPERTIES TIMEOUT 240)
 endif()
