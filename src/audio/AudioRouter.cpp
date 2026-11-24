@@ -2377,9 +2377,14 @@ core::Result<RenderStep> AudioRouter::render_step() {
     };
     // Lossless: roles whose next run waits to be planned as a head of its own.
     std::array<bool, kRoleCount> replan{};
+    // Lossless: roles whose cut heads were finished here. `planned` holds every
+    // run of the role, and those after the cut one are popped or replanned
+    // already: a cut that took the whole queue left them pointing at freed runs
+    // (d0c5b41 crashed there behind a retime cascade).
+    std::array<bool, kRoleCount> cut_through{};
     for (const auto& head : planned) {
         const auto role = head.role;
-        if (heads[role] || replan[role]) { continue; }
+        if (heads[role] || replan[role] || cut_through[role]) { continue; }
         auto& queue = impl_->pending[role];
         if (head.start_frame == head.end_frame) {
             finish_cut(head);
@@ -2387,6 +2392,7 @@ core::Result<RenderStep> AudioRouter::render_step() {
                 ScheduledRun next;
                 while (place_next(role, cursor, next) && next.start_frame == next.end_frame) { finish_cut(next); }
                 replan[role] = !queue.empty();
+                cut_through[role] = true;
             }
             continue;
         }

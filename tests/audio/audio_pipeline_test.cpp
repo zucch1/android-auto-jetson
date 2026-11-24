@@ -7191,6 +7191,39 @@ TEST_F(AudioPipelineRoute, WiredDefaultsPlayOnThroughASinkThatStoodStill) {
     }
 }
 
+// A sink that cannot hold still cascades after a pause (as d0c5b41 did with
+// pulsesink) until the 2 s bound cuts. That cut can take a role's whole queue
+// in one step; d0c5b41 then planned the runs it had just popped and crashed.
+TEST_F(AudioPipelineRoute, WiredDefaultsCutAWholeQueueBehindASinkThatCannotHold) {
+    std::int64_t clock = 0;
+    WiredRoute route{{}, [&clock](aa::audio::RouterConfig& config) {
+        config.clock = [&clock] { return aa::core::Nanoseconds{clock}; };
+    }};
+    ASSERT_TRUE(route.router);
+    PausingSink sink{&clock};
+    sink.holds = false;
+    sink.attach(*route.sink);
+    std::int64_t next = 0;
+    const auto run_to = [&](std::int64_t chunk) {
+        while (next < chunk) {
+            clock = std::max(clock, route.start + next * kA26ChunkNs);
+            do { ASSERT_TRUE(route.submit_media(next * kA26ChunkNs)); }
+            while (++next < chunk && route.start + next * kA26ChunkNs <= clock);
+            ASSERT_TRUE(route.drain());
+        }
+    };
+    run_to(100);
+    sink.pause_next = 1'000 * kMs;
+    run_to(101 + 30'000 / 42);
+    const auto& stats = route.stats();
+    EXPECT_FALSE(route.router->report().render_failure);
+    EXPECT_GT(stats.playout_retimes, 3U);
+    EXPECT_GT(stats.playout_overflows, 0U);
+    EXPECT_EQ(stats.frames_trimmed, stats.frames_overflowed);
+    EXPECT_GT(sink.waited, 1'000 * kMs);
+    EXPECT_EQ(sink.held, 0);
+}
+
 // The other way a slot passes: this thread was held up between writes and the
 // sink played on dry. Nothing is held; its stamps move on with the schedule,
 // or what follows lands behind its read position. A sink that cannot hold
