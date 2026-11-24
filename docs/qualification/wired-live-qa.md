@@ -153,13 +153,30 @@ underrun; the cost is latency:
 
 - steady: ~`60` ms on wired audio, video, touch-to-photon and IDR recovery
   (leaving ~`940` ms of the `1.0` s `waiting_idr_max` budget);
-- after a stall with a full 8-chunk backlog: up to ~`360` ms (video hold cap
-  `400` ms, leaving ~`600` ms of that budget), drained by playing 0.5% fast, up
-  to 1% while the excess is over `100` ms: about `10` s per 100 ms of deep excess,
-  ~`45` s from ~`360` ms to `75` ms;
-- beyond `2` s of backlog only (above the 1.6 s a role can queue): the excess is
-  cut and logged (`audio_playout_overflow`, `playout_overflows`,
-  `frames_overflowed`).
+- after a burst with a full 8-chunk backlog: up to ~`360` ms, drained by playing
+  0.5% fast, up to 1% while the excess is over `100` ms: about `10` s per 100 ms
+  of deep excess, ~`45` s from ~`360` ms to `75` ms. Packets of any size down to
+  a third of a millisecond are corrected (a short run takes the whole frame its
+  predecessors' fractions add up to);
+- after a sink stall of `S` ms past a slot: everything later plays ~`S` - 20 ms
+  later (`audio_playout_retime`) and drains the same way. Written on at slots that
+  had passed, it would be lost behind the ring buffer's read position;
+- video is held with the audio up to `700` ms (wireless `400`): a 16-chunk burst
+  or a stall of about `600` ms, leaving ~`300` ms of the `1.0` s budget. Deeper,
+  the hold is clipped (`video_hold_capped`) and A/V parts by the rest until it
+  drains;
+- a stopped stream (`AV_STOP`, a restart, the receiver's own shutdown) plays out
+  what was accepted, so it goes quiet one playout offset later.
+
+Where latency ends and loss begins:
+
+| Case | Outcome |
+| --- | --- |
+| one write blocked, sink recovers, stall + depth before it within `2` s | nothing lost, nothing withheld from the phone: each role queues `4.4` s by time, whatever the packet size |
+| a chunk would play more than `2` s after its arrival | the part beyond is cut: `audio_playout_overflow`, `playout_overflows`, `frames_overflowed` |
+| the sink fails its write (`2` s deadline, lost route) | stuck: what is queued is dropped and reported (`audio_stall_bypass`, `sink_write_error`), the sink reopened, the session survives (#60) |
+| one write blocked over `2` s without failing, and a credit withheld for 250 ms (queue full) | the same drop and report, trigger `credit_wait` |
+| a stop whose tail would not leave room for two of the next stream's largest messages (~4 s queued) | cancelled and reported (`audio_stop_discarded`); also what a shutdown could not play out in `2` s |
 
 Check on a long hold with navigation prompts over music, from the last
 `media_timing`: `frames_trimmed`, `frames_shed`, `frames_padded`,
@@ -167,8 +184,8 @@ Check on a long hold with navigation prompts over music, from the last
 `frames_skipped` grow only with `audio_playout_underrun` or
 `audio_playout_anchor` records; `frames_compressed` / `frames_stretched` follow
 the phone's clock (a few hundred ppm of `frames_decoded`). No
-`audio_stall_bypass` (that path drops audio once a sink write has blocked for
-over about 1.5 s and the queue is full). Listen for pitch movement after a provoked stall: 1% is 17 cents, slid
+`audio_stall_bypass` and no `audio_stop_discarded`; `playout_retimes` grows only
+with `audio_playout_retime` records. Listen for pitch movement after a provoked stall: 1% is 17 cents, slid
 in over about half a second. `--audio-playout-ms 0` restores the legacy
 arrival-time model.
 

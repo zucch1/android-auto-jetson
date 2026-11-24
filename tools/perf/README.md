@@ -274,7 +274,12 @@ records add `frames_compressed` and `frames_stretched` (output frames the rate
 correction made the decoded runs shorter or longer by: nothing is dropped or
 inserted), `playout_overflows` (chunks cut by the 2 s emergency bound) and
 `frames_overflowed` (what they lost, a subset of `frames_trimmed`, also logged
-as `audio_playout_overflow` with `frames`, `frames_lifetime` and `depth_ms`).
+as `audio_playout_overflow` with `frames`, `frames_lifetime` and `depth_ms`),
+`playout_retimes` (times everything to come was moved later because a write
+blocked past its slot, each logged as `audio_playout_retime` with `shifted_ms`,
+`offset_ms` and `retimes_lifetime`; nothing is lost) and `playout_retimed_ms`
+(their sum). A stopped stream plays out; `audio_stop_discarded` (`role`, `null`
+at shutdown, and `chunks`) reports accepted audio a stop had to cancel.
 There `playout_offset_ms` and `playout_offset_ns` are the media stream's while
 media plays. Each underrun also logs
 `audio_playout_underrun` with `underruns_lifetime`, `late_ms` (how long after
@@ -282,7 +287,7 @@ its slot the chunk arrived) and `depth_ms` (the depth it re-anchored with),
 and each anchor logs `audio_playout_anchor` with `reason` (`start` or
 `resume`), `skipped_ms` (elapsed time jumped over without a write),
 `depth_ms` and `anchors_lifetime`. The VideoOutlet logs
-`video_hold_capped` (`requested_ms`, `cap_ms` 400, `capped_frames`, counted
+`video_hold_capped` (`requested_ms`, `cap_ms` 400 wireless or 700 wired, `capped_frames`, counted
 when a capped frame is released) when the offset it follows exceeds its hold
 cap, and `video_release_late` (`late_ms`, `late_releases`, `by`: the path that
 released it, `timer`, `checkpoint`, `arrival` or `service`, and

@@ -241,8 +241,12 @@ them prescribes a p99, a rolling mean or a coverage rule.
   include the playout offset (starting at `60` ms, half of wireless's `120` ms),
   so the signed A/V contract is unchanged while touch-to-photon and each
   `waiting_idr` recovery episode gain ~`60` ms (leaving ~`940` ms of the `1.0` s
-  `waiting_idr_max` budget). After a stall both grow by the backlog (at most
-  ~`360` ms for a phone's 8 buffered chunks) and shrink again at 5-10 ms/s.
+  `waiting_idr_max` budget). After a burst both grow by the backlog (at most
+  ~`360` ms for a phone's 8 buffered chunks), after a sink stall by the stall,
+  and shrink again at 5-10 ms/s. While a write is blocked past its slot, video
+  whose audio it holds waits with it; the hold then follows the offset the sink
+  really plays with. It is capped at `700` ms (wireless `400`), above which A/V
+  parts by the rest.
   `--audio-playout-ms 0` restores the legacy arrival-time model. Live wired
   verification: `docs/qualification/wired-live-qa.md`.
 - **Wired playout depth basis (#228):** `audio_write_completed` of 47 wired A26
@@ -262,7 +266,7 @@ them prescribes a p99, a rolling mean or a coverage rule.
   builds; the largest since is 43.3 ms. So 60 ms is expected to underrun at
   most about once in two hours because of the link, and less on current builds. The
   204.7 ms gap followed a 283.6 ms blocked write whose 249 ms credit deferral
-  held the phone back: the lossless queue (1.6 s per role) now grants that credit
+  held the phone back: the lossless queue (4.4 s per role) now grants that credit
   on receipt. `--audio-playout-ms 100` would also cover 69.5 and 85.6 ms, at
   40 ms more latency. These are receipt times on the receiver; USB-side bursts
   above 8 chunks (the phone's 341 ms capture buffer) were not seen.
