@@ -18,7 +18,7 @@ public:
     const std::string name;
     std::atomic<bool> available{};
     std::atomic<std::int64_t> held{}, drift{};
-    std::atomic<std::uint64_t> disruptions{}, suspends{};
+    std::atomic<std::uint64_t> disruptions{}, suspends{}, suspend_loss_frames{};
 private:
     struct Observer;
     std::unique_ptr<Observer> observer_;

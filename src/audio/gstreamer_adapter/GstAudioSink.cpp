@@ -967,6 +967,7 @@ public:
                 graph_->drift = 0;
                 graph_->disruptions = 0;
                 graph_->suspends = 0;
+                graph_->suspend_loss_frames = 0;
             }
             handoff_.late_frames = 0;
             handoff_.underflow = false;
@@ -1083,6 +1084,7 @@ public:
             if (timing.held.count) { device_rate_.restart(observation_time().count); }
             timing.disruptions = graph_->disruptions.exchange(0);
             timing.suspends = graph_->suspends.exchange(0);
+            timing.suspend_loss_frames = graph_->suspend_loss_frames.exchange(0);
         }
         timing.starvations = stream_starvations_.exchange(0);
         timing.starved.count = starved_ns_.exchange(0);

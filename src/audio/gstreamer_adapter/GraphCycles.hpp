@@ -16,9 +16,13 @@ public:
         std::int64_t held_ns{};
         bool discontinuity{};
         std::int64_t drift_ns{};
+        std::uint64_t suspend_loss_frames{};
     };
 
-    Change observe(std::int64_t position, std::int64_t frames, std::uint32_t rate, int state, std::int64_t ns) {
+    void suspend() { resuming_ = expected_time_.has_value(); }
+
+    Change observe(std::int64_t position, std::int64_t frames, std::uint32_t rate, int state,
+                   std::int64_t ns, bool sink_running = true) {
         Change change;
         // A timed-out follower can finish after the driver has already
         // reported that cycle. PipeWire then publishes its final state
@@ -26,6 +30,25 @@ public:
         const bool same_cycle = expected_ && position == *expected_ - previous_frames_
             && frames == previous_frames_ && rate == previous_rate_;
         if (same_cycle && (state != 3 || !missed_cycles_)) { return change; }
+        const auto duration_ns = frames * 1'000'000'000 / rate;
+        if (resuming_) {
+            if (state != 3 || same_cycle) { return change; }
+            // This period was consumed on a disconnected route or was in
+            // flight at reactivation. The device cannot confirm those frames.
+            change.suspend_loss_frames = static_cast<std::uint64_t>(frames);
+            if (!sink_running) {
+                *expected_time_ += duration_ns;
+                expected_ = position + frames;
+                previous_frames_ = frames;
+                previous_rate_ = rate;
+                return change;
+            }
+            // Start the new driver epoch at its measured time. A restarted
+            // driver may begin earlier or later than its next scheduled tick.
+            change.held_ns = ns - *expected_time_;
+            *this = {};
+        }
+        expected_time_ = ns + duration_ns;
         if (!same_cycle && expected_ && (position != *expected_ || frames != previous_frames_ || rate != previous_rate_)) {
             change.discontinuity = true;
             missed_ns_ = 0;
@@ -71,5 +94,7 @@ private:
     std::int64_t previous_frames_{}, missed_ns_{};
     std::uint32_t previous_rate_{};
     unsigned missed_cycles_{};
+    std::optional<std::int64_t> expected_time_;
+    bool resuming_{};
 };
 }

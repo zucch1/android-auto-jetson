@@ -195,7 +195,12 @@ for a stream start, a resume or a real underrun; the cost is latency:
   and refill lead. Pulse timing replies are sampled, so this check has finite
   resolution.
 - `playout_sink_suspends` counts observed suspensions of the linked output
-  device. `playout_sink_disruptions` counts graph quantum changes and isolated
+  device. `playout_sink_suspend_loss_frames` estimates the lost output in
+  frames from completed playback periods while disconnected and the period
+  in flight on reactivation. The monitor is suspended too, so its missing
+  clicks partly reflect the capture gap. Compare its graph-clock timestamps
+  before and after resume. The receiver aligns its schedule once to the new
+  driver epoch. `playout_sink_disruptions` counts graph quantum changes and isolated
   unfinished cycles. These events identify intervals where accepted PCM may have
   disappeared downstream. Use monitor markers to measure the number of missing frames.
 

@@ -2212,6 +2212,7 @@ core::Result<RenderStep> AudioRouter::render_step() {
         impl_->report.stats.playout_sink_starvations += timing.starvations;
         impl_->report.stats.playout_sink_starved.count += timing.starved.count;
         impl_->report.stats.playout_sink_suspends += timing.suspends;
+        impl_->report.stats.playout_sink_suspend_loss_frames += timing.suspend_loss_frames;
         impl_->report.stats.playout_sink_disruptions += timing.disruptions;
         impl_->report.stats.playout_sink_late_frames += timing.late_frames;
         const auto held = timing.held.count != 0 && impl_->sink->hold_stream(timing.held)

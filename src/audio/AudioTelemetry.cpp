@@ -132,6 +132,7 @@ RouterStats accumulate_router_stats(const RouterStats& lifetime, const RouterSta
     out.playout_sink_starvations += lifetime.playout_sink_starvations;
     out.playout_sink_starved.count += lifetime.playout_sink_starved.count;
     out.playout_sink_suspends += lifetime.playout_sink_suspends;
+    out.playout_sink_suspend_loss_frames += lifetime.playout_sink_suspend_loss_frames;
     out.playout_sink_disruptions += lifetime.playout_sink_disruptions;
     out.playout_sink_late_frames += lifetime.playout_sink_late_frames;
     out.playout_shed_residual_chunks += lifetime.playout_shed_residual_chunks;
@@ -213,6 +214,7 @@ std::string media_timing_json(const RouterStats& stats, const MediaTimingContext
             ",\"playout_sink_starvations\":" + std::to_string(stats.playout_sink_starvations) +
             ",\"playout_sink_starved_ms\":" + format_ms(stats.playout_sink_starved) +
             ",\"playout_sink_suspends\":" + std::to_string(stats.playout_sink_suspends) +
+            ",\"playout_sink_suspend_loss_frames\":" + std::to_string(stats.playout_sink_suspend_loss_frames) +
             ",\"playout_sink_disruptions\":" + std::to_string(stats.playout_sink_disruptions) +
             ",\"playout_sink_late_frames\":" + std::to_string(stats.playout_sink_late_frames);
     }

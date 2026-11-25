@@ -56,8 +56,9 @@ struct GraphClock::Observer {
             }
             if (status < 0 || duration <= 0 || duration > 65536 || rate.num != 1 || !rate.denom) { continue; }
             if (position < 0 || position > INT64_MAX - duration) { continue; }
-            const auto change = self.cycles.observe(position, duration, rate.denom, status, ns);
+            const auto change = self.cycles.observe(position, duration, rate.denom, status, ns, self.sink_running);
             if (change.discontinuity) { ++self.clock.disruptions; }
+            if (change.suspend_loss_frames) { self.clock.suspend_loss_frames += change.suspend_loss_frames; }
             if (change.drift_ns) { self.clock.drift += change.drift_ns; }
             if (change.held_ns) { self.clock.held += change.held_ns; }
             self.clock.available = true;
@@ -69,6 +70,7 @@ struct GraphClock::Observer {
         if (info->state == PW_NODE_STATE_RUNNING) { self.sink_running = true; }
         if (info->state == PW_NODE_STATE_SUSPENDED && self.sink_running) {
             self.sink_running = false;
+            self.cycles.suspend();
             ++self.clock.suspends;
         }
     }

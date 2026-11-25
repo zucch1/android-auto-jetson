@@ -536,6 +536,8 @@ struct RouterStats final {
     std::uint64_t playout_sink_starvations{};
     core::Nanoseconds playout_sink_starved{};
     std::uint64_t playout_sink_suspends{};
+    // Graph estimate of lost output frames at device suspension.
+    std::uint64_t playout_sink_suspend_loss_frames{};
     std::uint64_t playout_sink_disruptions{};
     std::uint64_t playout_sink_late_frames{};
     // Committed offset above the shedding threshold, even when the buffer

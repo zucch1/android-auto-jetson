@@ -7485,6 +7485,23 @@ TEST(AudioPipelineSinkBackend, GraphPauseCompletesAtLastTimedOutPosition) {
     }
 }
 
+TEST(AudioPipelineSinkBackend, SuspensionAccountsDisconnectedPeriodsAndRebasesTheDriverOnce) {
+    aa::audio::detail::GraphCycles graph;
+    constexpr auto period = 1024LL * 1'000'000'000 / 48000;
+    graph.observe(0, 1024, 48000, 3, 0);
+    graph.suspend();
+    const auto disconnected = graph.observe(1024, 1024, 48000, 3, period, false);
+    EXPECT_EQ(disconnected.suspend_loss_frames, 1024U);
+    EXPECT_EQ(disconnected.held_ns, 0);
+    EXPECT_EQ(graph.observe(1024, 1024, 48000, 3, period, false).suspend_loss_frames, 0U);
+    const auto resumed = graph.observe(3072, 2048, 48000, 3, 2 * period - 9'000'000);
+    EXPECT_EQ(resumed.held_ns, -9'000'000);
+    EXPECT_EQ(resumed.suspend_loss_frames, 2048U);
+    const auto next = graph.observe(5120, 2048, 48000, 3, 4 * period - 9'000'000);
+    EXPECT_EQ(next.held_ns, 0);
+    EXPECT_EQ(next.suspend_loss_frames, 0U);
+}
+
 TEST(AudioPipelineSinkBackend, SlowGraphRateSlewsWallTimeWithoutRetiming) {
     aa::audio::detail::GraphCycles graph;
     std::int64_t drift = 0;

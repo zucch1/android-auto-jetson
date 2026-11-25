@@ -33,9 +33,9 @@ struct SinkTimingAdjustment final {
     // is moved onto the reader through `held`), and for how long in total.
     std::uint64_t starvations{};
     core::Nanoseconds starved{};
-    // The server suspended the stream; what it had buffered downstream of the
-    // credit accounting is gone and cannot be measured here.
+    // Device suspensions and graph frames charged to their output gap.
     std::uint64_t suspends{};
+    std::uint64_t suspend_loss_frames{};
     std::uint64_t disruptions{};
     std::uint64_t late_frames{};
 };
