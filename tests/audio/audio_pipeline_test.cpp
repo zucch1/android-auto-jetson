@@ -18,6 +18,7 @@
 #include "../../src/audio/RateCorrection.hpp"
 #include "../../src/audio/gstreamer_adapter/DeviceRateEstimate.hpp"
 #include "../../src/audio/gstreamer_adapter/GraphCycles.hpp"
+#include "../../src/audio/gstreamer_adapter/ReaderPhase.hpp"
 
 #include <gtest/gtest.h>
 
@@ -2703,6 +2704,7 @@ struct RecordingSinkState final {
     std::function<bool(aa::core::Nanoseconds)> on_hold{};
     aa::audio::detail::SinkTimingAdjustment timing{};
     bool handles_late_slots{};
+    bool compression_safe{true};
     std::optional<aa::core::Nanoseconds> playback_slot{};
     aa::audio::PlaybackSlotAbsence slot_absence{aa::audio::PlaybackSlotAbsence::unavailable};
 };
@@ -2742,6 +2744,7 @@ public:
     aa::audio::detail::SinkTimingAdjustment take_timing_adjustment() override {
         return std::exchange(state->timing, {});
     }
+    bool compression_safe() const override { return state->compression_safe; }
     bool handles_late_slots() const override { return state->handles_late_slots; }
     bool hold_stream(aa::core::Nanoseconds by) override {
         return state->on_hold ? state->on_hold(by) : false;
@@ -7439,6 +7442,43 @@ TEST_F(AudioPipelineRoute, WiredDefaultsApplyAForwardReadStepWithContiguousSinkS
     EXPECT_EQ(events.front().kind, aa::audio::PlayoutEvent::Kind::retime);
     EXPECT_EQ(events.front().held.count, -kA26ChunkNs);
     expect_nothing_lost(route);
+}
+
+TEST_F(AudioPipelineRoute, LowWriteLeadStopsActiveHoldRecovery) {
+    WiredRoute route;
+    ASSERT_TRUE(route.router);
+    route.sink->handles_late_slots = true;
+    route.sink->on_hold = [](aa::core::Nanoseconds) { return true; };
+    ASSERT_TRUE(route.media(0));
+    route.sink->timing.held.count = 300 * kMs;
+    for (int i = 1; i < 100; ++i) { ASSERT_TRUE(route.media(i * kA26ChunkNs)); }
+    const auto compressed = route.stats().frames_compressed;
+    ASSERT_GT(compressed, 0U);
+    route.sink->compression_safe = false;
+    for (int i = 100; i < 200; ++i) { ASSERT_TRUE(route.media(i * kA26ChunkNs)); }
+    EXPECT_EQ(route.stats().frames_compressed, compressed);
+    expect_nothing_lost(route);
+}
+
+TEST(AudioPipelineSinkBackend, DriverStallAndQuantumChangeReconcileFromThePulseEndpoint) {
+    using aa::audio::detail::ReaderPhase;
+    // A driver catches up with several callbacks in quick succession. Their
+    // apparent missed periods do not establish how many samples Pulse read.
+    for (const auto new_period : {20 * kMs, 40 * kMs}) {
+        ReaderPhase phase;
+        const auto old_period = 20 * kMs;
+        phase.cycle(0, old_period, {});
+        phase.cycle(old_period, old_period, ReaderPhase::Read{5 * kMs, old_period});
+        phase.ambiguous_epoch(300 * kMs);
+        ASSERT_TRUE(phase.reconciling());
+        phase.cycle(400 * kMs, new_period, {});
+        // One old period consumed before the stop, one new period after it.
+        const ReaderPhase::Read after{405 * kMs, old_period + new_period};
+        EXPECT_EQ(phase.cycle(400 * kMs + new_period, new_period, after),
+                  400 * kMs + new_period - 2 * old_period);
+        EXPECT_FALSE(phase.reconciling());
+        EXPECT_EQ(phase.cycle(400 * kMs + 2 * new_period, new_period, after), 0);
+    }
 }
 
 TEST(AudioPipelineSinkBackend, GraphCyclesCountOnlyConsecutiveUnfinishedPlaybackCycles) {

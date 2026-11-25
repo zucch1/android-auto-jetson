@@ -508,6 +508,10 @@ struct AudioRouter::Impl final {
     [[nodiscard]] bool lossless() const noexcept {
         return config.playout.enabled && config.playout.lossless;
     }
+    [[nodiscard]] std::int64_t target_depth() const {
+        if (!lossless() || !sink) { return config.playout.depth.count; }
+        return std::clamp(sink->reader_depth().count, config.playout.depth.count, kMaxPlayoutDepth.count);
+    }
     // pump()/flush(): everything pending is written, nothing is held.
     bool draining{};
     // The render_step() in progress has just retimed the timeline.
@@ -538,7 +542,7 @@ struct AudioRouter::Impl final {
     // Wanted playback-rate correction (ppm; positive drains, negative
     // refills) for a role whose window floor is `floor_ns` deep.
     [[nodiscard]] double wanted_rate_ppm(std::int64_t floor_ns) const noexcept {
-        const double depth_ms = static_cast<double>(config.playout.depth.count) / 1e6;
+        const double depth_ms = static_cast<double>(target_depth()) / 1e6;
         const double floor_ms = static_cast<double>(floor_ns) / 1e6;
         const double excess_ms = floor_ms - depth_ms;
         if (excess_ms > kRateDeadBandMs) {
@@ -556,7 +560,7 @@ struct AudioRouter::Impl final {
         auto& state = playout[role];
         const auto floor = window_floor(role, run.timestamp.count, plan.depth_ns);
         double backlog_rate = floor.sustained ? wanted_rate_ppm(floor.low) : 0.0;
-        const auto excess_ms = static_cast<double>(floor.low - config.playout.depth.count) / 1e6;
+        const auto excess_ms = static_cast<double>(floor.low - target_depth()) / 1e6;
         if (state.recovering_from_hold && floor.sustained) {
             if (excess_ms <= kHoldRecoveryDeadBandMs && state.rate_ppm <= 2 * kRatePpm) {
                 state.recovering_from_hold = false;
@@ -572,6 +576,11 @@ struct AudioRouter::Impl final {
         const double slew = kRateSlewPpmPerSecond * static_cast<double>(run.frames)
             / static_cast<double>(config.output_format.sample_rate_hz);
         state.rate_ppm += std::clamp(wanted - state.rate_ppm, -slew, slew);
+        if (sink && !sink->compression_safe()) {
+            state.recovering_from_hold = false;
+            state.rate_ppm = std::min(0.0, state.rate_ppm);
+            state.rate_carry = std::min(0.0, state.rate_carry);
+        }
         state.rate_carry += static_cast<double>(run.frames) * state.rate_ppm / 1e6;
         const auto limit = detail::max_warp_frames(run.frames, percent);
         const auto removed = std::clamp(static_cast<std::int64_t>(state.rate_carry), -limit, limit);
@@ -661,7 +670,7 @@ struct AudioRouter::Impl final {
                                     std::uint64_t own_frame, std::int64_t base_ns, bool anchored,
                                     PlayoutPlan& plan) const {
         const std::int64_t arrival = run.timestamp.count;
-        const std::int64_t depth = config.playout.depth.count;
+        const std::int64_t depth = target_depth();
         std::int64_t slot_ns = 0;
         if (!frame_time(slot_frame, base_ns, slot_ns)) { return false; }
         plan = PlayoutPlan{};
@@ -1066,7 +1075,8 @@ struct AudioRouter::Impl final {
             const bool fresh = !state.anchored || stream_ended[role];
             if (fresh) {
                 const auto at = last_header[role]->timestamp.count;
-                if (at <= INT64_MAX - config.playout.depth.count) { end_ns = at + config.playout.depth.count; }
+                const auto depth = target_depth();
+                if (at <= INT64_MAX - depth) { end_ns = at + depth; }
             } else if (!timeline_base || !frame_time(role_end_frames[role], timeline_base->count, end_ns)) {
                 end_ns = INT64_MIN;
             }
@@ -2246,7 +2256,7 @@ core::Result<RenderStep> AudioRouter::render_step() {
     if (!base) {
         // A playout stream's timeline starts at its anchor (arrival + depth),
         // so the buffer fills without synthesized silence.
-        const auto lead = impl_->playout_enabled() ? impl_->config.playout.depth.count : 0;
+        const auto lead = impl_->playout_enabled() ? impl_->target_depth() : 0;
         for (const auto& queue : impl_->pending) {
             for (const auto& run : queue) {
                 const core::Nanoseconds start{

@@ -142,8 +142,11 @@ struct HandoffTracker final {
     std::thread::id window_thread{};
     WriteProgress* progress{};
     std::int64_t pulse_bytes_per_frame{};
+    std::uint32_t pulse_rate{};
+    std::atomic<std::int64_t> sink_delay_ns{};
     std::atomic<std::uint64_t> late_frames{};
     std::atomic<bool> underflow{};
+    detail::GraphClock::Reader reader;
     std::atomic<std::int64_t> last_read_byte{};
     std::uint64_t observation_sequence{};
 };
@@ -204,11 +207,27 @@ void handoff_log_observer(GstDebugCategory*, GstDebugLevel, const gchar*, const 
         }
         if (!fields.starts_with("0:")) { return; }
         std::int64_t index{};
-        if (std::from_chars(fields.data() + 2, fields.data() + fields.size(), index).ec != std::errc{}
-            || index < 0) { return; }
+        const auto end = fields.data() + fields.size();
+        const auto parsed = std::from_chars(fields.data() + 2, end, index);
+        if (parsed.ec != std::errc{} || index < 0) { return; }
+        std::int64_t delay_us{};
+        const auto rest = std::string_view(parsed.ptr, static_cast<std::size_t>(end - parsed.ptr));
+        if (!rest.starts_with(", ") || std::from_chars(parsed.ptr + 2, end, delay_us).ec != std::errc{}
+            || delay_us < 0 || delay_us > 1'000'000) { return; }
         std::lock_guard lock(g_trackers_mutex);
         const auto entry = g_trackers.find(GST_OBJECT(object));
-        if (entry != g_trackers.end()) { entry->second->last_read_byte = index; }
+        if (entry != g_trackers.end() && entry->second->pulse_bytes_per_frame > 0) {
+            auto& tracker = *entry->second;
+            tracker.last_read_byte = index;
+            tracker.sink_delay_ns = delay_us * 1000;
+            const auto endpoint = gst_util_uint64_scale(static_cast<guint64>(index), GST_SECOND,
+                static_cast<guint64>(tracker.pulse_bytes_per_frame) * tracker.pulse_rate);
+            if (endpoint <= G_MAXINT64) {
+                std::lock_guard reader_lock(tracker.reader.mutex);
+                tracker.reader.sample = detail::ReaderPhase::Read{observation_time().count,
+                                                                  static_cast<std::int64_t>(endpoint)};
+            }
+        }
         return;
     }
     // Keep absolute flush offset accounting independent of the graph clock.
@@ -744,11 +763,12 @@ public:
         handoff_.progress = &progress_;
         if (observe_read_clock_) {
             gchar* id = g_uuid_string_random();
-            graph_ = std::make_unique<detail::GraphClock>(std::string{"aa-wired-"} + id);
+            graph_ = std::make_unique<detail::GraphClock>(std::string{"aa-wired-"} + id, handoff_.reader);
             g_free(id);
             auto* props = gst_structure_new("props", "node.name", G_TYPE_STRING, graph_->name.c_str(), nullptr);
             g_object_set(sink_element_, "stream-properties", props, nullptr);
             gst_structure_free(props);
+            handoff_.pulse_rate = format_.sample_rate_hz;
             handoff_.pulse_bytes_per_frame = static_cast<std::int64_t>(format_.channels) * 2;
         }
         (void)drop_nonempty;
@@ -1090,6 +1110,15 @@ public:
         timing.starved.count = starved_ns_.exchange(0);
         timing.late_frames = handoff_.late_frames.exchange(0);
         return timing;
+    }
+
+    [[nodiscard]] core::Nanoseconds reader_depth() const override {
+        if (!graph_ || !graph_->available) { return {}; }
+        return core::Nanoseconds{handoff_.sink_delay_ns.load() + 2 * graph_->quantum_ns.load()};
+    }
+
+    [[nodiscard]] bool compression_safe() const override {
+        return !graph_timing_ || write_lead_ns_.load() > 2 * graph_->quantum_ns.load();
     }
 
     [[nodiscard]] bool handles_late_slots() const override { return graph_timing_; }
@@ -1455,6 +1484,16 @@ private:
         if (sample) { device_rate_.sample(sample->first, sample->second); }
     }
 
+    std::int64_t reader_time(std::int64_t now, std::int64_t read_frame) {
+        // Use the sample timestamp even when several writes fit between
+        // callbacks. segdone alone has no timestamp and rounds to a segment.
+        std::lock_guard lock(handoff_.reader.mutex);
+        const auto& read = handoff_.reader.sample;
+        if (read) { return read->endpoint_ns + (now - read->at); }
+        return static_cast<std::int64_t>(gst_util_uint64_scale(
+            static_cast<guint64>(read_frame), GST_SECOND, format_.sample_rate_hz));
+    }
+
     [[nodiscard]] static GQuark chain_owner_key() {
         return g_quark_from_static_string("aa-audio-clocked-chain");
     }
@@ -1475,12 +1514,21 @@ private:
             const auto bpf = self.handoff_.pulse_bytes_per_frame;
             const auto read_frame = std::max(reader_lower_bound(self.sink_element_),
                                              self.handoff_.last_read_byte.load()) / bpf;
+            const auto now = observation_time().count;
+            self.write_lead_ns_ = 0;
             const bool underflow = self.handoff_.underflow.exchange(false);
             // next_sample describes the contiguous successor. A discontinuity
             // gets its own absolute offset from GstAudioBaseSink.
             if (GST_CLOCK_TIME_IS_VALID(self.last_chain_end_) && base->next_sample <= G_MAXINT64
                 && std::abs(GST_CLOCK_DIFF(self.last_chain_end_, pts)) <= GST_MSECOND) {
                 const auto behind = read_frame - static_cast<std::int64_t>(base->next_sample);
+                // Pulse updates the read index intermittently. Age the last
+                // observation for pacing only. A paused reader makes this
+                // estimate conservative until the next observation.
+                const auto write_time = gst_util_uint64_scale(base->next_sample, GST_SECOND, self.format_.sample_rate_hz);
+                if (write_time <= G_MAXINT64) {
+                    self.write_lead_ns_ = static_cast<std::int64_t>(write_time) - self.reader_time(now, read_frame);
+                }
                 if (underflow || behind > 0) {
                     ++self.stream_starvations_;
                     if (behind > 0) {
@@ -1712,6 +1760,8 @@ private:
     bool read_clock_slot_{};
     GstPadChainFunction original_chain_{nullptr};
     GstClockTime last_chain_end_{GST_CLOCK_TIME_NONE};
+    // Pre-write headroom published by the chain thread.
+    std::atomic<std::int64_t> write_lead_ns_{};
     std::atomic<std::int64_t> ingress_schedule_ns_{};
     std::atomic<std::int64_t> ingress_move_ns_{};
     std::atomic<std::uint64_t> stream_starvations_{};

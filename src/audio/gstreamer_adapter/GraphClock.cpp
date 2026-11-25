@@ -24,6 +24,8 @@ struct GraphClock::Observer {
     pw_node* sink{};
     bool sink_running{};
     GraphCycles cycles;
+    ReaderPhase phase;
+    std::int64_t last_ns{}, last_period{};
     bool started{};
 
     static void profile(void* data, const spa_pod* pod) {
@@ -35,6 +37,7 @@ struct GraphClock::Observer {
             spa_fraction rate{};
             std::int64_t position{}, duration{}, ns{};
             int status = -1;
+            int64_t follower_signal{};
             spa_pod_prop* field;
             SPA_POD_OBJECT_FOREACH(reinterpret_cast<spa_pod_object*>(object), field) {
                 if (field->key == SPA_PROFILER_clock) {
@@ -51,16 +54,36 @@ struct GraphClock::Observer {
                         SPA_POD_Long(&previous), SPA_POD_Long(&signal), SPA_POD_Long(&awake),
                         SPA_POD_Long(&finish), SPA_POD_Int(&state)) >= 0 && static_cast<uint32_t>(id) == self.stream_id && self.clock.name == name) {
                         status = state;
+                        follower_signal = signal;
                     }
                 }
             }
             if (status < 0 || duration <= 0 || duration > 65536 || rate.num != 1 || !rate.denom) { continue; }
             if (position < 0 || position > INT64_MAX - duration) { continue; }
+            const auto period = duration * 1'000'000'000 / rate.denom;
+            self.clock.quantum_ns = period;
+            if (self.last_period && (period != self.last_period || ns - self.last_ns > 2 * self.last_period
+                || follower_signal > ns + 2 * period)) {
+                self.phase.ambiguous_epoch(std::max(ns, follower_signal));
+            }
+            self.last_period = period;
+            self.last_ns = ns;
+            std::optional<ReaderPhase::Read> sample;
+            {
+                std::lock_guard lock(self.clock.reader.mutex);
+                sample = self.clock.reader.sample;
+            }
+            const auto uncertain = self.phase.reconciling();
+            const auto reconciled = self.phase.cycle(ns, period, sample);
+            if (reconciled) { self.clock.held += reconciled; }
             const auto change = self.cycles.observe(position, duration, rate.denom, status, ns, self.sink_running);
             if (change.discontinuity) { ++self.clock.disruptions; }
             if (change.suspend_loss_frames) { self.clock.suspend_loss_frames += change.suspend_loss_frames; }
             if (change.drift_ns) { self.clock.drift += change.drift_ns; }
-            if (change.held_ns) { self.clock.held += change.held_ns; }
+            if (change.held_ns && !uncertain) {
+                self.clock.held += change.held_ns;
+                self.phase.held(change.held_ns);
+            }
             self.clock.available = true;
         }
     }
@@ -159,6 +182,6 @@ struct GraphClock::Observer {
     }
 };
 
-GraphClock::GraphClock(std::string node) : name(std::move(node)), observer_(std::make_unique<Observer>(*this)) {}
+GraphClock::GraphClock(std::string node, Reader& input) : name(std::move(node)), reader(input), observer_(std::make_unique<Observer>(*this)) {}
 GraphClock::~GraphClock() = default;
 }

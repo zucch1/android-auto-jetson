@@ -100,6 +100,10 @@ public:
     // A sink observing its own read clock can distinguish a pause from a dry
     // late buffer. The router must not restamp against wall time while it does.
     [[nodiscard]] virtual bool handles_late_slots() const { return false; }
+    [[nodiscard]] virtual core::Nanoseconds reader_depth() const { return {}; }
+    // A contiguous PCM write needs enough room ahead of the device reader
+    // to survive the next graph period before removing more PCM frames.
+    [[nodiscard]] virtual bool compression_safe() const { return true; }
     // Positive ppm means the sink reads slower than monotonic time.
     [[nodiscard]] virtual double read_clock_skew_ppm() const { return 0.0; }
     // A read-clock slot includes any phase step and late-ingress correction.
