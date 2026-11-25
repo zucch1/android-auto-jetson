@@ -37,7 +37,7 @@ struct GraphClock::Observer {
             spa_fraction rate{};
             std::int64_t position{}, duration{}, ns{};
             int status = -1;
-            int64_t follower_signal{};
+            std::int64_t follower_signal{}, follower_finish{};
             spa_pod_prop* field;
             SPA_POD_OBJECT_FOREACH(reinterpret_cast<spa_pod_object*>(object), field) {
                 if (field->key == SPA_PROFILER_clock) {
@@ -55,6 +55,7 @@ struct GraphClock::Observer {
                         SPA_POD_Long(&finish), SPA_POD_Int(&state)) >= 0 && static_cast<uint32_t>(id) == self.stream_id && self.clock.name == name) {
                         status = state;
                         follower_signal = signal;
+                        follower_finish = finish;
                     }
                 }
             }
@@ -77,19 +78,24 @@ struct GraphClock::Observer {
                 sample = self.clock.reader.sample;
             }
             const auto uncertain = self.phase.reconciling();
-            const auto reconciled = self.phase.cycle(ns, ticks, period,
-                status == 3 && self.sink_running ? sample : std::nullopt);
-            if (reconciled) {
-                self.clock.held += reconciled;
-                self.cycles.follow_driver();
-            }
             const auto change = self.cycles.observe(position, duration, rate.denom, status, ns, self.sink_running);
             if (change.discontinuity) { ++self.clock.disruptions; }
             if (change.suspend_loss_frames) { self.clock.suspend_loss_frames += change.suspend_loss_frames; }
-            if (change.drift_ns) { self.clock.drift += change.drift_ns; }
+            // While the epoch is ambiguous the phase accounts for all of it.
+            if (change.drift_ns && !uncertain) {
+                self.clock.drift += change.drift_ns;
+                self.phase.drifted(change.drift_ns);
+            }
             if (change.held_ns && !uncertain) {
                 self.clock.held += change.held_ns;
                 self.phase.held(change.held_ns);
+                self.cycles.follow_driver();
+            }
+            const auto measured = self.phase.cycle({ns, ticks, period, status == 3, status == 1, follower_finish},
+                self.cycles.relocking(), self.sink_running ? sample : std::nullopt);
+            if (measured.drift) { self.clock.drift += measured.drift; }
+            if (measured.step) {
+                self.clock.held += measured.step;
                 self.cycles.follow_driver();
             }
             self.clock.driver_relocking = self.cycles.relocking() || self.phase.reconciling();
@@ -137,6 +143,12 @@ struct GraphClock::Observer {
         if (id == self.stream_id || id == self.profiler_id) {
             self.clock.available = false;
             self.cycles = {};
+            self.phase = {};
+            self.last_period = 0;
+            {
+                std::lock_guard lock(self.clock.reader.mutex);
+                self.clock.reader.sample.reset();
+            }
             if (id == self.stream_id) { self.stream_id = PW_ID_ANY; }
             if (id == self.profiler_id) {
                 pw_proxy_destroy(self.profiler);

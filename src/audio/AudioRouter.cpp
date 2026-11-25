@@ -73,6 +73,8 @@ constexpr double kDeepRatePpmPerMs = 50.0;
 // 300 ms in about 15 s, 1.6 s in about 80 s. Guidance and system voice keep
 // the ordinary 1% ceiling: pitch moves are easier to hear on speech. The
 // wireless video hold cap (#232) covers the longer A/V drain.
+// A device (Bluetooth) whose own delay alone exceeds the configured depth.
+constexpr std::int64_t kMaxReaderDepthNs = 500'000'000;
 constexpr unsigned kHoldRecoveryPercent = 2;
 constexpr double kHoldRecoveryPpm = kHoldRecoveryPercent * 10'000.0;
 constexpr double kHoldRecoveryDeadBandMs = 2.0;
@@ -510,7 +512,14 @@ struct AudioRouter::Impl final {
     }
     [[nodiscard]] std::int64_t target_depth() const {
         if (!lossless() || !sink) { return config.playout.depth.count; }
-        return std::clamp(sink->reader_depth().count, config.playout.depth.count, kMaxPlayoutDepth.count);
+        return std::clamp(sink->reader_depth().count, config.playout.depth.count, kMaxReaderDepthNs);
+    }
+    // Depth a stream is placed at: the steady depth plus room for arrival
+    // jitter, which the window floor measures and drains to afterwards.
+    [[nodiscard]] std::int64_t anchor_depth() const {
+        if (!lossless() || !sink || sink->reader_depth().count == 0) { return config.playout.depth.count; }
+        return std::min(std::max(config.playout.depth.count,
+                                 sink->reader_depth().count + sink->arrival_margin().count), kMaxReaderDepthNs);
     }
     // pump()/flush(): everything pending is written, nothing is held.
     bool draining{};
@@ -669,7 +678,7 @@ struct AudioRouter::Impl final {
                                     std::uint64_t own_frame, std::int64_t base_ns, bool anchored,
                                     PlayoutPlan& plan) const {
         const std::int64_t arrival = run.timestamp.count;
-        const std::int64_t depth = target_depth();
+        const std::int64_t depth = anchor_depth();
         std::int64_t slot_ns = 0;
         if (!frame_time(slot_frame, base_ns, slot_ns)) { return false; }
         plan = PlayoutPlan{};
@@ -1074,7 +1083,7 @@ struct AudioRouter::Impl final {
             const bool fresh = !state.anchored || stream_ended[role];
             if (fresh) {
                 const auto at = last_header[role]->timestamp.count;
-                const auto depth = target_depth();
+                const auto depth = anchor_depth();
                 if (at <= INT64_MAX - depth) { end_ns = at + depth; }
             } else if (!timeline_base || !frame_time(role_end_frames[role], timeline_base->count, end_ns)) {
                 end_ns = INT64_MIN;
@@ -2258,7 +2267,7 @@ core::Result<RenderStep> AudioRouter::render_step() {
     if (!base) {
         // A playout stream's timeline starts at its anchor (arrival + depth),
         // so the buffer fills without synthesized silence.
-        const auto lead = impl_->playout_enabled() ? impl_->target_depth() : 0;
+        const auto lead = impl_->playout_enabled() ? impl_->anchor_depth() : 0;
         for (const auto& queue : impl_->pending) {
             for (const auto& run : queue) {
                 const core::Nanoseconds start{

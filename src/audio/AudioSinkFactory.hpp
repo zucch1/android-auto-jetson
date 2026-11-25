@@ -100,7 +100,11 @@ public:
     // A sink observing its own read clock can distinguish a pause from a dry
     // late buffer. The router must not restamp against wall time while it does.
     [[nodiscard]] virtual bool handles_late_slots() const { return false; }
+    // Time a sample must be queued before it plays: what the measured reader
+    // needs, zero when the sink cannot measure it.
     [[nodiscard]] virtual core::Nanoseconds reader_depth() const { return {}; }
+    // Added to that when a stream is placed and nothing is known of its jitter.
+    [[nodiscard]] virtual core::Nanoseconds arrival_margin() const { return {}; }
     // A contiguous PCM write needs enough room ahead of the device reader
     // to survive the next graph period before removing more PCM frames.
     [[nodiscard]] virtual bool compression_safe() const { return true; }

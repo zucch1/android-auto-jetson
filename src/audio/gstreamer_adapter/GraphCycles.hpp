@@ -63,10 +63,18 @@ public:
             missed_ns_ = 0;
             missed_cycles_ = 0;
         }
+        const auto lag = ns - (position / rate * 1'000'000'000 + position % rate * 1'000'000'000 / rate);
+        // A lost record or a new quantum moves position and time together.
+        if (change.discontinuity && completed_lag_ && std::abs(lag - *completed_lag_) > 40'000'000) {
+            completed_lag_.reset();
+        }
         // Compare graph time and nominal frame duration using the timestamp
         // captured by the driver. Delivery time of the profiler batch plays
         // no part. Move the phase at most 500 ppm, in one-second windows.
-        if (!reference_ || change.discontinuity || ns < reference_->time) {
+        // The hold itself accounts for the driver during missed cycles.
+        if (missed_cycles_ || state == 1 || state == 2) {
+            reference_.reset();
+        } else if (!reference_ || change.discontinuity || ns < reference_->time) {
             reference_ = Reference{position, ns, 0};
         } else if (ns - reference_->time >= (relocking_ ? 250'000'000 : 1'000'000'000)) {
             const auto elapsed = ns - reference_->time;
@@ -94,17 +102,22 @@ public:
             ++missed_cycles_;
             missed_ns_ += frames * 1'000'000'000 / rate;
         } else if (state == 3 && missed_cycles_) {
-            if (missed_cycles_ >= 2) { change.held_ns = missed_ns_; }
+            // A driver refilling its device runs fast during the stall: what
+            // the listener loses is the elapsed time, not the nominal ticks.
+            if (missed_cycles_ >= 2) {
+                change.held_ns = missed_ns_ + (completed_lag_ ? lag - *completed_lag_ : 0);
+            }
             else { change.discontinuity = true; }
             missed_cycles_ = 0;
             missed_ns_ = 0;
         }
+        if (state == 3) { completed_lag_ = lag; }
         return change;
     }
 private:
     struct Reference { std::int64_t position, time, residual; };
     std::optional<Reference> reference_;
-    std::optional<std::int64_t> expected_;
+    std::optional<std::int64_t> expected_, completed_lag_;
     std::int64_t previous_frames_{}, missed_ns_{};
     std::uint32_t previous_rate_{};
     unsigned missed_cycles_{};

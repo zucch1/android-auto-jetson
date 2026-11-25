@@ -1123,7 +1123,15 @@ public:
 
     [[nodiscard]] core::Nanoseconds reader_depth() const override {
         if (!graph_ || !graph_->available) { return {}; }
-        return core::Nanoseconds{handoff_.sink_delay_ns.load() + 2 * graph_->quantum_ns.load()};
+        // A PTS names the time its sample leaves the device, so Pulse reads
+        // it one device delay earlier, up to a quantum at a time, and the
+        // next one has to be queued by then. Keep what starving has shown.
+        return core::Nanoseconds{handoff_.sink_delay_ns.load() + 2 * graph_->quantum_ns.load()
+                                 + starvation_margin_ns_.load()};
+    }
+
+    [[nodiscard]] core::Nanoseconds arrival_margin() const override {
+        return graph_ && graph_->available ? core::Nanoseconds{graph_->quantum_ns.load()} : core::Nanoseconds{};
     }
 
     [[nodiscard]] bool compression_safe() const override {
@@ -1546,6 +1554,9 @@ private:
                     }
                 }
                 if (behind > 0) {
+                    // Draining back to the depth that starved would starve again.
+                    const auto quantum = self.graph_ ? self.graph_->quantum_ns.load() : 0;
+                    self.starvation_margin_ns_ = std::min(self.starvation_margin_ns_.load() + quantum, kMaxStarvationMarginNs);
                     move = static_cast<std::int64_t>(gst_util_uint64_scale(
                         static_cast<guint64>(behind), GST_SECOND, self.format_.sample_rate_hz)) + 60'000'000;
                 }
@@ -1771,6 +1782,8 @@ private:
     GstClockTime last_chain_end_{GST_CLOCK_TIME_NONE};
     // Pre-write headroom published by the chain thread.
     std::atomic<std::int64_t> write_lead_ns_{};
+    static constexpr std::int64_t kMaxStarvationMarginNs = 60'000'000;
+    std::atomic<std::int64_t> starvation_margin_ns_{};
     std::atomic<std::int64_t> ingress_schedule_ns_{};
     std::atomic<std::int64_t> ingress_move_ns_{};
     std::atomic<std::uint64_t> stream_starvations_{};
