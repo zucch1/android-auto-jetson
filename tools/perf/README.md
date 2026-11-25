@@ -277,17 +277,14 @@ inserted), `playout_overflows` (chunks cut by the 2 s emergency bound) and
 as `audio_playout_overflow` with `frames`, `frames_lifetime` and `depth_ms`),
 `playout_retimes` (times queued audio was rescheduled, each logged as
 `audio_playout_retime` with `shifted_ms`, `held_ms`, `offset_ms` and
-`retimes_lifetime`. `held_ms` is the measured step in the Pulse ring's read
-clock against monotonic time. This part moves the router timeline while keeping
-the sink stamps contiguous. Time lost while the sink kept reading instead
-moves its stamps. The 2 s emergency bound applies. Verify the heard shift and
-check for missing audio with numbered markers recorded on the sink monitor.)
-and `playout_retimed_ms` (their sum), `playout_sink_starvations` and
-`playout_sink_starved_ms` (times the Pulse server's read index passed audio
-still scheduled, which is lost, and how far it ran ahead in total; each also
-logs `audio_sink_starved` and moves the schedule onto the reader) and
-`playout_sink_suspends` (server suspends of the sink stream, which can lose what
-the server had buffered). A stopped stream plays out; `audio_stop_discarded` (`role`, `null`
+`retimes_lifetime`. `held_ms` is the duration of missed playback-node cycles on PipeWire, or a write-lateness
+estimate when the profiler is unavailable. The held interval moves the router
+timeline while preserving sink timestamps. The 2 s emergency bound applies.)
+`playout_retimed_ms` sums the shifts. `playout_sink_late_frames` counts
+frames flushed behind the observed read position. `playout_sink_suspends`
+counts suspensions of the linked output and `playout_sink_disruptions`
+counts changes in graph quantum and isolated missed cycles.
+A stopped stream plays out; `audio_stop_discarded` (`role`, `null`
 at shutdown, and `chunks`; at shutdown also `frames`, 48 kHz output frames of all
 roles, where a decoder tail alone is one chunk) reports accepted audio a stop had
 to cancel, or lost to a write that failed during it, including decoder tails whose

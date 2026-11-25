@@ -36,6 +36,8 @@ struct SinkTimingAdjustment final {
     // The server suspended the stream; what it had buffered downstream of the
     // credit accounting is gone and cannot be measured here.
     std::uint64_t suspends{};
+    std::uint64_t disruptions{};
+    std::uint64_t late_frames{};
 };
 
 // The routed output sink (gate r2 F1 semantics).
@@ -133,10 +135,7 @@ struct SinkOpenRequest final {
     bool contiguous_stream{false};
     // Tests can exercise the write-lateness fallback on an unslaved Pulse ring.
     bool disable_pulse_read_clock_for_test{false};
-    // Tests can drop the read-progress trace (as a renamed GStreamer log line
-    // would) and shorten how long warm-up may take before it is declared broken.
-    bool ignore_pulse_read_trace_for_test{false};
-    std::optional<core::Milliseconds> pulse_read_clock_broken_after_for_test{};
+    bool disable_graph_for_test{};
     // Tests can stand in for the pulsesink's own clock (its reads may block)
     // and shorten the device-rate window.
     std::function<std::optional<std::int64_t>()> pulse_device_clock_for_test{};

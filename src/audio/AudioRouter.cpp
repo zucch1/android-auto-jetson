@@ -565,12 +565,14 @@ struct AudioRouter::Impl final {
                     (excess_ms - kHoldRecoveryDeadBandMs) * kHoldRecoveryPpmPerMs, 0.0, kHoldRecoveryPpm));
             }
         }
-        const double wanted = backlog_rate + (sink ? sink->read_clock_skew_ppm() : 0.0);
+        const unsigned percent = state.recovering_from_hold ? kHoldRecoveryPercent : 1U;
+        const double ceiling = static_cast<double>(percent) * 10'000.0;
+        const double wanted = std::clamp(backlog_rate + (sink ? sink->read_clock_skew_ppm() : 0.0),
+                                         -ceiling, ceiling);
         const double slew = kRateSlewPpmPerSecond * static_cast<double>(run.frames)
             / static_cast<double>(config.output_format.sample_rate_hz);
         state.rate_ppm += std::clamp(wanted - state.rate_ppm, -slew, slew);
         state.rate_carry += static_cast<double>(run.frames) * state.rate_ppm / 1e6;
-        const unsigned percent = state.recovering_from_hold ? kHoldRecoveryPercent : 1U;
         const auto limit = detail::max_warp_frames(run.frames, percent);
         const auto removed = std::clamp(static_cast<std::int64_t>(state.rate_carry), -limit, limit);
         state.rate_carry = std::clamp(state.rate_carry - static_cast<double>(removed),
@@ -2210,6 +2212,8 @@ core::Result<RenderStep> AudioRouter::render_step() {
         impl_->report.stats.playout_sink_starvations += timing.starvations;
         impl_->report.stats.playout_sink_starved.count += timing.starved.count;
         impl_->report.stats.playout_sink_suspends += timing.suspends;
+        impl_->report.stats.playout_sink_disruptions += timing.disruptions;
+        impl_->report.stats.playout_sink_late_frames += timing.late_frames;
         const auto held = timing.held.count != 0 && impl_->sink->hold_stream(timing.held)
             ? timing.held.count : 0;
         const bool have_timeline = impl_->timeline_base

@@ -16,7 +16,8 @@
 
 #include "../../src/audio/AudioSinkFactory.hpp"
 #include "../../src/audio/RateCorrection.hpp"
-#include "../../src/audio/gstreamer_adapter/PulseReadClock.hpp"
+#include "../../src/audio/gstreamer_adapter/DeviceRateEstimate.hpp"
+#include "../../src/audio/gstreamer_adapter/GraphCycles.hpp"
 
 #include <gtest/gtest.h>
 
@@ -2030,22 +2031,21 @@ TEST(AudioPipelineSinkBackend, DefaultAutomaticOpenSelectsPulseSinkWhenRuntimeAv
 // #229: without a usable read-progress trace (a renamed GStreamer log line)
 // the contiguous Pulse sink declares it broken and follows the pulsesink's
 // own clock for device skew. Silence only.
-TEST(AudioPipelineSinkBackend, BrokenPulseReadTraceFallsBackToTheSinkClock) {
+TEST(AudioPipelineSinkBackend, MissingGraphProfilerFallsBackToTheSinkClock) {
     aa::audio::detail::SinkOpenRequest request;
     request.backend = aa::audio::SinkBackend::pulse;
     request.format = stereo_48k();
     request.start_timeout = aa::core::Milliseconds{2000};
     request.write_timeout = aa::core::Milliseconds{500};
     request.contiguous_stream = true;
-    request.ignore_pulse_read_trace_for_test = true;
-    request.pulse_read_clock_broken_after_for_test = aa::core::Milliseconds{1500};
+    request.disable_graph_for_test = true;
     // #229 review 12f1f21 P2-5: the sink clock's reads wait on the Pulse
     // mainloop. One that takes 300 ms must not hold a write up; the device
     // here reads 400 ppm slow, and the estimate must find it.
-    std::atomic<std::uint64_t> device_reads{0};
-    request.pulse_device_clock_for_test = [&device_reads]() -> std::optional<std::int64_t> {
+    auto device_reads = std::make_shared<std::atomic<std::uint64_t>>(0);
+    request.pulse_device_clock_for_test = [device_reads]() -> std::optional<std::int64_t> {
         std::this_thread::sleep_for(std::chrono::milliseconds(300));
-        ++device_reads;
+        ++*device_reads;
         return static_cast<std::int64_t>(static_cast<double>(now_ns().count) * (1.0 - 400e-6));
     };
     request.pulse_device_rate_window_for_test = aa::core::Milliseconds{500};
@@ -2074,10 +2074,10 @@ TEST(AudioPipelineSinkBackend, BrokenPulseReadTraceFallsBackToTheSinkClock) {
         EXPECT_FALSE(outcome.sink->last_slot_from_read_clock());
     }
     EXPECT_FALSE(outcome.sink->handles_late_slots());
-    EXPECT_GE(device_reads.load(), 4U);
+    EXPECT_GE(device_reads->load(), 4U);
     EXPECT_LT(longest, 150'000'000);
     std::cout << "BROKEN_TRACE skew_ppm=" << outcome.sink->read_clock_skew_ppm() << " device_reads="
-              << device_reads.load() << " longest_write_ms=" << longest / 1'000'000 << '\n';
+              << device_reads->load() << " longest_write_ms=" << longest / 1'000'000 << '\n';
     EXPECT_GT(outcome.sink->read_clock_skew_ppm(), 150.0);
     EXPECT_LT(outcome.sink->read_clock_skew_ppm(), 500.0);
     const auto timing = outcome.sink->take_timing_adjustment();
@@ -7441,324 +7441,41 @@ TEST_F(AudioPipelineRoute, WiredDefaultsApplyAForwardReadStepWithContiguousSinkS
     expect_nothing_lost(route);
 }
 
-namespace {
-
-struct PulseClockTrace {
-    aa::audio::detail::PulseReadClock clock;
-    std::int64_t read_ms{};
-
-    PulseClockTrace() { clock.reset(192'000); }
-
-    void request(std::int64_t advance_ms, std::int64_t phase_ns) {
-        read_ms += advance_ms;
-        constexpr auto writable = 4'096;
-        clock.submitted(read_ms * 192 - writable);
-        clock.requested(writable, read_ms * kMs + phase_ns);
+TEST(AudioPipelineSinkBackend, GraphCyclesCountOnlyConsecutiveUnfinishedPlaybackCycles) {
+    aa::audio::detail::GraphCycles cycles;
+    constexpr int rate = 48000;
+    constexpr int frames = 1024;
+    std::int64_t position = 0;
+    auto cycle = [&](int state) {
+        auto result = cycles.observe(position, frames, rate, state, position * 1'000'000'000 / rate);
+        position += frames;
+        return result;
+    };
+    for (int i = 0; i < 300; ++i) { EXPECT_EQ(cycle(3).held_ns, 0); }
+    for (int length : {13, 46, 74}) {
+        for (int i = 0; i < length; ++i) { EXPECT_EQ(cycle(1).held_ns, 0); }
+        EXPECT_EQ(cycle(3).held_ns, length * (frames * 1'000'000'000LL / rate));
+        EXPECT_EQ(cycle(3).held_ns, 0);
     }
-
-    // The sink activates the clock on its first on-time write after this.
-    void warm(bool activate = true) {
-        for (int i = 0; i < 8; ++i) { request(40, 0); }
-        if (activate) { clock.activate(true); }
-    }
-};
-
-} // namespace
-
-TEST(AudioPipelineSinkBackend, PulseReadClockRejectsDelayedDispatchAndBatchedCredits) {
-    PulseClockTrace trace;
-    EXPECT_FALSE(trace.clock.ready());
-    trace.warm();
-    ASSERT_TRUE(trace.clock.ready());
-    EXPECT_TRUE(trace.clock.is_playing(trace.read_ms * kMs));
-    EXPECT_FALSE(trace.clock.is_playing((trace.read_ms + 90) * kMs));
-    trace.request(40, 200 * kMs);
-    EXPECT_FALSE(trace.clock.is_playing((trace.read_ms + 200) * kMs));
-    for (int lag_ms : {160, 120, 80, 40, 0}) { trace.request(40, lag_ms * kMs); }
-    EXPECT_EQ(trace.clock.take_adjustment().held.count, 0);
-    EXPECT_TRUE(trace.clock.is_playing(trace.read_ms * kMs));
+    cycle(2);
+    EXPECT_TRUE(cycle(3).discontinuity);
+    cycle(1);
+    position += frames;
+    EXPECT_TRUE(cycle(1).discontinuity);
+    EXPECT_EQ(cycle(3).held_ns, 0);
+    EXPECT_TRUE(cycles.observe(position, 2048, rate, 3, position * 1'000'000'000 / rate).discontinuity);
 }
 
-TEST(AudioPipelineSinkBackend, PulseReadClockMeasuresOneStepAcrossIrregularResumeRequests) {
-    PulseClockTrace trace;
-    trace.warm();
-    trace.request(40, 260 * kMs);
-    EXPECT_EQ(trace.clock.take_adjustment().held.count, 0);
-    trace.request(20, 280 * kMs);
-    trace.request(20, 300 * kMs);
-    trace.request(60, 300 * kMs); // the first write's 110 ms wait would have expired
-    EXPECT_FALSE(trace.clock.is_playing((trace.read_ms + 300) * kMs));
-    EXPECT_EQ(trace.clock.take_adjustment().held.count, 0);
-    trace.request(40, 301 * kMs);
-    EXPECT_EQ(trace.clock.take_adjustment().held.count, 300 * kMs);
-    for (int i = 0; i < 8; ++i) { trace.request(40, 300 * kMs); }
-    EXPECT_EQ(trace.clock.take_adjustment().held.count, 0);
-}
-
-TEST(AudioPipelineSinkBackend, PulseReadClockReportsForwardAndAccumulatedSteps) {
-    PulseClockTrace trace;
-    trace.warm();
-    for (int i = 0; i < 5; ++i) { trace.request(45, -42 * kMs); }
-    EXPECT_EQ(trace.clock.take_adjustment().held.count, -42 * kMs);
-    for (int i = 0; i < 12; ++i) { trace.request(40, -25 * kMs); }
-    EXPECT_EQ(trace.clock.take_adjustment().held.count, 0);
-    for (int i = 0; i < 6; ++i) { trace.request(40, -8 * kMs); }
-    EXPECT_NEAR(static_cast<double>(trace.clock.take_adjustment().held.count), 34.0e6, 0.3e6);
-}
-
-TEST(AudioPipelineSinkBackend, PulseReadClockSlewsForFiftyPpmWithoutSteps) {
-    PulseClockTrace trace;
-    trace.warm();
-    for (int i = 1; i <= 1'600; ++i) { trace.request(40, i * 2'000); }
-    const auto timing = trace.clock.take_adjustment();
-    EXPECT_EQ(timing.held.count, 0);
-    EXPECT_NEAR(static_cast<double>(timing.drift.count), 3.2e6, 0.02e6);
-    EXPECT_NEAR(trace.clock.skew_ppm(), 50.0, 4.0);
-}
-
-TEST(AudioPipelineSinkBackend, PulseReadClockLeavesAFallbackHoldAloneAfterItIsReady) {
-    // #229 P1: mapped from a pre-pause phase, then a 300 ms pause. The
-    // router's fallback holds 268 ms before the clock confirms the step.
-    PulseClockTrace trace;
-    trace.warm(false);
-    trace.request(40, 300 * kMs);
-    trace.clock.fallback_held(268 * kMs);
-    for (int i = 0; i < 12; ++i) { trace.request(40, 300 * kMs); }
-    EXPECT_FALSE(trace.clock.active());
-    ASSERT_TRUE(trace.clock.activate(true));
-    // No second hold, and the fallback's 32 ms error stays (no drift: what
-    // was measured before the hold never reaches the router).
-    const auto timing = trace.clock.take_adjustment();
-    EXPECT_EQ(timing.held.count, 0);
-    EXPECT_EQ(timing.drift.count, 0);
-}
-
-TEST(AudioPipelineSinkBackend, PulseReadClockDropsAConfirmedStepTheFallbackAlsoHeld) {
-    PulseClockTrace trace;
-    trace.warm(false);
-    for (int i = 0; i < 5; ++i) { trace.request(40, 300 * kMs); }
-    trace.clock.fallback_held(310 * kMs);
-    for (int i = 0; i < 8; ++i) { trace.request(40, 300 * kMs); }
-    ASSERT_TRUE(trace.clock.activate(true));
-    const auto timing = trace.clock.take_adjustment();
-    EXPECT_EQ(timing.held.count, 0);
-    EXPECT_EQ(timing.drift.count, 0);
-}
-
-// The baseline comes from the eight requests after the most recent fallback
-// hold only: it cannot activate, or hold a step candidate, before them.
-TEST(AudioPipelineSinkBackend, PulseReadClockTakesItsBaselineAfterTheFallbackHold) {
-    for (const int before : {0, 1, 2, 5, 7}) {
-        SCOPED_TRACE(before);
-        PulseClockTrace trace;
-        for (int i = 0; i < before; ++i) { trace.request(40, 0); }
-        trace.request(40, 300 * kMs);
-        trace.clock.fallback_held(250 * kMs);
-        for (int i = 0; i < 7; ++i) {
-            trace.request(40, i % 2 == 0 ? 300 * kMs : 360 * kMs);
-            EXPECT_FALSE(trace.clock.ready());
-            EXPECT_FALSE(trace.clock.activate(true));
-        }
-        trace.request(40, 300 * kMs);
-        ASSERT_TRUE(trace.clock.activate(true));
-        const auto timing = trace.clock.take_adjustment();
-        EXPECT_EQ(timing.held.count, 0);
-        EXPECT_EQ(timing.drift.count, 0);
-        for (int i = 0; i < 20; ++i) { trace.request(40, 300 * kMs); }
-        const auto later = trace.clock.take_adjustment();
-        EXPECT_EQ(later.held.count, 0);
-        EXPECT_EQ(later.drift.count, 0);
+TEST(AudioPipelineSinkBackend, SlowGraphRateSlewsWallTimeWithoutRetiming) {
+    aa::audio::detail::GraphCycles graph;
+    std::int64_t drift = 0;
+    for (int i = 0; i <= 5000; ++i) {
+        const auto change = graph.observe(i * 480, 480, 48000, 3, i * 10'002'000LL);
+        ASSERT_EQ(change.held_ns, 0);
+        ASSERT_FALSE(change.discontinuity);
+        drift += change.drift_ns;
     }
-}
-
-// #229 review 12f1f21 P1: the pause began before Pulse's first credit, so
-// every request seen before the fallback hold came after the resume (here
-// during a 90 ms post-handoff completion delay). 12f1f21 took two or more of
-// them as a pre-pause baseline and turned the 269 ms hold into -269 ms of
-// drift. At startup and after a new stream re-warms the clock.
-TEST(AudioPipelineSinkBackend, PulseReadClockIgnoresPostResumeRequestsBeforeTheFallbackHold) {
-    for (const bool rewarm : {false, true}) {
-        for (const int after_resume : {1, 2, 4, 7}) {
-            SCOPED_TRACE(testing::Message() << "rewarm " << rewarm << " requests " << after_resume);
-            PulseClockTrace trace;
-            if (rewarm) {
-                trace.warm();
-                trace.clock.reset(192'000);
-            }
-            for (int i = 0; i < after_resume; ++i) { trace.request(20, 269 * kMs + i * kMs); }
-            trace.clock.fallback_held(269 * kMs);
-            for (int i = 0; i < 8; ++i) { trace.request(40, 269 * kMs); }
-            ASSERT_TRUE(trace.clock.activate(true));
-            for (int i = 0; i < 20; ++i) { trace.request(40, 269 * kMs); }
-            const auto timing = trace.clock.take_adjustment();
-            EXPECT_EQ(timing.held.count, 0);
-            EXPECT_EQ(timing.drift.count, 0);
-        }
-    }
-}
-
-// #229 review 12f1f21 P2-4: two pauses while the clock warms up, each held by
-// the fallback. Nothing from before the second hold reaches the router; the
-// two fallback estimates stand (12f1f21 emitted -13 ms of drift here).
-TEST(AudioPipelineSinkBackend, PulseReadClockKeepsTwoWarmUpHoldsAsTheFallbackPlacedThem) {
-    PulseClockTrace trace;
-    trace.request(40, 0);
-    trace.request(40, 0);
-    trace.request(40, 256 * kMs);
-    trace.clock.fallback_held(269 * kMs);
-    trace.request(40, 256 * kMs);
-    trace.request(40, 256 * kMs);
-    trace.request(40, 512 * kMs);
-    trace.clock.fallback_held(269 * kMs);
-    for (int i = 0; i < 8; ++i) { trace.request(40, 512 * kMs); }
-    ASSERT_TRUE(trace.clock.activate(true));
-    for (int i = 0; i < 8; ++i) { trace.request(40, 512 * kMs); }
-    const auto timing = trace.clock.take_adjustment();
-    EXPECT_EQ(timing.held.count, 0);
-    EXPECT_EQ(timing.drift.count, 0);
-}
-
-namespace {
-
-// The router's side of the applied record: its plan for the newest byte, 20
-// ms after the request (a 4 KB queue), with every adjustment it has taken.
-struct StarvingTrace {
-    PulseClockTrace trace;
-    std::int64_t taken{};
-
-    StarvingTrace() {
-        trace.warm();
-        plan();
-    }
-
-    [[nodiscard]] std::int64_t write_end() const { return trace.read_ms * 192 - 4'096; }
-
-    void plan() { trace.clock.scheduled(trace.read_ms * kMs + 20 * kMs + taken); }
-
-    void request(std::int64_t advance_ms, std::int64_t phase_ns) {
-        trace.request(advance_ms, phase_ns);
-        plan();
-    }
-
-    // The server's read index `ahead_ms` past the newest written byte.
-    void latency(std::int64_t ahead_ms) {
-        trace.clock.read_position(write_end() + ahead_ms * 192, trace.read_ms * kMs);
-    }
-
-    std::int64_t take() {
-        const auto timing = trace.clock.take_adjustment();
-        taken += timing.held.count + timing.drift.count;
-        plan();
-        return timing.held.count;
-    }
-};
-
-} // namespace
-
-// A hold the clock never heard of leaves the router's plan 300 ms after the
-// reader passed its newest byte (the review's 12f1f21 P1(b) capture). The
-// server's read index shows it: reported once, and the schedule moves onto
-// the reader.
-TEST(AudioPipelineSinkBackend, PulseReadClockMovesAStarvedScheduleOntoTheReader) {
-    StarvingTrace ring;
-    ring.trace.clock.scheduled(ring.trace.read_ms * kMs + 300 * kMs);
-    ring.latency(211);
-    ring.trace.request(40, 0);
-    ring.trace.clock.scheduled(ring.trace.read_ms * kMs + 300 * kMs);
-    // Not until more than two segments were committed behind the reader.
-    ring.latency(211);
-    EXPECT_EQ(ring.trace.clock.take_starvation().first, 0U);
-    ring.trace.request(40, 0);
-    ring.trace.clock.scheduled(ring.trace.read_ms * kMs + 300 * kMs);
-    ring.latency(211);
-    const auto [starvations, starved] = ring.trace.clock.take_starvation();
-    EXPECT_EQ(starvations, 1U);
-    EXPECT_EQ(starved, 211 * kMs);
-    EXPECT_EQ(ring.trace.clock.take_adjustment().held.count, -511 * kMs);
-    // One episode is reported once.
-    ring.trace.request(40, 0);
-    ring.latency(211);
-    ring.trace.request(40, 0);
-    ring.latency(211);
-    EXPECT_EQ(ring.trace.clock.take_starvation().first, 0U);
-}
-
-TEST(AudioPipelineSinkBackend, PulseReadClockLeavesAnEndedOrUnderrunStreamAlone) {
-    // A stream that ended: the reader runs on past a write index that no
-    // longer moves (pulsesink flushes at most one more segment).
-    StarvingTrace ended;
-    const auto last = ended.write_end();
-    for (int i = 1; i <= 6; ++i) {
-        ended.trace.read_ms += 200;
-        ended.trace.clock.submitted(last + (i == 3 ? 4'096 : 0));
-        ended.trace.clock.read_position(ended.trace.read_ms * 192, ended.trace.read_ms * kMs);
-    }
-    EXPECT_EQ(ended.trace.clock.take_starvation().first, 0U);
-    EXPECT_EQ(ended.trace.clock.take_adjustment().held.count, 0);
-    // A plan that has passed too: the writer is late, and the sink's ingress
-    // move puts its next buffer ahead of the reader.
-    StarvingTrace late;
-    for (int i = 0; i < 4; ++i) {
-        late.request(40, 0);
-        late.trace.clock.scheduled(late.trace.read_ms * kMs - 100 * kMs);
-        late.latency(100);
-    }
-    EXPECT_EQ(late.trace.clock.take_starvation().first, 0U);
-    EXPECT_EQ(late.trace.clock.take_adjustment().held.count, 0);
-}
-
-// #229 review 12f1f21 P2-2: a 60 ms forward step that takes the reader past
-// a shallow queue is one displacement. Starvation recovery and the phase
-// step work on the same record, whichever sees it first, and whether or not
-// the router took the step in between.
-TEST(AudioPipelineSinkBackend, PulseReadClockAppliesAForwardStepPastTheQueueOnce) {
-    for (const int order : {0, 1, 2}) {
-        SCOPED_TRACE(order);
-        StarvingTrace ring;
-        std::int64_t held = 0;
-        const auto jumped = [&](std::int64_t advance_ms) { ring.request(advance_ms, -60 * kMs); };
-        if (order == 0) {
-            // The read index shows it before the requests confirm the step.
-            jumped(30);
-            ring.latency(40);
-            jumped(30);
-            jumped(30);
-            ring.latency(40);
-            EXPECT_EQ(ring.trace.clock.take_starvation().first, 1U);
-        } else {
-            for (int i = 0; i < 6; ++i) { jumped(40); }
-            if (order == 2) { held += ring.take(); }
-            ring.latency(40);
-            jumped(40);
-            jumped(40);
-            ring.latency(40);
-        }
-        for (int i = 0; i < 12; ++i) {
-            jumped(40);
-            if (i % 4 == 0) { ring.latency(-20); }
-        }
-        held += ring.take();
-        EXPECT_EQ(held, -60 * kMs);
-    }
-}
-
-// #229 review 12f1f21 P2-3: Pulse raises its target (tlength) when the graph
-// quantum grows; credit then exceeds the old target with a healthy queue.
-// Starvation comes from the server's read index, not credit against a cached
-// target, so nothing is reported and at most the one credit step reaches the
-// router (12f1f21: a false starvation of -60 ms, then -60 ms more).
-TEST(AudioPipelineSinkBackend, PulseReadClockReportsNoStarvationWhenPulseRaisesItsTarget) {
-    StarvingTrace ring;
-    for (int i = 0; i < 16; ++i) {
-        ring.trace.read_ms += 40;
-        ring.trace.clock.submitted(ring.write_end());
-        // 20 ms queued; 160 ms target instead of 100 ms (11,520 bytes more).
-        ring.trace.clock.requested(4'096 + 11'520, ring.trace.read_ms * kMs);
-        ring.plan();
-        if (i % 3 == 0) { ring.latency(-20); }
-    }
-    EXPECT_EQ(ring.trace.clock.take_starvation().first, 0U);
-    EXPECT_GE(ring.take(), -60 * kMs);
+    EXPECT_EQ(drift, 10'000'000);
 }
 
 TEST(AudioPipelineSinkBackend, DeviceRateEstimateFollowsTheSinkClockBetweenHolds) {
@@ -7772,309 +7489,6 @@ TEST(AudioPipelineSinkBackend, DeviceRateEstimateFollowsTheSinkClockBetweenHolds
     rate.sample(60'500'000'000, 0);
     for (std::int64_t s = 61; s <= 120; ++s) { rate.sample(s * 1'000'000'000, 9'000'000'000 + s * 999'900'000); }
     EXPECT_NEAR(rate.ppm(), 100.0, 15.0);
-}
-
-namespace {
-
-// A Pulse ring buffer with the production read clock and its hand-over to
-// the router (as GstSink drives it). The server reads 1,024-frame quanta at
-// 48 kHz from the first chunk's slot, grants credit after each quantum, sends
-// its read index in timing updates (libpulse's: 10 ms apart, doubling to
-// 1.5 s), and stands still for each pause's length from its start (reader
-// time without the pauses). A write waits while the ring (tlength, about 117
-// ms) is full. The completion callback of one that waited across a pause can
-// take `completion_delay` (after the write returned, before the router's next
-// step), with requests arriving meanwhile. Bytes the reader passes before
-// they are written are read dry.
-struct PulseRingModel final {
-    static constexpr std::int64_t kRate = 192'000;
-    static constexpr std::int64_t kQuantum = 4'096;
-    static constexpr std::int64_t kTarget = 22'528;
-
-    struct Pause {
-        std::int64_t at;
-        std::int64_t ns;
-    };
-
-    std::int64_t* clock;
-    aa::audio::detail::PulseReadClock read_clock{};
-    std::vector<Pause> pauses{};
-    // Hide this many fallback holds from the clock (a hold it cannot see).
-    int unseen_holds{};
-    std::int64_t next_latency{};
-    std::int64_t latency_interval{10 * kMs};
-    bool delay_completion{};
-    std::int64_t gaps{};
-    std::int64_t pts_hold{};
-    std::int64_t credited_written{};
-    bool stale_credit{};
-    std::int64_t hole_start{};
-    std::int64_t hole_end{};
-    std::optional<std::int64_t> origin{};
-    std::int64_t read{};
-    std::int64_t written{};
-    std::int64_t dry{};
-    std::uint64_t holds{};
-    std::int64_t activated_at{-1};
-    // Router plan of the newest write's first byte, and that byte.
-    std::int64_t planned{};
-    std::int64_t planned_byte{};
-
-    [[nodiscard]] std::int64_t reaches(std::int64_t byte) const {
-        const auto content = byte * 1'000'000'000 / kRate;
-        auto at = *origin + content;
-        for (const auto& pause : pauses) {
-            if (content > pause.at) { at += pause.ns; }
-        }
-        return at;
-    }
-
-    void advance_to(std::int64_t now) {
-        while (origin && reaches(read + kQuantum) <= now) {
-            const auto at = reaches(read + kQuantum);
-            read += kQuantum;
-            if (read > written) { dry += read - std::max(written, read - kQuantum); }
-            // The first credit after a discontinuous write was computed
-            // before the server had it.
-            const auto credited = std::exchange(stale_credit, false) ? credited_written : written;
-            credited_written = written;
-            read_clock.requested(kTarget - (credited - read), at);
-            if (at >= next_latency) {
-                read_clock.read_position(read, at);
-                next_latency = at + latency_interval;
-                latency_interval = std::min(latency_interval * 2, 1'500 * kMs);
-            }
-        }
-    }
-
-    // Residual: when the router plans the newest write minus when it plays.
-    [[nodiscard]] std::int64_t residual() const { return planned - reaches(planned_byte); }
-
-    void attach(RecordingSinkState& state) {
-        state.on_hold = [this](aa::core::Nanoseconds by) {
-            if (!read_clock.active()) {
-                if (unseen_holds > 0) { --unseen_holds; } else { read_clock.fallback_held(by.count); }
-            }
-            ++holds;
-            pts_hold += by.count;
-            return true;
-        };
-        state.on_write = [this, &state](const aa::audio::MixedChunk& chunk) {
-            const auto bytes = static_cast<std::int64_t>(chunk.pcm.size());
-            const auto duration = bytes / 4 * 1'000'000'000 / 48'000;
-            if (!origin) {
-                origin = chunk.timestamp.count;
-                next_latency = *origin;
-                read_clock.reset(kRate);
-            }
-            advance_to(*clock);
-            const auto entered = *clock;
-            // A hole the stamps skipped is charged to the server's credit but
-            // not to the writer: pulsesink's own ring takes the audio after it.
-            const auto unread_hole = [this] {
-                return std::clamp(hole_end - std::max(read, hole_start), std::int64_t{0}, hole_end - hole_start);
-            };
-            while (written + bytes - read - unread_hole() > kTarget) {
-                *clock = std::max(*clock, reaches(read + kQuantum));
-                advance_to(*clock);
-            }
-            const bool across_pause = std::any_of(pauses.begin(), pauses.end(), [&](const Pause& pause) {
-                const auto start = *origin + pause.at;
-                return entered < start + pause.ns && *clock > start;
-            });
-            delay_completion = delay_completion || (across_pause && *clock > entered);
-            // GstSink's stamp (a hold keeps it contiguous) and ingress move:
-            // a late buffer goes 60 ms past the reader.
-            auto pts = chunk.timestamp.count - pts_hold - *origin;
-            const auto late = *clock - chunk.timestamp.count;
-            if (read_clock.active() && late > 5 * kMs && read_clock.is_playing(*clock)) {
-                const auto move = late + 60 * kMs;
-                pts += move;
-                state.timing.moved.count += move;
-            }
-            // A stamp more than 1 ms past where the stream left off is marked
-            // DISCONT, and pulsesink writes it at its own offset.
-            const auto at = pts * kRate / 1'000'000'000 / 4 * 4;
-            if (at - written > kRate / 1'000) {
-                gaps += at - written;
-                hole_start = written;
-                hole_end = at;
-                credited_written = written;
-                stale_credit = true;
-                written = at;
-            }
-            planned_byte = written;
-            written += bytes;
-            read_clock.submitted(planned_byte, written);
-            const bool on_time = *clock <= chunk.timestamp.count + duration;
-            const bool was_active = read_clock.active();
-            state.handles_late_slots = read_clock.activate(on_time);
-            if (!was_active && state.handles_late_slots) { activated_at = *clock - *origin; }
-            const auto timing = read_clock.take_adjustment();
-            state.timing.held.count += timing.held.count;
-            state.timing.drift.count += timing.drift.count;
-            const auto [starvations, starved] = read_clock.take_starvation();
-            state.timing.starvations += starvations;
-            state.timing.starved.count += starved;
-            planned = chunk.timestamp.count + state.timing.moved.count + timing.held.count + timing.drift.count;
-            read_clock.scheduled(planned + duration);
-        };
-    }
-};
-
-struct WarmupPauseRun {
-    std::uint64_t retimes{};
-    std::int64_t held{};
-    std::int64_t residual{};
-    std::int64_t dry{};
-    std::int64_t activated_at{};
-    std::uint64_t starvations{};
-    std::int64_t dry_at_30s{};
-};
-
-struct WarmupPauseOptions {
-    std::vector<PulseRingModel::Pause> pauses{};
-    std::int64_t completion_delay{};
-    int unseen_holds{};
-    std::int64_t seconds{15};
-};
-
-WarmupPauseRun run_warmup_pause(const WarmupPauseOptions& options) {
-    std::int64_t clock = 0;
-    PulseRingModel ring{&clock};
-    WiredRoute route{{}, [&clock, &ring, &options](aa::audio::RouterConfig& config) {
-        config.clock = [&clock] { return aa::core::Nanoseconds{clock}; };
-        config.on_write_completed = [inner = config.on_write_completed, &clock, &ring,
-                                     &options](const aa::audio::WriteCompletion& value) {
-            inner(value);
-            if (std::exchange(ring.delay_completion, false)) {
-                clock += options.completion_delay;
-                ring.advance_to(clock);
-            }
-        };
-    }};
-    EXPECT_TRUE(route.router);
-    if (!route.router) { return {}; }
-    ring.pauses = options.pauses;
-    ring.unseen_holds = options.unseen_holds;
-    const auto seconds = options.seconds;
-    const auto unseen_holds = options.unseen_holds;
-    ring.attach(*route.sink);
-    std::int64_t next = 0;
-    const auto run_to = [&](std::int64_t chunk) {
-        while (next < chunk) {
-            clock = std::max(clock, route.start + next * kA26ChunkNs);
-            do { EXPECT_TRUE(route.submit_media(next * kA26ChunkNs)); }
-            while (++next < chunk && route.start + next * kA26ChunkNs <= clock);
-            EXPECT_TRUE(route.drain());
-        }
-    };
-    WarmupPauseRun run;
-    for (std::int64_t s = 1; s <= seconds; ++s) {
-        run_to(s * 1'000 * kMs / kA26ChunkNs);
-        if (s == 30) { run.dry_at_30s = ring.dry * 1'000'000'000 / PulseRingModel::kRate; }
-        if (std::getenv("AA_RING_TRACE")) {
-            std::cout << "RING s=" << s << " dry_ms=" << ring.dry * 1'000 / PulseRingModel::kRate
-                      << " residual_ms=" << ring.residual() / kMs << " starv="
-                      << route.stats().playout_sink_starvations << " depth_ms="
-                      << route.stats().playout_depth.count / kMs << '\n';
-        }
-    }
-    const auto events = route.router->take_playout_events();
-    for (const auto& event : events) {
-        if (event.kind != aa::audio::PlayoutEvent::Kind::retime) { continue; }
-        ++run.retimes;
-        run.held += event.held.count;
-    }
-    run.residual = ring.residual();
-    run.dry = ring.dry * 1'000'000'000 / PulseRingModel::kRate;
-    run.activated_at = ring.activated_at;
-    run.starvations = route.stats().playout_sink_starvations;
-    if (unseen_holds == 0) {
-        expect_nothing_lost(route);
-        EXPECT_EQ(route.stats().playout_underruns, 0U);
-        // A writer that stalls after the blocked write returned lets the
-        // queue run down meanwhile; the fallback keeps that part of its
-        // shift out of the hold, and the stamps skip ahead by it (silence,
-        // nothing lost).
-        EXPECT_LE(ring.gaps * 1'000'000'000 / PulseRingModel::kRate, options.completion_delay + 10 * kMs);
-    }
-    return run;
-}
-
-} // namespace
-
-// #229 P1: a pause while the read clock warms up was held by the fallback
-// and then confirmed again by the read clock once it took over. The phantom
-// backlog drained the real queue to nothing: silence, every counter at 0.
-// #229 P1(b): should the router's schedule ever run ahead of the reader by
-// more than its depth (here a fallback hold the clock never hears of), the
-// ring starves silently. It is reported, the schedule moves onto the reader
-// and audio resumes, instead of silence with every counter at 0.
-TEST_F(AudioPipelineRoute, WiredDefaultsReportAndRecoverAStarvedPulseRing) {
-    const auto run = run_warmup_pause({{{100 * kMs, 300 * kMs}}, 0, 1, 45});
-    EXPECT_GE(run.starvations, 1U);
-    EXPECT_GT(run.dry, 0);
-    // Audio came back: no more dry reads after the first 30 s.
-    EXPECT_EQ(run.dry, run.dry_at_30s);
-    // The heal measures against the newest write, not the byte the reader
-    // passed: up to about a chunk of A/V error stays, flagged by
-    // playout_sink_starvations.
-    EXPECT_LE(std::abs(run.residual), 50 * kMs);
-}
-
-// The write-lateness fallback's estimate of a warm-up pause stands as a
-// residual: docs/wired-live-qa.md bounds it at 50 ms. Once the read clock is
-// active its own measurement holds the residual to 10 ms.
-constexpr std::int64_t kFallbackResidualNs = 50 * kMs;
-
-void expect_one_warmup_hold(const WarmupPauseOptions& options, std::int64_t held_ms,
-                            std::int64_t activated_at) {
-    const auto run = run_warmup_pause(options);
-    const bool after_activation = options.pauses.front().at > activated_at;
-    if (std::getenv("AA_RING_TRACE")) {
-        std::cout << "WARMUP at_ms=" << options.pauses.front().at / kMs << " pauses=" << options.pauses.size()
-                  << " delay_ms=" << options.completion_delay / kMs << " retimes=" << run.retimes
-                  << " held_ms=" << run.held / kMs << " residual_ms="
-                  << static_cast<double>(run.residual) / 1e6 << '\n';
-    }
-    EXPECT_EQ(run.retimes, options.pauses.size());
-    EXPECT_NEAR(static_cast<double>(run.held) / 1e6, static_cast<double>(held_ms), 60.0);
-    EXPECT_LE(std::abs(run.residual), after_activation ? 10 * kMs : kFallbackResidualNs);
-    EXPECT_EQ(run.dry, 0);
-    EXPECT_EQ(run.starvations, 0U);
-}
-
-TEST_F(AudioPipelineRoute, WiredDefaultsHoldAPauseDuringReadClockWarmUpOnce) {
-    const auto quiet = run_warmup_pause({});
-    EXPECT_EQ(quiet.retimes, 0U);
-    EXPECT_GT(quiet.activated_at, 0);
-    SCOPED_TRACE(quiet.activated_at);
-    // Before the first request, among the first eight, around the first
-    // mapping, between it and activation, and just after activation.
-    for (const std::int64_t at_ms : {5, 30, 100, 150, 165, 175, 185, 200, 240}) {
-        for (const std::int64_t pause_ms : {300, 1'000}) {
-            if (pause_ms == 1'000 && at_ms != 30 && at_ms != 175 && at_ms != 200) { continue; }
-            SCOPED_TRACE(testing::Message() << "pause " << pause_ms << " ms at " << at_ms << " ms");
-            expect_one_warmup_hold({{{at_ms * kMs, pause_ms * kMs}}}, pause_ms, quiet.activated_at);
-        }
-    }
-}
-
-// #229 review 12f1f21 P1 and P2-4 orderings: the blocked write returns 90 ms
-// after the resume, with requests arriving meanwhile (12f1f21 took them as a
-// pre-pause baseline and undid the hold), and two pauses during warm-up.
-TEST_F(AudioPipelineRoute, WiredDefaultsHoldWarmUpPausesOnceWhateverRequestsPrecedeTheHold) {
-    const auto quiet = run_warmup_pause({});
-    for (const std::int64_t at_ms : {5, 30, 100, 165, 200}) {
-        SCOPED_TRACE(testing::Message() << "90 ms completion delay, pause at " << at_ms << " ms");
-        expect_one_warmup_hold({{{at_ms * kMs, 300 * kMs}}, 90 * kMs}, 300, quiet.activated_at);
-    }
-    for (const std::int64_t second_ms : {60, 110, 150}) {
-        SCOPED_TRACE(testing::Message() << "two pauses, the second at " << second_ms << " ms");
-        expect_one_warmup_hold({{{20 * kMs, 256 * kMs}, {second_ms * kMs, 256 * kMs}}}, 512,
-                               quiet.activated_at);
-    }
 }
 
 // A sink that cannot hold still cascades after a pause (as d0c5b41 did with

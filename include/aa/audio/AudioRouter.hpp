@@ -536,6 +536,8 @@ struct RouterStats final {
     std::uint64_t playout_sink_starvations{};
     core::Nanoseconds playout_sink_starved{};
     std::uint64_t playout_sink_suspends{};
+    std::uint64_t playout_sink_disruptions{};
+    std::uint64_t playout_sink_late_frames{};
     // Committed offset above the shedding threshold, even when the buffer
     // minimum prevents additional shedding.
     std::uint64_t playout_shed_residual_chunks{};

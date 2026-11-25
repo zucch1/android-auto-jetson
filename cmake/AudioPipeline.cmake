@@ -29,13 +29,14 @@ endif()
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(AA_AUDIO_GST REQUIRED IMPORTED_TARGET
     NO_CMAKE_PATH NO_CMAKE_ENVIRONMENT_PATH
-    gstreamer-1.0 gstreamer-app-1.0)
+    gstreamer-1.0 gstreamer-app-1.0 libpipewire-0.3)
 
 set(AA_AUDIO_SOURCES
     src/audio/AudioMix.cpp
     src/audio/RateCorrection.cpp
     src/audio/AudioRouter.cpp
     src/audio/gstreamer_adapter/GstAudioDecoder.cpp
+    src/audio/gstreamer_adapter/GraphClock.cpp
     src/audio/gstreamer_adapter/GstAudioSink.cpp)
 set(AA_AUDIO_TEST_SOURCES
     tests/audio/audio_pipeline_test.cpp)
