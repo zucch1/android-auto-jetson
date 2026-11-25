@@ -26,6 +26,7 @@ struct GraphClock::Observer {
     GraphCycles cycles;
     ReaderPhase phase;
     std::int64_t last_ns{}, last_tick{}, last_period{};
+    std::int32_t driver{-1};
     bool started{};
 
     static void profile(void* data, const spa_pod* pod) {
@@ -37,14 +38,15 @@ struct GraphClock::Observer {
             spa_fraction rate{};
             std::int64_t position{}, duration{}, ns{};
             int status = -1;
+            std::int32_t driver_id = -1;
             std::int64_t follower_signal{}, follower_finish{};
             spa_pod_prop* field;
             SPA_POD_OBJECT_FOREACH(reinterpret_cast<spa_pod_object*>(object), field) {
                 if (field->key == SPA_PROFILER_clock) {
-                    int32_t flags{}, id{};
-                    const char* driver{};
-                    if (spa_pod_parse_struct(&field->value, SPA_POD_Int(&flags), SPA_POD_Int(&id),
-                        SPA_POD_String(&driver), SPA_POD_Long(&ns), SPA_POD_Fraction(&rate),
+                    int32_t flags{};
+                    const char* driver_name{};
+                    if (spa_pod_parse_struct(&field->value, SPA_POD_Int(&flags), SPA_POD_Int(&driver_id),
+                        SPA_POD_String(&driver_name), SPA_POD_Long(&ns), SPA_POD_Fraction(&rate),
                         SPA_POD_Long(&position), SPA_POD_Long(&duration)) < 0) { duration = 0; }
                 } else if (field->key == SPA_PROFILER_followerBlock) {
                     int32_t id{}, state{};
@@ -65,7 +67,17 @@ struct GraphClock::Observer {
             self.clock.quantum_ns = period;
             const auto ticks = position / rate.denom * 1'000'000'000
                 + position % rate.denom * 1'000'000'000 / rate.denom;
-            if (self.last_period && (period != self.last_period || ns - self.last_ns - (ticks - self.last_tick) > self.last_period
+            if (self.clock.restart.exchange(false)) { self.phase = {}; }
+            if (driver_id != self.driver) {
+                if (self.driver >= 0) {
+                    self.cycles = {};
+                    self.phase.new_driver();
+                }
+                self.driver = driver_id;
+                self.last_period = 0;
+            }
+            if (self.last_period && (period != self.last_period
+                || std::abs(ns - self.last_ns - (ticks - self.last_tick)) > self.last_period
                 || follower_signal > ns + 2 * period)) {
                 self.phase.ambiguous_epoch(std::max(ns, follower_signal));
             }
@@ -145,6 +157,7 @@ struct GraphClock::Observer {
             self.cycles = {};
             self.phase = {};
             self.last_period = 0;
+            self.driver = -1;
             {
                 std::lock_guard lock(self.clock.reader.mutex);
                 self.clock.reader.sample.reset();

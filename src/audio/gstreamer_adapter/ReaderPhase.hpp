@@ -10,11 +10,13 @@ namespace aa::audio::detail {
 
 // Where the Pulse reader lies on the driver's timeline.
 //
-// A sample the follower reads in a cycle is presented a fixed number of
-// periods later, so while every cycle completes the presentation delay moves
-// only with the driver: its time against its ticks, and the period. That gives
-// the displacement of a driver stall, restart or new quantum as soon as the
-// driver runs evenly again.
+// A sample the follower reads in a cycle is presented one period after it, so
+// while every cycle completes the presentation delay moves only with the
+// driver: its time against the frames read, and the period. A driver counts a
+// period's ticks when it starts, so ticks lead the frames read by a period.
+// That gives the displacement of a driver stall, restart or new quantum as
+// soon as the driver runs evenly again, within the periods a burst after the
+// stall leaves unclear.
 //
 // A Pulse latency reply measures the same thing independently: the endpoint
 // read through the period it was sampled in, against that period. Replies are
@@ -42,6 +44,16 @@ public:
         if (!ambiguous_since_) { ambiguous_since_ = at; }
         settled_ = 0;
         agreeing_ = 0;
+    }
+    // Another driver: its ticks do not continue the last one's, so only the
+    // read endpoint, which is paired with time alone, can tell the step.
+    void new_driver() {
+        previous_.reset();
+        shape_.reset();
+        ambiguous_since_.reset();
+        missed_ = 0;
+        agreeing_ = 0;
+        verify_ = true;
     }
     bool reconciling() const { return ambiguous_since_.has_value() && shape_.has_value(); }
 

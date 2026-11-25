@@ -2705,6 +2705,7 @@ struct RecordingSinkState final {
     aa::audio::detail::SinkTimingAdjustment timing{};
     bool handles_late_slots{};
     bool compression_safe{true};
+    aa::core::Nanoseconds reader_depth{}, arrival_margin{};
     std::optional<aa::core::Nanoseconds> playback_slot{};
     aa::audio::PlaybackSlotAbsence slot_absence{aa::audio::PlaybackSlotAbsence::unavailable};
 };
@@ -2745,6 +2746,8 @@ public:
         return std::exchange(state->timing, {});
     }
     bool compression_safe() const override { return state->compression_safe; }
+    aa::core::Nanoseconds reader_depth() const override { return state->reader_depth; }
+    aa::core::Nanoseconds arrival_margin() const override { return state->arrival_margin; }
     bool handles_late_slots() const override { return state->handles_late_slots; }
     bool hold_stream(aa::core::Nanoseconds by) override {
         return state->on_hold ? state->on_hold(by) : false;
@@ -7460,28 +7463,165 @@ TEST_F(AudioPipelineRoute, LowWriteLeadStopsActiveHoldRecovery) {
     expect_nothing_lost(route);
 }
 
-TEST(AudioPipelineSinkBackend, DriverStallAndQuantumChangeReconcileFromThePulseEndpoint) {
-    using aa::audio::detail::ReaderPhase;
-    // A driver catches up with several callbacks in quick succession. Their
-    // apparent missed periods do not establish how many samples Pulse read.
-    for (const auto new_period : {20 * kMs, 40 * kMs}) {
-        ReaderPhase phase;
-        const auto old_period = 20 * kMs;
-        phase.cycle(0, 0, old_period, {});
-        phase.cycle(old_period, old_period, old_period, ReaderPhase::Read{5 * kMs, old_period});
-        phase.cycle(2 * old_period, 2 * old_period, old_period, ReaderPhase::Read{25 * kMs, 2 * old_period});
-        phase.ambiguous_epoch(300 * kMs);
-        ASSERT_TRUE(phase.reconciling());
-        phase.cycle(400 * kMs, 400 * kMs, new_period, {});
-        // One old period consumed before the stop, one new period after it.
-        const ReaderPhase::Read after{405 * kMs, old_period + new_period};
-        EXPECT_EQ(phase.cycle(400 * kMs + new_period, 400 * kMs + new_period, new_period, after), 0);
-        const ReaderPhase::Read confirmed{after.at + new_period, after.endpoint_ns + new_period};
-        EXPECT_EQ(phase.cycle(400 * kMs + 2 * new_period, 400 * kMs + 2 * new_period, new_period, confirmed),
-                  400 * kMs + new_period - 2 * old_period);
-        EXPECT_FALSE(phase.reconciling());
-        EXPECT_EQ(phase.cycle(400 * kMs + 3 * new_period, 400 * kMs + 3 * new_period, new_period, confirmed), 0);
+TEST_F(AudioPipelineRoute, WiredDepthFollowsWhatTheMeasuredReaderNeeds) {
+    // Anchored at the configured 60 ms, a reader 90 ms ahead of the device
+    // found the ring empty, and draining to 60 ms emptied it again (#229).
+    WiredRoute route;
+    ASSERT_TRUE(route.router);
+    route.sink->handles_late_slots = true;
+    route.sink->reader_depth.count = 90 * kMs;
+    route.sink->arrival_margin.count = 20 * kMs;
+    route.sink->on_hold = [](aa::core::Nanoseconds) { return true; };
+    ASSERT_TRUE(route.media(0));
+    EXPECT_EQ(route.stats().playout_offset.count, 110 * kMs);
+    route.sink->timing.held.count = 300 * kMs;
+    for (int i = 1; i < 600; ++i) { ASSERT_TRUE(route.media(i * kA26ChunkNs)); }
+    EXPECT_GT(route.stats().frames_compressed, 0U);
+    EXPECT_GE(route.stats().playout_offset.count, 90 * kMs);
+    EXPECT_LE(route.stats().playout_offset.count, 103 * kMs); // the drain's dead band
+    expect_nothing_lost(route);
+}
+
+TEST_F(AudioPipelineRoute, StarvationEndsHoldRecovery) {
+    WiredRoute route;
+    ASSERT_TRUE(route.router);
+    route.sink->handles_late_slots = true;
+    route.sink->on_hold = [](aa::core::Nanoseconds) { return true; };
+    ASSERT_TRUE(route.media(0));
+    route.sink->timing.held.count = 120 * kMs;
+    for (int i = 1; i < 60; ++i) { ASSERT_TRUE(route.media(i * kA26ChunkNs)); }
+    const auto before = route.stats().frames_compressed;
+    ASSERT_GT(before, 0U);
+    route.sink->timing.starvations = 1;
+    route.sink->timing.moved.count = 60 * kMs;
+    for (int i = 60; i < 110; ++i) { ASSERT_TRUE(route.media(i * kA26ChunkNs)); }
+    // The ordinary drain stays below 1%, the recovery ran at up to 2%.
+    const auto after = route.stats().frames_compressed - before;
+    EXPECT_LT(after, 50U * kA26Frames / 100);
+    expect_nothing_lost(route);
+}
+
+namespace {
+// A 20 ms driver read by a follower that takes part in every cycle.
+struct PhaseRig final {
+    aa::audio::detail::ReaderPhase phase;
+    std::int64_t at{}, tick{}, period{20 * kMs}, read{};
+    std::int64_t moved{};
+    int steps{};
+
+    void cycle(bool sampled, bool completed = true, bool relocking = false) {
+        tick += period; // a driver counts the period it starts
+        std::optional<aa::audio::detail::ReaderPhase::Read> sample;
+        if (sampled) { sample = aa::audio::detail::ReaderPhase::Read{at - period / 2, read}; }
+        const auto change = phase.cycle({at, tick, period, completed, !completed, at + 100'000}, relocking, sample);
+        moved += change.step + change.drift;
+        steps += change.step != 0;
+        if (completed) { read += period; }
+        at += period;
     }
+    void run(int cycles) { for (int i = 0; i < cycles; ++i) { cycle(i % 10 == 9); } }
+};
+}
+
+TEST(AudioPipelineSinkBackend, ADriverStallMovesTheReaderOnceByTheTimeItStoodStill) {
+    PhaseRig rig;
+    rig.run(100);
+    EXPECT_EQ(rig.moved, 0);
+    rig.at += 300 * kMs;
+    rig.phase.ambiguous_epoch(rig.at);
+    EXPECT_TRUE(rig.phase.reconciling());
+    rig.run(9);
+    // Known long before a second latency reply.
+    EXPECT_EQ(rig.moved, 300 * kMs);
+    EXPECT_FALSE(rig.phase.reconciling());
+    rig.run(200);
+    EXPECT_EQ(rig.moved, 300 * kMs);
+    EXPECT_EQ(rig.steps, 1);
+}
+
+TEST(AudioPipelineSinkBackend, AQuantumChangeMovesTheReaderByTheNewPeriodsPresentation) {
+    for (const auto period : {10 * kMs, 40 * kMs}) {
+        PhaseRig rig;
+        rig.run(100);
+        rig.period = period;
+        rig.phase.ambiguous_epoch(rig.at);
+        rig.run(200);
+        EXPECT_EQ(rig.moved, period - 20 * kMs);
+        EXPECT_EQ(rig.steps, 1);
+    }
+}
+
+TEST(AudioPipelineSinkBackend, APauseAcrossAQuantumChangeCountsItsMissedPeriods) {
+    PhaseRig rig;
+    rig.run(100);
+    for (int i = 0; i < 4; ++i) { rig.cycle(false, false); }
+    rig.period = 40 * kMs;
+    rig.phase.ambiguous_epoch(rig.at);
+    for (int i = 0; i < 2; ++i) { rig.cycle(false, false); }
+    rig.run(200);
+    EXPECT_EQ(rig.moved, 4 * 20 * kMs + 2 * 40 * kMs + 20 * kMs);
+    EXPECT_EQ(rig.steps, 1);
+}
+
+TEST(AudioPipelineSinkBackend, PulseEndpointClosesWhatTheCycleRecordsLeftOut) {
+    PhaseRig rig;
+    rig.run(100);
+    // A period the records show as complete was never read.
+    rig.read -= rig.period;
+    rig.run(9);
+    EXPECT_EQ(rig.moved, 0);
+    rig.run(40);
+    EXPECT_EQ(rig.moved, 20 * kMs);
+    EXPECT_EQ(rig.steps, 0);
+    rig.run(200);
+    EXPECT_EQ(rig.moved, 20 * kMs);
+    // After a step taken from cycle records, two agreeing replies suffice.
+    rig.at += 300 * kMs;
+    rig.phase.ambiguous_epoch(rig.at);
+    rig.read -= rig.period;
+    rig.run(20);
+    EXPECT_EQ(rig.moved, (20 + 300 + 20) * kMs);
+    EXPECT_EQ(rig.steps, 1);
+}
+
+TEST(AudioPipelineSinkBackend, ALoneDisagreeingEndpointMovesNothing) {
+    PhaseRig rig;
+    rig.run(100);
+    // The reply crossed the server's process completion.
+    rig.read -= rig.period;
+    rig.cycle(true);
+    rig.read += rig.period;
+    rig.run(100);
+    EXPECT_EQ(rig.moved, 0);
+}
+
+TEST(AudioPipelineSinkBackend, ADriverThatNeverRunsEvenlyAgainStopsWithholdingHolds) {
+    PhaseRig rig;
+    rig.run(100);
+    rig.phase.ambiguous_epoch(rig.at);
+    for (int i = 0; i < 400; ++i) {
+        rig.at += 20 * kMs; // every other period lost
+        rig.cycle(false);
+    }
+    EXPECT_FALSE(rig.phase.reconciling());
+}
+
+TEST(AudioPipelineSinkBackend, AHoldIsTheElapsedTimeWhileTheDriverRefillsItsDevice) {
+    aa::audio::detail::GraphCycles cycles;
+    std::int64_t position = 0, ns = 0, held = 0, drift = 0;
+    const auto step = [&](int state, std::int64_t elapsed) {
+        const auto change = cycles.observe(position, 480, 48000, state, ns);
+        held += change.held_ns;
+        drift += change.drift_ns;
+        position += 480;
+        ns += elapsed;
+    };
+    for (int i = 0; i < 50; ++i) { step(3, 10'000'000); }
+    // 100 missed 10 ms periods in 980 ms.
+    for (int i = 0; i < 100; ++i) { step(1, 9'800'000); }
+    step(3, 10'000'000);
+    EXPECT_EQ(held, 980'000'000);
+    EXPECT_EQ(drift, 0);
 }
 
 TEST(AudioPipelineSinkBackend, GraphCyclesCountOnlyConsecutiveUnfinishedPlaybackCycles) {

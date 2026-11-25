@@ -992,6 +992,7 @@ public:
             started_audio_ = true;
             graph_timing_ = graph_ && graph_->available;
             if (graph_) {
+                graph_->restart = true;
                 graph_->held = 0;
                 graph_->drift = 0;
                 graph_->disruptions = 0;
