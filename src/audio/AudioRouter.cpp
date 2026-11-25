@@ -577,7 +577,6 @@ struct AudioRouter::Impl final {
             / static_cast<double>(config.output_format.sample_rate_hz);
         state.rate_ppm += std::clamp(wanted - state.rate_ppm, -slew, slew);
         if (sink && !sink->compression_safe()) {
-            state.recovering_from_hold = false;
             state.rate_ppm = std::min(0.0, state.rate_ppm);
             state.rate_carry = std::min(0.0, state.rate_carry);
         }
@@ -2219,6 +2218,9 @@ core::Result<RenderStep> AudioRouter::render_step() {
     bool retimed = std::exchange(impl_->retimed, false);
     if (impl_->lossless()) {
         const auto timing = impl_->sink->take_timing_adjustment();
+        if (timing.starvations || timing.moved.count > 0) {
+            impl_->playout[role_index(Role::media)].recovering_from_hold = false;
+        }
         impl_->report.stats.playout_sink_starvations += timing.starvations;
         impl_->report.stats.playout_sink_starved.count += timing.starved.count;
         impl_->report.stats.playout_sink_suspends += timing.suspends;

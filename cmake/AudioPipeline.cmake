@@ -30,8 +30,9 @@ find_package(PkgConfig REQUIRED)
 if(CMAKE_CROSSCOMPILING)
     # Decode can use a GStreamer-only overlay. Audio also needs PipeWire
     # from the same validated provider, including its transitive metadata.
-    pkg_check_modules(AA_AUDIO_PW QUIET NO_CMAKE_PATH NO_CMAKE_ENVIRONMENT_PATH libpipewire-0.3)
-    if(NOT AA_AUDIO_PW_FOUND)
+    execute_process(COMMAND "${PKG_CONFIG_EXECUTABLE}" --exists libpipewire-0.3
+        RESULT_VARIABLE _aa_audio_pipewire_status)
+    if(NOT _aa_audio_pipewire_status EQUAL 0)
         message(STATUS "Audio pipeline: UNAVAILABLE (target PipeWire development metadata missing)")
         return()
     endif()

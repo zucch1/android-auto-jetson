@@ -24,7 +24,7 @@ public:
     const std::string name;
     Reader& reader;
     std::atomic<std::int64_t> quantum_ns{};
-    std::atomic<bool> available{};
+    std::atomic<bool> available{}, driver_relocking{};
     std::atomic<std::int64_t> held{}, drift{};
     std::atomic<std::uint64_t> disruptions{}, suspends{}, suspend_loss_frames{};
 private:

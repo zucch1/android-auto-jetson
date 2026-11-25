@@ -7554,6 +7554,26 @@ TEST(AudioPipelineSinkBackend, SlowGraphRateSlewsWallTimeWithoutRetiming) {
     EXPECT_EQ(drift, 10'000'000);
 }
 
+TEST(AudioPipelineSinkBackend, DriverRecoveryCountsTheClockProgressAlreadyDrainingTheHold) {
+    aa::audio::detail::GraphCycles cycles;
+    cycles.follow_driver();
+    std::int64_t moved = 0;
+    for (int i = 0; i <= 100; ++i) {
+        const auto progress = cycles.observe(i * 480, 480, 48000, 3, i * 9'800'000LL);
+        moved += progress.drift_ns;
+        EXPECT_EQ(progress.held_ns, 0);
+    }
+    EXPECT_LT(moved, -15'000'000);
+    EXPECT_GE(moved, -20'000'000);
+    EXPECT_TRUE(cycles.relocking());
+    for (int i = 1; i <= 250; ++i) {
+        const auto progress = cycles.observe((100 + i) * 480, 480, 48000, 3, 980'000'000LL + i * 10'000'000LL);
+        moved += progress.drift_ns;
+    }
+    EXPECT_EQ(moved, -20'000'000);
+    EXPECT_FALSE(cycles.relocking());
+}
+
 TEST(AudioPipelineSinkBackend, DeviceRateEstimateFollowsTheSinkClockBetweenHolds) {
     aa::audio::detail::DeviceRateEstimate rate;
     // The device reads 100 ppm slower than monotonic time.

@@ -19,6 +19,15 @@ public:
         std::uint64_t suspend_loss_frames{};
     };
 
+    // Some ALSA drivers run faster briefly after an xrun while their PLL
+    // settles. Count that measured progress against the hold exactly once.
+    void follow_driver() {
+        relocking_ = true;
+        stable_ns_ = 0;
+        reference_.reset();
+    }
+    bool relocking() const { return relocking_; }
+
     void suspend() { resuming_ = expected_time_.has_value(); }
 
     Change observe(std::int64_t position, std::int64_t frames, std::uint32_t rate, int state,
@@ -59,12 +68,17 @@ public:
         // no part. Move the phase at most 500 ppm, in one-second windows.
         if (!reference_ || change.discontinuity || ns < reference_->time) {
             reference_ = Reference{position, ns, 0};
-        } else if (ns - reference_->time >= 1'000'000'000) {
+        } else if (ns - reference_->time >= (relocking_ ? 250'000'000 : 1'000'000'000)) {
             const auto elapsed = ns - reference_->time;
             const auto ticks = position - reference_->position;
             const auto nominal = ticks / rate * 1'000'000'000 + ticks % rate * 1'000'000'000 / rate;
             const auto error = elapsed - nominal + reference_->residual;
-            if (std::abs(error) <= 40'000'000) {
+            if (relocking_ && std::abs(error) <= elapsed / 8) {
+                change.drift_ns = error;
+                reference_ = Reference{position, ns, 0};
+                stable_ns_ = std::abs(error) <= elapsed / 2000 ? stable_ns_ + elapsed : 0;
+                if (stable_ns_ >= 2'000'000'000) { relocking_ = false; }
+            } else if (std::abs(error) <= 40'000'000) {
                 change.drift_ns = std::clamp(error, -elapsed / 2000, elapsed / 2000);
                 reference_ = Reference{position, ns, error - change.drift_ns};
             } else {
@@ -95,6 +109,7 @@ private:
     std::uint32_t previous_rate_{};
     unsigned missed_cycles_{};
     std::optional<std::int64_t> expected_time_;
-    bool resuming_{};
+    bool resuming_{}, relocking_{};
+    std::int64_t stable_ns_{};
 };
 }

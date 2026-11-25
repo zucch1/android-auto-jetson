@@ -3,7 +3,6 @@
 
 #include <cstdint>
 #include <optional>
-#include <cstdlib>
 
 namespace aa::audio::detail {
 

@@ -74,8 +74,12 @@ struct GraphClock::Observer {
                 sample = self.clock.reader.sample;
             }
             const auto uncertain = self.phase.reconciling();
-            const auto reconciled = self.phase.cycle(ns, period, sample);
-            if (reconciled) { self.clock.held += reconciled; }
+            const auto reconciled = self.phase.cycle(ns, period,
+                status == 3 && self.sink_running ? sample : std::nullopt);
+            if (reconciled) {
+                self.clock.held += reconciled;
+                self.cycles.follow_driver();
+            }
             const auto change = self.cycles.observe(position, duration, rate.denom, status, ns, self.sink_running);
             if (change.discontinuity) { ++self.clock.disruptions; }
             if (change.suspend_loss_frames) { self.clock.suspend_loss_frames += change.suspend_loss_frames; }
@@ -83,7 +87,9 @@ struct GraphClock::Observer {
             if (change.held_ns && !uncertain) {
                 self.clock.held += change.held_ns;
                 self.phase.held(change.held_ns);
+                self.cycles.follow_driver();
             }
+            self.clock.driver_relocking = self.cycles.relocking() || self.phase.reconciling();
             self.clock.available = true;
         }
     }

@@ -200,6 +200,15 @@ void handoff_log_observer(GstDebugCategory*, GstDebugLevel, const gchar*, const 
     if (object && line.starts_with(latency)
         && std::strcmp(function, "gst_pulsering_stream_latency_cb") == 0) {
         auto fields = line.substr(latency.size());
+        // libpulse timestamps the latency reply in wall time. Convert that
+        // observation to the profiler's monotonic clock before pairing it.
+        std::int64_t stamp{};
+        const auto timestamp = std::from_chars(fields.data(), fields.data() + fields.size(), stamp);
+        if (timestamp.ec != std::errc{} || stamp <= 0) { return; }
+        const auto received = observation_time().count;
+        const auto wall = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+        const auto age = wall - stamp;
         for (int n = 0; n < 2; ++n) {
             const auto comma = fields.find(", ");
             if (comma == fields.npos) { return; }
@@ -222,9 +231,9 @@ void handoff_log_observer(GstDebugCategory*, GstDebugLevel, const gchar*, const 
             tracker.sink_delay_ns = delay_us * 1000;
             const auto endpoint = gst_util_uint64_scale(static_cast<guint64>(index), GST_SECOND,
                 static_cast<guint64>(tracker.pulse_bytes_per_frame) * tracker.pulse_rate);
-            if (endpoint <= G_MAXINT64) {
+            if (endpoint <= G_MAXINT64 && age >= -500'000 && age <= 100'000'000) {
                 std::lock_guard reader_lock(tracker.reader.mutex);
-                tracker.reader.sample = detail::ReaderPhase::Read{observation_time().count,
+                tracker.reader.sample = detail::ReaderPhase::Read{received - age,
                                                                   static_cast<std::int64_t>(endpoint)};
             }
         }
@@ -1118,7 +1127,7 @@ public:
     }
 
     [[nodiscard]] bool compression_safe() const override {
-        return !graph_timing_ || write_lead_ns_.load() > 2 * graph_->quantum_ns.load();
+        return !graph_timing_ || (!graph_->driver_relocking && write_lead_ns_.load() > 2 * graph_->quantum_ns.load());
     }
 
     [[nodiscard]] bool handles_late_slots() const override { return graph_timing_; }
