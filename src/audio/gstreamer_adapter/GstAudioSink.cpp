@@ -18,6 +18,7 @@
 #include "../AudioSinkFactory.hpp"
 #include "DeviceRateEstimate.hpp"
 #include "GraphClock.hpp"
+#include "RecentLow.hpp"
 
 #include <gst/app/gstappsrc.h>
 #include <gst/audio/gstaudiobasesink.h>
@@ -1136,7 +1137,7 @@ public:
     }
 
     [[nodiscard]] bool compression_safe() const override {
-        return !graph_timing_ || (!graph_->driver_relocking && write_lead_ns_.load() > 2 * graph_->quantum_ns.load());
+        return !graph_timing_ || (!graph_->driver_relocking && write_lead_ns_ > 2 * graph_->quantum_ns);
     }
 
     [[nodiscard]] bool handles_late_slots() const override { return graph_timing_; }
@@ -1533,7 +1534,7 @@ private:
             const auto read_frame = std::max(reader_lower_bound(self.sink_element_),
                                              self.handoff_.last_read_byte.load()) / bpf;
             const auto now = observation_time().count;
-            self.write_lead_ns_ = 0;
+            std::int64_t lead = 0;
             const bool underflow = self.handoff_.underflow.exchange(false);
             // next_sample describes the contiguous successor. A discontinuity
             // gets its own absolute offset from GstAudioBaseSink.
@@ -1545,7 +1546,7 @@ private:
                 // estimate conservative until the next observation.
                 const auto write_time = gst_util_uint64_scale(base->next_sample, GST_SECOND, self.format_.sample_rate_hz);
                 if (write_time <= G_MAXINT64) {
-                    self.write_lead_ns_ = static_cast<std::int64_t>(write_time) - self.reader_time(now, read_frame);
+                    lead = static_cast<std::int64_t>(write_time) - self.reader_time(now, read_frame);
                 }
                 if (underflow || behind > 0) {
                     ++self.stream_starvations_;
@@ -1562,6 +1563,8 @@ private:
                         static_cast<guint64>(behind), GST_SECOND, self.format_.sample_rate_hz)) + 60'000'000;
                 }
             }
+            self.write_lead_.sample(now, lead);
+            self.write_lead_ns_ = self.write_lead_.low();
             if (move > 0) {
                 self.ingress_move_ns_ = move;
                 pts += static_cast<GstClockTime>(move);
@@ -1781,7 +1784,9 @@ private:
     bool read_clock_slot_{};
     GstPadChainFunction original_chain_{nullptr};
     GstClockTime last_chain_end_{GST_CLOCK_TIME_NONE};
-    // Pre-write headroom published by the chain thread.
+    // Least headroom before a write over the last writes: of a burst, only
+    // the first one shows how close the reader came. Published by the chain.
+    detail::RecentLow write_lead_;
     std::atomic<std::int64_t> write_lead_ns_{};
     static constexpr std::int64_t kMaxStarvationMarginNs = 60'000'000;
     std::atomic<std::int64_t> starvation_margin_ns_{};

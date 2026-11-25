@@ -19,6 +19,7 @@
 #include "../../src/audio/gstreamer_adapter/DeviceRateEstimate.hpp"
 #include "../../src/audio/gstreamer_adapter/GraphCycles.hpp"
 #include "../../src/audio/gstreamer_adapter/ReaderPhase.hpp"
+#include "../../src/audio/gstreamer_adapter/RecentLow.hpp"
 
 #include <gtest/gtest.h>
 
@@ -7604,6 +7605,17 @@ TEST(AudioPipelineSinkBackend, ADriverThatNeverRunsEvenlyAgainStopsWithholdingHo
         rig.cycle(false);
     }
     EXPECT_FALSE(rig.phase.reconciling());
+}
+
+TEST(AudioPipelineSinkBackend, WriteLeadIsTheLeastOfABurst) {
+    aa::audio::detail::RecentLow low;
+    EXPECT_EQ(low.low(), 0);
+    for (int i = 0; i < 400; ++i) { low.sample(i * kA26ChunkNs, i % 2 ? 60 * kMs : 18 * kMs); }
+    EXPECT_EQ(low.low(), 18 * kMs);
+    for (int i = 400; i < 800; ++i) { low.sample(i * kA26ChunkNs, 60 * kMs); }
+    EXPECT_EQ(low.low(), 60 * kMs);
+    low.sample(801 * kA26ChunkNs, 5 * kMs);
+    EXPECT_EQ(low.low(), 5 * kMs);
 }
 
 TEST(AudioPipelineSinkBackend, AHoldIsTheElapsedTimeWhileTheDriverRefillsItsDevice) {
