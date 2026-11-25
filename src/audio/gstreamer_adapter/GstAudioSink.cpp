@@ -30,6 +30,7 @@
 #include <thread>
 #include <condition_variable>
 #include <cstring>
+#include <functional>
 #include <limits>
 #include <map>
 #include <memory>
@@ -63,6 +64,12 @@ struct SlotWorkerState final {
     std::uint64_t answer_sequence{0};
     GstClockTime request_pts{GST_CLOCK_TIME_NONE};
     PlaybackSlotResult answer{};
+    // Broken read trace (#229 P2-5): the pulsesink's own clock waits on the
+    // Pulse mainloop, so the worker samples it and the write path only ever
+    // reads the newest sample (observation time, device time).
+    bool device_pending{false};
+    std::optional<std::pair<std::int64_t, std::int64_t>> device_sample{};
+    std::function<std::optional<std::int64_t>()> device_clock_for_test{};
 };
 
 } // namespace aa::audio::detail
@@ -158,6 +165,22 @@ void unregister_tracker(GstObject* element) {
     g_trackers.erase(element);
 }
 
+// "<timestamp>, <corrupt>:<write index>, <corrupt>:<read index>, ...": the
+// read index, unless the server marked it corrupt.
+[[nodiscard]] std::optional<std::int64_t> latency_read_index(std::string_view fields) {
+    for (int skip = 0; skip < 2; ++skip) {
+        const auto comma = fields.find(", ");
+        if (comma == std::string_view::npos) { return std::nullopt; }
+        fields.remove_prefix(comma + 2);
+    }
+    if (!fields.starts_with("0:")) { return std::nullopt; }
+    fields.remove_prefix(2);
+    std::int64_t index = 0;
+    const auto parsed = std::from_chars(fields.data(), fields.data() + fields.size(), index);
+    if (parsed.ec != std::errc{} || index < 0) { return std::nullopt; }
+    return index;
+}
+
 void handoff_log_observer(GstDebugCategory*, GstDebugLevel, const gchar*, const gchar* function,
                           gint, GObject* object, GstDebugMessage* message, gpointer) {
     if (function == nullptr) {
@@ -181,25 +204,23 @@ void handoff_log_observer(GstDebugCategory*, GstDebugLevel, const gchar*, const 
         && line.find(offset_prefix) != std::string_view::npos
         && (std::strcmp(function, "gst_pulseringbuffer_commit") == 0
             || std::strcmp(function, "gst_pulsering_flush") == 0);
-    // Stream setup logs the wanted and then the negotiated tlength.
-    constexpr std::string_view target_prefix{"tlength:"};
-    const bool pulse_target = std::strcmp(function, "gst_pulseringbuffer_acquire") == 0
-        && line.starts_with(target_prefix);
+    // Timing updates carry the server's read index: "latency_update,
+    // <timestamp>, <corrupt>:<write index>, <corrupt>:<read index>, ...".
+    constexpr std::string_view latency_prefix{"latency_update, "};
+    const bool pulse_latency = std::strcmp(function, "gst_pulsering_stream_latency_cb") == 0
+        && line.starts_with(latency_prefix);
     const bool pulse_suspended = std::strcmp(function, "gst_pulsering_stream_suspended_cb") == 0
         && line.starts_with("stream suspended");
-    if (object != nullptr && (pulse_target || pulse_suspended)) {
+    if (object != nullptr && (pulse_latency || pulse_suspended)) {
+        const auto now = observation_time().count;
         std::lock_guard lock(g_trackers_mutex);
         const auto entry = g_trackers.find(GST_OBJECT(object));
         if (entry != g_trackers.end() && entry->second->pulse_clock != nullptr) {
             auto& tracker = *entry->second;
             if (pulse_suspended) {
                 tracker.pulse_suspends.fetch_add(1, std::memory_order_relaxed);
-            } else {
-                auto amount = line.substr(target_prefix.size());
-                amount.remove_prefix(std::min(amount.find_first_not_of(' '), amount.size()));
-                std::int64_t bytes = 0;
-                const auto parsed = std::from_chars(amount.data(), amount.data() + amount.size(), bytes);
-                if (parsed.ec == std::errc{} && bytes > 0) { tracker.pulse_clock->set_target_length(bytes); }
+            } else if (const auto read = latency_read_index(line.substr(latency_prefix.size()))) {
+                tracker.pulse_clock->read_position(*read, now);
             }
         }
         return;
@@ -226,7 +247,7 @@ void handoff_log_observer(GstDebugCategory*, GstDebugLevel, const gchar*, const 
                         const auto at = std::from_chars(position.data(), position.data() + position.size(), offset);
                         if (at.ec == std::errc{} && offset >= 0
                             && count <= (INT64_MAX - offset) / tracker.pulse_bytes_per_frame) {
-                            tracker.pulse_clock->submitted(offset + count * tracker.pulse_bytes_per_frame);
+                            tracker.pulse_clock->submitted(offset, offset + count * tracker.pulse_bytes_per_frame);
                         }
                     }
                 }
@@ -665,23 +686,50 @@ constexpr std::chrono::milliseconds kSlotWorkerStopWait{100};
     return {core::Nanoseconds{now.count + delta}, PlaybackSlotAbsence::none};
 }
 
+// The pulsesink's own clock (pa_stream_get_time), which it keeps even with
+// provide-clock off. Reading it waits on the Pulse mainloop: slot worker only.
+[[nodiscard]] std::optional<std::int64_t> read_device_clock(GstElement* element) {
+    if (element == nullptr) { return std::nullopt; }
+    // Only a pulsesink (a GstAudioBaseSink) is sampled.
+    auto* base = reinterpret_cast<GstAudioBaseSink*>(element);
+    GstClock* clock = nullptr;
+    GST_OBJECT_LOCK(element);
+    if (base->provided_clock != nullptr) { clock = GST_CLOCK(gst_object_ref(base->provided_clock)); }
+    GST_OBJECT_UNLOCK(element);
+    if (clock == nullptr) { return std::nullopt; }
+    const auto device = gst_clock_get_time(clock);
+    gst_object_unref(clock);
+    if (!GST_CLOCK_TIME_IS_VALID(device) || device == 0 || device > G_MAXINT64) { return std::nullopt; }
+    return static_cast<std::int64_t>(device);
+}
+
 void run_slot_worker(const std::shared_ptr<detail::SlotWorkerState>& state) {
     std::unique_lock<std::mutex> lock(state->mutex);
     for (;;) {
-        state->cv.wait(lock, [&] { return state->stop || state->pending; });
+        state->cv.wait(lock, [&] { return state->stop || state->pending || state->device_pending; });
         if (state->stop) {
             break;
         }
-        state->pending = false;
-        const std::uint64_t sequence = state->request_sequence;
-        const GstClockTime pts = state->request_pts;
+        if (state->pending) {
+            state->pending = false;
+            const std::uint64_t sequence = state->request_sequence;
+            const GstClockTime pts = state->request_pts;
+            lock.unlock();
+            const auto answer = query_playback_slot(state->element, pts);
+            lock.lock();
+            state->answer = answer;
+            state->answer_sequence = sequence;
+            state->busy = false;
+            state->cv.notify_all();
+            continue;
+        }
+        state->device_pending = false;
+        const auto sampler = state->device_clock_for_test;
         lock.unlock();
-        const auto answer = query_playback_slot(state->element, pts);
+        const auto device = sampler ? sampler() : read_device_clock(state->element);
+        const auto at = observation_time().count;
         lock.lock();
-        state->answer = answer;
-        state->answer_sequence = sequence;
-        state->busy = false;
-        state->cv.notify_all();
+        if (device) { state->device_sample = std::pair{at, *device}; }
     }
     GstElement* element = std::exchange(state->element, nullptr);
     lock.unlock();
@@ -731,13 +779,20 @@ public:
 
     ~GstSink() override { release(); }
 
-    void configure_read_clock_for_test(bool ignore_trace, std::optional<core::Milliseconds> broken_after) {
+    void configure_read_clock_for_test(bool ignore_trace, std::optional<core::Milliseconds> broken_after,
+                                       std::function<std::optional<std::int64_t>()> device_clock,
+                                       std::optional<core::Milliseconds> device_window) {
         if (!observe_read_clock_) { return; }
         if (ignore_trace) {
             std::lock_guard lock(g_trackers_mutex);
             handoff_.pulse_clock = nullptr;
         }
         if (broken_after) { read_clock_broken_after_ms_ = broken_after->count; }
+        if (device_clock) {
+            std::lock_guard lock(slot_state_->mutex);
+            slot_state_->device_clock_for_test = std::move(device_clock);
+        }
+        if (device_window) { device_rate_ = detail::DeviceRateEstimate{device_window->count * 1'000'000}; }
     }
 
     [[nodiscard]] bool attach_probe() {
@@ -1131,7 +1186,7 @@ public:
             // Only the router's write-lateness fallback holds while the read
             // clock is inactive: the clock hands nothing over until then.
             pulse_clock_.fallback_held(by.count);
-            device_rate_.restart();
+            device_rate_.restart(observation_time().count);
         }
         return true;
     }
@@ -1480,27 +1535,22 @@ private:
         last_media_end_ = GST_CLOCK_TIME_NONE;
         warned_warming_ = false;
         // A broken trace stays broken across streams; only activation clears it.
-        device_rate_.restart();
+        device_rate_.restart(observation_time().count);
     }
 
     // Permanent fallback: follow the device rate through the pulsesink's own
-    // clock (pa_stream_get_time), which it keeps even with provide-clock off.
+    // clock. The slot worker samples it (#229 P2-5); this takes the newest
+    // sample and asks for the next one, and never waits.
     void sample_device_rate() {
-        // observe_read_clock_ implies the element is a pulsesink, which
-        // derives from GstAudioBaseSink.
-        if (sink_element_ != nullptr) {
-            auto* base = reinterpret_cast<GstAudioBaseSink*>(sink_element_);
-            GstClock* clock = nullptr;
-            GST_OBJECT_LOCK(sink_element_);
-            if (base->provided_clock != nullptr) { clock = GST_CLOCK(gst_object_ref(base->provided_clock)); }
-            GST_OBJECT_UNLOCK(sink_element_);
-            if (clock == nullptr) { return; }
-            const auto device = gst_clock_get_time(clock);
-            gst_object_unref(clock);
-            if (GST_CLOCK_TIME_IS_VALID(device) && device > 0) {
-                device_rate_.sample(observation_time().count, static_cast<std::int64_t>(device));
-            }
+        std::optional<std::pair<std::int64_t, std::int64_t>> sample;
+        {
+            std::lock_guard lock(slot_state_->mutex);
+            if (slot_state_->stop || slot_state_->exited) { return; }
+            sample = std::exchange(slot_state_->device_sample, std::nullopt);
+            slot_state_->device_pending = true;
+            slot_state_->cv.notify_all();
         }
+        if (sample) { device_rate_.sample(sample->first, sample->second); }
     }
 
     [[nodiscard]] static GQuark chain_owner_key() {
@@ -2319,7 +2369,9 @@ static SinkOpenOutcome open_sink(const SinkOpenRequest& request, bool native_qua
                                             contiguous_pulse,
                                             contiguous_pulse && !request.disable_pulse_read_clock_for_test);
     handle->configure_read_clock_for_test(request.ignore_pulse_read_trace_for_test,
-                                          request.pulse_read_clock_broken_after_for_test);
+                                          request.pulse_read_clock_broken_after_for_test,
+                                          request.pulse_device_clock_for_test,
+                                          request.pulse_device_rate_window_for_test);
     if (!handle->attach_probe()) {
         handle->release();
         outcome.report.usable = false;

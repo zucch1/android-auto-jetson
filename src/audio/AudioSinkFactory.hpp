@@ -137,6 +137,10 @@ struct SinkOpenRequest final {
     // would) and shorten how long warm-up may take before it is declared broken.
     bool ignore_pulse_read_trace_for_test{false};
     std::optional<core::Milliseconds> pulse_read_clock_broken_after_for_test{};
+    // Tests can stand in for the pulsesink's own clock (its reads may block)
+    // and shorten the device-rate window.
+    std::function<std::optional<std::int64_t>()> pulse_device_clock_for_test{};
+    std::optional<core::Milliseconds> pulse_device_rate_window_for_test{};
 };
 
 struct SinkOpenOutcome final {

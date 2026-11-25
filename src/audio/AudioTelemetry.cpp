@@ -123,6 +123,7 @@ RouterStats accumulate_router_stats(const RouterStats& lifetime, const RouterSta
     out.playout_resumes += lifetime.playout_resumes;
     out.frames_shed += lifetime.frames_shed;
     out.frames_compressed += lifetime.frames_compressed;
+    out.frames_compressed_voice += lifetime.frames_compressed_voice;
     out.frames_stretched += lifetime.frames_stretched;
     out.playout_overflows += lifetime.playout_overflows;
     out.frames_overflowed += lifetime.frames_overflowed;

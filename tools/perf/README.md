@@ -283,9 +283,9 @@ the sink stamps contiguous. Time lost while the sink kept reading instead
 moves its stamps. The 2 s emergency bound applies. Verify the heard shift and
 check for missing audio with numbered markers recorded on the sink monitor.)
 and `playout_retimed_ms` (their sum), `playout_sink_starvations` and
-`playout_sink_starved_ms` (times the Pulse reader passed audio still scheduled,
-which is lost, and how far it ran ahead in total; each also logs
-`audio_sink_starved` and moves the schedule onto the reader) and
+`playout_sink_starved_ms` (times the Pulse server's read index passed audio
+still scheduled, which is lost, and how far it ran ahead in total; each also
+logs `audio_sink_starved` and moves the schedule onto the reader) and
 `playout_sink_suspends` (server suspends of the sink stream, which can lose what
 the server had buffered). A stopped stream plays out; `audio_stop_discarded` (`role`, `null`
 at shutdown, and `chunks`; at shutdown also `frames`, 48 kHz output frames of all

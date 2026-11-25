@@ -1119,6 +1119,9 @@ struct AudioRouter::Impl final {
             if (plan.shed) { stats.frames_shed += entry.head_trim_frames; }
             if (plan.warped_frames < 0) {
                 stats.frames_compressed += static_cast<std::uint64_t>(-plan.warped_frames);
+                if (role != role_index(Role::media)) {
+                    stats.frames_compressed_voice += static_cast<std::uint64_t>(-plan.warped_frames);
+                }
             } else {
                 stats.frames_stretched += static_cast<std::uint64_t>(plan.warped_frames);
             }
@@ -2213,7 +2216,9 @@ core::Result<RenderStep> AudioRouter::render_step() {
             && std::any_of(impl_->playout.begin(), impl_->playout.end(),
                            [](const auto& state) { return state.anchored; });
         if (timing.drift.count != 0 && impl_->sink->hold_stream(timing.drift) && have_timeline) {
-            impl_->shift_timeline(timing.drift.count, false);
+            // A later schedule ages placed PCM like a retime does: the same
+            // emergency bound applies (#229 P2-4).
+            impl_->shift_timeline(timing.drift.count, timing.drift.count > 0);
         }
         const auto shift = held + timing.moved.count;
         if (shift != 0 && have_timeline) {
@@ -2868,6 +2873,9 @@ core::Result<RenderStep> AudioRouter::render_step() {
     const auto written = impl_->sink->write(MixedChunk{
         impl_->config.output_format, core::Nanoseconds{scheduled_ns}, output});
     const auto done = steady_now_ns();
+    // When the write returned: the lateness fallback measures a blocked write
+    // by it, so nothing after it (the completion callback) may add to it.
+    const auto returned = impl_->config.clock ? impl_->now_ns() : done;
     impl_->report.sink_probe = impl_->sink->probe_stats();
     impl_->report.render_barrier = impl_->sink->render_stats();
     if (!written) {
@@ -2941,7 +2949,7 @@ core::Result<RenderStep> AudioRouter::render_step() {
     lock.lock();
     if (impl_->lossless() && std::any_of(impl_->playout.begin(), impl_->playout.end(),
             [](const auto& state) { return state.anchored; })) {
-        impl_->last_write = Impl::LastWrite{end_ns, write_entered, impl_->config.clock ? impl_->now_ns() : done};
+        impl_->last_write = Impl::LastWrite{end_ns, write_entered, returned};
     }
     std::erase_if(result.completed, [&](const auto& header) {
         const auto role = role_of(header.channel);

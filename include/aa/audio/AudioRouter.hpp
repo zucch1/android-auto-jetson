@@ -519,6 +519,9 @@ struct RouterStats final {
     // pending), and the emergency-bound losses (subset of frames_trimmed).
     std::uint64_t frames_compressed{};
     std::uint64_t frames_stretched{};
+    // Subset of frames_compressed taken from guidance and system-voice runs
+    // (they keep the ordinary 1% ceiling while media drains a hold at 2%).
+    std::uint64_t frames_compressed_voice{};
     std::uint64_t playout_overflows{};
     std::uint64_t frames_overflowed{};
     // Lossless playout: times the sink fell behind the schedule (a write blocked
