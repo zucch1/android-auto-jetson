@@ -125,8 +125,11 @@ constexpr std::uint64_t kMinDecodeNs = 2'500'000U; // a resampler to a lower rat
 struct PlayoutPlan final {
     enum class Mode : std::uint8_t { anchor, steady, underrun };
     Mode mode{Mode::anchor};
-    // anchor/underrun: arrival + depth, where the run is placed.
+    // anchor/underrun: arrival + depth (or overdue_start()), where the run is placed.
     std::int64_t target_ns{};
+    // anchor/underrun: what is before this has played out already (the arrival,
+    // or now for an overdue placement).
+    std::int64_t elapsed_ns{};
     // Buffer depth at arrival: slot minus arrival (anchor/underrun: the depth
     // it is re-anchored with).
     std::int64_t depth_ns{};
@@ -206,6 +209,12 @@ struct Run final {
     // old its head is (bot review of #229). Empty: `timestamp` plus
     // content_ahead_ns is the receipt of all of it.
     std::vector<SourceSpan> sources{};
+    // When it (or the parent it is the rest of) was handed in: near `timestamp`
+    // when that is a stamp of this clock.
+    std::int64_t received_ns{};
+    // Input that was only decoded because its stream ended (drain_decoder):
+    // however long ago it came in, none of it was placed before.
+    bool held_back{};
 };
 
 // One run placed on the sample timeline at an effective (non-overlapping)
@@ -509,6 +518,29 @@ struct AudioRouter::Impl final {
     [[nodiscard]] std::int64_t now_ns() const {
         return config.clock ? config.clock().count : steady_now_ns();
     }
+    // now_ns() when the render_step() in progress began: one clock for all of
+    // its placements.
+    std::int64_t step_ns{};
+
+    // Lossless: where a fresh run plays instead of at its anchor, arrival + depth,
+    // when that (and its slot, plan_playout()) has passed and a late-slot retime does
+    // not see to it: there is no timeline to move yet, or the run was held back until
+    // its stream ended, which can be longer ago than any lateness. It plays with the
+    // lead of a retime; what is too old by then goes by its receipt (overflow_beyond).
+    // Not for stamps of another clock: those are placed as they say.
+    [[nodiscard]] std::optional<std::int64_t> overdue_start(const Run& run) const noexcept {
+        const auto depth = config.playout.depth.count;
+        const auto arrival = run.timestamp.count;
+        if (!lossless() || (timeline_base && !run.held_back)
+            || arrival > INT64_MAX - depth || arrival + depth >= step_ns) { return {}; }
+        const auto bound = config.playout.emergency_backlog.count;
+        const auto near = [bound](std::int64_t later, std::int64_t earlier) {
+            return later < INT64_MIN + bound || later - bound <= earlier;
+        };
+        if (!near(step_ns, arrival + depth)
+            && !(near(run.received_ns, arrival) && near(arrival, run.received_ns))) { return {}; }
+        return step_ns + std::min(kHoldLeadNs, depth / 2);
+    }
 
     // Frames of committed parents the decoder still owes once `run` is
     // committed. A re-anchored role (or a decoder that has caught up) owes
@@ -637,6 +669,7 @@ struct AudioRouter::Impl final {
         std::int64_t slot_ns = 0;
         if (!frame_time(slot_frame, base_ns, slot_ns)) { return false; }
         plan = PlayoutPlan{};
+        plan.elapsed_ns = arrival;
         const auto& state = playout[role];
         if (anchored && state.last_arrival && arrival < *state.last_arrival - kPlayoutBackwardCapNs) {
             plan.backward = true;
@@ -670,6 +703,10 @@ struct AudioRouter::Impl final {
             plan.late_ns = std::max<std::int64_t>(0, arrival - due_ns);
             if (arrival > INT64_MAX - depth) { return false; }
             plan.target_ns = arrival + depth;
+            if (const auto overdue = overdue_start(run); overdue && slot_ns < step_ns) {
+                plan.target_ns = *overdue;
+                plan.elapsed_ns = step_ns;
+            }
             plan.depth_ns = std::max(plan.target_ns, slot_ns) - arrival;
             return true;
         }
@@ -863,8 +900,9 @@ struct AudioRouter::Impl final {
     // next run submitted starts a new one (end_stream).
     std::array<bool, kRoleCount> stream_ended{};
     std::array<std::optional<protocol::MessageHeader>, kRoleCount> last_header{};
-    // Content duration of that parent.
+    // Content duration of that parent, and when it was handed in.
     std::array<std::int64_t, kRoleCount> last_content_ns{};
+    std::array<std::int64_t, kRoleCount> last_received_ns{};
 
     // Lossless, a resampling role: input that is not decoded yet, and the output
     // frames of the part of it whose runs are done already.
@@ -1046,6 +1084,8 @@ struct AudioRouter::Impl final {
             run.submitted_at_ns = now_ns();
             run.content_ahead_ns = fresh ? 0 : last_content_ns[role];
             run.sources = std::move(sources);
+            run.received_ns = last_received_ns[role];
+            run.held_back = unplayed;
             run.stream_start = fresh && std::exchange(stream_ended[role], false);
             pending[role].push_back(std::move(run));
         }
@@ -1597,6 +1637,7 @@ core::Result<void> AudioRouter::submit(const protocol::MessageView& message,
             / impl_->config.output_format.sample_rate_hz);
     }
     run.submitted_at_ns = submitted_at_ns;
+    run.received_ns = submitted_at_ns;
     run.awaiting = buffered;
     if (run.frames == 0 && !buffered) {
         return Error{ErrorCode::audio_format_unsupported};
@@ -1610,6 +1651,7 @@ core::Result<void> AudioRouter::submit(const protocol::MessageView& message,
     run.stream_start = std::exchange(impl_->stream_ended[index], false);
     impl_->last_header[index] = message.header;
     impl_->last_content_ns[index] = impl_->frames_to_ns(run.content_frames).count;
+    impl_->last_received_ns[index] = submitted_at_ns;
     impl_->report.stats.frames_decoded += run.frames;
     impl_->newest_arrival = std::max(impl_->newest_arrival, run.timestamp.count);
     {
@@ -2175,6 +2217,7 @@ core::Result<RenderStep> AudioRouter::render_step() {
             }
         }
     }
+    impl_->step_ns = impl_->now_ns();
     auto base = impl_->timeline_base;
     if (!base) {
         // A playout stream's timeline starts at its anchor (arrival + depth),
@@ -2182,8 +2225,8 @@ core::Result<RenderStep> AudioRouter::render_step() {
         const auto lead = impl_->playout_enabled() ? impl_->config.playout.depth.count : 0;
         for (const auto& queue : impl_->pending) {
             for (const auto& run : queue) {
-                const core::Nanoseconds start{
-                    run.timestamp.count > INT64_MAX - lead ? INT64_MAX : run.timestamp.count + lead};
+                const core::Nanoseconds start{impl_->overdue_start(run).value_or(
+                    run.timestamp.count > INT64_MAX - lead ? INT64_MAX : run.timestamp.count + lead)};
                 if (!base || start < *base) { base = start; }
             }
         }
@@ -2239,12 +2282,12 @@ core::Result<RenderStep> AudioRouter::render_step() {
             std::int64_t arrived = 0;
             if (!impl_->ns_to_frames_signed(core::Nanoseconds{plan.target_ns - base->count}, target)
                 || !impl_->ns_to_frames_signed(
-                       core::Nanoseconds{run.timestamp.count - base->count}, arrived)) {
+                       core::Nanoseconds{plan.elapsed_ns - base->count}, arrived)) {
                 return RenderFailureReason::intended_time_conversion;
             }
             entry.start_frame = static_cast<std::uint64_t>(
                 std::max<std::int64_t>(target, static_cast<std::int64_t>(slot_frame)));
-            // The hole up to the arrival has already played out.
+            // The hole up to the arrival (or now) has already played out.
             if (arrived > static_cast<std::int64_t>(slot_frame)) {
                 entry.skip_first = slot_frame;
                 entry.skip_last = std::min(entry.start_frame, static_cast<std::uint64_t>(arrived));
@@ -2494,6 +2537,8 @@ core::Result<RenderStep> AudioRouter::render_step() {
             impl_->commit_playout(head.role, queue.front(), head, base->count);
         }
         impl_->role_end_frames[head.role] = head.end_frame;
+        // What was cut first of all: the role's end and anchor are on this timeline.
+        impl_->timeline_base = base;
         reach_source_end(head);
         result.completed.push_back(queue.front().header);
         queue.pop_front();

@@ -340,6 +340,8 @@ private:
 //   write is the sink's: how late it plays is endpoint_offset, and up to all of
 //   it (50 ms) can still be lost there, unseen here (#232);
 // - stop: what the peer sent before stopping a stream plays out (end_stream);
+//   what never had a slot by then (a voice stream too short to resample, or no
+//   timeline yet) and whose anchor has passed plays 20 ms from now instead;
 // - silence is written only on an anchor, a resume or an underrun. A role
 //   underruns when its own stream (its end plus what a resampler split still
 //   owes) ran out before the arrival, even while another role plays; a stream
