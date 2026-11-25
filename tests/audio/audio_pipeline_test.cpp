@@ -7467,17 +7467,20 @@ TEST(AudioPipelineSinkBackend, DriverStallAndQuantumChangeReconcileFromThePulseE
     for (const auto new_period : {20 * kMs, 40 * kMs}) {
         ReaderPhase phase;
         const auto old_period = 20 * kMs;
-        phase.cycle(0, old_period, {});
-        phase.cycle(old_period, old_period, ReaderPhase::Read{5 * kMs, old_period});
+        phase.cycle(0, 0, old_period, {});
+        phase.cycle(old_period, old_period, old_period, ReaderPhase::Read{5 * kMs, old_period});
+        phase.cycle(2 * old_period, 2 * old_period, old_period, ReaderPhase::Read{25 * kMs, 2 * old_period});
         phase.ambiguous_epoch(300 * kMs);
         ASSERT_TRUE(phase.reconciling());
-        phase.cycle(400 * kMs, new_period, {});
+        phase.cycle(400 * kMs, 400 * kMs, new_period, {});
         // One old period consumed before the stop, one new period after it.
         const ReaderPhase::Read after{405 * kMs, old_period + new_period};
-        EXPECT_EQ(phase.cycle(400 * kMs + new_period, new_period, after),
+        EXPECT_EQ(phase.cycle(400 * kMs + new_period, 400 * kMs + new_period, new_period, after), 0);
+        const ReaderPhase::Read confirmed{after.at + new_period, after.endpoint_ns + new_period};
+        EXPECT_EQ(phase.cycle(400 * kMs + 2 * new_period, 400 * kMs + 2 * new_period, new_period, confirmed),
                   400 * kMs + new_period - 2 * old_period);
         EXPECT_FALSE(phase.reconciling());
-        EXPECT_EQ(phase.cycle(400 * kMs + 2 * new_period, new_period, after), 0);
+        EXPECT_EQ(phase.cycle(400 * kMs + 3 * new_period, 400 * kMs + 3 * new_period, new_period, confirmed), 0);
     }
 }
 

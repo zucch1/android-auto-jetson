@@ -25,7 +25,7 @@ struct GraphClock::Observer {
     bool sink_running{};
     GraphCycles cycles;
     ReaderPhase phase;
-    std::int64_t last_ns{}, last_period{};
+    std::int64_t last_ns{}, last_tick{}, last_period{};
     bool started{};
 
     static void profile(void* data, const spa_pod* pod) {
@@ -62,11 +62,14 @@ struct GraphClock::Observer {
             if (position < 0 || position > INT64_MAX - duration) { continue; }
             const auto period = duration * 1'000'000'000 / rate.denom;
             self.clock.quantum_ns = period;
-            if (self.last_period && (period != self.last_period || ns - self.last_ns > 2 * self.last_period
+            const auto ticks = position / rate.denom * 1'000'000'000
+                + position % rate.denom * 1'000'000'000 / rate.denom;
+            if (self.last_period && (period != self.last_period || ns - self.last_ns - (ticks - self.last_tick) > self.last_period
                 || follower_signal > ns + 2 * period)) {
                 self.phase.ambiguous_epoch(std::max(ns, follower_signal));
             }
             self.last_period = period;
+            self.last_tick = ticks;
             self.last_ns = ns;
             std::optional<ReaderPhase::Read> sample;
             {
@@ -74,7 +77,7 @@ struct GraphClock::Observer {
                 sample = self.clock.reader.sample;
             }
             const auto uncertain = self.phase.reconciling();
-            const auto reconciled = self.phase.cycle(ns, period,
+            const auto reconciled = self.phase.cycle(ns, ticks, period,
                 status == 3 && self.sink_running ? sample : std::nullopt);
             if (reconciled) {
                 self.clock.held += reconciled;
