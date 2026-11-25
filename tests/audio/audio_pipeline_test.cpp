@@ -7466,6 +7466,25 @@ TEST(AudioPipelineSinkBackend, GraphCyclesCountOnlyConsecutiveUnfinishedPlayback
     EXPECT_TRUE(cycles.observe(position, 2048, rate, 3, position * 1'000'000'000 / rate).discontinuity);
 }
 
+TEST(AudioPipelineSinkBackend, GraphPauseCompletesAtLastTimedOutPosition) {
+    aa::audio::detail::GraphCycles graph;
+    for (const int quantum : {1024, 2048}) {
+        graph = {};
+        const auto observe = [&](int cycle, int state) {
+            const std::int64_t tick = cycle * quantum;
+            return graph.observe(tick, quantum, 48000, state, tick * 1'000'000'000 / 48000);
+        };
+        observe(0, 3);
+        for (int i = 1; i <= 7; ++i) { EXPECT_EQ(observe(i, 1).held_ns, 0); }
+        EXPECT_EQ(observe(7, 1).held_ns, 0);
+        const auto completed = observe(7, 3);
+        EXPECT_FALSE(completed.discontinuity);
+        EXPECT_EQ(completed.held_ns, 7 * (quantum * 1'000'000'000LL / 48000));
+        EXPECT_EQ(observe(7, 3).held_ns, 0);
+        EXPECT_EQ(observe(8, 3).held_ns, 0);
+    }
+}
+
 TEST(AudioPipelineSinkBackend, SlowGraphRateSlewsWallTimeWithoutRetiming) {
     aa::audio::detail::GraphCycles graph;
     std::int64_t drift = 0;

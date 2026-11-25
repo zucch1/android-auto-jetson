@@ -20,7 +20,13 @@ public:
 
     Change observe(std::int64_t position, std::int64_t frames, std::uint32_t rate, int state, std::int64_t ns) {
         Change change;
-        if (expected_ && (position != *expected_ || frames != previous_frames_ || rate != previous_rate_)) {
+        // A timed-out follower can finish after the driver has already
+        // reported that cycle. PipeWire then publishes its final state
+        // at the same graph position before advancing to the next cycle.
+        const bool same_cycle = expected_ && position == *expected_ - previous_frames_
+            && frames == previous_frames_ && rate == previous_rate_;
+        if (same_cycle && (state != 3 || !missed_cycles_)) { return change; }
+        if (!same_cycle && expected_ && (position != *expected_ || frames != previous_frames_ || rate != previous_rate_)) {
             change.discontinuity = true;
             missed_ns_ = 0;
             missed_cycles_ = 0;
