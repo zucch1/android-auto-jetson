@@ -2061,11 +2061,13 @@ TEST(AudioPipelineSinkBackend, MissingGraphProfilerFallsBackToTheSinkClock) {
     constexpr std::size_t kFrames = 1024;
     constexpr std::int64_t kChunkNs = 1024LL * 1'000'000'000LL / 48'000;
     const std::vector<std::byte> silence(kFrames * 4, std::byte{0});
-    const auto first = now_ns().count + 60'000'000;
+    // Ahead of the largest usual graph quantum (2048): the ring never runs dry.
+    constexpr std::int64_t kLeadNs = 100'000'000;
+    const auto first = now_ns().count + kLeadNs + 20'000'000;
     std::int64_t longest = 0;
     for (std::int64_t i = 0; i < 220; ++i) {
         const auto slot = first + i * kChunkNs;
-        while (now_ns().count < slot - 40'000'000) { std::this_thread::sleep_for(std::chrono::milliseconds(2)); }
+        while (now_ns().count < slot - kLeadNs) { std::this_thread::sleep_for(std::chrono::milliseconds(2)); }
         aa::audio::MixedChunk chunk;
         chunk.format = request.format;
         chunk.timestamp = aa::core::Nanoseconds{slot};
