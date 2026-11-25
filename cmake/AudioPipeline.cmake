@@ -27,26 +27,15 @@ if(NOT TARGET aa_core)
 endif()
 
 find_package(PkgConfig REQUIRED)
-if(CMAKE_CROSSCOMPILING)
-    # Decode can use a GStreamer-only overlay. Audio also needs PipeWire
-    # from the same validated provider, including its transitive metadata.
-    execute_process(COMMAND "${PKG_CONFIG_EXECUTABLE}" --exists libpipewire-0.3
-        RESULT_VARIABLE _aa_audio_pipewire_status)
-    if(NOT _aa_audio_pipewire_status EQUAL 0)
-        message(STATUS "Audio pipeline: UNAVAILABLE (target PipeWire development metadata missing)")
-        return()
-    endif()
-endif()
 pkg_check_modules(AA_AUDIO_GST REQUIRED IMPORTED_TARGET
     NO_CMAKE_PATH NO_CMAKE_ENVIRONMENT_PATH
-    gstreamer-1.0 gstreamer-app-1.0 libpipewire-0.3)
+    gstreamer-1.0 gstreamer-app-1.0)
 
 set(AA_AUDIO_SOURCES
     src/audio/AudioMix.cpp
     src/audio/RateCorrection.cpp
     src/audio/AudioRouter.cpp
     src/audio/gstreamer_adapter/GstAudioDecoder.cpp
-    src/audio/gstreamer_adapter/GraphClock.cpp
     src/audio/gstreamer_adapter/GstAudioSink.cpp)
 set(AA_AUDIO_TEST_SOURCES
     tests/audio/audio_pipeline_test.cpp)

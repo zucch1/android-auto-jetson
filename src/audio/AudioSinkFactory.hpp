@@ -25,21 +25,6 @@ namespace aa::audio::detail {
 // Test-only scripted decode (open_router_with_decoder_for_test).
 using TestDecodeFn = std::function<core::Result<std::vector<std::byte>>(const EncodedChunk&)>;
 
-struct SinkTimingAdjustment final {
-    core::Nanoseconds held{};  // signed read-clock phase step
-    core::Nanoseconds moved{}; // the current buffer was rescheduled at ingress
-    core::Nanoseconds drift{}; // small signed correction to the clock mapping
-    // The reader passed audio the router still planned to play (its schedule
-    // is moved onto the reader through `held`), and for how long in total.
-    std::uint64_t starvations{};
-    core::Nanoseconds starved{};
-    // Device suspensions and graph frames charged to their output gap.
-    std::uint64_t suspends{};
-    std::uint64_t suspend_loss_frames{};
-    std::uint64_t disruptions{};
-    std::uint64_t late_frames{};
-};
-
 // The routed output sink (gate r2 F1 semantics).
 //
 // write() returns only once the mixed chunk has reached the RENDERER'S
@@ -84,37 +69,21 @@ public:
     [[nodiscard]] virtual SinkProbeStats probe_stats() const = 0;
     [[nodiscard]] virtual RenderBarrierStats render_stats() const = 0;
     // #60 playback endpoint of the last acknowledged write: the steady-clock
-    // time its first sample is due on the sink's clock. Wired Pulse derives
-    // this from read progress. Other routes use a position query after handoff.
-    // Absent when the sink cannot supply a timing observation.
+    // time its first sample is due on the sink's own clock, read from the
+    // element's position query right after the handoff. Absent when the
+    // element did not answer (or for sinks without a clock, e.g. test fakes).
     [[nodiscard]] virtual std::optional<core::Nanoseconds> last_playback_slot() const {
         return std::nullopt;
     }
     [[nodiscard]] virtual PlaybackSlotAbsence last_playback_slot_absence() const {
         return last_playback_slot() ? PlaybackSlotAbsence::none : PlaybackSlotAbsence::unavailable;
     }
-    // Lossless routes can report a read-clock phase step or an ingress
-    // reschedule once, after the acknowledged write. Other sinks use the
-    // router's ordinary late-slot recovery.
-    [[nodiscard]] virtual SinkTimingAdjustment take_timing_adjustment() { return {}; }
-    // A sink observing its own read clock can distinguish a pause from a dry
-    // late buffer. The router must not restamp against wall time while it does.
-    [[nodiscard]] virtual bool handles_late_slots() const { return false; }
-    // Time a sample must be queued before it plays: what the measured reader
-    // needs, zero when the sink cannot measure it.
-    [[nodiscard]] virtual core::Nanoseconds reader_depth() const { return {}; }
-    // Added to that when a stream is placed and nothing is known of its jitter.
-    [[nodiscard]] virtual core::Nanoseconds arrival_margin() const { return {}; }
-    // A contiguous PCM write needs enough room ahead of the device reader
-    // to survive the next graph period before removing more PCM frames.
-    [[nodiscard]] virtual bool compression_safe() const { return true; }
-    // Positive ppm means the sink reads slower than monotonic time.
-    [[nodiscard]] virtual double read_clock_skew_ppm() const { return 0.0; }
-    // A read-clock slot includes any phase step and late-ingress correction.
-    [[nodiscard]] virtual bool last_slot_from_read_clock() const { return false; }
-    // Subtract the signed read-clock correction from future sink stamps.
-    // The router shifts the wall-clock timeline by the same amount so the PCM
-    // stays contiguous on the sink clock. False for unsupported sinks.
+    // Lossless playout (#228): the output stood still for `by` while a write
+    // blocked (a ring buffer is only full while nothing drains it), so its own
+    // clock stopped too and it plays on from where it was. Every later chunk is
+    // stamped `by` earlier on the sink's clock, so what it is handed stays
+    // contiguous with what it holds: a later stamp is a gap it would wait out
+    // in silence. False when the sink cannot (the stamps then move on).
     [[nodiscard]] virtual bool hold_stream(core::Nanoseconds by) {
         (void)by;
         return false;
@@ -141,13 +110,6 @@ struct SinkOpenRequest final {
     // drops or repeats samples to put its stopped clock right) and honours
     // hold_stream(). The router's rate correction owns the timing.
     bool contiguous_stream{false};
-    // Tests can exercise the write-lateness fallback on an unslaved Pulse ring.
-    bool disable_pulse_read_clock_for_test{false};
-    bool disable_graph_for_test{};
-    // Tests can stand in for the pulsesink's own clock (its reads may block)
-    // and shorten the device-rate window.
-    std::function<std::optional<std::int64_t>()> pulse_device_clock_for_test{};
-    std::optional<core::Milliseconds> pulse_device_rate_window_for_test{};
 };
 
 struct SinkOpenOutcome final {

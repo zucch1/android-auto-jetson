@@ -119,9 +119,10 @@ struct AudioRenderWorker::SettlementDiagnostics {
                 continue;
             }
             if (event.kind == PlayoutEvent::Kind::retime) {
-                // The timeline moved by signed shifted_ms. held_ms is the
-                // read-clock step (negative when the reader jumped ahead).
-                // The remaining shift moved the stamps handed to the sink.
+                // The sink fell behind the schedule (a write blocked past its
+                // slot): everything after it plays shifted_ms later. held_ms of
+                // it the sink took into its own stream (its clock stood still);
+                // the rest moved the stamps it is handed.
                 telemetry.log_media("audio_playout_retime",
                     "{\"event\":\"audio_playout_retime\",\"shifted_ms\":" + format_ms(event.late) +
                     ",\"held_ms\":" + format_ms(event.held) +

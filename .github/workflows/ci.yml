@@ -92,7 +92,7 @@ jobs:
           apt_get_install --no-install-recommends -y ninja-build cmake g++ \
             libprotobuf-dev protobuf-compiler libboost-system-dev libboost-log-dev \
             libssl-dev libusb-1.0-0-dev pkg-config libgstreamer1.0-dev \
-            libpipewire-0.3-dev libgstreamer-plugins-base1.0-dev gstreamer1.0-tools gstreamer1.0-plugins-bad \
+            libgstreamer-plugins-base1.0-dev gstreamer1.0-tools gstreamer1.0-plugins-bad \
             gstreamer1.0-plugins-good gstreamer1.0-pipewire pipewire-bin wireplumber \
             pipewire-pulse pulseaudio-utils dbus-daemon qt6-base-dev valgrind \
             g++-aarch64-linux-gnu binutils ccache
@@ -100,7 +100,7 @@ jobs:
           valgrind --version
           dpkg-query -W libprotobuf-dev protobuf-compiler libboost-system-dev \
             libboost-log-dev libssl-dev libusb-1.0-0-dev libgstreamer1.0-dev \
-            libpipewire-0.3-dev libgstreamer-plugins-base1.0-dev gstreamer1.0-tools gstreamer1.0-plugins-bad \
+            libgstreamer-plugins-base1.0-dev gstreamer1.0-tools gstreamer1.0-plugins-bad \
             gstreamer1.0-plugins-good gstreamer1.0-pipewire pipewire-bin wireplumber \
             pipewire-pulse pulseaudio-utils dbus-daemon qt6-base-dev valgrind
           gst-inspect-1.0 openh264dec
@@ -332,7 +332,7 @@ jobs:
           apt_update
           apt_get_install --no-install-recommends -y ninja-build cmake \
             g++-aarch64-linux-gnu pkg-config binutils libgstreamer1.0-dev \
-            libpipewire-0.3-dev libgstreamer-plugins-base1.0-dev
+            libgstreamer-plugins-base1.0-dev
       - name: Require AVAILABLE probe, AArch64 ELF and bound overlay provenance
         run: |
           set -euo pipefail

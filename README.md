@@ -32,7 +32,7 @@ To prevent confusion between host tests, cross-compilation, and device qualifica
 ### Prerequisites
 
 - CMake >= 3.20, Ninja, Python >= 3.12, C++20 compiler (GCC or Clang).
-- System development packages: `libprotobuf-dev`, `protobuf-compiler`, `libboost-system-dev`, `libboost-log-dev`, `libssl-dev`, `libusb-1.0-0-dev`, `libgstreamer1.0-dev`, `libgstreamer-plugins-base1.0-dev`, `libpipewire-0.3-dev`, `gstreamer1.0-tools`, `gstreamer1.0-plugins-good`, `gstreamer1.0-plugins-bad`, `gstreamer1.0-pipewire`, `pipewire-bin`, `wireplumber`, `pipewire-pulse`, `pulseaudio-utils`, `dbus-daemon`, `qt6-base-dev`, `valgrind`, `pkg-config`, `binutils` (matching `.github/workflows/ci.yml`).
+- System development packages: `libprotobuf-dev`, `protobuf-compiler`, `libboost-system-dev`, `libboost-log-dev`, `libssl-dev`, `libusb-1.0-0-dev`, `libgstreamer1.0-dev`, `libgstreamer-plugins-base1.0-dev`, `gstreamer1.0-tools`, `gstreamer1.0-plugins-good`, `gstreamer1.0-plugins-bad`, `gstreamer1.0-pipewire`, `pipewire-bin`, `wireplumber`, `pipewire-pulse`, `pulseaudio-utils`, `dbus-daemon`, `qt6-base-dev`, `valgrind`, `pkg-config`, `binutils` (matching `.github/workflows/ci.yml`).
 - Pre-staged locked GoogleTest v1.15.2 archive (configure never downloads dependencies).
 - Audio runtime: Audio pipeline route tests require an active user-session PipeWire audio runtime with default sink resolution and PulseAudio compatibility (see the audio runtime step in `.github/workflows/ci.yml`).
 

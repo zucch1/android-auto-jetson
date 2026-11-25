@@ -49,7 +49,7 @@ def make_sysroot(base: Path) -> tuple[Path, Path]:
 def make_overlay(base: Path) -> Path:
     """Use public declaration headers and AArch64 symbol stubs, not captured target libraries."""
     overlay = base / 'overlay'
-    modules = ('gstreamer-1.0', 'gstreamer-app-1.0', 'gstreamer-video-1.0', 'libpipewire-0.3')
+    modules = ('gstreamer-1.0', 'gstreamer-app-1.0', 'gstreamer-video-1.0')
     include_flags = shlex.split(subprocess.check_output(
         ['pkg-config', '--cflags-only-I', *modules], text=True))
     flags: list[str] = []
@@ -74,7 +74,7 @@ def make_overlay(base: Path) -> Path:
         for line in listing.splitlines():
             fields = line.split()
             symbol = fields[-1].split('@', 1)[0]
-            if re.fullmatch(r'_?(?:gst|g|pw|spa)_[A-Za-z0-9_]+', symbol):
+            if re.fullmatch(r'_?(?:gst|g)_[A-Za-z0-9_]+', symbol):
                 symbols[symbol] = fields[-2]
     source = base / 'decode-fixture-stubs.c'
     source.write_text(''.join(f'unsigned char {name}[128];\n' if kind.upper() in 'BDRSGVC'

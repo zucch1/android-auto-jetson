@@ -94,12 +94,12 @@ void warp_middle(const std::vector<std::int16_t>& in, std::vector<std::byte>& ou
 } // namespace
 
 std::vector<std::byte> warp_frames(std::span<const std::byte> pcm, std::size_t channels,
-                                   std::int64_t delta_frames, unsigned percent) {
+                                   std::int64_t delta_frames) {
     std::vector<std::byte> unchanged(pcm.begin(), pcm.end());
     const auto frame_bytes = channels * sizeof(std::int16_t);
     if (frame_bytes == 0 || pcm.size() % frame_bytes != 0) { return unchanged; }
     const auto frames = pcm.size() / frame_bytes;
-    if (delta_frames == 0 || std::abs(delta_frames) > max_warp_frames(frames, percent)) { return unchanged; }
+    if (delta_frames == 0 || std::abs(delta_frames) > max_warp_frames(frames)) { return unchanged; }
 
     std::vector<std::int16_t> in(frames * channels);
     std::memcpy(in.data(), pcm.data(), pcm.size());

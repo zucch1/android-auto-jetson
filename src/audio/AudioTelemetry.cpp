@@ -123,18 +123,11 @@ RouterStats accumulate_router_stats(const RouterStats& lifetime, const RouterSta
     out.playout_resumes += lifetime.playout_resumes;
     out.frames_shed += lifetime.frames_shed;
     out.frames_compressed += lifetime.frames_compressed;
-    out.frames_compressed_voice += lifetime.frames_compressed_voice;
     out.frames_stretched += lifetime.frames_stretched;
     out.playout_overflows += lifetime.playout_overflows;
     out.frames_overflowed += lifetime.frames_overflowed;
     out.playout_retimes += lifetime.playout_retimes;
     out.playout_retimed.count += lifetime.playout_retimed.count;
-    out.playout_sink_starvations += lifetime.playout_sink_starvations;
-    out.playout_sink_starved.count += lifetime.playout_sink_starved.count;
-    out.playout_sink_suspends += lifetime.playout_sink_suspends;
-    out.playout_sink_suspend_loss_frames += lifetime.playout_sink_suspend_loss_frames;
-    out.playout_sink_disruptions += lifetime.playout_sink_disruptions;
-    out.playout_sink_late_frames += lifetime.playout_sink_late_frames;
     out.playout_shed_residual_chunks += lifetime.playout_shed_residual_chunks;
     out.playout_shed_residual_peak =
         std::max(out.playout_shed_residual_peak, lifetime.playout_shed_residual_peak);
@@ -208,15 +201,7 @@ std::string media_timing_json(const RouterStats& stats, const MediaTimingContext
             ",\"frames_overflowed\":" + std::to_string(stats.frames_overflowed) +
             // Slots moved later behind a stalled sink (latency, nothing lost).
             ",\"playout_retimes\":" + std::to_string(stats.playout_retimes) +
-            ",\"playout_retimed_ms\":" + format_ms(stats.playout_retimed) +
-            // The sink's reader ran past scheduled audio (lost), or the server
-            // suspended the stream.
-            ",\"playout_sink_starvations\":" + std::to_string(stats.playout_sink_starvations) +
-            ",\"playout_sink_starved_ms\":" + format_ms(stats.playout_sink_starved) +
-            ",\"playout_sink_suspends\":" + std::to_string(stats.playout_sink_suspends) +
-            ",\"playout_sink_suspend_loss_frames\":" + std::to_string(stats.playout_sink_suspend_loss_frames) +
-            ",\"playout_sink_disruptions\":" + std::to_string(stats.playout_sink_disruptions) +
-            ",\"playout_sink_late_frames\":" + std::to_string(stats.playout_sink_late_frames);
+            ",\"playout_retimed_ms\":" + format_ms(stats.playout_retimed);
     }
     return json + "}";
 }

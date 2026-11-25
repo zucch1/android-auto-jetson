@@ -275,16 +275,17 @@ correction made the decoded runs shorter or longer by: nothing is dropped or
 inserted), `playout_overflows` (chunks cut by the 2 s emergency bound) and
 `frames_overflowed` (what they lost, a subset of `frames_trimmed`, also logged
 as `audio_playout_overflow` with `frames`, `frames_lifetime` and `depth_ms`),
-`playout_retimes` (times queued audio was rescheduled, each logged as
-`audio_playout_retime` with `shifted_ms`, `held_ms`, `offset_ms` and
-`retimes_lifetime`. `held_ms` is the duration of missed playback-node cycles on PipeWire, or a write-lateness
-estimate when the profiler is unavailable. The held interval moves the router
-timeline while preserving sink timestamps. The 2 s emergency bound applies.)
-`playout_retimed_ms` sums the shifts. `playout_sink_late_frames` counts
-frames flushed behind the observed read position. `playout_sink_suspends`
-counts suspensions of the linked output and `playout_sink_disruptions`
-counts changes in graph quantum and isolated missed cycles.
-A stopped stream plays out; `audio_stop_discarded` (`role`, `null`
+`playout_retimes` (times everything to come was moved later because a write
+blocked past its slot, each logged as `audio_playout_retime` with `shifted_ms`,
+`held_ms`, `offset_ms` and `retimes_lifetime`; `held_ms` is the part the sink took
+into its own stream because its clock stood still while the write blocked, so it
+plays on contiguously: a pause of the sink is one retime with `held_ms` equal to
+`shifted_ms`, time lost between writes has `held_ms` 0 and moves the sink's
+stamps; nothing after the blocked write is lost while
+the stall plus the depth before it stay within the 2 s bound, beyond which a retime
+makes late audio overflow; the write itself can lose up to ~50 ms inside the sink,
+which no counter shows, #232)
+and `playout_retimed_ms` (their sum). A stopped stream plays out; `audio_stop_discarded` (`role`, `null`
 at shutdown, and `chunks`; at shutdown also `frames`, 48 kHz output frames of all
 roles, where a decoder tail alone is one chunk) reports accepted audio a stop had
 to cancel, or lost to a write that failed during it, including decoder tails whose

@@ -152,37 +152,20 @@ wired audio drops no sample (within the limits below) and inserts silence only
 for a stream start, a resume or a real underrun; the cost is latency:
 
 - steady: ~`60` ms on wired audio, video, touch-to-photon and IDR recovery
-  (leaving ~`940` ms of the `1.0` s `waiting_idr_max` budget), or what the
-  measured reader needs if that is more: the output device's delay plus two
-  graph quanta. A sink timestamp names the time its sample leaves the device,
-  so Pulse reads it one device delay earlier, a quantum at a time. A stream is
-  anchored one more quantum above that, and each starvation adds a quantum
-  (`60` ms at most) for the rest of the session. With a 43 ms device and a
-  quantum of 1024 that is ~`107` ms;
+  (leaving ~`940` ms of the `1.0` s `waiting_idr_max` budget);
 - after a burst with a full 8-chunk backlog: up to ~`360` ms, drained by playing
   0.5% fast, up to 1% while the excess is over `100` ms: about `10` s per 100 ms
   of deep excess, ~`45` s from ~`360` ms to `75` ms. Packets of any size down to
   a third of a millisecond are corrected (a short run takes the whole frame its
   predecessors' fractions add up to);
-- wired pulsesink tags its playback node with a route-specific name. The PipeWire
-  profiler reports the graph duration, sample rate and follower completion state
-  for each cycle. Two or more consecutive unfinished cycles followed by completion
-  produce one hold equal to the time they took (a driver refilling its device
-  after the stall runs fast, so graph ticks overstate it). The router shifts its
-  wall-clock schedule and subtracts the same hold from sink timestamps. Media
-  drains excess depth at up to 2% and guidance and system voice at up to 1%.
-- a stall or restart of the graph driver and a quantum change are one hold too,
-  taken from the driver's time against its ticks once it has run evenly for 8
-  periods. Pulse latency replies measure the read endpoint independently and
-  close what the cycle records left out, also while the driver refills its
-  device. On a steady stream they are ~1.5 s apart: a hold can be off by one or
-  two quanta until the second reply after it.
-- audio is never compressed while the least lead of the recent writes over the
-  Pulse reader is under two quanta or the driver is refilling, and a starvation
-  ends hold recovery.
-- if the route has no matching profiler observation at its first media write,
-  `audio_graph_clock_unavailable` identifies write-lateness fallback. A fallback
-  hold can leave a residual because the ring accepts writes during part of a stall.
+- after a sink stall of `S` ms past a slot: everything later plays ~`S` - 20 ms
+  later (one `audio_playout_retime`) and drains the same way. A sink that stood
+  still (its server paused: the write blocked) plays on from where it was, so its
+  stamps stay where they were (`held_ms` = `shifted_ms`; `pulsesink` runs with
+  `slave-method=none` on wired so it does not drop the pause's worth to catch its
+  clock up). Time lost between writes, which the sink played through dry, moves
+  its stamps instead (`held_ms` 0): written on at slots that had passed, the rest
+  would be lost behind the ring buffer's read position;
 - video is held with the audio up to `700` ms (wireless `400`): a 16-chunk burst
   or a stall of about `600` ms, leaving ~`300` ms of the `1.0` s budget. Deeper,
   the hold is clipped (`video_hold_capped`) and A/V parts by the rest until it
@@ -195,36 +178,25 @@ for a stream start, a resume or a real underrun; the cost is latency:
 
 **Known limits of a sink stall that recovers (`#232`):**
 
-- The sink ingress can reschedule a buffer that arrives late from upstream.
-  Once the renderer has started committing it, only the audio server can
-  account for samples already handed over. Verify output with numbered audio
-  markers as described below.
+- The write in progress can lose up to ~`50` ms (one piece) inside the sink.
+  Measured at the output with a `300` ms stall before `pulsesink` took the piece:
+  34 to 48 ms of a continuous tone. The router counts those frames as played, so
+  no counter shows it. This path is **not** lossless at the output; only what
+  comes after that piece is kept.
 - A/V stays within the gates only while the offset stays under the wired hold cap:
   stalls up to about `600` ms (`700` ms less the normal `60` ms depth). Beyond,
   video leads audio by the rest until the buffer has drained back under the cap
-  (up to about 20 ms/s for a confirmed hold). A 1 s hold initially places the
-  audio about 300 ms beyond the cap.
-- Wired Pulse uses `slave-method=none`. The slot worker samples the provided
-  sink clock for slow device-rate correction, bounded to ±500 ppm.
-- `playout_sink_late_frames` counts frames flushed behind the observed reader.
-  At ingress a contiguous buffer already behind the reader gets a new timestamp
-  and refill lead. Pulse timing replies are sampled, so this check has finite
-  resolution.
-- `playout_sink_suspends` counts observed suspensions of the linked output
-  device. `playout_sink_suspend_loss_frames` estimates the lost output in
-  frames from completed playback periods while disconnected and the period
-  in flight on reactivation. The monitor is suspended too, so its missing
-  clicks partly reflect the capture gap. Compare its graph-clock timestamps
-  before and after resume. The receiver aligns its schedule once to the new
-  driver epoch. `playout_sink_disruptions` counts graph quantum changes and isolated
-  unfinished cycles. These events identify intervals where accepted PCM may have
-  disappeared downstream. Use monitor markers to measure the number of missing frames.
+  (5 to 10 ms/s): after a `1` s stall up to `300` ms, 92 of 100 pairs over 50 ms.
+- With `slave-method=none` the sink no longer corrects its device clock's drift
+  from the system clock. A slower device blocks writes later, which the router
+  takes as a stall it holds and drains; a faster one would run the sink's ring
+  down by the drift. Measured on the Jetson: about 2 ppm (7 ms an hour).
 
 Where latency ends and loss begins:
 
 | Case | Outcome |
 | --- | --- |
-| one write blocked, sink recovers, stall + depth before it within `2` s | the router preserves accepted audio and continues returning credits on receipt. Each role queues `4.4` s by time. Over ~`600` ms of stall, A/V parts as above |
+| one write blocked, sink recovers, stall + depth before it within `2` s | every frame but those in the blocked write is kept, and nothing is withheld from the phone: each role queues `4.4` s by time, whatever the packet size. The blocked write itself can lose up to ~`50` ms inside the sink (`#232`); over ~`600` ms of stall A/V parts as above |
 | audio would play more than `2` s after its content time (its chunk's arrival plus its place in the chunk), also after a stall or in a stream started behind another | the part beyond is cut: `audio_playout_overflow`, `playout_overflows`, `frames_overflowed` |
 | the sink fails its write (`2` s deadline, lost route) | stuck: what is queued is dropped and reported (`audio_stall_bypass`, `sink_write_error`), the sink reopened, the session survives (#60) |
 | one write blocked over `2` s without failing, and a credit withheld for 250 ms (queue full) | the same drop and report, trigger `credit_wait` |
@@ -235,29 +207,15 @@ Check on a long hold with navigation prompts over music, from the last
 `frames_caught_up`, `playout_overflows` all `0`; `frames_silence` and
 `frames_skipped` grow only with `audio_playout_underrun` or
 `audio_playout_anchor` records; `frames_compressed` / `frames_stretched` follow
-the phone clock, sink clock and backlog. Check for zero `audio_stall_bypass`
-and `audio_stop_discarded`. A provoked sink pause should produce one
-`audio_playout_retime`.
-
-Wired Pulse derives `presented_ns` from the router's schedule and the read-clock
-adjustments it uses. The A/V evaluator checks consistency with that schedule.
-To measure heard A/V in an A26 session, capture an external audio marker and
-align it with the corresponding video event.
-
-For the stall check, feed one numbered click in each input chunk. Record the
-sink monitor and align the click times to the logged schedule using the
-pre-stall clicks. After the first retime and before the backlog has drained,
-compare each surviving click with its scheduled output time
-(`scheduled_ns` plus `playout_offset_ns`) and count missing IDs. Require zero
-missing IDs and a post-stall residual within 10 ms of the pre-stall residual.
-In one run, pause Pulse for 300, 1000 and 1600 ms, giving the stream about 60 s
-after each pause. Check for a return to about 60 ms of depth between pauses and
-for zero overflow cuts. Repeat with an upstream write delay while the sink
-keeps running. For that case, include the shifted time of the in-flight chunk from
-`presented_ns` and check its click too. For a physical output without a monitor,
-record the same markers at the speaker. The audio server can pause for longer
-than the wired video hold cap, so apply the separate A/V gate as above.
-`--audio-playout-ms 0` restores the legacy arrival-time model.
+the phone's clock (a few hundred ppm of `frames_decoded`). No
+`audio_stall_bypass` and no `audio_stop_discarded`; `playout_retimes` grows only
+with `audio_playout_retime` records, and a provoked sink pause makes one, with
+`held_ms` equal to `shifted_ms` (d0c5b41 retimed again behind each one: 28 for a
+1 s `pipewire-pulse` pause, then cut 6.3 s). A provoked stall may be heard as a gap of up
+to ~50 ms besides the stall itself, and one over ~600 ms breaks the A/V gates
+(`#232`). Listen for pitch movement after it: 1% is 17 cents, slid
+in over about half a second. `--audio-playout-ms 0` restores the legacy
+arrival-time model.
 
 ## Privacy
 

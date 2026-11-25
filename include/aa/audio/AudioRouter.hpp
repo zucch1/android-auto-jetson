@@ -107,10 +107,11 @@ struct WriteCompletion final {
     core::Nanoseconds scheduled{};
     core::Nanoseconds scheduled_end{};
     core::Nanoseconds completed{};
-    // #60: when the chunk starts playing. Wired Pulse uses the schedule
-    // adjusted by read-clock phase and late ingress. Other routes use the
-    // position-based slot bounded by write completion. Absent when the sink
-    // could not report a slot.
+    // #60: when the chunk starts playing, max(completed, playback slot on the
+    // sink's clock). A sample cannot play before its handoff, and with
+    // sync=true it does not play before its slot; pulsesink hands off early
+    // (ring-buffer commit), pipewiresink near the slot. Absent when the sink
+    // reported no position.
     std::optional<core::Nanoseconds> presented{};
     PlaybackSlotAbsence playback_slot_absence{PlaybackSlotAbsence::unavailable};
     // Wireless playout (PlayoutPolicy): how far after its content time this
@@ -326,17 +327,18 @@ private:
 //   (frames_compressed / frames_stretched: frames the resampled run became
 //   shorter or longer by). Proportional, at most 0.5% (under 9 cents), up to
 //   1% only while the excess is over 100 ms; the rate moves by at most 0.1%
-//   per A26 chunk. A 300 ms arrival backlog is back under 15 ms in about 45 s.
-//   After a confirmed sink hold media can use up to 2% until the backlog
-//   drains (guidance and system voice keep 1%);
+//   per A26 chunk. A 300 ms excess is back under 15 ms in about 45 s;
 // - a short run (any packet size down to a third of a millisecond) takes the
 //   whole frame its predecessors' fractions add up to. It is placed and cut on its
 //   own, and written together with those that follow it without a gap;
-// - retime: a Pulse read-clock phase step shifts the timeline and preserves
-//   contiguous ring timestamps. Pulse can also move a dry buffer before
-//   ingress. Other sinks move a late slot to 20 ms ahead on both clocks.
-//   The resulting depth drains by rate correction (audio_playout_retime).
-//   A server may still discard samples after handoff (#232);
+// - retime: a piece whose slot has already passed when it is about to be written
+//   (the write before it blocked, or the render thread was held up) moves the
+//   whole timeline to 20 ms from now first: the depth and the offset grow by
+//   that and drain by the rate correction (audio_playout_retime). Writing on
+//   at slots that had passed would be lossless only on paper: the ring buffer
+//   throws samples behind its read position away. The piece inside the blocked
+//   write is the sink's: how late it plays is endpoint_offset, and up to all of
+//   it (50 ms) can still be lost there, unseen here (#232);
 // - stop: what the peer sent before stopping a stream plays out (end_stream);
 // - silence is written only on an anchor, a resume or an underrun. A role
 //   underruns when its own stream (its end plus what a resampler split still
@@ -519,9 +521,6 @@ struct RouterStats final {
     // pending), and the emergency-bound losses (subset of frames_trimmed).
     std::uint64_t frames_compressed{};
     std::uint64_t frames_stretched{};
-    // Subset of frames_compressed taken from guidance and system-voice runs
-    // (they keep the ordinary 1% ceiling while media drains a hold at 2%).
-    std::uint64_t frames_compressed_voice{};
     std::uint64_t playout_overflows{};
     std::uint64_t frames_overflowed{};
     // Lossless playout: times the sink fell behind the schedule (a write blocked
@@ -529,17 +528,6 @@ struct RouterStats final {
     // written at slots that had passed, and by how much in total.
     std::uint64_t playout_retimes{};
     core::Nanoseconds playout_retimed{};
-    // Lossless playout on a read-clocked sink: times its reader ran past
-    // audio still scheduled to play (that audio is lost; the timeline is moved
-    // onto the reader), the total it ran ahead by, and server suspends of the
-    // sink stream (each can lose what the server had buffered).
-    std::uint64_t playout_sink_starvations{};
-    core::Nanoseconds playout_sink_starved{};
-    std::uint64_t playout_sink_suspends{};
-    // Graph estimate of lost output frames at device suspension.
-    std::uint64_t playout_sink_suspend_loss_frames{};
-    std::uint64_t playout_sink_disruptions{};
-    std::uint64_t playout_sink_late_frames{};
     // Committed offset above the shedding threshold, even when the buffer
     // minimum prevents additional shedding.
     std::uint64_t playout_shed_residual_chunks{};
@@ -553,14 +541,14 @@ struct PlayoutEvent final {
     enum class Kind : std::uint8_t { start, resume, underrun, retime };
     Kind kind{Kind::start};
     // How long after its slot the run arrived: the elapsed time skipped.
-    // retime: signed change to when everything after it plays.
+    // retime: how much later everything after it plays.
     core::Nanoseconds late{};
     // Depth the role was re-anchored with; retime: the offset it left.
     core::Nanoseconds depth{};
     Role role{Role::media};
-    // retime: the signed part of `late` measured by sink read progress
-    // (ObservedAudioSink::hold_stream). Only the wall-clock timeline moves;
-    // the stamps stay contiguous on the sink clock.
+    // retime: the part of `late` the sink took into its own stream because its
+    // clock stood still while a write blocked (ObservedAudioSink::hold_stream):
+    // it plays on contiguously instead of waiting that out in silence.
     core::Nanoseconds held{};
 };
 
