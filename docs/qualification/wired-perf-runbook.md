@@ -238,7 +238,8 @@ them prescribes a p99, a rolling mean or a coverage rule.
   playout clock by default (`--audio-playout-ms 60`, `--video-delay-ms match`,
   stop-and-wait `max_unacked 1`, catch-up off). Both audio
   (`presented_ns - scheduled_ns`) and held video (`completed_ns - scheduled_ns`)
-  include the playout offset (starting at `60` ms, half of wireless's `120` ms),
+  include the playout offset (starting at `60` ms, half of wireless's `120` ms,
+  or what the measured reader needs, see `wired-live-qa.md`),
   so the signed A/V contract is unchanged while touch-to-photon and each
   `waiting_idr` recovery episode gain ~`60` ms (leaving ~`940` ms of the `1.0` s
   `waiting_idr_max` budget). After a burst both grow by the backlog (at most

@@ -152,7 +152,13 @@ wired audio drops no sample (within the limits below) and inserts silence only
 for a stream start, a resume or a real underrun; the cost is latency:
 
 - steady: ~`60` ms on wired audio, video, touch-to-photon and IDR recovery
-  (leaving ~`940` ms of the `1.0` s `waiting_idr_max` budget);
+  (leaving ~`940` ms of the `1.0` s `waiting_idr_max` budget), or what the
+  measured reader needs if that is more: the output device's delay plus two
+  graph quanta. A sink timestamp names the time its sample leaves the device,
+  so Pulse reads it one device delay earlier, a quantum at a time. A stream is
+  anchored one more quantum above that, and each starvation adds a quantum
+  (`60` ms at most) for the rest of the session. With a 43 ms device and a
+  quantum of 1024 that is ~`107` ms;
 - after a burst with a full 8-chunk backlog: up to ~`360` ms, drained by playing
   0.5% fast, up to 1% while the excess is over `100` ms: about `10` s per 100 ms
   of deep excess, ~`45` s from ~`360` ms to `75` ms. Packets of any size down to
@@ -161,9 +167,19 @@ for a stream start, a resume or a real underrun; the cost is latency:
 - wired pulsesink tags its playback node with a route-specific name. The PipeWire
   profiler reports the graph duration, sample rate and follower completion state
   for each cycle. Two or more consecutive unfinished cycles followed by completion
-  produce one hold equal to their total duration. The router shifts its wall-clock
-  schedule and subtracts the same hold from sink timestamps. Media drains excess
-  depth at up to 2% and guidance and system voice at up to 1%.
+  produce one hold equal to the time they took (a driver refilling its device
+  after the stall runs fast, so graph ticks overstate it). The router shifts its
+  wall-clock schedule and subtracts the same hold from sink timestamps. Media
+  drains excess depth at up to 2% and guidance and system voice at up to 1%.
+- a stall or restart of the graph driver and a quantum change are one hold too,
+  taken from the driver's time against its ticks once it has run evenly for 8
+  periods. Pulse latency replies measure the read endpoint independently and
+  close what the cycle records left out, also while the driver refills its
+  device. On a steady stream they are ~1.5 s apart: a hold can be off by one or
+  two quanta until the second reply after it.
+- audio is never compressed while the least lead of the recent writes over the
+  Pulse reader is under two quanta or the driver is refilling, and a starvation
+  ends hold recovery.
 - if the route has no matching profiler observation at its first media write,
   `audio_graph_clock_unavailable` identifies write-lateness fallback. A fallback
   hold can leave a residual because the ring accepts writes during part of a stall.
