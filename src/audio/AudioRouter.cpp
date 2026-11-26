@@ -816,8 +816,19 @@ struct AudioRouter::Impl final {
                     const auto skip = ns_to_frames(core::Nanoseconds{oldest - received});
                     part = skip >= end - from ? end - content_frame : ahead + skip;
                 } else {
-                    const auto slack = ns_to_frames(core::Nanoseconds{received - oldest});
-                    part = slack >= ahead ? 0 : ahead - slack;
+                    // Frames kept before the part: as many as still let its first
+                    // frame play, at its own rounded output time, by its receipt
+                    // plus the bound (Sol re-check of #229: the slack rounded down
+                    // cut a frame that plays exactly at the bound).
+                    const auto in_bound = [&](std::uint64_t kept) {
+                        std::int64_t plays = 0;
+                        return kept <= UINT64_MAX - start_frame && frame_time(start_frame + kept, base_ns, plays)
+                            && plays - bound <= received;
+                    };
+                    auto kept = std::min(ahead, ns_to_frames(core::Nanoseconds{received - oldest}));
+                    while (kept < ahead && in_bound(kept + 1)) { ++kept; }
+                    while (kept > 0 && !in_bound(kept)) { --kept; }
+                    part = ahead - kept;
                 }
                 need = std::max(need, part);
             }
@@ -2275,7 +2286,14 @@ core::Result<RenderStep> AudioRouter::render_step() {
         }
         const auto slot_frame = std::max(at, role_end);
         PlayoutPlan plan;
-        if (run.playout) {
+        // Lossless: a re-anchor planned against a timeline nothing has been written
+        // to yet goes stale when its time passes before the first write (a step
+        // that only skipped the hole, then a pause): planned again by the current
+        // clock, with its overflow, rather than written in the past (Sol re-check
+        // of #229).
+        const bool expired = run.playout && impl_->lossless() && impl_->timeline_unwritten
+            && run.playout->mode != PlayoutPlan::Mode::steady && run.playout->target_ns < impl_->step_ns;
+        if (run.playout && !expired) {
             plan = *run.playout;
         } else if (!impl_->plan_playout(role, run, slot_frame, role_end + decoder_owed,
                                         base->count, anchored, plan)) {

@@ -8369,6 +8369,125 @@ TEST(WiredReceiver, LosslessEveryFrameIsHeardOrCutByItsOwnReceipt) {
     }
 }
 
+// Sol re-check of #229 at 77d64cf, P2: media after a first stream that was cut whole,
+// planned by one step that only skipped the elapsed hole, then a 3 s pause before
+// the next step. 77d64cf wrote all 2,048 frames 2.98 s in the past from the stale
+// plan; they are 3 s past their receipt by then, so they are cut and counted.
+TEST(WiredReceiver, LosslessStalePlanAfterWholeCutIsCutNotWrittenInThePast) {
+    constexpr std::uint64_t kVoiceFrames = 58;
+    ReceiverLogScope logging{g_running};
+    auto gate = std::make_shared<RenderGate>();
+    gate->release();
+    const std::int64_t t0 = 1'000'000'000'000;
+    std::int64_t clock = t0;
+    auto config = pcm_router_config();
+    config.clock = [&clock] { return aa::core::Nanoseconds{clock}; };
+    gate->clock = [&clock] { return clock; };
+    auto opened = aa::audio::detail::open_router_with_sink_for_test(config, std::make_unique<GatedRenderSink>(gate));
+    ASSERT_TRUE(opened);
+    auto &router = opened.value();
+    const auto media = aa::protocol::ChannelRole::media_audio;
+    const auto guidance = aa::protocol::ChannelRole::guidance_audio;
+    std::uint64_t sequence = 0;
+    const auto render = [&] {
+        for (int i = 0; i < 10'000; ++i) {
+            auto step = router.render_step();
+            ASSERT_TRUE(step);
+            if (!step.value().pending) { return; }
+        }
+        FAIL() << "render does not settle";
+    };
+    for (std::uint64_t k = 0; k < 20; ++k) {
+        clock = t0 + static_cast<std::int64_t>(k) * 62'000;
+        ASSERT_TRUE(router.submit({{guidance, ++sequence, {clock}}, std::vector<std::byte>{std::byte{0xE8}, std::byte{0x03}}},
+                                  aa::core::Nanoseconds{clock}));
+    }
+    clock = t0 + 2'500'000'000;
+    (void)router.end_stream(guidance);
+    ASSERT_NO_FATAL_FAILURE(render());
+    ASSERT_EQ(router.report().stats.frames_overflowed, kVoiceFrames);
+    ASSERT_TRUE(gate->pcm.empty());
+    clock += 100'000'000;
+    const auto media_at = clock;
+    ASSERT_TRUE(router.submit({{media, ++sequence, {media_at}}, std::vector<std::byte>(8192, std::byte{1})},
+                              aa::core::Nanoseconds{media_at}));
+    clock = media_at + 1'000'000'000;
+    auto first = router.render_step();
+    ASSERT_TRUE(first);
+    ASSERT_TRUE(first.value().pending); // the elapsed hole was skipped, nothing written
+    ASSERT_TRUE(gate->pcm.empty());
+    clock += 3'000'000'000;
+    ASSERT_NO_FATAL_FAILURE(render());
+    const auto &stats = router.report().stats;
+    EXPECT_EQ(stats.frames_decoded, kVoiceFrames + 2'048);
+    EXPECT_EQ(stats.frames_decoded, stats.frames_retained + stats.frames_overflowed);
+    EXPECT_EQ(stats.frames_overflowed, kVoiceFrames + 2'048);
+    for (std::size_t piece = 0; piece < gate->pcm.size(); ++piece) {
+        EXPECT_GE(gate->timestamps[piece].count, gate->clock_ns[piece]) << piece;
+        const auto &pcm = gate->pcm[piece];
+        EXPECT_TRUE(std::all_of(pcm.begin(), pcm.end(), [](std::byte b) { return b == std::byte{0}; })) << piece;
+    }
+}
+
+// Sol re-check of #229 at 77d64cf, P3: 48 kHz mono voice, one frame a packet on the
+// 48 kHz clock, stopped at the first receipt + 1,980 ms: with the 20 ms lead each
+// frame plays exactly at its own 2 s bound. 77d64cf rounded the receipt slack down
+// to frames and cut one of them; 1549533 kept all 20.
+TEST(WiredReceiver, LosslessVoiceExactlyAtTheBoundIsKept) {
+    constexpr std::uint64_t kPackets = 20;
+    constexpr std::int64_t kBound = 2'000'000'000;
+    ReceiverLogScope logging{g_running};
+    auto gate = std::make_shared<RenderGate>();
+    gate->release();
+    const std::int64_t t0 = 1'000'000'000'000;
+    std::int64_t clock = t0;
+    auto config = pcm_router_config();
+    config.roles[aa::audio::role_index(aa::audio::Role::guidance)].input_format = aa::audio::AudioFormat{48000, 1, 16};
+    config.clock = [&clock] { return aa::core::Nanoseconds{clock}; };
+    gate->clock = [&clock] { return clock; };
+    auto opened = aa::audio::detail::open_router_with_sink_for_test(config, std::make_unique<GatedRenderSink>(gate));
+    ASSERT_TRUE(opened);
+    auto &router = opened.value();
+    const auto guidance = aa::protocol::ChannelRole::guidance_audio;
+    const auto render = [&] {
+        for (int i = 0; i < 10'000; ++i) {
+            auto step = router.render_step();
+            ASSERT_TRUE(step);
+            if (!step.value().pending) { return; }
+        }
+        FAIL() << "render does not settle";
+    };
+    const auto packet_at = [&](std::uint64_t k) {
+        return t0 + static_cast<std::int64_t>(k * 1'000'000'000 / 48'000);
+    };
+    for (std::uint64_t k = 0; k < kPackets; ++k) {
+        clock = packet_at(k);
+        ASSERT_TRUE(router.submit({{guidance, k + 1, {clock}}, std::vector<std::byte>{std::byte{0xE8}, std::byte{0x03}}},
+                                  aa::core::Nanoseconds{clock}));
+        ASSERT_NO_FATAL_FAILURE(render()); // retires the zero-output parent
+    }
+    clock = t0 + kBound - 20'000'000;
+    (void)router.end_stream(guidance);
+    ASSERT_NO_FATAL_FAILURE(render());
+    const auto &stats = router.report().stats;
+    EXPECT_EQ(stats.frames_decoded, kPackets);
+    EXPECT_EQ(stats.frames_overflowed, 0U);
+    EXPECT_EQ(stats.frames_retained, kPackets);
+    std::uint64_t heard = 0;
+    for (std::size_t piece = 0; piece < gate->pcm.size(); ++piece) {
+        const auto &pcm = gate->pcm[piece];
+        const auto stamp = gate->timestamps[piece].count;
+        EXPECT_GE(stamp, gate->clock_ns[piece]) << piece;
+        for (std::size_t at = 0; at + 4 <= pcm.size(); at += 4) {
+            if (pcm[at] == std::byte{0} && pcm[at + 1] == std::byte{0}) { continue; }
+            const auto plays = stamp + static_cast<std::int64_t>(at / 4 * 1'000'000'000 / 48'000);
+            EXPECT_LE(plays - packet_at(heard), kBound) << "frame " << heard;
+            ++heard;
+        }
+    }
+    EXPECT_EQ(heard, kPackets);
+}
+
 // Third review of #229, P2: an AV_STOP/START storm through the production worker.
 // 07b82f0 scheduled the last of 80 one-chunk streams 3.4 s after its receipt.
 TEST(WiredReceiver, LosslessStopStartStormStaysWithinTheEmergencyBound) {
