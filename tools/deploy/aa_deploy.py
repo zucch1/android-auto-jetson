@@ -288,8 +288,8 @@ def build_preflight_script(
     """)
 
 
-def build_recovery_preflight_script(state_dir: str | None = None) -> str:
-    """Check architecture and measurement marker, plus the state dir for rollback."""
+def build_recovery_preflight_script(state_dir: str) -> str:
+    """Check architecture, the measurement marker and the recovery state dir."""
     script = textwrap.dedent(f"""\
         set -euo pipefail
         if [ -e "$HOME/MEASUREMENT_IN_PROGRESS" ]; then
@@ -307,14 +307,13 @@ def build_recovery_preflight_script(state_dir: str | None = None) -> str:
             exit 1
         fi
     """)
-    if state_dir is not None:
-        q_state = shlex.quote(state_dir)
-        script += textwrap.dedent(f"""\
-            if ! sudo -n test -d {q_state}; then
-                echo "preflight: deploy state directory missing:" {q_state} >&2
-                exit 1
-            fi
-        """)
+    q_state = shlex.quote(state_dir)
+    script += textwrap.dedent(f"""\
+        if ! sudo -n test -d {q_state}; then
+            echo "preflight: deploy state directory missing:" {q_state} >&2
+            exit 1
+        fi
+    """)
     return script
 
 
@@ -511,6 +510,24 @@ print(root.rstrip("/") + commands[0])
 """
 
 
+LEGACY_PACKAGE_OVERLAP_CHECK = r"""
+from pathlib import Path
+import sys
+import tarfile
+
+root, executable = map(Path, sys.argv[1:])
+try:
+    paths = {executable.relative_to(root), executable.resolve(strict=True).relative_to(root)}
+    with tarfile.open(fileobj=sys.stdin.buffer, mode="r|") as payload:
+        for member in payload:
+            path = Path(member.name)
+            if path in paths:
+                sys.exit(f"legacy helper executable overlaps a package-owned file: /{path}; migrate it manually")
+except (OSError, ValueError, tarfile.TarError) as error:
+    sys.exit(f"could not check legacy helper against the incoming package: {error}")
+"""
+
+
 def mutation_script(state_dir: str, run_dir: str) -> str:
     return textwrap.dedent(f"""\
         set -euo pipefail
@@ -546,34 +563,70 @@ import sys
 import tarfile
 
 root = Path(sys.argv[1])
+
+
+def digest(stream):
+    result = hashlib.sha256()
+    for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+        result.update(chunk)
+    return result.digest()
+
+
 try:
+    packaged_paths = set()
     with tarfile.open(fileobj=sys.stdin.buffer, mode="r|") as payload:
         for member in payload:
             name = PurePosixPath(member.name)
             if name.is_absolute() or ".." in name.parts:
                 sys.exit(f"adopt: unsafe archive path {member.name!r}")
             path = root / name
+            packaged_paths.add(path)
             if member.isdir():
                 matches = path.is_dir()
             elif member.issym():
                 matches = path.is_symlink() and os.readlink(path) == member.linkname
             elif member.isfile() and stat.S_ISREG(path.lstat().st_mode):
-                with path.open("rb") as installed, payload.extractfile(member) as archived:
-                    matches = hashlib.file_digest(installed, "sha256").digest() == (
-                        hashlib.file_digest(archived, "sha256").digest()
-                    )
+                matches = stat.S_IMODE(path.stat().st_mode) == member.mode
+                if matches:
+                    with path.open("rb") as installed, payload.extractfile(member) as archived:
+                        matches = digest(installed) == digest(archived)
             else:
                 matches = False
             if not matches:
                 sys.exit(f"adopt: installed payload differs at {member.name!r}")
-except (OSError, tarfile.TarError) as error:
+
+    # Check machine-wide drop-ins, including dash-prefix and service-wide
+    # drop-ins. Per-user projection overrides are operator configuration.
+    unexpected = []
+    units = {
+        "system": ("aa-system-helper.service", "aa-system-.service", "aa-.service", "service"),
+        "user": ("aa-receiver.service", "aa-.service", "service"),
+    }
+    for base in ("etc", "run", "usr/local/lib", "usr/lib"):
+        for scope, names in units.items():
+            for unit in names:
+                directory = root / base / "systemd" / scope / f"{unit}.d"
+                unexpected.extend(path.relative_to(root) for path in directory.glob("*.conf")
+                                  if path not in packaged_paths)
+    if unexpected:
+        sys.exit("adopt: unexpected machine-wide systemd drop-ins: " +
+                 ", ".join(f"/{path}" for path in sorted(unexpected)) +
+                 "; review and resolve these overrides before adoption")
+except (OSError, EOFError, ValueError, tarfile.TarError) as error:
     sys.exit(f"adopt: could not verify installed payload: {error}")
 """
 
 
-def build_adopt_script(state_dir: str, expected_sha: str) -> str:
-    return locked_mutation(mutation_script(state_dir, "") + textwrap.dedent(f"""\
+def build_adopt_script(state_dir: str, run_dir: str, expected_sha: str) -> str:
+    return locked_mutation(mutation_script(state_dir, run_dir) + textwrap.dedent(f"""\
         expected_sha={shlex.quote(expected_sha)}
+        for directory in "$state_dir" "$state_dir/packages" "$state_dir/runs"; do
+            if [[ "$directory" = "$state_dir/runs" && ! -e "$directory" && ! -L "$directory" ]]; then
+                continue
+            fi
+            [[ -d "$directory" && ! -L "$directory" && "$(stat -c '%u %a' -- "$directory")" = '0 700' ]] ||
+                fail "adopt: expected a root-owned mode-0700 directory at $directory"
+        done
         read_installed_version
         [ -n "$installed_version" ] ||
             fail "adopt: android-auto-receiver is not installed; deploy normally on a clean target, or follow the incomplete rollback procedure in docs/deploy.md if records remain"
@@ -593,12 +646,16 @@ def build_adopt_script(state_dir: str, expected_sha: str) -> str:
         fi
         if ! dpkg-deb --fsys-tarfile "$archive" |
             python3 -I -c {shlex.quote(ADOPT_PAYLOAD_VERIFIER)} /; then
-            fail "adopt: restore the installed payload by reinstalling the verified archive with sudo dpkg -i -- '$archive' on the target, then retry --adopt-installed $expected_sha; see docs/deploy.md"
+            fail "adopt: resolve the reported differences before retrying --adopt-installed $expected_sha; for altered or missing payload files, reinstall the verified archive with sudo dpkg -i -- '$archive' on the target (see docs/deploy.md)"
         fi
         read_installed_version
         [ "$archive" = "$state_dir/packages/{PACKAGE_NAME}_${{installed_version}}_{EXPECTED_ARCH}.deb" ] ||
             fail "adopt: installed version changed during verification; retry after package-manager activity ends"
 
+        install -d -m 0700 -o root -g root -- "$state_dir/runs"
+        mkdir -m 0700 -- "$run_dir"
+        dpkg-query -W > "$run_dir/dpkg-query-before.txt"
+        printf 'run_dir=%s\n' "$run_dir"
         if [[ -f "$current_env" && ! -L "$current_env" &&
             "$(state_field "$current_env" PREV_MODE)" = deb &&
             "$(state_field "$current_env" VERSION)" = "$installed_version" &&
@@ -607,11 +664,9 @@ def build_adopt_script(state_dir: str, expected_sha: str) -> str:
             printf 'current.env already records installed version %s\n' "$installed_version"
             exit 0
         fi
-        temporary="$(mktemp -- "$state_dir/.current.env.XXXXXX")"
-        trap 'rm -f -- "$temporary"' EXIT
         printf 'PREV_MODE=deb\nVERSION=%s\nDEB_PATH=%s\nDEB_SHA256=%s\n' \
-            "$installed_version" "$archive" "$expected_sha" > "$temporary"
-        mv -fT -- "$temporary" "$current_env"
+            "$installed_version" "$archive" "$expected_sha" > "$run_dir/current.env"
+        mv -fT -- "$run_dir/current.env" "$current_env"
         printf 'recovered current.env for installed version %s\n' "$installed_version"
         installed_digest="$(sha256sum -- {shlex.quote(INSTALLED_RECEIVER)} 2>/dev/null | cut -d' ' -f1 || true)"
         recorded_digest="$(head -c 65 -- {shlex.quote(RECEIVER_SHA256)} 2>/dev/null | tr -d '\n' || true)"
@@ -641,13 +696,17 @@ def build_install_script(
 
         helper_needs_restart
         read_installed_version
+        repair_archive=0
         if [ -n "$installed_version" ]; then
             read_current_metadata
             if dpkg --compare-versions "$installed_version" eq "$version" && [ "$current_sha" != "$deb_sha" ]; then
                 fail "Debian version $version is already installed with different bytes; build with a new version"
             fi
-            if [[ "$current_deb" != "$stored_deb" || "$current_sha" != "$deb_sha" ||
-                -e "$current_deb" || -L "$current_deb" ]]; then
+            if [[ "$installed_version" = "$version" && "$current_deb" = "$stored_deb" &&
+                  "$current_sha" = "$deb_sha" && ! -L "$stored_deb" &&
+                  ( ! -e "$stored_deb" || -f "$stored_deb" ) ]]; then
+                repair_archive=1
+            else
                 [[ -f "$current_deb" && ! -L "$current_deb" &&
                     "$(sha256sum "$current_deb" | cut -d' ' -f1)" = "$current_sha" ]] ||
                     fail "current deployment archive missing or corrupt at $current_deb; restore the exact archive (SHA-256 $current_sha) using docs/deploy.md, then retry"
@@ -657,11 +716,15 @@ def build_install_script(
         fi
 
         # Version-keyed archives are immutable, including those used by an older rollback record.
-        if [ -e "$stored_deb" ] || [ -L "$stored_deb" ]; then
+        if [[ "$repair_archive" = 0 && ( -e "$stored_deb" || -L "$stored_deb" ) ]]; then
             [[ -f "$stored_deb" && ! -L "$stored_deb" &&
                 "$(sha256sum "$stored_deb" | cut -d' ' -f1)" = "$deb_sha" ]] ||
                 fail "Debian version $version is already cached with different bytes; build with a new version"
         fi
+
+        install -m 0644 -o root -g root {shlex.quote(staged_deb)} "$incoming_deb"
+        [ "$(sha256sum "$incoming_deb" | cut -d' ' -f1)" = "$deb_sha" ] ||
+            fail "install: cached .deb sha256 mismatch"
 
         # Prepare all backups before APT can overwrite legacy payloads. Publish them
         # after install succeeds, before removing shadowing files or restarting.
@@ -688,6 +751,9 @@ def build_install_script(
                     [[ "$legacy_exec" = "$packaged_helper" && ! -L "$packaged_helper" ]] ||
                         fail "legacy helper aliases the packaged helper path; migrate it manually"
                     cp -p -- "$packaged_helper" "$legacy_dir/legacy-helper"
+                else
+                    dpkg-deb --fsys-tarfile "$incoming_deb" |
+                        python3 -I -c {shlex.quote(LEGACY_PACKAGE_OVERLAP_CHECK)} / "$legacy_exec"
                 fi
             fi
             if [ -d "$legacy_dir" ]; then
@@ -697,17 +763,15 @@ def build_install_script(
             fi
         fi
 
-        install -m 0644 -o root -g root {shlex.quote(staged_deb)} "$incoming_deb"
-        [ "$(sha256sum "$incoming_deb" | cut -d' ' -f1)" = "$deb_sha" ] ||
-            fail "install: cached .deb sha256 mismatch"
         if ! env DEBIAN_FRONTEND=noninteractive apt-get install -y --reinstall "$incoming_deb"; then
             fail "install: apt-get install failed; deploy backups retained in $run_dir"
         fi
         read_installed_version
         [ "$installed_version" = "$version" ] ||
             fail "install: expected Debian version $version after APT; deploy backups retained in $run_dir"
-        if [ ! -e "$stored_deb" ]; then
-            mv -T -- "$incoming_deb" "$stored_deb"
+        if [[ ! -e "$stored_deb" || ( "$repair_archive" = 1 &&
+              "$(sha256sum "$stored_deb" | cut -d' ' -f1)" != "$deb_sha" ) ]]; then
+            mv -fT -- "$incoming_deb" "$stored_deb"
         fi
 
         # Record the installed package before post-install work that may need rollback.
@@ -954,15 +1018,15 @@ def main(argv: list[str] | None = None) -> int:
     runner = Runner(args.target, args.ssh_opt, args.dry_run)
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     run_id = f"{timestamp}-{os.getpid()}"
-    action = "rollback" if args.rollback else "deploy"
+    action = "adopt" if args.adopt_installed is not None else "rollback" if args.rollback else "deploy"
     run_dir = f"{args.state_dir}/runs/{run_id}-{action}"
 
     try:
         if args.adopt_installed is not None:
-            runner.ssh("adoption preflight checks", build_recovery_preflight_script())
+            runner.ssh("adoption preflight checks", build_recovery_preflight_script(args.state_dir))
             output = runner.ssh(
                 "adopt installed package",
-                build_adopt_script(args.state_dir, args.adopt_installed),
+                build_adopt_script(args.state_dir, run_dir, args.adopt_installed),
             )
             if not args.dry_run:
                 print(output.strip())

@@ -115,8 +115,8 @@ FAKE_REMOTE_PYTHON = r"""#!/usr/bin/python3
 import os
 import sys
 
-if sys.argv[1:3] == ["-I", "-c"] and sys.argv[4:] == ["/"]:
-    os.execv("/usr/bin/python3", ["python3", *sys.argv[1:4], os.environ["FAKE_TARGET_ROOT"]])
+if sys.argv[1:3] == ["-I", "-c"] and sys.argv[4:5] == ["/"]:
+    os.execv("/usr/bin/python3", ["python3", *sys.argv[1:4], os.environ["FAKE_TARGET_ROOT"], *sys.argv[5:]])
 if sys.argv[1:4] != ["-I", "-", "/"]:
     os.execv("/usr/bin/python3", ["python3", *sys.argv[1:]])
 sys.argv = ["-", os.environ["FAKE_TARGET_ROOT"], *sys.argv[4:]]
@@ -622,6 +622,11 @@ class DeployHarnessTest(unittest.TestCase):
         self.assertIn("already records installed version 1.0.0", result.stdout)
         self.assertEqual((current.read_bytes(), current.stat().st_ino), saved)
         self.assertFalse(previous.exists())
+        inventories = list(state.glob("runs/*-adopt/dpkg-query-before.txt"))
+        self.assertEqual(len(inventories), 2)
+        for inventory in inventories:
+            self.assertIn("android-auto-receiver\t1.0.0", inventory.read_text())
+            self.assertEqual(inventory.stat().st_mode & 0o777, 0o600)
         self.assertEqual(backup.read_bytes(), legacy_helper)
         self.assertTrue(unit.exists())
         self.assertNotIn("apt-get", self.event_log.read_text()[len(before):])
@@ -672,20 +677,69 @@ class DeployHarnessTest(unittest.TestCase):
         self.assertIn("rolled_back_to=legacy", result.stdout)
         self.assertEqual(helper.read_bytes(), legacy_helper)
 
-    def test_identical_redeploy_restores_pruned_archive_but_upgrade_refuses(self) -> None:
+    def test_adopt_rejects_insecure_state_and_payload_drift(self) -> None:
+        result = self.adopt(self.pkg_v1)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("deploy state directory missing", result.stderr)
+        result = self.install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        state = self.target / "var/lib/android-auto-receiver/deploy"
+        current = state / "current.env"
+        current.unlink()
+        cache = state / "packages"
+        cache.chmod(0o777)
+        result = self.adopt(self.pkg_v1)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("expected a root-owned mode-0700 directory", result.stderr)
+        cache.chmod(0o700)
+
+        receiver = self.target / "usr/bin/aa-wireless-receiver"
+        receiver_bytes = receiver.read_bytes()
+        receiver.chmod(0o4755)
+        result = self.adopt(self.pkg_v1)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("installed payload differs", result.stderr)
+        receiver.unlink()
+        result = self.adopt(self.pkg_v1)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("could not verify installed payload", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+        receiver.write_bytes(receiver_bytes)
+        receiver.chmod(0o755)
+
+        dropin = self.target / "etc/systemd/system/aa-system-.service.d/override.conf"
+        dropin.parent.mkdir()
+        dropin.write_text("[Service]\n")
+        user_dropin = self.target / "etc/systemd/user/aa-receiver.service.d/override.conf"
+        user_dropin.parent.mkdir(parents=True)
+        user_dropin.write_text("[Service]\n")
+        result = self.adopt(self.pkg_v1)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("unexpected machine-wide systemd drop-ins", result.stderr)
+        for path in (dropin, user_dropin):
+            self.assertIn(f"/{path.relative_to(self.target)}", result.stderr)
+        self.assertFalse(current.exists())
+        self.assertFalse(list(state.glob("runs/*-adopt")))
+
+    def test_identical_redeploy_repairs_archive_but_upgrade_refuses(self) -> None:
         result = self.install()
         self.assertEqual(result.returncode, 0, result.stderr)
         state = self.target / "var/lib/android-auto-receiver/deploy"
         previous = (state / "previous.env").read_bytes()
         archive = state / "packages" / self.pkg_v1.name
-        archive.unlink()
-        result = self.install(self.pkg_v2)
-        self.assertNotEqual(result.returncode, 0, result.stdout)
-        self.assertIn("current deployment archive missing or corrupt", result.stderr)
-        result = self.install()
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(archive.read_bytes(), self.pkg_v1.read_bytes())
-        self.assertEqual((state / "previous.env").read_bytes(), previous)
+        for damage in ("missing", "corrupt"):
+            with self.subTest(damage=damage):
+                if damage == "missing":
+                    archive.unlink()
+                else:
+                    archive.write_bytes(b"corrupt")
+                result = self.install(self.pkg_v2)
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn("current deployment archive missing or corrupt", result.stderr)
+                result = self.install()
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(archive.read_bytes(), self.pkg_v1.read_bytes())
+                self.assertEqual((state / "previous.env").read_bytes(), previous)
 
     def test_identical_redeploy_reinstalls_modified_receiver(self) -> None:
         result = self.install()
@@ -744,6 +798,22 @@ class DeployHarnessTest(unittest.TestCase):
         self.assertTrue(os.access(helper, os.X_OK))
         self.assertEqual(helper.read_bytes(), old_helper)
         self.assertEqual(unit.read_bytes(), old_unit)
+
+    def test_deploy_refuses_legacy_helper_owned_by_incoming_package(self) -> None:
+        helper, unit = self.legacy_helper()
+        receiver = self.target / "usr/bin/aa-wireless-receiver"
+        helper.rename(receiver)
+        alias = self.target / "home/zucchi/helper-alias"
+        alias.symlink_to(receiver)
+        for path in (receiver, alias):
+            with self.subTest(path=path):
+                unit.write_text(f"[Service]\nExecStart=/{path.relative_to(self.target)}\n")
+                result = self.install()
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn("legacy helper executable overlaps a package-owned file", result.stderr)
+                self.assertTrue(unit.exists())
+                self.assertTrue(receiver.exists())
+        self.assertNotIn("apt-get install", self.event_log.read_text())
 
     def test_rollback_refuses_legacy_unit_without_its_saved_executable(self) -> None:
         helper, unit = self.legacy_helper()

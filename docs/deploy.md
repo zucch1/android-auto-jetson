@@ -81,7 +81,12 @@ tools/deploy/aa-deploy.sh "$target" --adopt-installed "$sha"
 ```
 
 Adoption checks dpkg's installed version, the matching version-keyed archive in
-`packages/`, and the installed payload. It updates only `current.env`.
+`packages/`, and the installed payload, including file modes. It lists and
+rejects unexpected machine-wide systemd drop-ins for the helper and receiver.
+Review and resolve those overrides before retrying. Per-user receiver projection drop-ins are operator-owned.
+Successful verification records a dpkg inventory under `runs/<id>-adopt/`
+even when `current.env` already matches. Adoption requires a root-owned
+mode-0700 state directory and cache.
 If `previous.env` exists, review the recorded target before rolling back.
 If it is absent, rollback is unavailable until a later deploy records a previous
 version. Adoption preserves the backups and any unpublished `previous.env` in
@@ -99,15 +104,19 @@ directory as the original invocation if it passed `--state-dir`.
 state=/var/lib/android-auto-receiver/deploy
 version=$(dpkg-query -W -f='${Version}' android-auto-receiver)
 archive="$state/packages/android-auto-receiver_${version}_arm64.deb"
-printf '%s  %s\n' "$sha" "$source_deb" | sha256sum --check --status &&
-  sudo flock --close --timeout 120 /run/aa-deploy.lock bash -ec '
-    install -d -m 0700 -o root -g root "$1" "$1/packages"
-    if [ -e "$2" ] || [ -L "$2" ]; then
-      saved=$(mktemp -d -- "$1/packages/recovery.XXXXXX")
-      mv -T -- "$2" "$saved/${2##*/}"
-    fi
-    install -m 0644 -o root -g root -- "$3" "$2"
-  ' bash "$state" "$archive" "$source_deb"
+sudo flock --close --timeout 120 /run/aa-deploy.lock \
+  bash -es -- "$state" "$archive" "$source_deb" "$sha" <<'RECOVER'
+  install -d -m 0700 -o root -g root "$1" "$1/packages"
+  temp=$(mktemp -- "$1/packages/.recovery.XXXXXX")
+  trap 'rm -f -- "$temp"' EXIT
+  install -m 0644 -o root -g root -- "$3" "$temp"
+  actual=$(sha256sum -- "$temp")
+  if [ "${actual%% *}" != "$4" ]; then
+    echo "recovery: source package SHA-256 mismatch" >&2
+    exit 1
+  fi
+  mv -fT -- "$temp" "$2"
+RECOVER
 ```
 
 Retry adoption with the same trusted digest. If it reports altered or missing
@@ -117,9 +126,9 @@ errors and retry adoption. If dpkg reports an unfinished configuration, run
 `sudo dpkg --configure -a` and resolve any errors first. Perform manual
 package-manager recovery with other deploy operations stopped.
 
-If only the archive was pruned and `current.env` still records the installed
-version, redeploy the identical package to restore the missing cache and retain
-the previous record. An upgrade needs the current archive as a rollback
+If the current archive is missing or corrupt and `current.env` still records
+the installed version and trusted digest, redeploy the identical package to
+restore the cache and retain the previous record. An upgrade needs the current archive as a rollback
 artifact. If a rollback's previous archive is missing or corrupt, use the
 recorded `DEB_PATH` and `DEB_SHA256` from `previous.env` for the cache restore
 command above, then retry rollback.
@@ -163,8 +172,8 @@ reference before a fresh deploy.
    exact same package preserves `previous.env`.
 7. **Legacy ad-hoc migration:** backs up the artifacts below in the deploy run's
    `legacy/` directory before invoking APT. Backup errors and symlinks at
-   the legacy paths abort installation. Record any symlink targets separately
-   and resolve the layout manually before migration.
+   the legacy paths abort installation. Their targets may live outside the
+   backup, so resolve the layout manually before migration.
    After installation succeeds, deploy publishes the rollback record and removes
    the shadowing config:
    - `/etc/udev/rules.d/70-android-auto-receiver.rules` (shadows the packaged
@@ -174,10 +183,10 @@ reference before a fresh deploy.
      `ExecStart=/usr/libexec/aa-system-helper`, deploy also saves the original
      executable and rollback restores it before restoring the unit. Other units
      need one literal absolute `ExecStart` path and its executable must remain
-     available. Deploy refuses a missing or non-executable target. Custom
-     executables must survive package removal for rollback to work, so check
-     the incoming package's file list with `dpkg-deb --contents "$deb"` and
-     resolve overlaps before migration.
+     available. Deploy refuses a missing or non-executable target because it
+     could not start the restored service. Custom
+     executables must survive package removal. Deploy refuses an executable
+     whose path or resolved target overlaps another file in the incoming package.
    - `/etc/dbus-1/system.d/org.custom.AndroidAutoSystemHelper.conf` (duplicates the
      packaged `/usr/share/dbus-1/system.d/org.custom.AndroidAutoSystemHelper.conf`).
      Operator per-user allow fragments
