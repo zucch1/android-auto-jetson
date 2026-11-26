@@ -101,15 +101,19 @@ configuration. Calculate the helper digest from the **installed** receiver
 after each upgrade or rollback. A per-user systemd drop-in can replace
 `ExecStart` with the intended receiver CLI and its arguments once provisioning
 is complete. The historical standalone USB-policy installer may have left a
-rule under `/etc/udev/rules.d` with the same name. Package configuration warns
-if that override or a masking symlink is present because udev gives it
-precedence over the packaged rule. For manual installs, back up and move an
-obsolete override out of the rules directory before installing, or reload udev
-and reconnect the affected device after moving it. The deployment tool backs up
-and removes the legacy rule during migration. Package configuration reloads
-the rules and triggers only the approved USB devices, their USB interfaces,
-and their tty children.
+rule under `/etc/udev/rules.d` with the same name. Check that override during
+deployment because udev gives it precedence over the packaged rule.
 
 Jetson install, upgrade, and rollback are documented in [deploy.md](deploy.md)
 (tracked in [#190](https://github.com/zucch1/android-auto-jetson/issues/190)).
 Installed-system qualification is tracked in [#191](https://github.com/zucch1/android-auto-jetson/issues/191).
+
+## Refreshing the USB rule
+
+Package configuration warns when the local override is present, including a
+masking symlink. For manual installs, back up and move an obsolete override
+out of the rules directory before installing, or reload udev and reconnect
+the affected device after moving it. The deployment tool backs up and removes
+the legacy rule during migration. Package configuration reloads the rules and
+triggers only the approved USB devices, their USB interfaces, and their tty
+children.
