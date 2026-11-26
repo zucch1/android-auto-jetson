@@ -12,6 +12,7 @@ aa_check_test_helper_bus("${AA_ENABLE_TEST_HELPER_BUS}" "${CMAKE_CROSSCOMPILING}
 
 if(NOT CMAKE_CROSSCOMPILING)
     add_executable(aa-wireless-receiver tools/wireless-receiver/main.cpp)
+    add_dependencies(aa-wireless-receiver aa-wired-receiver)
     set_target_properties(aa-wireless-receiver PROPERTIES
         CXX_STANDARD 20 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
     target_compile_definitions(aa-wireless-receiver PRIVATE
@@ -32,7 +33,8 @@ if(NOT CMAKE_CROSSCOMPILING)
         target_link_options(aa-wireless-receiver PRIVATE -fsanitize=address)
     endif()
 
-    add_executable(aa_wireless_receiver_cli_prod_test tests/wireless_e2e/receiver_cli_test.cpp)
+    add_executable(aa_wireless_receiver_cli_prod_test
+        tests/wireless_e2e/receiver_cli_test.cpp tests/wireless_e2e/wired_worker_test.cpp)
     add_executable(aa_wireless_receiver_cli_dev_test tests/wireless_e2e/receiver_cli_test.cpp)
     target_compile_definitions(aa_wireless_receiver_cli_prod_test PRIVATE
         AA_WIRELESS_ALLOW_HELPER_BUS_ADDRESS=0)

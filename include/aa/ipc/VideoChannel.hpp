@@ -245,6 +245,11 @@ public:
     [[nodiscard]] static core::Result<VideoServer> listen(const VideoSocketPath& path,
                                                           const VideoServerOptions& options);
 
+    // Take an inherited listener from the receiver supervisor. The
+    // supervisor remains responsible for the socket's filesystem entry.
+    [[nodiscard]] static core::Result<VideoServer> adopt_listener(
+        int fd, const VideoServerOptions& options);
+
     // Peer-credential gate then limits exchange. Rejected peers are counted
     // and never returned; the listener stays up. timeout.count < 0 blocks.
     // Multiplicity is caller-owned: each call may return a live producer

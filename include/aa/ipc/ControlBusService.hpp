@@ -47,6 +47,8 @@ public:
         PhoneDirectory& phones;
         helper::Confirmation* confirmation{nullptr};
         std::function<bool()> session_active{};
+        ProjectionPolicy* projection_policy{};
+        std::function<bool()> stop_legacy_projection{};
     };
 
     // Connects to the session bus (DBUS_SESSION_BUS_ADDRESS), owns the

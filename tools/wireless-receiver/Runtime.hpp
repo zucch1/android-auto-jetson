@@ -46,6 +46,9 @@ struct Runtime final {
     std::function<void(app::WiredSession&, bool in_poll, const core::Result<void>& serviced)>
         on_after_audio_completions_for_test{};
 
+    // A managed projection stops its media and leaves the shared bus alive.
+    std::function<bool(ipc::StateSnapshot)> keep_running{};
+
     void stop_runtime() {
         stopping = true;
         running.store(false);
@@ -131,6 +134,11 @@ struct Runtime final {
             report("session bus dispatch", step.error().code()); failed = true; stop_runtime();
         }
         const auto state = bus.service().state();
+        if (stopping || (keep_running && !keep_running(state))) {
+            stopping = true;
+            if (auto* session = receiver.session()) session->request_stop();
+            return;
+        }
         auto* recovery_session = receiver.session();
         if (recovery_session && !recovery_session->outbound_in_progress()) {
             if (auto pending = recovery_session->service_pending_video_idr(); !pending) {
@@ -317,9 +325,11 @@ struct Runtime final {
                 std::this_thread::sleep_until(std::min(deadline, turn + poll_step));
             }
         }
-        running.store(false);
+        if (!keep_running) {
+            running.store(false);
+            bus.service().shutdown();
+        }
         media.audio.stop();
-        bus.service().shutdown();
         receiver.stop();
         if (on_turn_for_test) { on_turn_for_test(false); }
         media.video.close();

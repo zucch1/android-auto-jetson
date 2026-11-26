@@ -449,6 +449,8 @@ inline constexpr std::string_view kContractSemVer = "{SEMVER}";
 inline constexpr std::array<std::string_view, {len(method_names)}> kMethodNames{{{{ {quoted(method_names)} }}}};
 inline constexpr std::array<std::string_view, {len(method_in)}> kMethodInSignatures{{{{ {quoted(method_in)} }}}};
 inline constexpr std::array<std::string_view, {len(method_out)}> kMethodOutSignatures{{{{ {quoted(method_out)} }}}};
+inline constexpr std::size_t kSetProjectionModeIndex = {method_names.index("SetProjectionMode")};
+inline constexpr std::size_t kSetTransportEnabledIndex = {method_names.index("SetTransportEnabled")};
 inline constexpr std::array<std::string_view, {len(signal_names)}> kSignalNames{{{{ {quoted(signal_names)} }}}};
 inline constexpr std::array<std::string_view, {len(property_names)}> kPropertyNames{{{{ {quoted(property_names)} }}}};
 

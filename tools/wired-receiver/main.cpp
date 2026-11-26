@@ -77,6 +77,7 @@
 #include <vector>
 
 #include <signal.h>
+#include <sys/prctl.h>
 #include "VideoOutlet.hpp"
 #include "StdoutLog.hpp"
 #include "AvCreditJson.hpp"
@@ -87,6 +88,7 @@ using aa::core::Milliseconds;
 using aa::wired_receiver::VideoOutlet;
 
 std::atomic<bool> g_running{true};
+std::atomic<bool> g_managed_idr{false};
 
 void log_line(const std::string &json) {
     auto *writer = aa::wired_receiver::active_stdout_log.load();
@@ -141,6 +143,7 @@ void log_sink_selected(const aa::audio::SinkReport &selected, std::string_view o
 }
 
 void on_signal(int) { g_running.store(false); }
+void on_managed_idr(int) { g_managed_idr.store(true); }
 
 // The handler only publishes the shutdown flag. A normal thread wakes USB waits,
 // even if the D-Bus dispatcher is inside a synchronous ForgetPhone call.
@@ -457,6 +460,8 @@ int receiver_main(int argc, char **argv) {
     std::int64_t duration_ms = 0;
     std::int64_t reconnect_ms = 30'000;
     bool no_bus = false;
+    pid_t supervisor_pid = 0;
+    aa::core::PhoneId managed_phone{};
     bool require_video_consumer = false;
     bool wired_enrolment = false;
     std::string required_usb_serial;
@@ -506,6 +511,19 @@ int receiver_main(int argc, char **argv) {
                 std::fputs("invalid --reconnect-ms\n", stderr);
                 return 2;
             }
+        } else if (std::strcmp(argv[index], "--managed-phone-id") == 0 && index + 1 < argc) {
+            const std::string_view value{argv[++index]};
+            if (!aa::tools::parse_uint64_strict(value, managed_phone.value) ||
+                managed_phone.value == 0 || managed_phone.value > aa::trust::kMaxPhoneId) {
+                return 2;
+            }
+        } else if (std::strcmp(argv[index], "--managed-by") == 0 && index + 1 < argc) {
+            const std::string_view value{argv[++index]};
+            const auto [end, error] = std::from_chars(value.data(), value.data() + value.size(),
+                                                       supervisor_pid);
+            if (error != std::errc{} || end != value.data() + value.size() || supervisor_pid <= 1) {
+                return 2;
+            }
         } else if (std::strcmp(argv[index], "--no-bus") == 0) {
             no_bus = true;
         } else if (std::strcmp(argv[index], "--require-video-consumer") == 0) {
@@ -553,6 +571,8 @@ int receiver_main(int argc, char **argv) {
         }
     }
     if (port.empty() || duration_ms < 0 || (wired_enrolment && no_bus) ||
+        (supervisor_pid ? (!no_bus || !managed_phone.value || !required_usb_serial.empty())
+                        : managed_phone.value != 0) ||
         !aa::tools::validate_playout_options(playout)) {
         std::fputs(kUsage, stderr);
         return 2;
@@ -590,6 +610,18 @@ int receiver_main(int argc, char **argv) {
 #endif
     ::signal(SIGINT, on_signal);
     ::signal(SIGTERM, on_signal);
+    if (supervisor_pid) {
+        // A child without its supervisor must never keep projecting. Check
+        // after arming the signal to cover a parent death during exec.
+        if (::prctl(PR_SET_PDEATHSIG, SIGKILL) != 0 || ::getppid() != supervisor_pid ||
+            ::signal(SIGUSR1, on_managed_idr) == SIG_ERR) {
+            return 3;
+        }
+        sigset_t idr_signal;
+        ::sigemptyset(&idr_signal);
+        ::sigaddset(&idr_signal, SIGUSR1);
+        if (::pthread_sigmask(SIG_UNBLOCK, &idr_signal, nullptr) != 0) return 3;
+    }
 
     std::filesystem::path store_file{};
     if (store_path.empty()) {
@@ -606,6 +638,16 @@ int receiver_main(int argc, char **argv) {
     if (!store.load().has_value() || !store.usable()) {
         log_line("{\"event\":\"err\",\"detail\":\"trust_store\"}");
         return 3;
+    }
+
+    if (supervisor_pid) {
+        for (const auto& phone : store.phones()) {
+            if (phone.phone_id != managed_phone) continue;
+            if (const auto* wired = std::get_if<aa::trust::WiredIdentity>(&phone.identity)) {
+                required_usb_serial = wired->usb_serial;
+            }
+        }
+        if (required_usb_serial.empty()) return 3;
     }
 
     if (store.dropped_port_only_count() != 0) {
@@ -636,12 +678,12 @@ int receiver_main(int argc, char **argv) {
         return 3;
     }
 
-    auto video =
-        aa::ipc::VideoServer::listen(aa::ipc::VideoSocketPath{video_socket},
-                                     aa::ipc::VideoServerOptions{{}, aa::ipc::current_uid()});
-    auto input_server =
-        aa::ipc::InputServer::listen(aa::ipc::InputSocketPath{input_socket},
-                                     aa::ipc::InputServerOptions{aa::ipc::current_uid()});
+    const aa::ipc::VideoServerOptions video_options{{}, aa::ipc::current_uid()};
+    const aa::ipc::InputServerOptions input_options{aa::ipc::current_uid()};
+    auto video = supervisor_pid ? aa::ipc::VideoServer::adopt_listener(3, video_options)
+                                : aa::ipc::VideoServer::listen({video_socket}, video_options);
+    auto input_server = supervisor_pid ? aa::ipc::InputServer::adopt_listener(4, input_options)
+                                       : aa::ipc::InputServer::listen({input_socket}, input_options);
     if (!video.has_value() || !input_server.has_value()) {
         log_line("{\"event\":\"err\",\"detail\":\"socket\"}");
         return 3;
@@ -664,13 +706,19 @@ int receiver_main(int argc, char **argv) {
     if (!wired_enrolment) {
         enrolment.close();
     }
+    std::atomic<bool> wired_link_live{false};
     std::optional<aa::ipc::ControlBusService> bus{};
     if (!no_bus) {
         auto started_bus = aa::ipc::ControlBusService::start(
             aa::ipc::ControlBusService::Config{aa::ipc::current_uid()},
             aa::ipc::ControlBusService::Deps{ids, wired_enrolment
                                                       ? static_cast<aa::ipc::PhoneDirectory &>(enrolment)
-                                                      : static_cast<aa::ipc::PhoneDirectory &>(phones)});
+                                                      : static_cast<aa::ipc::PhoneDirectory &>(phones),
+                                            nullptr, {}, nullptr, [&] {
+                                                if (!wired_link_live.exchange(false)) return false;
+                                                g_running.store(false);
+                                                return true;
+                                            }});
         if (!started_bus.has_value()) {
             log_line("{\"event\":\"err\",\"detail\":\"dbus\"}");
             return 3;
@@ -802,6 +850,7 @@ int receiver_main(int argc, char **argv) {
         return 3;
     }
     enrolment.close();  // a session now owns the store; pairing is refused again
+    wired_link_live.store(true);
     std::optional<aa::app::WiredLink> link{std::move(first_link.value())};
     session.attach_transport(link->transport.get());
     if (!bind_link_cipher(link->phone)) {
@@ -914,8 +963,9 @@ int receiver_main(int argc, char **argv) {
                 return false;
             }
         }
-        if (bus && !video_outlet.idr_dispatching() &&
-            bus->service().consume_idr_recovery_request()) {
+        if (!video_outlet.idr_dispatching() &&
+            ((bus && bus->service().consume_idr_recovery_request()) ||
+             g_managed_idr.exchange(false))) {
             const auto idr = video_outlet.request_idr_external("consumer_ipc");
             if (!idr) {
                 const bool fatal = idr.error().code() == aa::ErrorCode::channel_focus_restore_failed;
@@ -944,6 +994,7 @@ int receiver_main(int argc, char **argv) {
     };
 
     auto io_checkpoint = [&] {
+        if (!g_running.load()) session.request_stop();
         control.checkpoint();
         if (in_receive_poll && !session.failure() && g_running.load()) {
             (void)service_video_recovery();

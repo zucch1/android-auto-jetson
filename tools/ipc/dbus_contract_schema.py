@@ -8,7 +8,7 @@
 
 The introspection XML is the contract authority; these tables are the
 machine-readable checked schema it must match exactly: interface identity,
-the fifteen method signatures, five events, the SemVer metadata and the
+method and event signatures, the SemVer metadata and the
 argument-type allowlist that keeps audio/video and every other high-rate
 payload off the control surface.
 """
@@ -19,7 +19,7 @@ from typing import Final
 
 INTERFACE: Final[str] = "org.custom.AndroidAutoReceiver1"
 OBJECT_PATH: Final[str] = "/org/custom/AndroidAutoReceiver"
-SEMVER: Final[str] = "1.2.0"
+SEMVER: Final[str] = "1.3.0"
 SEMVER_ANNOTATION: Final[str] = "org.custom.AndroidAutoReceiver1.ContractSemVer"
 INTERFACE_PREFIX: Final[str] = "org.custom.AndroidAutoReceiver"
 
@@ -43,6 +43,8 @@ METHODS: Final[dict[str, tuple[str, str]]] = {
     "RequestIdrRecovery": ("", ""),
     "ListPhones": ("", "aa{ss}"),
     "GetPairingOutcome": ("t", "s"),
+    "SetProjectionMode": ("s", ""),
+    "SetTransportEnabled": ("sb", ""),
 }
 # name -> full signal argument signature
 SIGNALS: Final[dict[str, str]] = {

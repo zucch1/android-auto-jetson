@@ -45,7 +45,8 @@ public:
     // subscribe: every contract signal. pairing_results: only PairingClosed and
     // PairingCompleted broadcast by the contract name's owner, so the daemon
     // never queues other broadcasts to this client. ignore: no subscription.
-    enum class Signals { subscribe, pairing_results, ignore };
+    // projection_and_pairing_results also subscribes to StateChanged.
+    enum class Signals { subscribe, pairing_results, projection_and_pairing_results, ignore };
 
     // Connects to the session bus (DBUS_SESSION_BUS_ADDRESS). Clients that
     // only make method calls can skip the contract signal subscription.
@@ -70,6 +71,8 @@ public:
     [[nodiscard]] core::Result<void> unregister_consumer();
     [[nodiscard]] core::Result<void> start_projection();
     [[nodiscard]] core::Result<void> stop_projection();
+    [[nodiscard]] core::Result<void> set_projection_mode(std::string_view mode);
+    [[nodiscard]] core::Result<void> set_transport_enabled(std::string_view transport, bool enabled);
     [[nodiscard]] core::Result<void> request_idr_recovery();
     [[nodiscard]] core::Result<void> set_display_viewport(Viewport viewport);
     [[nodiscard]] core::Result<StateSnapshot> get_state();

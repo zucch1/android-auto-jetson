@@ -184,6 +184,17 @@ struct ControlServiceConfig final {
     std::uint32_t session_unix_uid{};
 };
 
+enum class ProjectionTransport { wired, wireless };
+
+struct ProjectionPolicy final {
+    bool ready{};
+    bool wired{true};
+    bool wireless{true};
+    // Validate operator provisioning before entering projection-ready.
+    std::function<core::Result<void>()> check_ready{};
+    std::optional<ProjectionTransport> active_transport{};
+};
+
 struct ControlServiceDeps final {
     PeerCredentialLookup& credentials;
     ControlEventSink& events;
@@ -192,10 +203,13 @@ struct ControlServiceDeps final {
     helper::Confirmation* confirmation{nullptr};
     std::function<std::chrono::steady_clock::time_point()> clock{};
     std::function<bool()> session_active{};
+    ProjectionPolicy* projection_policy{};
+    // Standalone wired can project before a consumer registers.
+    std::function<bool()> stop_legacy_projection{};
 };
 
 // Session D-Bus control dispatcher (task 21) for
-// org.custom.AndroidAutoReceiver1: the fifteen contract methods with their
+// org.custom.AndroidAutoReceiver1: contract methods with their
 // authorization semantics, the one-time pairing request-id gate, and the
 // typed event stream behind the contract's signals.
 //
@@ -216,7 +230,9 @@ public:
     ControlService(ControlServiceConfig config, ControlServiceDeps deps)
         : config_(config), credentials_(deps.credentials), events_(deps.events),
           phones_(deps.phones), gate_(deps.pairing_ids), confirmation_(deps.confirmation),
-          clock_(std::move(deps.clock)), session_active_(std::move(deps.session_active)) {}
+          clock_(std::move(deps.clock)), session_active_(std::move(deps.session_active)),
+          projection_policy_(deps.projection_policy),
+          stop_legacy_projection_(std::move(deps.stop_legacy_projection)) {}
 
     // RegisterConsumer / UnregisterConsumer.
     [[nodiscard]] core::Result<core::ConsumerId> register_consumer(const BusName& caller,
@@ -242,6 +258,11 @@ public:
     [[nodiscard]] core::Result<void> start_projection(const BusName& caller);
     [[nodiscard]] core::Result<void> stop_projection(const BusName& caller);
     [[nodiscard]] core::Result<void> request_idr_recovery(const BusName& caller);
+    [[nodiscard]] core::Result<void> set_projection_mode(const BusName& caller, std::string_view mode);
+    [[nodiscard]] core::Result<void> set_transport_enabled(const BusName& caller,
+                                                           std::string_view transport, bool enabled);
+    // Receiver-side transport exit, while keeping the consumer registered.
+    void projection_ended();
     [[nodiscard]] bool consume_idr_recovery_request() noexcept {
         return idr_recovery_requested_.exchange(false);
     }
@@ -348,6 +369,9 @@ private:
     helper::Confirmation* confirmation_{};
     std::function<std::chrono::steady_clock::time_point()> clock_{};
     std::function<bool()> session_active_{};
+    ProjectionPolicy* projection_policy_{};
+    std::function<bool()> stop_legacy_projection_{};
+    void publish_projection_stop(core::ConsumerId consumer);
     std::vector<PendingRevocation> revocations_;
     std::size_t source_retry_cursor_{0};
     bool reconcile_due_{true};

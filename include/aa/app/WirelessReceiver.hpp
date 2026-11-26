@@ -19,6 +19,11 @@ public:
               eligibility_.consumer(std::nullopt);
           }) {}
     ~WirelessReceiver() { stop(); }
+    void configure(WirelessLink::Config config) {
+        stop();
+        ap_channel_ = config.ap_channel;
+        link_.configure(std::move(config));
+    }
     helper::Confirmation& confirmation() { return confirmation_; }
     WiredSession* session() const { return link_.session(); }
     // A phone's bootstrap is in progress (bounded): don't defer or retry the attempt (#161).

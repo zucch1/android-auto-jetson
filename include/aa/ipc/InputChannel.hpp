@@ -136,6 +136,11 @@ public:
     [[nodiscard]] static core::Result<InputServer> listen(const InputSocketPath& path,
                                                           const InputServerOptions& options);
 
+    // Take an inherited listener from the receiver supervisor. The
+    // supervisor remains responsible for the socket's filesystem entry.
+    [[nodiscard]] static core::Result<InputServer> adopt_listener(
+        int fd, const InputServerOptions& options);
+
     // Peer-credential gate. Rejected peers are counted and never returned;
     // the listener stays up. timeout.count < 0 blocks.
     [[nodiscard]] core::Result<InputEndpoint> accept_sender(core::Milliseconds timeout);

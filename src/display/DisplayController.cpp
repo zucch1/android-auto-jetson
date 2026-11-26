@@ -338,6 +338,16 @@ core::Result<void> DisplayController::stop_projection() {
     return stopped.error();
 }
 
+void DisplayController::observe_projection_state(ipc::StateSnapshot snapshot) noexcept {
+    if (!impl_ || snapshot.consumer != impl_->consumer ||
+        snapshot.projection != ipc::ProjectionState::stopped ||
+        (impl_->state != DisplayState::projecting && impl_->state != DisplayState::stop_failed)) {
+        return;
+    }
+    impl_->release_media();
+    impl_->state = DisplayState::idle;
+}
+
 core::Result<std::size_t> DisplayController::pump(Milliseconds wait) {
     if (!impl_) {
         return Error{ErrorCode::transport_closed};

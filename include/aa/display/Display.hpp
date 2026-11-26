@@ -180,6 +180,9 @@ public:
     // stop failure (never per pump/tick).
     [[nodiscard]] core::Result<void> stop_projection();
 
+    // Apply a fresh state snapshot after a receiver-initiated projection stop.
+    void observe_projection_state(ipc::StateSnapshot snapshot) noexcept;
+
     // Drains the video channel into the decode helper and presents decoded
     // frames to the FrameTarget; returns the frames presented this call.
     // Retryable ipc_queue_full submission retains exactly one complete AU and

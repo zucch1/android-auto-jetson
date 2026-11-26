@@ -12,7 +12,7 @@ Checks:
   2. Receiver D-Bus XML (docs/dbus/org.custom.AndroidAutoReceiver1.xml),
      Contract.hpp runtime identity constants (bus name, object path, interface,
      major), BusWire.hpp max message size, and DispatchReply.hpp custom error
-     names match the contract tables exactly.
+     names and runtime capability keys match the contract tables.
   3. System Helper D-Bus XML (docs/dbus/org.custom.AndroidAutoSystemHelper1.xml)
      and BusService.hpp runtime identity constants (bus name, object path,
      interface) match the contract tables exactly.
@@ -44,6 +44,7 @@ from typing import Final
 CONTRACT_REL: Final[str] = "docs/INTEGRATION-CONTRACT.md"
 RECEIVER_XML_REL: Final[str] = "docs/dbus/org.custom.AndroidAutoReceiver1.xml"
 HELPER_XML_REL: Final[str] = "docs/dbus/org.custom.AndroidAutoSystemHelper1.xml"
+CONTROL_SERVICE_REL: Final[str] = "src/ipc/ControlService.cpp"
 CONTRACT_HPP_REL: Final[str] = "include/aa/ipc/Contract.hpp"
 BUS_WIRE_HPP_REL: Final[str] = "src/ipc/dbus_adapter/BusWire.hpp"
 DISPATCH_REPLY_HPP_REL: Final[str] = "src/ipc/dbus_adapter/DispatchReply.hpp"
@@ -503,6 +504,21 @@ def check_contract(root: Path) -> list[Violation]:
                      f"{name}: doc={doc_methods.get(name)!r} xml={sig!r}")
         for name in sorted(set(doc_methods) - set(xml_methods)):
             fail("INTEGRATION_CONTRACT_RECEIVER_EXTRA_METHOD", name)
+
+        control_service = root / CONTROL_SERVICE_REL
+        if control_service.is_file():
+            runtime_caps = set(re.findall(
+                r'result\.emplace\("((?:projection|transport)\.[a-z.]+)"',
+                control_service.read_text(encoding="utf-8"),
+            ))
+            documented_caps = {
+                unquote_code(row[0]) for row in parse_markdown_table(doc, "Runtime Capability Keys")
+            }
+            if not runtime_caps or runtime_caps != documented_caps:
+                fail("INTEGRATION_CONTRACT_RUNTIME_CAPABILITIES",
+                     f"doc={sorted(documented_caps)!r} code={sorted(runtime_caps)!r}")
+        else:
+            fail("INTEGRATION_CONTRACT_MISSING_SOURCE", CONTROL_SERVICE_REL)
 
         doc_signals = {
             unquote_code(row[0]): unquote_code(row[1])

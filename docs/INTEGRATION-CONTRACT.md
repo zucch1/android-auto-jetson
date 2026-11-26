@@ -2,7 +2,7 @@
 # Android Auto Infotainment Integration Contract
 
 - **Contract version:** `1.0.0`
-- **Receiver D-Bus contract:** `org.custom.AndroidAutoReceiver1` (`1.2.0`)
+- **Receiver D-Bus contract:** `org.custom.AndroidAutoReceiver1` (`1.3.0`)
 - **System helper D-Bus contract:** `org.custom.AndroidAutoSystemHelper1` (`1.5.0`)
 - **Video socket ABI:** `AF_UNIX` `SOCK_SEQPACKET`, protocol version `1` (data header v1 / v2 profile-bearing)
 - **Input socket ABI:** `AF_UNIX` `SOCK_SEQPACKET`, protocol version `1`
@@ -45,7 +45,7 @@ Control and status only. Audio, video, and every other high-rate stream stay off
 | Service name | `org.custom.AndroidAutoReceiver` |
 | Object path | `/org/custom/AndroidAutoReceiver` |
 | Interface | `org.custom.AndroidAutoReceiver1` |
-| Contract SemVer | `1.2.0` |
+| Contract SemVer | `1.3.0` |
 | Authority XML | `docs/dbus/org.custom.AndroidAutoReceiver1.xml` |
 | Schema validator | `tools/ipc/dbus_contract.py` (`tools/ipc/dbus_contract_schema.py`) |
 | Max message bytes | `65536` (`64 KiB`, `kMaxMessageBytes` in `src/ipc/dbus_adapter/BusWire.hpp`) |
@@ -62,7 +62,7 @@ Control and status only. Audio, video, and every other high-rate stream stay off
 ### Versioning Rules
 
 - The **major** version is encoded in the interface name (`org.custom.AndroidAutoReceiver1`, `kContractMajor = 1` in `include/aa/ipc/Contract.hpp`). Any unsupported major (e.g., `org.custom.AndroidAutoReceiver2`) fails closed with `org.custom.AndroidAutoReceiver1.Error.UnsupportedContractMajor`.
-- The **minor** version grows for backwards-compatible additions (methods, signals, typed errors, capability keys). `1.1.0` added `GetPairingCandidate`, `Error.NotWiredCandidate`, and `Error.NotDurable`. `1.2.0` added `ListPhones`, `GetPairingOutcome`, `PairingCompleted`, and capability keys `phones.list` / `pairing.outcomes`. Consumers feature-detect by reading the `ContractSemVer` property (or `contract.semver` and feature keys in `GetCapabilities`) before calling `1.1.0+` / `1.2.0+` methods.
+- The **minor** version grows for backwards-compatible additions (methods, signals, typed errors, capability keys). `1.1.0` added `GetPairingCandidate`, `Error.NotWiredCandidate`, and `Error.NotDurable`. `1.2.0` added `ListPhones`, `GetPairingOutcome`, `PairingCompleted`, and capability keys `phones.list` / `pairing.outcomes`. Consumers can use the `ContractSemVer` property or `GetCapabilities` to detect those additions. `1.3.0` adds `SetProjectionMode` and `SetTransportEnabled`. Use their respective keys in `GetCapabilities` because standalone receivers may implement only the original projection controls.
 - The **patch** version fixes behavior or wording without changing wire shape.
 
 ### Receiver Methods
@@ -71,14 +71,14 @@ Control and status only. Audio, video, and every other high-rate stream stay off
 | --- | --- | --- | --- |
 | `RegisterConsumer` | `s` | `t` | Registers caller owning `consumer_name` as the exclusive session consumer; returns `consumer_id`. |
 | `UnregisterConsumer` | `` | `` | Drops caller's registration and stops projection first. |
-| `StartProjection` | `` | `` | Opens projection control for the registered consumer. |
-| `StopProjection` | `` | `` | Closes projection control. Stops wireless projection; does **not** silence an active wired session (see Section 7). |
+| `StartProjection` | `` | `` | Opens projection control for the registered consumer. On the supervisor, requires projection-ready and at least one enabled transport. |
+| `StopProjection` | `` | `` | Closes projection control and retires the wired or wireless projection (see Section 7). |
 | `RequestAddPhone` | `` | `t` | Issues a one-time `request_id` (`PairingGate::kMaxPending = 8`, `kIssuedBudget = 64` per gate lifetime) and emits `PairingRequest`. Wireless: also prepares and binds a peer, which the helper refuses unless exactly one public BR/EDR candidate is already visible (see the enrolment sequence). |
 | `ConfirmPhonePairing` | `t` | `` | Wireless: opens the 60 s comparison window and emits `PairingOpened`. Wired: commits candidate after `GetPairingCandidate` (`Error.NotDurable` if directory `fsync` fails). |
 | `CancelPhonePairing` | `t` | `` | Cancels pending request or closes open pairing window without persisting approval. |
 | `ForgetPhone` | `t` | `` | Forgets paired `phone_id`. Wireless: also rotates shared AP credentials and demotes the bond to `revoked-bonds` without removing the BlueZ pairing; on the wired control service (no helper backend) it is a local-store revocation only. See partial-outcome semantics below. |
 | `GetState` | `` | `st` | Available before registration. Returns `projection_state` (`"stopped"` or `"projecting"`) and active `consumer_id` (`0` if none). |
-| `GetCapabilities` | `` | `a{ss}` | Available before registration. Static capability map: `contract.interface`, `contract.semver`, `consumer.exclusive`, `pairing.one_time_request_ids`, `pairing.outcomes`, `phones.list`, `display.viewport`, `diagnostics.events`. |
+| `GetCapabilities` | `` | `a{ss}` | Available before registration. Base capability map: `contract.interface`, `contract.semver`, `consumer.exclusive`, `pairing.one_time_request_ids`, `pairing.outcomes`, `phones.list`, `display.viewport`, `diagnostics.events`. See the runtime capability keys below. |
 | `SetDisplayViewport` | `uuu` | `` | Validates and stores consumer-reported `width` (`1..8192`), `height` (`1..8192`), `dpi` (`1..2000`). Does not negotiate stream or input geometry (see Section 3). |
 | `Ping` | `` | `t` | Available before registration. Liveness probe returning receiver monotonic clock in nanoseconds. |
 | `GetPairingComparison` | `t` | `a{ss}` | Consumer-only retrieval during an **open** wireless enrolment window (after `ConfirmPhonePairing` / `PairingOpened`): `challenge_id`, `comparison` (6 digits), `address`, `adapter`. Never broadcast. |
@@ -87,6 +87,24 @@ Control and status only. Audio, video, and every other high-rate stream stay off
 | `RequestIdrRecovery` | `` | `` | Requests a fresh H.264/video IDR keyframe from the active phone session while projecting. |
 | `ListPhones` | `` | `aa{ss}` | Consumer-only redacted list of approved phones (`1.2.0`, `phones.list`). Each entry contains `phone_id` (decimal `uint64` for `ForgetPhone`), `label` (per-process pseudonym, never raw addresses/serials/ports), `transport` (`"wired"`, `"wireless"`, `"opaque"`), and `strength` (`last_seen` omitted under store schema v3). |
 | `GetPairingOutcome` | `t` | `s` | Consumer-only outcome query for `request_id` (`1.2.0`, `pairing.outcomes`), reporting whether the approval/retraction was durable. Outcome records are in-memory, scoped to the issuing registration, and live only for the receiver's lifetime (bounded to 64 entries; lost on restart). Returns `"pending"`, `"approved"`, `"approved_commit_failed"`, `"not_durable"`, `"retracted"`, `"retraction_failed"`, `"rejected"`, `"cancelled"`, `"expired"`, or `"failed"`. Fails `Error.MalformedRequest` on zero/unknown `request_id` and `Error.PeerUnauthorized` on a `request_id` issued to a different registration. |
+| `SetProjectionMode` | `s` | `` | Sets `pairing_only` or `projection_ready`. Entering pairing-only stops projection. Projection-ready validates the provisioned HU credential and opens the media listeners. |
+| `SetTransportEnabled` | `sb` | `` | Sets `wired` or `wireless` independently. Disabling the current transport, or disabling both while waiting, stops projection. |
+
+### Runtime Capability Keys
+
+| Key | Value |
+| --- | --- |
+| `projection.mode` | `true` when `SetProjectionMode` is supported. |
+| `projection.mode.current` | `pairing_only` or `projection_ready`. |
+| `transport.control` | `true` when `SetTransportEnabled` is supported. |
+| `transport.wired.enabled` | `true` or `false`. |
+| `transport.wireless.enabled` | `true` or `false`. |
+
+- The packaged supervisor starts in `pairing_only` with both transports enabled. Settings last until the process restarts. The transport flags apply to projection. Each setter is idempotent. An unsupported setting or unready `StartProjection` returns `Error.IllegalTransition`. Unknown mode and transport strings return `org.freedesktop.DBus.Error.InvalidArgs`.
+- Projection-ready permits `StartProjection`. A start uses an approved wired candidate already attached when available, otherwise the first approved wireless phone if wireless is enabled. When neither is available, the supervisor waits for an approved candidate while projection is requested. Serial-backed wired phones remain eligible on any USB port and go through the existing full wired admission check.
+- One transport owns media at a time. Enabling a second transport leaves the active session in place. After disabling the active transport or switching to pairing-only, use a new `StartProjection` when ready. A successful setter records the policy. Observe `StateChanged` to release display resources when projection stops.
+- The user unit owns one registered consumer and one pair of video/input socket paths. It runs wireless projection in-process and supervises a wired worker with inherited media listeners. The worker exits on stop, owner loss, or revocation of its selected phone. Projection restarts require a current registration.
+- The standalone `--phone-id` wireless receiver and standalone wired receiver keep their existing startup configuration and omit the new capability keys. Older consumers can keep using their existing method signatures. The reference display offers runtime controls on F7 (mode), F8 (wired), and F9 (wireless) where advertised.
 
 ### Enrolment Sequences and `ForgetPhone` Semantics
 
@@ -338,10 +356,10 @@ AA owns autostart of its own units. Infotainment starts independently and must n
 
 - **System unit (`/usr/lib/systemd/system/aa-system-helper.service`):** Runs as `root` with `aa-system-helper.service`, the system D-Bus policy + per-UID delivery fragment, `/etc/android-auto-receiver/session.uid`, `/etc/android-auto-receiver/receiver.sha256`, `/etc/android-auto-receiver/ap.conf`, and `70-android-auto-receiver.rules`.
 - **Packaged user unit (`/usr/lib/systemd/user/aa-receiver.service`):** Once enabled, it starts with the user manager (`WantedBy=default.target`, `LimitCORE=0`) and runs `/usr/bin/aa-wireless-receiver --store-dir %S/android-auto-receiver --pairing-only`. It uses the user session bus and the provisioned system helper. Its lifetime follows the user manager, including managers started by Xfce, by a non-graphical login such as SSH, or at boot for a user with linger enabled. It restarts on failure after two seconds (`Restart=on-failure`, `RestartSec=2`) with at most five starts per 60-second interval (`StartLimitIntervalSec=60`, `StartLimitBurst=5`). Invalid command-line arguments exit with status 2 and suppress restart (`RestartPreventExitStatus=2`).
-- **Operator activation and projection-mode override:**
+- **Operator activation and provisioning:**
   - Operator activation is required for both services. The package ships no systemd presets or enablement symlinks for either unit. After provisioning and starting the system helper, enable and start the receiver with `systemctl --user enable --now aa-receiver.service` as the intended user. See `docs/debian-package.md` for migrating existing enablement links on upgrade.
-  - The packaged `--pairing-only` default exposes `org.custom.AndroidAutoReceiver` on the session bus for enrolment and control only (`tools/wireless-receiver/Options.hpp`). A wireless projection override waits for a consumer before starting an AP or projection.
-  - To enable projection, the operator must provision `/etc/android-auto-receiver/session.uid`, `/etc/android-auto-receiver/receiver.sha256` (computed from the installed receiver binary after each install/upgrade), `/etc/android-auto-receiver/ap.conf`, the per-UID D-Bus fragment, and `HU_KEY_PATH` (an owner-only certificate/private-key PEM bundle; see `tools/wireless-receiver/Options.hpp`, `docs/tls-credentials.md`), and install a per-user systemd drop-in overriding `ExecStart` to run with `--phone-id <N>` (or `aa-wired-receiver`) instead of `--pairing-only`. Any custom receiver unit must preserve `LimitCORE=0`.
+  - The packaged `--pairing-only` default exposes the control and pairing API. The active registered consumer can enter projection-ready using `SetProjectionMode` and then request projection.
+  - The operator provisions `/etc/android-auto-receiver/session.uid`, `/etc/android-auto-receiver/receiver.sha256` (computed from the installed wireless receiver binary after each install or upgrade), `/etc/android-auto-receiver/ap.conf`, the per-UID D-Bus fragment, and `HU_KEY_PATH` (an owner-only certificate/private-key PEM bundle, see `docs/tls-credentials.md`). Custom receiver units must preserve `LimitCORE=0`.
 - **Infotainment scope:** Starts `infotainmentd`, `infotainment-ui`, and its display runtime (Weston or Qt Compositor) with no `Requires=`/`After=` dependency on AA.
 
 ---
@@ -403,9 +421,9 @@ Normative replacement rules live in `docs/system-helper.md` (Section "System bus
 - **Audio backend:** AA routes through GStreamer `pulsesink` (`pipewire-pulse`) to the current default PipeWire output. Native `pipewiresink` is refused on PipeWire 1.0.5 / Ubuntu noble (`#80`).
 - **Playout buffer and added latency (`#182`, `#228`):** Both receivers use the playout clock by default (`--audio-playout-ms`, default `60` ms on `aa-wired-receiver` and `120` ms on `aa-wireless-receiver`, max `180` ms) with video held to match (`--video-delay-ms match`, following the audio playout offset, at most `400` ms wireless and `700` ms wired). This adds the playout offset (starting at `60` ms on wired and `120` ms on wireless) to audio, video, touch-to-photon, and IDR recovery latency while keeping A/V lip-sync unchanged. Wired never drops audio to correct the offset (`#228`): a burst after a stall deepens the buffer (to about `360` ms for the phone's `341` ms capture buffer) and it drains by playing at most `0.5`% fast (`1`% while more than `100` ms over), back within `15` ms of `60` ms in about `45` s; a sink stall moves everything after it later by the stall (one `audio_playout_retime`; a sink that stood still keeps playing contiguously from where it stopped) and drains the same way; a stopped stream plays out what was accepted. Known limits (`#232`): a sink stall that recovers can still lose up to ~`50` ms inside the sink (the write in progress, which no counter shows), and A/V stays within its gates only for stalls up to the wired hold cap less the normal depth (~`600` ms); beyond that video leads audio by the rest until the buffer drains back under the cap. Audio that would play more than `2` s after its content time is cut (`audio_playout_overflow`), however it got there, a shutdown plays out for at most `2` s including the sink's end of stream (the rest is reported, `audio_stop_discarded`), and a sink that fails its write (`2` s) drops and reopens (`audio_stall_bypass`, `#60`). Wireless keeps the bounded drift trim, pad and shed of `#182`. Passing `--audio-playout-ms 0` restores the legacy arrival-time model (where `--audio-catch-up-watermark-ms` is available).
 - **Focus requests:** Inside the AAP protocol (`include/aa/protocol/Messages.hpp`), the phone sends `AudioFocusRequest` (`ControlMessageId::audio_focus_request = 18`: `gain`, `gain_transient`, `gain_transient_may_duck`, `release`) and AA replies with `AudioFocusNotification` (`ControlMessageId::audio_focus_notification = 19`). Currently `src/app/WiredSession.cpp` answers focus requests locally (`release -> loss`, otherwise `gain`), and `AudioRouter::set_muted()` provides global mute. No external focus forwarding RPC exists in receiver contract `1.1.0`.
-- **Infotainment arbitration and transport difference for `StopProjection`:**
+- **Infotainment arbitration and `StopProjection`:**
   - Infotainment owns system-wide audio focus, volume, and output routing, and arbitrates AA audio at the PipeWire/WirePlumber layer (mute, duck, cork, or route AA's `pulsesink` stream).
-  - **`StopProjection` does not silence wired AA:** `aa-wireless-receiver` (`tools/wireless-receiver/Runtime.hpp`) observes D-Bus control state and stops the receiver session on `StopProjection`, whereas `aa-wired-receiver` (`tools/wired-receiver/main.cpp`) continues servicing its active session, audio, and input independently of `StopProjection` control state. Infotainment must therefore apply its PipeWire/WirePlumber routing/mute policy directly to the actual AA audio stream whenever wired audio must yield.
+  - Contract `1.3.0` stops the projection session on either transport, including standalone wired projection with the control bus enabled. The control reply accepts the stop request. Session teardown closes media asynchronously. Standalone wired exits after a live stop. The packaged supervisor stays available for another start. Use infotainment's PipeWire mute or routing policy for immediate focus changes.
 
 ---
 
@@ -445,17 +463,19 @@ Exact amendments required in `zucch1/infotainment` when integrating Android Auto
 
 ### Settings
 
-- [ ] Add an Android Auto settings page behind `AppState` (QML declarative only): show AA availability/degraded state when `org.custom.AndroidAutoReceiver` is absent (and note that bus-name presence alone does not prove projection readiness if the unit is running `--pairing-only`), and drive explicit enrolment separately for wireless (exactly one visible public BR/EDR candidate established *first*, then `RequestAddPhone` -> `ConfirmPhonePairing` to open window / `PairingOpened` -> poll `GetPairingComparison` -> human modal -> `RespondPairingComparison(request_id, challenge_id, accept)` -> observe `PairingCompleted` / `GetPairingOutcome` for `"approved"`, `"approved_commit_failed"` (kept), `"not_durable"`, `"retracted"`, or `"retraction_failed"`) and wired (refused candidate under `--wired-enrolment` -> `RequestAddPhone` -> `GetPairingCandidate` -> human modal -> subscribe to `PairingCompleted` -> `ConfirmPhonePairing` / `CancelPhonePairing` -> take final result from the confirm reply or `PairingCompleted` -> restart receiver; after a durable confirm go straight to receiver restart, never a post-confirm `CancelPhonePairing`).
+- [ ] Add an Android Auto settings page behind `AppState` (QML declarative only): show AA availability/degraded state when `org.custom.AndroidAutoReceiver` is absent (read `projection.mode.current` when advertised), and drive explicit enrolment separately for wireless (exactly one visible public BR/EDR candidate established *first*, then `RequestAddPhone` -> `ConfirmPhonePairing` to open window / `PairingOpened` -> poll `GetPairingComparison` -> human modal -> `RespondPairingComparison(request_id, challenge_id, accept)` -> observe `PairingCompleted` / `GetPairingOutcome` for `"approved"`, `"approved_commit_failed"` (kept), `"not_durable"`, `"retracted"`, or `"retraction_failed"`) and wired (refused candidate under `--wired-enrolment` -> `RequestAddPhone` -> `GetPairingCandidate` -> human modal -> subscribe to `PairingCompleted` -> `ConfirmPhonePairing` / `CancelPhonePairing` -> take final result from the confirm reply or `PairingCompleted` -> restart receiver; after a durable confirm go straight to receiver restart, never a post-confirm `CancelPhonePairing`).
 - [ ] Approved-phone list / forget UI (unblocked in `1.2.0`): feature-detect `phones.list` in `GetCapabilities` (or `ContractSemVer >= 1.2.0`), call `ListPhones()` to render approved phones (`phone_id`, redacted `label`, `transport`, `strength`), and drive `ForgetPhone(phone_id)` from the list. Still do **not** read `approved-phones.json` directly. When `ForgetPhone` is wired: handle partial outcomes (local revocation can land while helper AP/bond legs remain pending and return an error), never announce a completed forget from the call's return, and retry the whole `ForgetPhone(phone_id)` explicitly for a pending AP leg — the receiver's refresh loop does not, while bond reconciliation may settle its own leg. The AP/BlueZ legs exist only on the wireless receiver.
 - [ ] Keep Bluetooth/HFP pairing and unpairing under infotainment Settings so the owner can connect HFP (`#160`) and unpair a forgotten phone before re-enrolment (`#136`).
 - [ ] Feature-detect receiver contract `1.1.0` (`GetPairingCandidate`, `Error.NotDurable`) and `1.2.0` (`phones.list` / `ListPhones`, `pairing.outcomes` / `GetPairingOutcome` / `PairingCompleted`) via `ContractSemVer` / `GetCapabilities`, and handle `Error.NotDurable` by never reporting an unconfirmed wired approval as succeeded.
+
+- [ ] Feature-detect `projection.mode` and `transport.control` in `GetCapabilities`. Offer pairing-only / projection-ready and separate wired and wireless switches, initialize them from the runtime capability values, and re-read the values after changes or receiver restart. Keep the controls available to the active registered consumer.
 
 ### App-Host
 
 - [ ] Implement a C++ AA consumer adapter behind `AppState` (built against a pinned `zucch1/android-auto-jetson` source checkout until an SDK package exists) that registers as the exclusive session consumer (`RegisterConsumer`), sends `SetDisplayViewport(width, height, dpi)`, connects to `video.sock` (`aa::ipc::connect_video_consumer`), decodes frames via `aa::consumer::DecodeHelper` (including v2 profile-change reopen at IDR and rate-limited recovery triggered by either `report().awaiting_idr` or the socket's startup-gated `waiting_idr()`, ~1 s grace, closed only when both clear, retaining one queue-full AU for retry), renders I420 frames into the app-host surface, and maps pointer coordinates through the letterboxed video rect into the input descriptor's coordinate space over `input.sock` (`aa::ipc::InputSender`).
 - [ ] Support the selected display runtime (`zucch1/infotainment#9`: Weston `ivi-shell` client surface or Qt Wayland Compositor / embedded QML texture under `eglfs`) without placing D-Bus or socket I/O in QML.
 - [ ] Wire `StartProjection` / `StopProjection` to app foreground/background transitions and request an IDR on surface resume, or on socket `waiting_idr()` / `ipc_consumer_rejected` with `report().awaiting_idr` true — through one rate-limited coordinator, never one raw call per notice.
-- [ ] Arbitrate AA's `pulsesink` PipeWire stream for volume, mute, ducking against infotainment navigation/media, and output routing; apply routing/mute directly to the PipeWire stream when wired AA must yield because `StopProjection` does not silence `aa-wired-receiver`.
+- [ ] Arbitrate AA's `pulsesink` PipeWire stream for volume, mute, ducking against infotainment navigation/media, and output routing. On a `StateChanged` projection stop, confirm the active consumer and release the display sockets. Use PipeWire mute for immediate focus changes and for wired receivers on older contract minors.
 
 ### Startup
 

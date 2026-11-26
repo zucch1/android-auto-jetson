@@ -28,7 +28,7 @@ inline constexpr bool kAllowHelperBusAddress = false;
 inline constexpr const char *usage =
     "usage: aa-wireless-receiver --store-dir PATH (--phone-id N | --pairing-only) [options]\n"
     "  PATH contains approved-phones.json; N selects an approved wireless phone.\n"
-    "  --pairing-only       run only the authenticated control/pairing API; no projection.\n"
+    "  --pairing-only       start in pairing mode; the consumer can enable projection.\n"
     "  --video-socket PATH   encoded video consumer socket\n"
     "  --input-socket PATH   normalized display input socket\n"
     "  --video-profiles WxH@FPS:CODEC,...  offered video profiles (same syntax as\n"
