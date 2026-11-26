@@ -167,7 +167,7 @@ struct MediaTimingContext final {
 // default, and playback-time completion telemetry routed through
 // `telemetry.log_media`. The defaults are wired's: kWiredPlayoutDepth and
 // lossless (PlayoutPolicy::lossless). Wireless passes kWirelessPlayoutDepth and
-// turns lossless off (its audio_config()). A zero depth restores the legacy
+// stays lossless too (#230). A zero depth restores the legacy
 // arrival model, where catch_up_watermark may be set.
 [[nodiscard]] RouterConfig pcm_router_config(
     AudioTelemetryCallbacks telemetry = {},

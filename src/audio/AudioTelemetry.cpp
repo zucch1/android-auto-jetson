@@ -446,8 +446,8 @@ RouterConfig pcm_router_config(AudioTelemetryCallbacks telemetry, SinkBackend ba
     // bounded head trims (or lossless playout's rate correction) the preserved
     // backlog grows without bound.
     config.live_pcm_drift.enabled = true;
-    // #228 / #182: both receivers use the playout clock by default (wired 60 ms
-    // and lossless, wireless 120 ms with the bounded drift rules), with
+    // #228 / #230: both receivers use the lossless playout clock by default
+    // (wired 60 ms, wireless 120 ms), with
     // catch-up off (0). Passing playout_depth = 0 restores the legacy arrival
     // model, where an explicit catch_up_watermark (e.g. 90 ms) remains
     // available behind its flag.

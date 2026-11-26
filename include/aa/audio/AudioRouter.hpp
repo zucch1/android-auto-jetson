@@ -318,8 +318,10 @@ private:
 //   `late`, as on the arrival model.
 // - playout requires LivePcmDriftPolicy::enabled (open fails otherwise).
 //
-// `lossless` (wired default, #228, owner decision 2026-11-23: wired audio must
-// not drop sound, latency is the accepted cost) replaces the drift rules above:
+// `lossless` (both receivers' default: wired #228, wireless #230; owner decision
+// 2026-11-23: audio must not drop sound on either transport, latency is the
+// accepted cost) replaces the drift rules above, which remain for a policy
+// that turns it off:
 // - no drift trim, no shed and no drift pad: every decoded sample is played.
 //   A burst simply deepens the buffer; the depth and the offset grow with it;
 // - rate correction: while the window's floor is more than 10 ms above `depth`
@@ -377,6 +379,12 @@ struct PlayoutPolicy final {
 // Wireless: 120 ms of playout buffer rides out a one-way delay excursion of
 // 120 ms (a round trip spike to ~250 ms) and keeps the pulsesink ring (200 ms)
 // able to take a whole 42.67 ms chunk ahead of it without blocking the worker.
+// Re-checked for lossless playout (#230): the depth is now the floor the rate
+// correction drains back to, not a bound on the offset (bursts deepen the buffer
+// instead of being shed). It stays 120 ms: it is still the underrun margin on
+// Wi-Fi (wired's 60 ms would underrun on every one-way excursion over 60 ms),
+// and the deepest burst the phone can deliver (12 chunks, 589 ms) stays under
+// the 700 ms video hold cap from any depth up to kMaxPlayoutDepth.
 inline constexpr core::Nanoseconds kWirelessPlayoutDepth{120'000'000};
 // Wired (#228): measured on 47 wired A26 runs (5.8 h, 488,000 media chunks,
 // 2026-11-15..17). Lateness accumulated within 2 s while the receiver's own sink
@@ -435,8 +443,8 @@ struct RouterConfig final {
     // 1.0.5 / Ubuntu noble due to missing rate control and long-run degradation (#80).
     core::Nanoseconds render_quantum{core::Nanoseconds{50'000'000}};
     // Playout clock. Off (the arrival model) in a bare RouterConfig;
-    // pcm_router_config() turns it on for both receivers: wired 60 ms and
-    // lossless, wireless 120 ms with the drift rules.
+    // pcm_router_config() turns it on, lossless, for both receivers: wired
+    // 60 ms, wireless 120 ms (#230).
     PlayoutPolicy playout{};
     // Clock of the arrival stamps (empty: the steady clock). Tests inject it.
     std::function<core::Nanoseconds()> clock{};

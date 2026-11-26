@@ -245,7 +245,7 @@ them prescribes a p99, a rolling mean or a coverage rule.
   ~`360` ms for a phone's 8 buffered chunks), after a sink stall by the stall,
   and shrink again at 5-10 ms/s. While a write is blocked past its slot, video
   whose audio it holds waits with it; the hold then follows the offset the sink
-  really plays with. It is capped at `700` ms (wireless `400`), above which A/V
+  really plays with. It is capped at `700` ms (wireless too since `#230`), above which A/V
   parts by the rest: A/V holds for sink stalls up to about `600` ms. The write in
   progress during a stall can also lose up to ~`50` ms inside the sink (both
   `#232`).

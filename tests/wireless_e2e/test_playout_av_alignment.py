@@ -41,7 +41,7 @@ DEPTH_NS = 120_000_000
 SINK_NS = 2_000_000    # sink handoff to playback slot
 PAINT_NS = 9_000_000   # decode + paint after release
 START_NS = 1_000_000_000
-HOLD_CAP_NS = 400_000_000  # VideoOutlet::kMaxPresentationDelay (wireless)
+HOLD_CAP_NS = 400_000_000  # VideoOutlet::kMaxPresentationDelay (the drift rules' cap)
 
 
 def one_way_ns(t_ns: int, spike: bool) -> int:
@@ -124,16 +124,20 @@ def step_audio_events(seconds: int, high: int, low: int, drop_at: int, slewed: b
     return events
 
 
-def wired_default_depth(root: Path) -> int:
-    """kWiredPlayoutDepth, so the fixtures follow the production default."""
+def default_depth(root: Path, name: str = "kWiredPlayoutDepth") -> int:
+    """kWiredPlayoutDepth (or `name`), so the fixtures follow the production default."""
     header = (root / "include/aa/audio/AudioRouter.hpp").read_text(encoding="utf-8")
-    found = re.search(r"kWiredPlayoutDepth\{([0-9']+)\}", header)
-    assert found, "kWiredPlayoutDepth not found"
+    found = re.search(name + r"\{([0-9']+)\}", header)
+    assert found, name + " not found"
     return int(found[1].replace("'", ""))
 
 
+def wired_default_depth(root: Path) -> int:
+    return default_depth(root)
+
+
 def lossless_backlog_audio_events(seconds: int, depth: int, burst: int) -> list[dict]:
-    """Records of a wired route that re-anchors on a `burst`-chunk backlog at 20 s.
+    """Records of a lossless route that re-anchors on a `burst`-chunk backlog at 20 s.
 
     The offset target rises to depth + (burst - 1) chunks, then falls by the
     lossless rate correction (AudioRouter wanted_rate_ppm: 250 ppm per ms over a
@@ -170,7 +174,7 @@ def offset_at(audio: list[dict], t: int) -> int:
 
 
 def wired_hold_cap(root: Path) -> int:
-    """kLosslessVideoHoldCap: the wired receiver's hold cap."""
+    """kLosslessVideoHoldCap: the hold cap behind lossless audio (both receivers)."""
     header = (root / "tools/media_playout_options.hpp").read_text(encoding="utf-8")
     found = re.search(r"kLosslessVideoHoldCap\{([0-9]+)\}", header)
     assert found, "kLosslessVideoHoldCap not found"
@@ -408,6 +412,24 @@ def main() -> int:
         assert res["abs_max_ms"] <= 50.0, res
     clipped = judge(smoke, contract, burst_audio, outlet_video(66, burst_audio, new_outlet=True), "cap")
     assert not clipped["passed"] and clipped["abs_max_ms"] > 150.0, clipped
+
+    # Wireless lossless playout (#230): the deepest burst the phone can deliver
+    # after a Wi-Fi drought is its credit window (4 chunks) plus its 341 ms
+    # capture buffer (8 chunks), 12 chunks at once: 120 ms + 11 chunks = 589 ms.
+    # The drift rules shed it under a 400 ms hold cap; lossless keeps it and the
+    # hold follows it under the lossless cap, in sync all the while it drains.
+    wireless_depth = default_depth(root, "kWirelessPlayoutDepth")
+    assert wireless_depth == DEPTH_NS, wireless_depth
+    wifi_audio = lossless_backlog_audio_events(70, wireless_depth, burst=12)
+    wifi_peak = max(a["playout_offset_ns"] for a in wifi_audio)
+    assert HOLD_CAP_NS < wifi_peak <= wired_cap - 100_000_000, wifi_peak
+    for clause in ("cap", "soak_rate"):
+        res = judge(smoke, contract, wifi_audio,
+                    outlet_video(66, wifi_audio, new_outlet=True, cap=wired_cap), clause)
+        assert res["passed"], ("wireless_twelve_chunk_burst", clause, res)
+        assert res["abs_max_ms"] <= 50.0, res
+    wifi_clipped = judge(smoke, contract, wifi_audio, outlet_video(66, wifi_audio, new_outlet=True), "cap")
+    assert not wifi_clipped["passed"] and wifi_clipped["abs_max_ms"] > 150.0, wifi_clipped
 
     stuck = judge(smoke, contract, deep_audio, wired_matched_video, "cap")
     assert not stuck["passed"], stuck

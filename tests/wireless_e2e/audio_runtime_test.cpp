@@ -449,6 +449,10 @@ struct RuntimeFixture final {
     bool session_live{false};
     bool session_active{false};
     aa::core::Nanoseconds audio_catch_up_watermark{0};
+    // The #182 drift rules (lossless off, wireless's default before #230): for
+    // tests of the withheld credit a blocked write causes without lossless
+    // playout, which grants on receipt instead.
+    bool drift_rules{false};
 
     void start(
         Clock::time_point deadline = Clock::now() + 20s,
@@ -490,11 +494,13 @@ struct RuntimeFixture final {
         ASSERT_TRUE(client_res);
         helper_client = std::move(client_res).value();
 
-        audio_worker = std::make_unique<audio::AudioRenderWorker>(
-            wr::audio_config(audio::SinkBackend::pulse, audio_catch_up_watermark,
+        auto audio_policy = wr::audio_config(audio::SinkBackend::pulse, audio_catch_up_watermark,
                              // Catch-up applies to the arrival model only.
                              audio_catch_up_watermark.count > 0 ? aa::core::Nanoseconds{0}
-                                                                : audio::kWirelessPlayoutDepth),
+                                                                : audio::kWirelessPlayoutDepth);
+        if (drift_rules) { audio_policy.playout.lossless = false; }
+        audio_worker = std::make_unique<audio::AudioRenderWorker>(
+            std::move(audio_policy),
             wr::audio_telemetry(),
             custom_open ? custom_open : make_gated_router(gate));
         ASSERT_TRUE(audio_worker->ready());
@@ -751,6 +757,7 @@ TEST(WirelessAudioRuntime, AckSendDropRetiresRecoverablyWhileOwnerCancelCleanAnd
     std::atomic<int> cancel_service_code{-1};
     {
         RuntimeFixture f;
+        f.drift_rules = true; // a withheld credit (see RuntimeFixture::drift_rules)
         f.gate->block_first_write = true;
         auto on_before = [&](app::WiredSession& session, bool in_poll) {
             const int p = inject_phase.load();
@@ -1484,6 +1491,7 @@ TEST(WirelessAudioRuntime, RuntimeAvPendingDuplicateBeforeAckEmitsQueueRejection
     int exit_code = -1;
     {
         RuntimeFixture f;
+        f.drift_rules = true; // a withheld credit (see RuntimeFixture::drift_rules)
         f.gate->block_first_write = true;
         ASSERT_NO_FATAL_FAILURE(f.start(Clock::now() + 20s));
         ASSERT_TRUE(f.backend->wait_authorized(1));

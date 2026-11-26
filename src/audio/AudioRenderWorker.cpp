@@ -181,7 +181,7 @@ AudioRenderWorker::AudioRenderWorker(RouterConfig config,
       ack_release_timeout_(std::max(std::chrono::milliseconds{1}, ack_release_timeout)),
       credit_window_(std::clamp<std::uint32_t>(credit.window, 1, AudioCreditPolicy::kMaxWindow)),
       lossless_(config.playout.enabled && config.playout.lossless),
-      capacity_scale_(lossless_ ? std::max<std::size_t>(credit_window_, lossless_scale(config))
+      capacity_scale_(lossless_ ? lossless_scale(config) + (credit_window_ > 1 ? credit_window_ : 0)
                                 : credit_window_),
       playout_depth_ns_(config.playout.enabled ? config.playout.depth.count : 0),
       emergency_backlog_ns_(config.playout.emergency_backlog.count),

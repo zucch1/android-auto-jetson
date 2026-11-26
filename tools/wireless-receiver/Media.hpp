@@ -90,14 +90,17 @@ private:
 // that anchored each stream, with chunks back to back (audio::PlayoutPolicy),
 // and the phone may keep audio::kWirelessCreditWindow chunks unacknowledged.
 // Zero restores the arrival model.
+//
+// #230 (owner rule 2026-11-23: audio must not drop sound on either transport):
+// the playout is lossless, as on wired (#228). A Wi-Fi burst deepens the buffer
+// instead of being shed or trimmed, nothing is padded before an underrun, and
+// the excess drains by playing at most 0.5% (1%) fast. pcm_router_config() sets
+// it; the video hold follows the deeper offset up to kLosslessVideoHoldCap.
 [[nodiscard]] inline audio::RouterConfig audio_config(
     audio::SinkBackend backend = audio::SinkBackend::pulse,
     core::Nanoseconds catch_up_watermark = core::Nanoseconds{0},
     core::Nanoseconds playout_depth = audio::kWirelessPlayoutDepth) {
-    auto config = audio::pcm_router_config(backend, audio_telemetry(), playout_depth, catch_up_watermark);
-    // Wireless keeps the #182 drift rules; lossless playout is wired's (#228).
-    config.playout.lossless = false;
-    return config;
+    return audio::pcm_router_config(backend, audio_telemetry(), playout_depth, catch_up_watermark);
 }
 
 // Video presentation delay (credit window + playout, 2026-11-20): with a fixed

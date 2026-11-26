@@ -96,8 +96,8 @@ public:
     // write returns: the value then keeps that content's due just ahead of now.
     // The newest write's end offset (0 when none).
     [[nodiscard]] std::chrono::nanoseconds current_playout_offset() const;
-    // Lossless playout (wired): the video hold may follow it further than
-    // wireless's cap (tools/media_playout_options.hpp).
+    // Lossless playout (both receivers' default since #230): the video hold may
+    // follow it further than the arrival-model cap (tools/media_playout_options.hpp).
     [[nodiscard]] bool lossless() const noexcept { return lossless_; }
     [[nodiscard]] SinkReport sink_report();
 
@@ -235,6 +235,15 @@ private:
     // 400 ms, 4.4 s by default. The credit is then granted on receipt through any
     // stall the sink recovers from, whatever the packet size, so the phone never
     // has to hold audio back (its capture buffer is 341 ms).
+    //
+    // A credit window of N > 1 (wireless, #230) adds N capacity units on top: the
+    // N permits the phone holds each reserve a whole envelope (100 ms of media,
+    // 200 ms of voice), and without them those reservations ate into the time
+    // above: credits were acknowledged on receipt for 4.0 s of 100 ms media
+    // packets and 3.6 s of guidance, at most the 4 s a stall the sink recovers
+    // from can queue, against wired's 4.3 and 4.2 s. With them each role keeps
+    // at least wired's margin. At wireless's window of 4 that is 5.2 s and 5,200
+    // slots a role (job records at all three slot limits: 11.9 MiB, not 10.1).
     //
     // Memory is bounded by one slot (job) per kSlotNs of that time, 4,400 a role.
     // Packets shorter than kSlotNs share one while they wait here (coalesce_locked,

@@ -516,9 +516,10 @@ private:
     };
     // Above the cap the hold is clipped (and logged). The default bounds touch
     // latency and keeps 600 ms of the drive smoke's 1.0 s waiting_idr budget;
-    // the wireless router sheds a backlog above 350 ms so the audio offset stays
-    // under it. Wired keeps every sample and raises the cap instead
-    // (tools/media_playout_options.hpp, kLosslessVideoHoldCap).
+    // the drift rules shed a backlog above 350 ms so the audio offset stays
+    // under it. Lossless playout (both receivers' default) keeps every sample
+    // and raises the cap instead (tools/media_playout_options.hpp,
+    // kLosslessVideoHoldCap).
     static constexpr std::chrono::milliseconds kMaxPresentationDelay{400};
 
     [[nodiscard]] std::chrono::nanoseconds requested_delay_locked(core::Nanoseconds content) const {
