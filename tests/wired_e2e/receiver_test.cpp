@@ -8237,6 +8237,138 @@ TEST(WiredReceiver, LosslessOverdueFirstPlacementGoesByTheCurrentClock) {
     }
 }
 
+// Sol review of #229 at 1549533: no frame is written at a time that has passed, and
+// each one plays within the emergency bound of its own receipt or is cut and counted.
+// - stop_before_render (P2): the stop drains voice parents that never had a render
+//   step, behind media that set the timeline. 1549533 wrote them 2.44 s in the past.
+// - after_whole_cut (P2): media after a first stream that was cut whole, the slot long
+//   passed. 1549533 took the cut's base for a schedule and wrote it 2.94 s in the past.
+// - grouped (P3): packets received together, stopped at the bound. 1549533 kept all of
+//   them because the first one was inside it.
+TEST(WiredReceiver, LosslessEveryFrameIsHeardOrCutByItsOwnReceipt) {
+    enum class Kind : std::uint8_t { stop_before_render, after_whole_cut, grouped };
+    struct Case {
+        Kind kind;
+        std::int64_t late_ms; // the stop (or the media render) after the receipt
+        bool all_cut;
+    };
+    constexpr std::uint64_t kPackets = 20;
+    constexpr std::uint64_t kVoiceFrames = kPackets * 3 - 2;
+    constexpr std::int64_t kBound = 2'000'000'000;
+    for (const Case c : {Case{Kind::stop_before_render, 500, false}, Case{Kind::stop_before_render, 1'900, false},
+                         Case{Kind::stop_before_render, 2'500, true}, Case{Kind::after_whole_cut, 1'000, false},
+                         Case{Kind::after_whole_cut, 3'000, true}, Case{Kind::grouped, 1'980, false}}) {
+        SCOPED_TRACE(std::to_string(static_cast<int>(c.kind)) + ", " + std::to_string(c.late_ms) + " ms");
+        ReceiverLogScope logging{g_running};
+        auto gate = std::make_shared<RenderGate>();
+        gate->release();
+        const std::int64_t t0 = 1'000'000'000'000;
+        std::int64_t clock = t0;
+        auto config = pcm_router_config();
+        config.clock = [&clock] { return aa::core::Nanoseconds{clock}; };
+        gate->clock = [&clock] { return clock; };
+        auto opened = aa::audio::detail::open_router_with_sink_for_test(config, std::make_unique<GatedRenderSink>(gate));
+        ASSERT_TRUE(opened);
+        auto &router = opened.value();
+        const auto media = aa::protocol::ChannelRole::media_audio;
+        const auto guidance = aa::protocol::ChannelRole::guidance_audio;
+        std::uint64_t sequence = 0;
+        const auto render = [&] {
+            for (int i = 0; i < 10'000; ++i) {
+                auto step = router.render_step();
+                ASSERT_TRUE(step);
+                if (!step.value().pending) { return; }
+            }
+            FAIL() << "render does not settle";
+        };
+        // Packet k is one frame of 1,000 + 100 k: a ramp, which resampling keeps.
+        std::int64_t voice_at = t0;
+        const std::int64_t spacing = c.kind == Kind::grouped ? 0 : 62'000;
+        const auto packet_at = [&](std::uint64_t k) { return voice_at + static_cast<std::int64_t>(k) * spacing; };
+        const auto submit_voice = [&] {
+            for (std::uint64_t k = 0; k < kPackets; ++k) {
+                const auto value = static_cast<std::uint16_t>(1'000 + 100 * k);
+                clock = packet_at(k);
+                ASSERT_TRUE(router.submit({{guidance, ++sequence, {packet_at(k)}},
+                                           std::vector<std::byte>{std::byte(value & 0xFF), std::byte(value >> 8)}},
+                                          aa::core::Nanoseconds{packet_at(k)}));
+            }
+        };
+        std::int64_t media_at = 0;
+        std::uint64_t media_frames = 0;
+        std::uint64_t expected_cut = 0;
+        if (c.kind == Kind::stop_before_render) {
+            // Media sets the timeline; the voice parents get no render step before the stop.
+            ASSERT_TRUE(router.submit({{media, ++sequence, {t0}}, std::vector<std::byte>(8192)}, aa::core::Nanoseconds{t0}));
+            media_frames += 2'048;
+            ASSERT_NO_FATAL_FAILURE(render());
+            voice_at = t0 + 200'000'000;
+            ASSERT_NO_FATAL_FAILURE(submit_voice());
+            clock = voice_at + c.late_ms * 1'000'000;
+            (void)router.end_stream(guidance);
+            ASSERT_NO_FATAL_FAILURE(render());
+            if (c.all_cut) { expected_cut = kVoiceFrames; }
+        } else if (c.kind == Kind::after_whole_cut) {
+            ASSERT_NO_FATAL_FAILURE(submit_voice());
+            clock = voice_at + 2'500'000'000;
+            (void)router.end_stream(guidance);
+            ASSERT_NO_FATAL_FAILURE(render());
+            ASSERT_EQ(router.report().stats.frames_overflowed, kVoiceFrames);
+            ASSERT_TRUE(gate->pcm.empty());
+            clock += 100'000'000;
+            media_at = clock;
+            ASSERT_TRUE(router.submit({{media, ++sequence, {media_at}}, std::vector<std::byte>(8192, std::byte{1})},
+                                      aa::core::Nanoseconds{media_at}));
+            media_frames += 2'048;
+            clock = media_at + c.late_ms * 1'000'000;
+            ASSERT_NO_FATAL_FAILURE(render());
+            expected_cut = kVoiceFrames + (c.all_cut ? 2'048 : 0);
+        } else {
+            ASSERT_NO_FATAL_FAILURE(submit_voice());
+            clock = voice_at + c.late_ms * 1'000'000;
+            (void)router.end_stream(guidance);
+            ASSERT_NO_FATAL_FAILURE(render());
+        }
+        const auto &stats = router.report().stats;
+        EXPECT_EQ(stats.frames_decoded, media_frames + kVoiceFrames);
+        EXPECT_EQ(stats.frames_decoded, stats.frames_retained + stats.frames_overflowed);
+        if (c.kind != Kind::grouped) { EXPECT_EQ(stats.frames_overflowed, expected_cut); }
+        EXPECT_EQ(stats.playout_overflows == 0, stats.frames_overflowed == 0);
+        // Each frame written: not in the past, and within the bound of its own receipt.
+        std::uint64_t voice_heard = 0;
+        std::uint64_t media_heard = 0;
+        for (std::size_t piece = 0; piece < gate->pcm.size(); ++piece) {
+            const auto &pcm = gate->pcm[piece];
+            const auto stamp = gate->timestamps[piece].count;
+            for (std::size_t at = 0; at + 4 <= pcm.size(); at += 4) {
+                const auto sample = static_cast<std::int16_t>(static_cast<std::uint16_t>(pcm[at]) |
+                                                              static_cast<std::uint16_t>(pcm[at + 1]) << 8);
+                if (sample == 0) { continue; }
+                const auto plays = stamp + static_cast<std::int64_t>(at / 4) * 1'000'000'000 / 48'000;
+                EXPECT_GE(stamp, gate->clock_ns[piece]) << piece;
+                if (sample == 257) { // media
+                    ++media_heard;
+                    EXPECT_LE(plays - media_at, kBound + 21'000) << piece;
+                    continue;
+                }
+                if (sample < 950) { continue; } // the resampler's ramp in from silence
+                ++voice_heard;
+                const auto k = std::min<std::uint64_t>(
+                    kPackets - 1, static_cast<std::uint64_t>(std::max(0.0, std::round((sample - 1'000.0) / 100.0))));
+                // The resampler shifts a frame by under one packet.
+                EXPECT_LE(plays - packet_at(k), kBound + spacing + 21'000) << "packet " << k;
+            }
+        }
+        if (c.kind == Kind::after_whole_cut) { EXPECT_EQ(media_heard, c.all_cut ? 0U : 2'048U); }
+        if (c.kind == Kind::stop_before_render) { EXPECT_NEAR(static_cast<double>(voice_heard), c.all_cut ? 0.0 : 58.0, 2.0); }
+        if (c.kind == Kind::grouped) {
+            // Received together: only the last packet is still inside the bound when it plays.
+            EXPECT_GT(stats.frames_overflowed, kVoiceFrames - 4);
+            EXPECT_LT(stats.frames_overflowed, kVoiceFrames);
+        }
+    }
+}
+
 // Third review of #229, P2: an AV_STOP/START storm through the production worker.
 // 07b82f0 scheduled the last of 80 one-chunk streams 3.4 s after its receipt.
 TEST(WiredReceiver, LosslessStopStartStormStaysWithinTheEmergencyBound) {

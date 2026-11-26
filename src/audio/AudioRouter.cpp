@@ -449,6 +449,9 @@ struct AudioRouter::Impl final {
     // the sink), and each role's committed end. Split and batched pumps of the
     // same schedule therefore produce identical output.
     std::optional<core::Nanoseconds> timeline_base{};
+    // The base was committed by a cut that wrote nothing (finish_cut): it keeps
+    // the cut's frame coordinates, but the sink has no schedule to retime yet.
+    bool timeline_unwritten{};
     std::uint64_t playback_cursor_frames{0};
     std::array<std::uint64_t, kRoleCount> role_end_frames{};
     // Committed source-time frontier (max intended + content_frames across
@@ -524,14 +527,15 @@ struct AudioRouter::Impl final {
 
     // Lossless: where a fresh run plays instead of at its anchor, arrival + depth,
     // when that (and its slot, plan_playout()) has passed and a late-slot retime does
-    // not see to it: there is no timeline to move yet, or the run was held back until
-    // its stream ended, which can be longer ago than any lateness. It plays with the
-    // lead of a retime; what is too old by then goes by its receipt (overflow_beyond).
+    // not see to it: there is no timeline to move yet (at most a cut's bookkeeping),
+    // or the run was held back until its stream ended, which can be longer ago than
+    // any lateness. It plays with the lead of a retime; what is too old by then goes
+    // by its receipt (overflow_beyond).
     // Not for stamps of another clock: those are placed as they say.
     [[nodiscard]] std::optional<std::int64_t> overdue_start(const Run& run) const noexcept {
         const auto depth = config.playout.depth.count;
         const auto arrival = run.timestamp.count;
-        if (!lossless() || (timeline_base && !run.held_back)
+        if (!lossless() || (timeline_base && !timeline_unwritten && !run.held_back)
             || arrival > INT64_MAX - depth || arrival + depth >= step_ns) { return {}; }
         const auto bound = config.playout.emergency_backlog.count;
         const auto near = [bound](std::int64_t later, std::int64_t earlier) {
@@ -787,28 +791,39 @@ struct AudioRouter::Impl final {
             if (age > bound) { cut = std::min(frames, ns_to_frames(core::Nanoseconds{age - bound})); }
             return true;
         }
-        // Each part goes by its own source's receipt: the cut ends at the first
-        // frame received no more than the bound before it plays at start_ns
-        // (cutting a frame moves every later one a frame earlier).
+        // Each part goes by its own source's receipt, where it plays once the cut
+        // is made (cutting a frame moves every later one a frame earlier): a part
+        // received closer to the one before than that one lasts plays later
+        // against its own receipt, so every part is judged, not only the first
+        // that is kept (Sol review of #229).
         if (start_ns < INT64_MIN + bound) { return true; }
         const auto oldest = start_ns - bound;
+        const auto stop = frames > UINT64_MAX - content_frame ? UINT64_MAX : content_frame + frames;
+        std::uint64_t need = 0;
         std::uint64_t at = 0;
-        for (std::size_t i = 0; i < run.sources.size(); ++i) {
+        for (std::size_t i = 0; i < run.sources.size() && at < stop; ++i) {
             const auto& span = run.sources[i];
             const bool last = i + 1 == run.sources.size();
             const auto end = last ? UINT64_MAX : at + span.frames;
             if (end > content_frame) {
                 const auto from = std::max(at, content_frame);
+                const auto ahead = from - content_frame;
                 const auto received = span.at_ns + frames_to_ns(from - at).count;
-                const auto skip = received >= oldest ? 0 : ns_to_frames(core::Nanoseconds{oldest - received});
-                if (skip < end - from) {
-                    cut = std::min(frames, from + skip - content_frame);
-                    return true;
+                // Kept, the part's first frame plays `ahead - cut` frames after
+                // start_ns, and the rest of the part keeps pace with its receipt.
+                std::uint64_t part = 0;
+                if (received < oldest) {
+                    const auto skip = ns_to_frames(core::Nanoseconds{oldest - received});
+                    part = skip >= end - from ? end - content_frame : ahead + skip;
+                } else {
+                    const auto slack = ns_to_frames(core::Nanoseconds{received - oldest});
+                    part = slack >= ahead ? 0 : ahead - slack;
                 }
+                need = std::max(need, part);
             }
             at = end;
         }
-        cut = frames;
+        cut = std::min(frames, need);
         return true;
     }
 
@@ -971,7 +986,7 @@ struct AudioRouter::Impl final {
     // share of it. What the decoder kept back is missing from the first of them, and
     // what it had kept back before is at the first one's head, as if each had been
     // decoded alone. A run left without output counts towards the next one's content.
-    void share_output(std::size_t role, std::span<const std::byte> pcm) {
+    void share_output(std::size_t role, std::span<const std::byte> pcm, bool held_back = false) {
         auto& queue = pending[role];
         const auto frame_bytes = static_cast<std::size_t>(config.output_format.channels) * sizeof(std::int16_t);
         const auto frames = static_cast<std::uint64_t>(pcm.size() / frame_bytes);
@@ -987,6 +1002,7 @@ struct AudioRouter::Impl final {
             due += run.content_frames;
             const auto upto = due + frames > content ? due + frames - content : 0;
             run.awaiting = false;
+            run.held_back = run.held_back || held_back;
             run.frames = upto - given;
             run.decoded_frames = run.frames;
             run.content_frames += std::exchange(unplayed, 0);
@@ -1047,7 +1063,9 @@ struct AudioRouter::Impl final {
             return {};
         }
         if (!pending[role].empty() && pending[role].back().awaiting) {
-            share_output(role, tail);
+            // Parents that had no output of their own yet: none of it was placed,
+            // so it is held back like a run of its own below (Sol review of #229).
+            share_output(role, tail, true);
             finish();
             return {};
         }
@@ -2043,6 +2061,7 @@ core::Result<void> AudioRouter::pump() {
     if (!impl_->timeline_base.has_value()) {
         impl_->timeline_base = core::Nanoseconds{base_ns};
     }
+    impl_->timeline_unwritten = false;
     impl_->playback_cursor_frames = timeline_frames;
     impl_->role_end_frames = new_role_ends;
     impl_->source_frontier_frames = planned_source_frontier;
@@ -2156,6 +2175,7 @@ void AudioRouter::reset_session_timeline() {
         ++impl_->generations[i];
     }
     impl_->timeline_base.reset();
+    impl_->timeline_unwritten = false;
     impl_->newest_arrival = INT64_MIN;
     impl_->last_reported.reset();
     impl_->last_write.reset();
@@ -2538,6 +2558,7 @@ core::Result<RenderStep> AudioRouter::render_step() {
         }
         impl_->role_end_frames[head.role] = head.end_frame;
         // What was cut first of all: the role's end and anchor are on this timeline.
+        if (!impl_->timeline_base) { impl_->timeline_unwritten = true; }
         impl_->timeline_base = base;
         reach_source_end(head);
         result.completed.push_back(queue.front().header);
@@ -2814,6 +2835,7 @@ core::Result<RenderStep> AudioRouter::render_step() {
         output.assign(static_cast<std::size_t>(frames) * frame_bytes, std::byte{0});
     }
     impl_->timeline_base = base;
+    impl_->timeline_unwritten = false;
     impl_->playback_cursor_frames = end;
     // The reported offset moves toward its target by at most half the output
     // time that passes, in both directions (Neon P1-1): content then advances
