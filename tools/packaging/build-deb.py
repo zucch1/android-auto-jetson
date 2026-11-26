@@ -23,6 +23,7 @@ NAME = "android-auto-receiver"
 DOC = f"usr/share/doc/{NAME}"
 LIB = f"usr/lib/{NAME}"
 ARCHITECTURES = {"arm64": "AArch64", "amd64": "Advanced Micro Devices X86-64"}
+PRIVATE_BUILD_PATH = re.compile(rb"(?<![A-Za-z0-9_./-])/(?:tmp|var/tmp|opt|src|build|workspace)/")
 APPS = (
     "aa-wireless-receiver", "aa-wired-receiver", "aa-wired-enrol", "aa-dummy-display",
     "aa-decode-probe", "aa-usb-aoa-probe", "aa-ipc-bench",
@@ -106,12 +107,11 @@ def validate_elf(path, architecture, runtime_path):
 def stage_binaries(stage, payload, architecture):
     executables = [f"usr/bin/{app}" for app in APPS] + ["usr/libexec/aa-system-helper"]
     private_runpath = "$ORIGIN/../lib/android-auto-receiver"
-    dynamic_sections = []
-    private_sonames = set()
+    dynamic_sections = {}
     for relative in executables:
         source = regular_file(stage / relative, stage)
         runpath = [private_runpath] if source.name in {"aa-wireless-receiver", "aa-wired-receiver"} else []
-        dynamic_sections.append(validate_elf(source, architecture, runpath))
+        dynamic_sections[payload / relative] = validate_elf(source, architecture, runpath)
         failures = check(source)
         if failures:
             raise ValueError(f"{source.name}: {', '.join(failures)}")
@@ -125,17 +125,27 @@ def stage_binaries(stage, payload, architecture):
             raise ValueError(f"expected exactly one staged version of {library}")
         source = regular_file(candidates[0], stage)
         dynamic = validate_elf(source, architecture, ["$ORIGIN"])
-        dynamic_sections.append(dynamic)
         soname = re.search(r"\(SONAME\).*?\[(.*?)\]", dynamic)
         if not soname or not pattern.fullmatch(soname[1]):
             raise ValueError(f"{library}: missing or invalid SONAME")
-        private_sonames.add(soname[1])
-        copy_file(source, payload / LIB / soname[1])
+        installed = payload / LIB / soname[1]
+        dynamic_sections[installed] = dynamic
+        copy_file(source, installed)
 
-    for dynamic in dynamic_sections:
-        required = set(re.findall(r"\(NEEDED\).*?\[(lib(?:aasdk|aap_protobuf)\.so[^\]]*)\]", dynamic))
-        if missing := required - private_sonames:
-            raise ValueError(f"missing private runtime libraries: {', '.join(sorted(missing))}")
+    for binary, dynamic in dynamic_sections.items():
+        # validate_elf has already restricted these to literal ORIGIN-relative
+        # entries. Verify each private NEEDED against the final payload layout.
+        runpaths = re.findall(r"\((?:RPATH|RUNPATH)\).*?\[(.*?)\]", dynamic)
+        directories = [(binary.parent / entry.removeprefix("$ORIGIN").lstrip("/")).resolve()
+                       for entry in runpaths]
+        needed = re.findall(r"\(NEEDED\).*?\[(lib(?:aasdk|aap_protobuf)\.so[^\]]*)\]", dynamic)
+        for name in needed:
+            expected = payload / LIB / name
+            resolved = next(((directory / name).resolve() for directory in directories
+                             if (directory / name).is_file()), None)
+            if resolved != expected:
+                raise ValueError(f"{binary.name}: private runtime library {name} does not resolve "
+                                 f"to {expected.relative_to(payload)}")
 
     archive = f"{LIB}/libaareceiver-consumer.a"
     source = regular_file(stage / archive, stage)
@@ -175,16 +185,17 @@ def build(stage, output, architecture):
 
         files = sorted(path for path in (payload / "usr").rglob("*") if path.is_file())
         installed_size = sum((path.stat().st_size + 1023) // 1024 for path in files)
-        control_fields = regular_file(ROOT / "packaging/debian/control", ROOT).read_text()
+        package_field, control_fields = regular_file(
+            ROOT / "packaging/debian/control", ROOT).read_text().split("\n", 1)
         write_metadata(control / "control", (
-            f"Version: {version}\nArchitecture: {architecture}\nInstalled-Size: {installed_size}\n"
-            f"{control_fields}"
+            f"{package_field}\nVersion: {version}\nArchitecture: {architecture}\n"
+            f"Installed-Size: {installed_size}\n{control_fields}"
         ).encode())
         private_paths = (b"/home/", b"/root/", os.fsencode(ROOT), os.fsencode(stage))
         checksums = []
         for path in files:
             data = path.read_bytes()
-            if any(private_path in data for private_path in private_paths):
+            if any(private_path in data for private_path in private_paths) or PRIVATE_BUILD_PATH.search(data):
                 raise ValueError(f"private path in package input: {path.relative_to(payload)}")
             digest = hashlib.md5(data, usedforsecurity=False).hexdigest()
             checksums.append(f"{digest}  {path.relative_to(payload)}\n")

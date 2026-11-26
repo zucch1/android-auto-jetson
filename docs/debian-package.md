@@ -37,7 +37,10 @@ comes from the Jetson software stack managed by the operator.
 For local verification on an x86-64 Ubuntu builder, run the same build and
 staging steps, then pass `--arch amd64` to the assembler. From either native
 architecture, CTest can exercise package assembly with small ELF fixtures
-without building the receiver binaries:
+without building the receiver binaries. With Debian staging enabled and
+`receiver-deb-binaries` built, `deb_package_staged` also installs the CMake
+component into a temporary directory, assembles it, and checks the resulting
+package. The tests skip on hosts missing the Debian or ELF tools.
 
 ```sh
 ctest --preset host-release -R '^deb_package_' --output-on-failure
@@ -98,8 +101,14 @@ configuration. Calculate the helper digest from the **installed** receiver
 after each upgrade or rollback. A per-user systemd drop-in can replace
 `ExecStart` with the intended receiver CLI and its arguments once provisioning
 is complete. The historical standalone USB-policy installer may have left a
-rule under `/etc/udev/rules.d` with the same name. Check that override during
-deployment because udev gives it precedence over the packaged rule.
+rule under `/etc/udev/rules.d` with the same name. Package configuration warns
+if that override or a masking symlink is present because udev gives it
+precedence over the packaged rule. For manual installs, back up and move an
+obsolete override out of the rules directory before installing, or reload udev
+and reconnect the affected device after moving it. The deployment tool backs up
+and removes the legacy rule during migration. Package configuration reloads
+the rules and triggers only the approved USB devices, their USB interfaces,
+and their tty children.
 
 Jetson install, upgrade, and rollback are documented in [deploy.md](deploy.md)
 (tracked in [#190](https://github.com/zucch1/android-auto-jetson/issues/190)).
