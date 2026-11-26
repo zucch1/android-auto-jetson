@@ -83,8 +83,9 @@ and starting the system helper, run
 `systemctl --user enable --now aa-receiver.service` as the intended receiver
 user. If that user already enabled the unit when it used
 `graphical-session.target`, run `systemctl --user reenable aa-receiver.service`
-to replace the old enablement link, then
-`systemctl --user start aa-receiver.service` to start it in the current session.
+to replace the old enablement link. After refreshing the digest and restarting
+the helper, run `systemctl --user restart aa-receiver.service` so any running
+pre-upgrade receiver is replaced by the newly installed binary.
 
 On removal, `prerm` stops a running `aa-system-helper.service` before its
 default-deny policy is removed, and `postrm` reloads udev. After an upgrade,
@@ -97,7 +98,10 @@ permission. [NetworkManager AP setup](networkmanager-ap.md) and
 configuration. Calculate the helper digest from the **installed** receiver
 after each upgrade or rollback. A per-user systemd drop-in can replace
 `ExecStart` with the intended receiver CLI and its arguments once provisioning
-is complete. The historical standalone USB-policy installer may have left a
+is complete. In the same drop-in, set the operator-owned PEM path under
+`[Service]`, for example `Environment=HU_KEY_PATH=%h/.config/android-auto-receiver/hu.pem`.
+The user manager then supplies the path on Xfce, SSH and linger starts without
+relying on shell login scripts. The historical standalone USB-policy installer may have left a
 rule under `/etc/udev/rules.d` with the same name. Check that override during
 deployment because udev gives it precedence over the packaged rule.
 

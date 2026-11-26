@@ -94,6 +94,8 @@ def inspect(package, owner, arch):
         receiver_unit.read_string(archive.extractfile(actual[USER_UNIT]).read().decode())
         assert receiver_unit["Install"]["WantedBy"] == "default.target"
         assert "PartOf" not in receiver_unit["Unit"]
+        assert receiver_unit["Unit"]["Wants"] == "dbus.socket"
+        assert receiver_unit["Unit"]["After"] == "dbus.socket"
         assert receiver_unit["Service"]["Restart"] == "on-failure"
         assert receiver_unit["Service"].getint("RestartSec") == 2
         assert receiver_unit["Service"].getint("RestartPreventExitStatus") == 2
