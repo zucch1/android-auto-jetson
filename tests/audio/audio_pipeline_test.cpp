@@ -10,15 +10,18 @@
 #include <aa/audio/AudioDecode.hpp>
 #include <aa/audio/AudioMix.hpp>
 #include <aa/audio/AudioRouter.hpp>
+#include <aa/audio/AudioTelemetry.hpp>
 #include <aa/audio/Microphone.hpp>
 #include <aa/protocol/Protocol.hpp>
 
 #include "../../src/audio/AudioSinkFactory.hpp"
+#include "../../src/audio/RateCorrection.hpp"
 
 #include <gtest/gtest.h>
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -719,6 +722,33 @@ TEST_F(AudioPipelineRoute, BackpressureTimeoutDegradesAndRefusesFurtherSubmit) {
     ASSERT_FALSE(refused.has_value());
     EXPECT_EQ(refused.error().code(), aa::ErrorCode::audio_sink_unavailable);
     // The harness releases the downstream block before teardown here.
+}
+
+// A shutdown's deadline cuts a write below its own timeout (#228).
+TEST_F(AudioPipelineRoute, WriteDeadlineCutsABlockedWriteBelowItsTimeout) {
+    aa::audio::detail::SinkOpenRequest request;
+    request.backend = aa::audio::SinkBackend::pulse;
+    request.format = stereo_48k();
+    auto outcome = aa::audio::detail::open_default_sink(request);
+    ASSERT_TRUE(outcome.sink != nullptr) << outcome.report.cause;
+    struct Release final {
+        aa::audio::detail::ObservedAudioSink& sink;
+        ~Release() { aa::audio::detail::unblock_downstream_for_test(sink); }
+    } release{*outcome.sink};
+    ASSERT_TRUE(aa::audio::detail::block_downstream_for_test(*outcome.sink));
+    const auto media = constant_pcm({kMediaLevel, 960});
+    aa::audio::MixedChunk chunk;
+    chunk.format = stereo_48k();
+    chunk.timestamp = now_ns();
+    chunk.pcm = media;
+    const auto started = std::chrono::steady_clock::now();
+    outcome.sink->set_write_deadline(started + std::chrono::milliseconds{200});
+    const auto written = outcome.sink->write(chunk);
+    const auto took = std::chrono::steady_clock::now() - started;
+    ASSERT_FALSE(written);
+    EXPECT_EQ(written.error().code(), aa::ErrorCode::timeout);
+    EXPECT_GE(took, std::chrono::milliseconds{190});
+    EXPECT_LT(took, std::chrono::milliseconds{1'000});
 }
 
 TEST_F(AudioPipelineRoute, MissingDefaultOutputDegradesTypedWithRecordedCause) {
@@ -2609,6 +2639,9 @@ struct RecordingSinkState final {
     bool fail_drain{false};
     bool fail_write{false};
     std::function<void()> during_write{};
+    // Sees every chunk before it is recorded; on_hold answers hold_stream().
+    std::function<void(const aa::audio::MixedChunk&)> on_write{};
+    std::function<bool(aa::core::Nanoseconds)> on_hold{};
     std::optional<aa::core::Nanoseconds> playback_slot{};
     aa::audio::PlaybackSlotAbsence slot_absence{aa::audio::PlaybackSlotAbsence::unavailable};
 };
@@ -2619,6 +2652,7 @@ public:
 
     aa::core::Result<void> write(const aa::audio::MixedChunk& chunk) override {
         if (state->during_write) { state->during_write(); }
+        if (state->on_write) { state->on_write(chunk); }
         state->writes.emplace_back(chunk.pcm.begin(), chunk.pcm.end());
         state->write_ns.push_back(chunk.timestamp.count);
         if (state->fail_write) { return aa::Error{aa::ErrorCode::audio_sink_unavailable}; }
@@ -2643,6 +2677,9 @@ public:
     }
     aa::audio::PlaybackSlotAbsence last_playback_slot_absence() const override {
         return state->playback_slot ? aa::audio::PlaybackSlotAbsence::none : state->slot_absence;
+    }
+    bool hold_stream(aa::core::Nanoseconds by) override {
+        return state->on_hold ? state->on_hold(by) : false;
     }
 };
 
@@ -6201,4 +6238,1469 @@ TEST_F(AudioPipelineRoute, IncrementalDefaultQuantumWritesOneObservedMediaParent
     std::vector<std::size_t> frames;
     for (const auto& write : observed->writes) { frames.push_back(write.size() / 4); }
     EXPECT_EQ(frames, (std::vector<std::size_t>{2048}));
+}
+
+// #173 P3: cancel_pending retires the cancelled role's unplayed source frontier.
+// The frontier matters once the cursor has moved past it: the catch-up's late
+// check compares a run's parent with min(cursor, frontier), so a frontier left
+// 200 ms ahead fails a run that is really within the cap.
+TEST_F(AudioPipelineRoute, CancellationRetiresTheUnplayedSourceFrontier) {
+    auto config = pcm_router_config();
+    config.live_pcm_drift.enabled = true;
+    config.live_pcm_drift.catch_up_watermark = aa::core::Nanoseconds{90'000'000};
+    auto opened = aa::audio::detail::open_router_with_sink_for_test(
+        config, std::make_unique<RecordingAudioSink>());
+    ASSERT_TRUE(opened);
+    auto& route = opened.value();
+    const auto drained = [&] {
+        for (int i = 0; i < 16; ++i) {
+            auto stepped = route.render_step();
+            if (!stepped) { return false; }
+            if (!stepped.value().pending) { return true; }
+        }
+        return false;
+    };
+    const auto at = [&](std::int64_t ms) { return aa::core::Nanoseconds{base.count + ms * 1'000'000}; };
+    // 50 ms of a 200 ms guidance parent play (cursor 50 ms, frontier 200 ms),
+    // then the prompt is cancelled.
+    ASSERT_TRUE(route.submit(make_message(guidance, 1, base, constant_pcm({1000, 9600}))));
+    ASSERT_TRUE(route.render_step());
+    route.cancel_pending(guidance);
+    // 100 ms of media stamped 30 ms before the base plays at 50..145 ms: the
+    // cursor is now 75 ms past the real frontier (70 ms).
+    ASSERT_TRUE(route.submit(make_message(media, 2, at(-30), constant_pcm({2000, 4800}))));
+    ASSERT_TRUE(drained());
+    // A 10 ms chunk ending at -90 ms is 160 ms behind the real frontier (caught
+    // up), but 235 ms behind the cursor and the retired one.
+    ASSERT_TRUE(route.submit(make_message(media, 3, at(-100), constant_pcm({2000, 480}))));
+    EXPECT_TRUE(drained());
+    EXPECT_FALSE(route.report().render_failure);
+    EXPECT_EQ(route.report().stats.frames_caught_up, 480U - 240U);
+}
+
+// #173 P3: reset_session_timeline clears the global and the per-role source
+// frontier. Two runs whose treatment depends on each.
+TEST_F(AudioPipelineRoute, SessionResetClearsTheSourceFrontiers) {
+    auto config = pcm_router_config();
+    config.live_pcm_drift.enabled = true;
+    config.live_pcm_drift.catch_up_watermark = aa::core::Nanoseconds{90'000'000};
+    for (const bool per_role : {true, false}) {
+        SCOPED_TRACE(per_role);
+        std::size_t extra_frames = 0;
+        auto opened = aa::audio::detail::open_router_with_decoder_for_test(
+            config, std::make_unique<RecordingAudioSink>(),
+            [&](const aa::audio::EncodedChunk& chunk) -> aa::core::Result<std::vector<std::byte>> {
+                std::vector<std::byte> out(chunk.payload.begin(), chunk.payload.end());
+                out.resize(out.size() + extra_frames * 4, std::byte{1});
+                return out;
+            });
+        ASSERT_TRUE(opened);
+        auto& route = opened.value();
+        const auto drained = [&] {
+            for (int i = 0; i < 16; ++i) {
+                auto stepped = route.render_step();
+                if (!stepped) { return false; }
+                if (!stepped.value().pending) { return true; }
+            }
+            return false;
+        };
+        const auto at = [&](std::int64_t ms) { return aa::core::Nanoseconds{base.count + ms * 1'000'000}; };
+        ASSERT_TRUE(route.submit(make_message(guidance, 1, base, constant_pcm({1000, 9600}))));
+        ASSERT_TRUE(route.render_step());
+        route.reset_session_timeline();
+        if (per_role) {
+            // An on-time first run carrying 100 ms of earlier output overlaps
+            // nothing in the new session, so its carryover is not a backlog.
+            extra_frames = 4800;
+            ASSERT_TRUE(route.submit(make_message(guidance, 2, at(0), constant_pcm({2000, 480}))));
+            EXPECT_TRUE(drained());
+            EXPECT_EQ(route.report().stats.frames_trimmed, 0U);
+        } else {
+            // As above: the cursor passes the real frontier (110 ms) to 175 ms,
+            // and a run 190 ms behind that frontier is caught up, not late.
+            ASSERT_TRUE(route.submit(make_message(media, 2, at(0), constant_pcm({2000, 4800}))));
+            ASSERT_TRUE(drained());
+            ASSERT_TRUE(route.submit(make_message(media, 3, at(30), constant_pcm({2000, 3840}))));
+            ASSERT_TRUE(drained());
+            ASSERT_TRUE(route.submit(make_message(media, 4, at(-90), constant_pcm({2000, 480}))));
+            EXPECT_TRUE(drained());
+            EXPECT_EQ(route.report().stats.frames_caught_up, 480U - 240U);
+        }
+        EXPECT_FALSE(route.report().render_failure);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #228: wired audio never drops sound. Every test below opens the router with
+// the receivers' production defaults, aa::audio::pcm_router_config(), and
+// reads only counters that existed before the lossless policy where it can, so
+// it can be run against earlier revisions too.
+namespace {
+
+constexpr std::uint64_t kA26Frames = 2048;
+constexpr std::int64_t kA26ChunkNs = 2048LL * 1'000'000'000LL / 48000LL; // 42.67 ms
+constexpr std::int64_t kMs = 1'000'000;
+
+// Continuous 440 Hz tone: a dropped or repeated sample shows as a jump.
+constexpr double kToneAmplitude = 8000.0;
+constexpr double kToneHz = 440.0;
+
+[[nodiscard]] std::vector<std::byte> tone_pcm(std::uint64_t first_frame, std::uint64_t frames) {
+    std::vector<std::byte> bytes(static_cast<std::size_t>(frames) * 4);
+    for (std::uint64_t i = 0; i < frames; ++i) {
+        const double phase = 2.0 * 3.14159265358979323846 * kToneHz
+            * static_cast<double>(first_frame + i) / 48000.0;
+        const auto value = static_cast<std::int16_t>(std::lround(kToneAmplitude * std::sin(phase)));
+        std::memcpy(bytes.data() + i * 4, &value, sizeof(value));
+        std::memcpy(bytes.data() + i * 4 + 2, &value, sizeof(value));
+    }
+    return bytes;
+}
+
+// Resampler as observed (#173): the first 200 ms guidance parent returns 96
+// frames, the second the other 19,098, later ones whatever is buffered.
+[[nodiscard]] aa::audio::detail::TestDecodeFn splitting_decoder() {
+    struct State {
+        std::deque<std::int16_t> buffered;
+        std::size_t calls{};
+    };
+    auto state = std::make_shared<State>();
+    return [state](const aa::audio::EncodedChunk& chunk) -> aa::core::Result<std::vector<std::byte>> {
+        if (chunk.input_format.sample_rate_hz == 48000) {
+            return std::vector<std::byte>(chunk.payload.begin(), chunk.payload.end());
+        }
+        for (std::size_t i = 0; i + 1 < chunk.payload.size(); i += 2) {
+            std::int16_t sample = 0;
+            std::memcpy(&sample, chunk.payload.data() + i, sizeof(sample));
+            state->buffered.insert(state->buffered.end(), 3, sample);
+        }
+        const auto take = state->calls == 0 ? std::size_t{96}
+            : state->calls == 1 ? std::min<std::size_t>(19098, state->buffered.size())
+                                : state->buffered.size();
+        ++state->calls;
+        std::vector<std::byte> out(take * 4);
+        for (std::size_t frame = 0; frame < take; ++frame) {
+            const auto value = state->buffered.front();
+            state->buffered.pop_front();
+            std::memcpy(out.data() + frame * 4, &value, sizeof(value));
+            std::memcpy(out.data() + frame * 4 + 2, &value, sizeof(value));
+        }
+        return out;
+    };
+}
+
+// A production wired route on a recording sink. Arrival stamps start an hour
+// ahead of the steady clock, so the newest arrival is the route's only notion
+// of now: the interleaving does not depend on how fast the test runs.
+struct WiredRoute final {
+    std::shared_ptr<RecordingSinkState> sink;
+    std::vector<aa::audio::WriteCompletion> writes;
+    std::optional<aa::audio::AudioRouter> router;
+    std::int64_t start;
+    std::uint64_t media_chunks{};
+    std::uint64_t guidance_chunks{};
+
+    explicit WiredRoute(aa::audio::detail::TestDecodeFn decode = {},
+                        std::function<void(aa::audio::RouterConfig&)> adjust = {})
+        : start(now_ns().count + 3'600'000'000'000LL) {
+        auto config = aa::audio::pcm_router_config();
+        config.on_write_completed = [this](const auto& value) { writes.push_back(value); };
+        if (adjust) { adjust(config); }
+        auto recording = std::make_unique<RecordingAudioSink>();
+        sink = recording->state;
+        auto opened = decode
+            ? aa::audio::detail::open_router_with_decoder_for_test(config, std::move(recording),
+                                                                   std::move(decode))
+            : aa::audio::detail::open_router_with_sink_for_test(config, std::move(recording));
+        if (opened) { router.emplace(std::move(opened).value()); }
+    }
+    WiredRoute(const WiredRoute&) = delete;
+    WiredRoute& operator=(const WiredRoute&) = delete;
+    WiredRoute(WiredRoute&&) = delete;
+    WiredRoute& operator=(WiredRoute&&) = delete;
+    ~WiredRoute() = default;
+
+    [[nodiscard]] bool drain() {
+        for (int i = 0; i < 1024; ++i) {
+            auto stepped = router->render_step();
+            if (!stepped) { return false; }
+            if (!stepped.value().pending) { return true; }
+        }
+        return false;
+    }
+    [[nodiscard]] bool submit_media(std::int64_t offset_ns) {
+        const auto pcm = tone_pcm(media_chunks * kA26Frames, kA26Frames);
+        return router->submit(make_message(aa::protocol::ChannelRole::media_audio, ++media_chunks,
+                                           {start + offset_ns}, pcm)).has_value();
+    }
+    // 200 ms of 16 kHz mono, the largest admitted guidance parent.
+    [[nodiscard]] bool submit_guidance(std::int64_t offset_ns, std::int16_t level = 1200) {
+        std::vector<std::byte> pcm(6400);
+        for (std::size_t i = 0; i < pcm.size(); i += 2) { std::memcpy(pcm.data() + i, &level, 2); }
+        return router->submit(make_message(aa::protocol::ChannelRole::guidance_audio, ++guidance_chunks,
+                                           {start + offset_ns}, pcm)).has_value();
+    }
+    [[nodiscard]] bool media(std::int64_t offset_ns) { return submit_media(offset_ns) && drain(); }
+    [[nodiscard]] const aa::audio::RouterStats& stats() const { return router->report().stats; }
+    [[nodiscard]] std::vector<std::int16_t> left() const {
+        std::vector<std::int16_t> out;
+        const auto all = flatten_i16(sink->writes);
+        for (std::size_t i = 0; i < all.size(); i += 2) { out.push_back(all[i]); }
+        return out;
+    }
+    // Largest offset any write reported (what the video hold follows).
+    [[nodiscard]] std::int64_t largest_offset() const {
+        std::int64_t largest = 0;
+        for (const auto& write : writes) {
+            largest = std::max({largest, write.playout_offset.count, write.playout_end_offset.count});
+        }
+        return largest;
+    }
+};
+
+void expect_nothing_lost(const WiredRoute& route) {
+    const auto& stats = route.stats();
+    EXPECT_EQ(stats.frames_trimmed, 0U);
+    EXPECT_EQ(stats.frames_shed, 0U);
+    EXPECT_EQ(stats.frames_caught_up, 0U);
+    EXPECT_EQ(stats.frames_padded, 0U);
+    EXPECT_FALSE(route.router->report().render_failure);
+}
+
+// Every cycle of the media tone was played, whatever rate it played at: one
+// silence gap may cut or add a crossing at either end. A 1,228-frame shed
+// (Sol's probe) removes 22.
+void expect_whole_tone(const WiredRoute& route, std::uint64_t gaps) {
+    std::int64_t crossings = 0;
+    std::int16_t previous = 0;
+    for (const auto sample : route.left()) {
+        if (sample == 0) { continue; }
+        if (previous != 0 && (sample > 0) != (previous > 0)) { ++crossings; }
+        previous = sample;
+    }
+    const auto expected = static_cast<double>(route.media_chunks * kA26Frames) / 48000.0 * kToneHz * 2.0;
+    EXPECT_NEAR(static_cast<double>(crossings), expected, 2.0 + 2.0 * static_cast<double>(gaps));
+}
+
+// Largest step between neighbouring samples away from silence: the tone's own
+// slope (461), so a splice or a repeat stands out.
+[[nodiscard]] int largest_step(const std::vector<std::int16_t>& samples) {
+    int largest = 0;
+    for (std::size_t i = 1; i < samples.size(); ++i) {
+        if (samples[i] == 0 || samples[i - 1] == 0) { continue; }
+        largest = std::max(largest, std::abs(samples[i] - samples[i - 1]));
+    }
+    return largest;
+}
+
+} // namespace
+
+// Review of #229, P1: 6 A26 chunks, the 7th withheld until 6T + 400 ms, then 8
+// chunks 1 ms apart. 25d4010 shed 1,228 frames here.
+TEST_F(AudioPipelineRoute, WiredDefaultsDropNothingInABurstAfterAnUnderrun) {
+    WiredRoute route;
+    ASSERT_TRUE(route.router);
+    for (int k = 0; k < 6; ++k) { ASSERT_TRUE(route.media(k * kA26ChunkNs)); }
+    const auto resumed = 6 * kA26ChunkNs + 400 * kMs;
+    for (int k = 0; k < 8; ++k) { ASSERT_TRUE(route.media(resumed + k * kMs)); }
+    EXPECT_EQ(route.stats().playout_underruns, 1U);
+    expect_nothing_lost(route);
+    expect_whole_tone(route, 1);
+    // The backlog became latency (60 ms + 7 chunks) that the writes report, so
+    // the video hold follows it, under its 400 ms cap ...
+    EXPECT_GT(route.stats().playout_depth, aa::core::Nanoseconds{340 * kMs});
+    EXPECT_LT(route.stats().playout_depth, aa::core::Nanoseconds{400 * kMs});
+    // ... and drains without loss while the phone plays on.
+    for (int k = 1; k <= 60'000 / 42; ++k) {
+        ASSERT_TRUE(route.media(resumed + 7 * kMs + k * kA26ChunkNs));
+    }
+    expect_nothing_lost(route);
+    expect_whole_tone(route, 1);
+    EXPECT_EQ(route.stats().playout_underruns, 1U);
+    EXPECT_LT(route.stats().playout_depth, aa::core::Nanoseconds{75 * kMs});
+    EXPECT_GE(route.stats().playout_depth, aa::core::Nanoseconds{60 * kMs});
+    EXPECT_LT(route.largest_offset(), 400 * kMs);
+    EXPECT_LE(largest_step(route.left()), 470);
+}
+
+// Review of #229, P1: four burst chunks, then on-cadence arrivals. 25d4010
+// trimmed 5,280 frames through the bounded drift correction.
+TEST_F(AudioPipelineRoute, WiredDefaultsDropNothingFromASustainedBacklog) {
+    WiredRoute route;
+    ASSERT_TRUE(route.router);
+    for (int k = 0; k < 6; ++k) { ASSERT_TRUE(route.media(k * kA26ChunkNs)); }
+    const auto resumed = 6 * kA26ChunkNs + 400 * kMs;
+    for (int k = 0; k < 4; ++k) { ASSERT_TRUE(route.media(resumed + k * kMs)); }
+    for (int k = 1; k <= 29; ++k) { ASSERT_TRUE(route.media(resumed + 3 * kMs + k * kA26ChunkNs)); }
+    EXPECT_EQ(route.stats().playout_underruns, 1U);
+    expect_nothing_lost(route);
+    expect_whole_tone(route, 1);
+    EXPECT_LE(largest_step(route.left()), 470);
+}
+
+// A phone clock 500 ppm fast used to be trimmed as soon as the depth floor was
+// 20 ms high; now the route plays 500 ppm fast.
+TEST_F(AudioPipelineRoute, WiredDefaultsFollowAFastPhoneClockWithoutTrimming) {
+    WiredRoute route;
+    ASSERT_TRUE(route.router);
+    const auto cadence = kA26ChunkNs - kA26ChunkNs / 2000;
+    for (int k = 0; k < 3000; ++k) { ASSERT_TRUE(route.media(k * cadence)); }
+    expect_nothing_lost(route);
+    expect_whole_tone(route, 0);
+    EXPECT_EQ(route.stats().playout_underruns, 0U);
+    EXPECT_EQ(route.stats().frames_silence, 0U);
+    EXPECT_LT(*route.stats().playout_depth_max, aa::core::Nanoseconds{80 * kMs});
+    EXPECT_LE(largest_step(route.left()), 470);
+}
+
+// Review of #229, P2: receipt 50 ms later for good. Every chunk is still in
+// time, so there is nothing to pad; 25d4010 inserted 240 zero frames.
+TEST_F(AudioPipelineRoute, WiredDefaultsInsertNoSilenceBeforeAnUnderrun) {
+    WiredRoute route;
+    ASSERT_TRUE(route.router);
+    for (int k = 0; k < 6; ++k) { ASSERT_TRUE(route.media(k * kA26ChunkNs)); }
+    for (int k = 6; k < 400; ++k) { ASSERT_TRUE(route.media(k * kA26ChunkNs + 50 * kMs)); }
+    expect_nothing_lost(route);
+    expect_whole_tone(route, 0);
+    EXPECT_EQ(route.stats().playout_underruns, 0U);
+    EXPECT_EQ(route.stats().frames_silence, 0U);
+    EXPECT_EQ(route.stats().frames_skipped, 0U);
+    // The thin buffer refilled by playing slow, to half the depth, no further.
+    EXPECT_GT(route.stats().playout_depth, aa::core::Nanoseconds{25 * kMs});
+    EXPECT_LT(*route.stats().playout_depth_max, aa::core::Nanoseconds{61 * kMs});
+    EXPECT_LT(route.stats().playout_depth, aa::core::Nanoseconds{32 * kMs});
+    EXPECT_LE(largest_step(route.left()), 470);
+}
+
+// Review of #229, P1: an on-time prompt whose first two 200 ms parents decode
+// to 96 + 19,098 frames, over 180 on-time media chunks (7.7 s). 25d4010 ran the
+// shared cursor ahead of media and later trimmed 16,220 (two parents) and
+// 40,546 frames (six).
+TEST_F(AudioPipelineRoute, WiredDefaultsPromptOverMediaLeavesMediaUntouched) {
+    for (const std::uint64_t parents : {std::uint64_t{2}, std::uint64_t{6}}) {
+        SCOPED_TRACE(parents);
+        WiredRoute route{splitting_decoder()};
+        ASSERT_TRUE(route.router);
+        for (int k = 0; k < 180; ++k) {
+            ASSERT_TRUE(route.submit_media(k * kA26ChunkNs));
+            while (route.guidance_chunks < parents
+                   && 200 * kMs + static_cast<std::int64_t>(route.guidance_chunks) * 200 * kMs
+                       < (k + 1) * kA26ChunkNs) {
+                ASSERT_TRUE(route.submit_guidance(
+                    200 * kMs + static_cast<std::int64_t>(route.guidance_chunks) * 200 * kMs));
+            }
+            ASSERT_TRUE(route.drain());
+        }
+        ASSERT_EQ(route.guidance_chunks, parents);
+        expect_nothing_lost(route);
+        EXPECT_EQ(route.stats().playout_underruns, 0U);
+        EXPECT_EQ(route.stats().frames_silence, 0U);
+        // Media never moved: it plays 60 ms after its arrival throughout, so
+        // the video hold stays there, and every output frame carries it.
+        EXPECT_LE(route.largest_offset(), 61 * kMs);
+        EXPECT_EQ(route.stats().frames_output, 180U * kA26Frames);
+    }
+}
+
+// A resampler that returns almost nothing for several parents and then all of
+// them at once is neither an underrun nor a gap that ends the session, alone or
+// over media.
+TEST_F(AudioPipelineRoute, WiredDefaultsSurviveADecoderHoldingSeveralParents) {
+    for (const bool over_media : {false, true}) {
+        SCOPED_TRACE(over_media);
+        auto calls = std::make_shared<std::size_t>(0);
+        auto held = std::make_shared<std::size_t>(0);
+        WiredRoute route{[calls, held](const aa::audio::EncodedChunk& chunk)
+                             -> aa::core::Result<std::vector<std::byte>> {
+            if (chunk.input_format.sample_rate_hz == 48000) {
+                return std::vector<std::byte>(chunk.payload.begin(), chunk.payload.end());
+            }
+            *held += chunk.payload.size() / 2 * 3;
+            const auto frames = ++*calls < 4 ? std::size_t{96} : *held;
+            *held -= frames;
+            std::vector<std::byte> out(frames * 4);
+            for (std::size_t i = 0; i < out.size(); i += 2) {
+                const std::int16_t level = 1200;
+                std::memcpy(out.data() + i, &level, sizeof(level));
+            }
+            return out;
+        }};
+        ASSERT_TRUE(route.router);
+        std::uint64_t decoded = 0;
+        for (int k = 0; k < 60; ++k) {
+            if (over_media) { ASSERT_TRUE(route.submit_media(k * kA26ChunkNs)); }
+            while (route.guidance_chunks < 8
+                   && static_cast<std::int64_t>(route.guidance_chunks) * 200 * kMs < (k + 1) * kA26ChunkNs) {
+                ASSERT_TRUE(route.submit_guidance(static_cast<std::int64_t>(route.guidance_chunks) * 200 * kMs));
+            }
+            ASSERT_TRUE(route.drain());
+            decoded = route.stats().frames_decoded;
+        }
+        ASSERT_TRUE(route.router->flush());
+        expect_nothing_lost(route);
+        EXPECT_EQ(route.stats().playout_underruns, 0U);
+        EXPECT_EQ(decoded, 8U * 9600U + (over_media ? 60U * kA26Frames : 0U));
+        EXPECT_EQ(decoded + route.stats().frames_stretched,
+                  route.stats().frames_retained + route.stats().frames_compressed);
+        if (over_media) { EXPECT_LE(route.largest_offset(), 61 * kMs); }
+    }
+}
+
+// Stall shapes of the wired A26 logs (2026-11-17, 1800 s drive): 283.6 ms sink
+// stall, the next chunk 204.7 ms late, its backlog at once; and the largest
+// lateness without a stall, 43.3 ms, which must cost nothing at all.
+TEST_F(AudioPipelineRoute, WiredDefaultsReplayTheMeasuredStallWithoutLoss) {
+    WiredRoute route;
+    ASSERT_TRUE(route.router);
+    int k = 0;
+    for (; k < 100; ++k) { ASSERT_TRUE(route.media(k * kA26ChunkNs)); }
+    ASSERT_TRUE(route.media(k * kA26ChunkNs + 43'300'000));
+    ++k;
+    for (; k < 200; ++k) { ASSERT_TRUE(route.media(k * kA26ChunkNs)); }
+    EXPECT_EQ(route.stats().playout_underruns, 0U);
+    EXPECT_EQ(route.stats().frames_silence, 0U);
+    const auto resumed = k * kA26ChunkNs + 204'700'000;
+    for (int burst = 0; burst < 5; ++burst, ++k) { ASSERT_TRUE(route.media(resumed + burst * kMs)); }
+    for (; k < 400; ++k) { ASSERT_TRUE(route.media(k * kA26ChunkNs)); }
+    EXPECT_EQ(route.stats().playout_underruns, 1U);
+    expect_nothing_lost(route);
+    expect_whole_tone(route, 1);
+    EXPECT_LT(route.largest_offset(), 400 * kMs);
+}
+
+// The wired acceptance list (#228) on the production defaults: steady state, a
+// burst on a fresh stream, a burst of guidance, and silence only for a real
+// underrun.
+TEST_F(AudioPipelineRoute, WiredPlayoutIsLosslessAcrossSteadyBurstsAndGuidanceOverMedia) {
+    {
+        WiredRoute route;
+        ASSERT_TRUE(route.router);
+        for (int k = 0; k < 8; ++k) { ASSERT_TRUE(route.media(k * kMs)); }
+        expect_nothing_lost(route);
+        expect_whole_tone(route, 0);
+        EXPECT_EQ(route.stats().frames_silence, 0U);
+        EXPECT_EQ(route.stats().playout_underruns, 0U);
+        // 250 ms after the last slot: the phone sent nothing to play.
+        ASSERT_TRUE(route.media(8 * kA26ChunkNs + 310 * kMs));
+        EXPECT_EQ(route.stats().playout_underruns, 1U);
+        EXPECT_GT(route.stats().frames_silence, 0U);
+        expect_nothing_lost(route);
+    }
+    {
+        WiredRoute route{splitting_decoder()};
+        ASSERT_TRUE(route.router);
+        for (const std::int64_t offset_ms : {0, 1, 10, 12, 12, 13, 20, 20}) {
+            ASSERT_TRUE(route.submit_guidance(offset_ms * kMs));
+            ASSERT_TRUE(route.drain());
+        }
+        // 8 parents x 200 ms at once, 1.6 s deep.
+        expect_nothing_lost(route);
+        EXPECT_EQ(route.stats().frames_silence, 0U);
+        EXPECT_EQ(route.stats().playout_underruns, 0U);
+    }
+}
+
+// A prompt keeps playing when media starves under it, and media's own hole is
+// an underrun even though the prompt kept the shared cursor moving.
+TEST_F(AudioPipelineRoute, WiredDefaultsCountAMediaUnderrunUnderAPrompt) {
+    std::int64_t clock = 0;
+    WiredRoute route{{}, [&clock](aa::audio::RouterConfig& config) {
+        config.clock = [&clock] { return aa::core::Nanoseconds{clock}; };
+    }};
+    ASSERT_TRUE(route.router);
+    const auto at = [&](std::int64_t offset) { clock = route.start + offset; };
+    const auto run_to = [&](std::int64_t offset) {
+        // What the worker does: step until held, sleep, step again.
+        for (int i = 0; i < 4096; ++i) {
+            auto stepped = route.router->render_step();
+            ASSERT_TRUE(stepped);
+            if (stepped.value().pending) { continue; }
+            if (!stepped.value().wait_until || stepped.value().wait_until->count >= route.start + offset) { break; }
+            clock = stepped.value().wait_until->count;
+        }
+        at(offset);
+    };
+    for (int k = 0; k < 6; ++k) {
+        run_to(k * kA26ChunkNs);
+        ASSERT_TRUE(route.submit_media(k * kA26ChunkNs));
+    }
+    for (int parent = 0; parent < 4; ++parent) {
+        run_to(6 * kA26ChunkNs + parent * 200 * kMs);
+        ASSERT_TRUE(route.submit_guidance(6 * kA26ChunkNs + parent * 200 * kMs));
+    }
+    // Media comes back 650 ms late with its backlog.
+    const auto resumed = 6 * kA26ChunkNs + 650 * kMs;
+    for (int k = 0; k < 8; ++k) {
+        run_to(resumed + k * kMs);
+        ASSERT_TRUE(route.submit_media(resumed + k * kMs));
+    }
+    run_to(resumed + 2'000 * kMs);
+    EXPECT_EQ(route.stats().playout_underruns, 1U);
+    expect_nothing_lost(route);
+    const auto& stats = route.stats();
+    EXPECT_EQ(stats.frames_decoded + stats.frames_stretched,
+              stats.frames_retained + stats.frames_compressed);
+}
+
+// The hold (RenderStep::wait_until): a frame the prompt could play alone waits
+// for media until 20 ms before its slot, then goes out 10 ms at a time.
+TEST_F(AudioPipelineRoute, WiredDefaultsHoldAPromptForMediaUntilShortlyBeforeItsSlot) {
+    std::int64_t clock = 0;
+    WiredRoute route{{}, [&clock](aa::audio::RouterConfig& config) {
+        config.clock = [&clock] { return aa::core::Nanoseconds{clock}; };
+    }};
+    ASSERT_TRUE(route.router);
+    clock = route.start;
+    ASSERT_TRUE(route.submit_media(0));
+    ASSERT_TRUE(route.submit_guidance(0));
+    auto stepped = route.router->render_step();
+    ASSERT_TRUE(stepped);
+    ASSERT_TRUE(stepped.value().pending);
+    EXPECT_EQ(stepped.value().contributors.size(), 2U);
+    EXPECT_EQ(route.stats().frames_output, kA26Frames);
+
+    stepped = route.router->render_step();
+    ASSERT_TRUE(stepped);
+    EXPECT_FALSE(stepped.value().pending);
+    EXPECT_TRUE(stepped.value().contributors.empty());
+    ASSERT_TRUE(stepped.value().wait_until);
+    const auto slot = route.start + 60 * kMs + kA26ChunkNs;
+    EXPECT_NEAR(static_cast<double>(stepped.value().wait_until->count),
+                static_cast<double>(slot - 20 * kMs), 25'000.0);
+    EXPECT_EQ(route.stats().frames_output, kA26Frames);
+
+    // Media is late: the prompt goes on, 10 ms at a time.
+    clock = stepped.value().wait_until->count;
+    stepped = route.router->render_step();
+    ASSERT_TRUE(stepped);
+    EXPECT_EQ(stepped.value().contributors.size(), 1U);
+    EXPECT_NEAR(static_cast<double>(route.stats().frames_output - kA26Frames), 480.0, 2.0);
+    // The late chunk joins right there, nothing lost.
+    ASSERT_TRUE(route.submit_media(clock - route.start));
+    stepped = route.router->render_step();
+    ASSERT_TRUE(stepped);
+    EXPECT_EQ(stepped.value().contributors.size(), 2U);
+    // Once media was stopped there is nothing to wait for.
+    route.router->cancel_pending(media);
+    EXPECT_TRUE(route.drain());
+    EXPECT_FALSE(route.router->render_step().value().wait_until);
+    EXPECT_EQ(route.stats().frames_trimmed, 0U);
+}
+
+// pump()/flush() write a held remainder instead of waiting for it.
+TEST_F(AudioPipelineRoute, WiredDefaultsFlushWritesAHeldPrompt) {
+    WiredRoute route;
+    ASSERT_TRUE(route.router);
+    ASSERT_TRUE(route.submit_media(0));
+    ASSERT_TRUE(route.submit_guidance(0));
+    ASSERT_TRUE(route.drain());
+    EXPECT_EQ(route.stats().frames_output, kA26Frames);
+    ASSERT_TRUE(route.router->flush());
+    // The whole parent up to its last input sample (frame 9,597 at 48 kHz), the
+    // resampler's last few included.
+    EXPECT_GE(route.stats().frames_output, 9'598U);
+    EXPECT_EQ(route.stats().frames_decoded, route.stats().frames_retained);
+}
+
+// Pulse backpressure: the sink accepts a piece only once its end is within the
+// 200 ms ring, and arrivals are submitted only between writes (the worker).
+// Split prompts over media, then a post-drought burst under a prompt.
+TEST_F(AudioPipelineRoute, WiredDefaultsStayLosslessBehindAPacedSink) {
+    std::int64_t clock = 0;
+    WiredRoute route{splitting_decoder(), [&clock](aa::audio::RouterConfig& config) {
+        config.clock = [&clock] { return aa::core::Nanoseconds{clock}; };
+        const auto record = config.on_write_completed;
+        config.on_write_completed = [&clock, record](const auto& value) {
+            clock = std::max(clock, value.scheduled_end.count - 200 * kMs);
+            record(value);
+        };
+    }};
+    ASSERT_TRUE(route.router);
+    struct Arrival {
+        std::int64_t at;
+        bool media;
+    };
+    std::vector<Arrival> arrivals;
+    for (int k = 0; k < 400; ++k) {
+        // Chunks 201..207 wait out a drought and arrive with the 208th, the
+        // most the phone's 341 ms capture buffer holds.
+        const bool late = k > 200 && k < 208;
+        arrivals.push_back({late ? 208 * kA26ChunkNs + (k - 208) * kMs : k * kA26ChunkNs, true});
+    }
+    for (int parent = 0; parent < 6; ++parent) { arrivals.push_back({300 * kMs + parent * 200 * kMs, false}); }
+    for (int parent = 0; parent < 6; ++parent) { arrivals.push_back({8'400 * kMs + parent * 200 * kMs, false}); }
+    std::stable_sort(arrivals.begin(), arrivals.end(),
+                     [](const auto& a, const auto& b) { return a.at < b.at; });
+    clock = route.start;
+    std::size_t next = 0;
+    for (int i = 0; i < 100'000; ++i) {
+        while (next < arrivals.size() && route.start + arrivals[next].at <= clock) {
+            ASSERT_TRUE(arrivals[next].media ? route.submit_media(arrivals[next].at)
+                                             : route.submit_guidance(arrivals[next].at));
+            ++next;
+        }
+        auto stepped = route.router->render_step();
+        ASSERT_TRUE(stepped);
+        if (stepped.value().pending) { continue; }
+        const auto wake = stepped.value().wait_until;
+        if (next < arrivals.size()) {
+            const auto due = route.start + arrivals[next].at;
+            clock = std::max(clock, wake ? std::min(wake->count, due) : due);
+        } else if (wake) {
+            clock = std::max(clock, wake->count);
+        } else {
+            break;
+        }
+    }
+    ASSERT_EQ(next, arrivals.size());
+    expect_nothing_lost(route);
+    EXPECT_EQ(route.stats().playout_underruns, 1U);
+    EXPECT_LT(route.largest_offset(), 400 * kMs);
+    EXPECT_EQ(route.stats().frames_overflowed, 0U);
+    EXPECT_EQ(route.stats().frames_decoded + route.stats().frames_stretched,
+              route.stats().frames_retained + route.stats().frames_compressed);
+}
+
+// The emergency bound: nothing is cut up to a 2 s backlog; beyond it only the
+// excess goes, and it is counted apart from every other trim.
+TEST_F(AudioPipelineRoute, WiredDefaultsCutOnlyBeyondTheEmergencyBacklog) {
+    EXPECT_EQ(aa::audio::pcm_router_config().playout.emergency_backlog,
+              aa::core::Nanoseconds{2'000 * kMs});
+    WiredRoute route;
+    ASSERT_TRUE(route.router);
+    // Chunk n is 60 ms + n x 42.67 ms deep: n = 45 stays under 2 s.
+    for (int k = 0; k < 46; ++k) { ASSERT_TRUE(route.media(0)); }
+    expect_nothing_lost(route);
+    EXPECT_EQ(route.stats().playout_overflows, 0U);
+    for (int k = 0; k < 8; ++k) { ASSERT_TRUE(route.media(0)); }
+    const auto& stats = route.stats();
+    EXPECT_GT(stats.playout_overflows, 0U);
+    EXPECT_EQ(stats.frames_trimmed, stats.frames_overflowed);
+    EXPECT_EQ(stats.frames_shed, 0U);
+    EXPECT_EQ(stats.frames_caught_up, 0U);
+    // The route still holds two seconds of audio.
+    EXPECT_GT(stats.frames_output, 93'000U);
+    EXPECT_EQ(stats.frames_decoded, stats.frames_retained + stats.frames_trimmed);
+    // A shorter bound than a second is refused.
+    auto config = aa::audio::pcm_router_config();
+    config.playout.emergency_backlog = aa::core::Nanoseconds{999 * kMs};
+    EXPECT_FALSE(aa::audio::detail::open_router_with_sink_for_test(
+        config, std::make_unique<RecordingAudioSink>()));
+}
+
+// Rate correction stays inaudible: at most 0.5% (1% while more than 100 ms
+// over), moving by at most 0.1% per A26 chunk.
+TEST_F(AudioPipelineRoute, WiredDefaultsRateCorrectionIsBoundedAndGradual) {
+    WiredRoute route;
+    ASSERT_TRUE(route.router);
+    for (int k = 0; k < 6; ++k) { ASSERT_TRUE(route.media(k * kA26ChunkNs)); }
+    const auto resumed = 6 * kA26ChunkNs + 400 * kMs;
+    for (int k = 0; k < 8; ++k) { ASSERT_TRUE(route.media(resumed + k * kMs)); }
+    auto before = route.stats().frames_compressed;
+    std::int64_t previous = 0;
+    std::int64_t largest = 0;
+    for (int k = 1; k < 1'200; ++k) {
+        const auto depth = route.stats().playout_depth.count;
+        ASSERT_TRUE(route.media(resumed + 7 * kMs + k * kA26ChunkNs));
+        const auto removed = static_cast<std::int64_t>(route.stats().frames_compressed - before);
+        before = route.stats().frames_compressed;
+        largest = std::max(largest, removed);
+        EXPECT_LE(removed, depth > 160 * kMs ? 21 : 13) << k; // 2048 x 1% / 0.5%, ramp and carry
+        EXPECT_LE(std::abs(removed - previous), 4) << k;      // 0.1% and the carry
+        previous = removed;
+    }
+    EXPECT_GE(largest, 19);
+    EXPECT_EQ(route.stats().frames_stretched, 0U);
+    EXPECT_EQ(previous, 0);
+}
+
+// Re-review of #229, P2: a phone clock 500 ppm off on packets far shorter than
+// A26's. 4a3f49f never corrected a run under 256 frames: 240-frame packets were
+// 90 ms deep after a minute and overflowed after 65.
+TEST_F(AudioPipelineRoute, WiredDefaultsFollowThePhoneClockOnShortPackets) {
+    struct Case {
+        std::uint64_t frames;
+        int seconds;
+        int ppm; // of the phone's clock: positive is fast
+    };
+    for (const Case c : {Case{240, 300, 500}, Case{240, 120, -500}, Case{480, 120, 500},
+                         Case{960, 120, 500}, Case{96, 60, 500}, Case{48, 30, 800}}) {
+        SCOPED_TRACE(std::to_string(c.frames) + " frames, " + std::to_string(c.ppm) + " ppm");
+        WiredRoute route;
+        ASSERT_TRUE(route.router);
+        const auto nominal = static_cast<std::int64_t>(c.frames) * 1'000'000'000 / 48000;
+        const auto cadence = nominal - nominal * c.ppm / 1'000'000;
+        const auto packets = static_cast<std::uint64_t>(c.seconds) * 48000 / c.frames;
+        for (std::uint64_t k = 0; k < packets; ++k) {
+            const auto pcm = tone_pcm(k * c.frames, c.frames);
+            ASSERT_TRUE(route.router->submit(make_message(
+                aa::protocol::ChannelRole::media_audio, k + 1,
+                {route.start + static_cast<std::int64_t>(k) * cadence}, pcm)));
+            ASSERT_TRUE(route.drain());
+        }
+        expect_nothing_lost(route);
+        EXPECT_EQ(route.stats().playout_underruns, 0U);
+        EXPECT_EQ(route.stats().frames_silence, 0U);
+        // Fast: within the dead band's equilibrium of 60 ms, where 4a3f49f is
+        // 60 ms + ppm x time. Slow: not below the half it refills to.
+        EXPECT_LT(*route.stats().playout_depth_max, aa::core::Nanoseconds{80 * kMs});
+        EXPECT_GT(*route.stats().playout_depth_min, aa::core::Nanoseconds{25 * kMs});
+        const auto corrected = route.stats().frames_compressed + route.stats().frames_stretched;
+        const auto drift = packets * c.frames * static_cast<std::uint64_t>(std::abs(c.ppm)) / 1'000'000;
+        // Whole 10 ms + 2 ms of drift stay inside the dead band.
+        if (c.ppm > 0 && drift > 1'000) { EXPECT_NEAR(static_cast<double>(corrected), static_cast<double>(drift), 800.0); }
+        EXPECT_EQ(route.stats().frames_decoded + route.stats().frames_stretched,
+                  route.stats().frames_retained + route.stats().frames_compressed);
+        // A frame taken out of 40 is 2.5% over those: the tone's slope by as much.
+        EXPECT_LE(largest_step(route.left()), c.frames < 64 ? 480 : 470);
+    }
+}
+
+// The correction a short run cannot take is never released in one burst:
+// 4a3f49f spent 32 frames (1.56%) on the first long run after 1,600 short ones.
+TEST_F(AudioPipelineRoute, WiredDefaultsNeverReleaseCarriedCorrectionInABurst) {
+    WiredRoute route;
+    ASSERT_TRUE(route.router);
+    constexpr std::uint64_t kShort = 240;
+    std::uint64_t frame = 0;
+    std::uint64_t sequence = 0;
+    const auto send = [&](std::int64_t at, std::uint64_t frames) {
+        const auto pcm = tone_pcm(frame, frames);
+        frame += frames;
+        return route.router->submit(make_message(aa::protocol::ChannelRole::media_audio, ++sequence,
+                                                 {route.start + at}, pcm)).has_value() && route.drain();
+    };
+    // Seven A26 chunks' worth at once, then 8 s on cadence.
+    for (int k = 0; k < 60; ++k) { ASSERT_TRUE(send(0, kShort)); }
+    for (int k = 1; k <= 1'600; ++k) { ASSERT_TRUE(send(k * 5 * kMs, kShort)); }
+    EXPECT_LT(route.stats().playout_depth, aa::core::Nanoseconds{330 * kMs}); // it drained meanwhile
+    const auto before = route.stats().frames_compressed;
+    ASSERT_TRUE(send(1'601 * 5 * kMs, kA26Frames));
+    EXPECT_LE(route.stats().frames_compressed - before, 21U); // 1% of 2048
+    expect_nothing_lost(route);
+    EXPECT_LE(largest_step(route.left()), 470);
+}
+
+// Re-review of #229, P2: the resampler holds about 100 frames of every guidance
+// parent. After a cancel or a session reset they belong to a stream that is
+// gone; 4a3f49f played 97 of them at the head of the next prompt.
+TEST_F(AudioPipelineRoute, WiredDefaultsCancelAndResetDropWhatTheDecoderHeld) {
+    for (const bool session_reset : {false, true}) {
+        SCOPED_TRACE(session_reset);
+        WiredRoute route;
+        ASSERT_TRUE(route.router);
+        ASSERT_TRUE(route.submit_guidance(0, 12'000));
+        ASSERT_TRUE(route.drain());
+        if (session_reset) { route.router->reset_session_timeline(); }
+        else { route.router->cancel_pending(aa::protocol::ChannelRole::guidance_audio); }
+        route.sink->writes.clear();
+        ASSERT_TRUE(route.submit_guidance(1'000 * kMs, -12'000));
+        ASSERT_TRUE(route.drain());
+        const auto samples = route.left();
+        EXPECT_EQ(std::count_if(samples.begin(), samples.end(), [](auto v) { return v > 1'000; }), 0);
+        EXPECT_GT(std::count_if(samples.begin(), samples.end(), [](auto v) { return v < -1'000; }), 9'000);
+    }
+}
+
+// The same tail at a regular end is sound: flush() plays it (4a3f49f: 9,502 of
+// 9,600 frames).
+TEST_F(AudioPipelineRoute, WiredDefaultsFlushPlaysWhatTheDecoderHolds) {
+    WiredRoute route;
+    ASSERT_TRUE(route.router);
+    ASSERT_TRUE(route.submit_guidance(0, 12'000));
+    ASSERT_TRUE(route.router->flush());
+    // Output frame 9,597 is the last input sample's own time.
+    EXPECT_GE(route.stats().frames_retained, 9'598U);
+    EXPECT_LE(route.stats().frames_retained, 9'600U + 64U);
+    EXPECT_EQ(route.stats().frames_decoded, route.stats().frames_retained);
+    const auto samples = route.left();
+    EXPECT_GE(std::count_if(samples.begin(), samples.end(), [](auto v) { return v > 1'000; }), 9'580);
+}
+
+// Re-review of #229, P2: a write that blocks past its slot leaves the sink's
+// read position ahead of every slot up to then. 4a3f49f wrote the backlog there
+// (a ring buffer throws it away) and reported 60 ms throughout; now what follows
+// plays later, says so, and drains.
+TEST_F(AudioPipelineRoute, WiredDefaultsRetimeBehindABlockedWrite) {
+    for (const std::int64_t stall_ms : {25, 100, 300, 600, 1'600}) {
+        SCOPED_TRACE(stall_ms);
+        std::int64_t clock = 0;
+        WiredRoute route{{}, [&clock](aa::audio::RouterConfig& config) {
+            config.clock = [&clock] { return aa::core::Nanoseconds{clock}; };
+        }};
+        ASSERT_TRUE(route.router);
+        std::size_t stalled_write = SIZE_MAX;
+        std::vector<std::int64_t> handed;
+        route.sink->during_write = [&] {
+            handed.push_back(clock); // the moment this piece reaches the sink
+            if (handed.size() == stalled_write) { clock += 60 * kMs + stall_ms * kMs; }
+        };
+        std::int64_t next = 0;
+        const auto run_to = [&](int chunk) {
+            while (next < chunk) {
+                clock = std::max(clock, route.start + next * kA26ChunkNs);
+                // What arrived while the last write blocked is submitted together.
+                do { ASSERT_TRUE(route.submit_media(next * kA26ChunkNs)); }
+                while (++next < chunk && route.start + next * kA26ChunkNs <= clock);
+                ASSERT_TRUE(route.drain());
+            }
+        };
+        run_to(100);
+        EXPECT_LE(route.largest_offset(), 60 * kMs + 1'000);
+        stalled_write = handed.size() + 1;
+        run_to(101); // blocks until stall_ms after its slot
+        const auto settled = handed.size();
+        run_to(160);
+        expect_nothing_lost(route);
+        EXPECT_EQ(route.stats().playout_underruns, 0U);
+        EXPECT_EQ(route.stats().frames_silence, 0U);
+        ASSERT_EQ(route.sink->write_ns.size(), handed.size());
+        // Every later piece reaches the sink before its slot ...
+        for (std::size_t i = settled; i < handed.size(); ++i) {
+            EXPECT_GT(route.sink->write_ns[i], handed[i]) << i;
+        }
+        // ... the reported offset carries the delay it plays with, and the
+        // content clock is continuous across the stall.
+        std::int64_t content = 0;
+        for (const auto& write : route.writes) {
+            const auto start = write.scheduled.count - write.playout_offset.count;
+            if (content != 0) { EXPECT_NEAR(static_cast<double>(start - content), 0.0, 50'000.0); }
+            content = write.scheduled_end.count - write.playout_end_offset.count;
+        }
+        // A stall within the piece's own 42.67 ms leaves the next one in time.
+        const auto expected = stall_ms * kMs < kA26ChunkNs
+            ? 60 * kMs : (60 + stall_ms + 20) * kMs - kA26ChunkNs;
+        EXPECT_NEAR(static_cast<double>(route.largest_offset()), static_cast<double>(expected), 2.0e6);
+        // It drains by the rate correction, as any backlog.
+        if (stall_ms == 300) {
+            run_to(160 + 40'000 / 42);
+            EXPECT_LT(route.stats().playout_depth, aa::core::Nanoseconds{75 * kMs});
+            expect_nothing_lost(route);
+            expect_whole_tone(route, 0);
+            EXPECT_LE(largest_step(route.left()), 470);
+        }
+        EXPECT_EQ(route.stats().frames_decoded + route.stats().frames_stretched,
+                  route.stats().frames_retained + route.stats().frames_compressed);
+    }
+}
+
+// Live A26 check of d0c5b41 (#228): a 1 s pipewire-pulse pause. pulsesink's
+// clock stops with its server, so it plays on from where it was; stamps moved
+// on by a retime were a gap it waited out in silence. Each later write blocked
+// 0.6-0.85 s, was taken for a new stall and retimed on top of the last one:
+// 28 retimes, depth 2.75 s, 6.3 s cut by the 2 s bound. This fake is that
+// sink (as measured with a private pipewire-pulse): its clock stands still
+// through the pause, it waits out 90% of a forward jump in its stamps (live,
+// its clock slaving took the rest back, so each block decayed), and drops
+// what is stamped behind its read position.
+struct PausingSink final {
+    std::int64_t* clock;
+    bool holds{true};                  // honours hold_stream()
+    std::int64_t lag{};                // how long its clock stood still
+    std::int64_t held{};               // hold_stream() total
+    std::optional<std::int64_t> end{}; // its stream time after the last sample
+    std::int64_t pause_next{};         // stands still this long in the next write
+    std::int64_t waited{};             // silence waited out for jumps
+    std::int64_t dropped{};            // stream time written behind its read position
+    std::int64_t longest_block{};      // after the pause: longest write past its start
+    std::int64_t queue{};              // how far ahead of its read position it takes a write
+    std::int64_t drag{};               // after the pause: its clock falls behind this much more,
+    std::int64_t drag_step{};          // this much per write (live: its clock settling)
+    std::int64_t written_end{};        // where the last write ends on the router's clock
+
+    void attach(RecordingSinkState& state) {
+        state.on_hold = [this](aa::core::Nanoseconds by) {
+            if (!holds) { return false; }
+            held += by.count;
+            return true;
+        };
+        state.on_write = [this](const aa::audio::MixedChunk& chunk) {
+            const auto length = static_cast<std::int64_t>(chunk.pcm.size() / 4) * 1'000'000'000 / 48'000;
+            const auto pts = chunk.timestamp.count - held;
+            if (!end) { end = pts; }
+            // Dry: what it plays now moved on in silence.
+            const auto reading = *clock - lag;
+            dropped += std::clamp<std::int64_t>(reading - pts, 0, length);
+            end = std::max(*end, reading);
+            auto start = *end;
+            if (const auto jump = pts - *end; jump > 40 * kMs) {
+                waited += jump * 9 / 10;
+                start += jump * 9 / 10;
+            }
+            const bool paused = pause_next != 0;
+            if (!paused && lag != 0 && drag != 0) {
+                const auto by = std::min(drag, drag_step);
+                lag += by;
+                drag -= by;
+            }
+            lag += std::exchange(pause_next, 0);
+            end = start + length;
+            // It takes the write when its read position reaches the write's start
+            // (less what it queues).
+            const auto taken = std::max(*clock, start + lag - queue);
+            if (!paused && lag != 0) { longest_block = std::max(longest_block, taken - *clock); }
+            written_end = chunk.timestamp.count + length;
+            *clock = taken;
+        };
+    }
+};
+
+TEST_F(AudioPipelineRoute, WiredDefaultsPlayOnThroughASinkThatStoodStill) {
+    for (const std::int64_t pause_ms : {300, 1'000, 1'600}) {
+        SCOPED_TRACE(pause_ms);
+        std::int64_t clock = 0;
+        WiredRoute route{{}, [&clock](aa::audio::RouterConfig& config) {
+            config.clock = [&clock] { return aa::core::Nanoseconds{clock}; };
+        }};
+        ASSERT_TRUE(route.router);
+        PausingSink sink{&clock};
+        sink.attach(*route.sink);
+        std::int64_t next = 0;
+        const auto run_to = [&](std::int64_t chunk) {
+            while (next < chunk) {
+                clock = std::max(clock, route.start + next * kA26ChunkNs);
+                do { ASSERT_TRUE(route.submit_media(next * kA26ChunkNs)); }
+                while (++next < chunk && route.start + next * kA26ChunkNs <= clock);
+                ASSERT_TRUE(route.drain());
+            }
+        };
+        run_to(100);
+        EXPECT_LE(route.largest_offset(), 60 * kMs + 1'000);
+        sink.pause_next = pause_ms * kMs;
+        run_to(101);
+        run_to(101 + 10'000 / 42); // 10 s
+        const auto& stats = route.stats();
+        expect_nothing_lost(route);
+        EXPECT_EQ(stats.playout_overflows, 0U);
+        EXPECT_EQ(stats.frames_overflowed, 0U);
+        EXPECT_EQ(stats.playout_underruns, 0U);
+        // One retime, held by the sink whole: no gap, nothing behind its read
+        // position, no write blocked longer than a chunk again.
+        EXPECT_EQ(stats.playout_retimes, 1U);
+        EXPECT_EQ(sink.waited, 0);
+        EXPECT_EQ(sink.dropped, 0);
+        EXPECT_LE(sink.longest_block, kA26ChunkNs);
+        const auto events = route.router->take_playout_events();
+        ASSERT_EQ(events.size(), 2U);
+        EXPECT_EQ(events[1].kind, aa::audio::PlayoutEvent::Kind::retime);
+        EXPECT_EQ(events[1].held, events[1].late);
+        EXPECT_EQ(sink.held, events[1].late.count);
+        // The offset carries what the sink plays with: about the pause.
+        EXPECT_NEAR(static_cast<double>(route.largest_offset()),
+                    static_cast<double>((60 + pause_ms) * kMs), 45.0e6);
+        // It drains by the rate correction, about 10 ms/s.
+        const auto after = route.stats().playout_depth.count;
+        run_to(101 + 70'000 / 42); // 60 s more
+        EXPECT_LT(route.stats().playout_depth.count, std::max(80 * kMs, after - 400 * kMs));
+        EXPECT_EQ(route.stats().playout_retimes, 1U);
+        EXPECT_EQ(sink.waited, 0);
+        EXPECT_EQ(sink.dropped, 0);
+        expect_nothing_lost(route);
+        expect_whole_tone(route, 0);
+        EXPECT_EQ(route.stats().frames_decoded + route.stats().frames_stretched,
+                  route.stats().frames_retained + route.stats().frames_compressed);
+    }
+}
+
+// A sink that cannot hold still cascades after a pause (as d0c5b41 did with
+// pulsesink) until the 2 s bound cuts. That cut can take a role's whole queue
+// in one step; d0c5b41 then planned the runs it had just popped and crashed.
+TEST_F(AudioPipelineRoute, WiredDefaultsCutAWholeQueueBehindASinkThatCannotHold) {
+    std::int64_t clock = 0;
+    WiredRoute route{{}, [&clock](aa::audio::RouterConfig& config) {
+        config.clock = [&clock] { return aa::core::Nanoseconds{clock}; };
+    }};
+    ASSERT_TRUE(route.router);
+    PausingSink sink{&clock};
+    sink.holds = false;
+    sink.attach(*route.sink);
+    std::int64_t next = 0;
+    const auto run_to = [&](std::int64_t chunk) {
+        while (next < chunk) {
+            clock = std::max(clock, route.start + next * kA26ChunkNs);
+            do { ASSERT_TRUE(route.submit_media(next * kA26ChunkNs)); }
+            while (++next < chunk && route.start + next * kA26ChunkNs <= clock);
+            ASSERT_TRUE(route.drain());
+        }
+    };
+    run_to(100);
+    sink.pause_next = 1'000 * kMs;
+    run_to(101 + 30'000 / 42);
+    const auto& stats = route.stats();
+    EXPECT_FALSE(route.router->report().render_failure);
+    EXPECT_GT(stats.playout_retimes, 3U);
+    EXPECT_GT(stats.playout_overflows, 0U);
+    EXPECT_EQ(stats.frames_trimmed, stats.frames_overflowed);
+    EXPECT_GT(sink.waited, 1'000 * kMs);
+    EXPECT_EQ(sink.held, 0);
+}
+
+// The other way a slot passes: this thread was held up between writes and the
+// sink played on dry. Nothing is held; its stamps move on with the schedule,
+// or what follows lands behind its read position. A sink that cannot hold
+// gets moved stamps after a pause, as before.
+TEST_F(AudioPipelineRoute, WiredDefaultsMoveTheStampsOfASinkThatPlayedOnDry) {
+    for (const bool holds : {true, false}) {
+        SCOPED_TRACE(holds);
+        std::int64_t clock = 0;
+        WiredRoute route{{}, [&clock](aa::audio::RouterConfig& config) {
+            config.clock = [&clock] { return aa::core::Nanoseconds{clock}; };
+        }};
+        ASSERT_TRUE(route.router);
+        PausingSink sink{&clock};
+        sink.holds = holds;
+        sink.attach(*route.sink);
+        std::int64_t next = 0;
+        const auto run_to = [&](std::int64_t chunk) {
+            while (next < chunk) {
+                clock = std::max(clock, route.start + next * kA26ChunkNs);
+                do { ASSERT_TRUE(route.submit_media(next * kA26ChunkNs)); }
+                while (++next < chunk && route.start + next * kA26ChunkNs <= clock);
+                ASSERT_TRUE(route.drain());
+            }
+        };
+        run_to(100);
+        clock += 1'000 * kMs; // held up before the next write
+        run_to(101 + 10'000 / 42);
+        expect_nothing_lost(route);
+        EXPECT_EQ(route.stats().playout_overflows, 0U);
+        EXPECT_EQ(route.stats().playout_retimes, 1U);
+        EXPECT_EQ(sink.held, 0);
+        EXPECT_EQ(sink.dropped, 0);
+        EXPECT_EQ(sink.waited, 0);
+        const auto events = route.router->take_playout_events();
+        ASSERT_EQ(events.size(), 2U);
+        EXPECT_EQ(events[1].held.count, 0);
+    }
+}
+
+// Live A26 check of d3c24e3 (#229): after each real hold, the sink's clock
+// fell behind a little more over the next seconds as it settled, until it took
+// a write just after its slot. That sub-millisecond lateness was taken for a
+// slot the sink had played through dry: a second retime with little or nothing
+// held, which moved everything on by the 20 ms lead again (1 s stall: 915.9 ms,
+// then 20.0 ms held 0; early: 20.5 ms held 7.7). The sink was full, not dry.
+// One retime per hold, nothing lost.
+TEST_F(AudioPipelineRoute, WiredDefaultsRetimeOnceWhenASinkSettlesAfterAHold) {
+    // The thread starts each step `step_ns` after the last write returned: the
+    // sink took the write after its end (part of the lateness held), or before
+    // it (none held).
+    for (const auto& [pause_ms, step_ns] : std::vector<std::pair<std::int64_t, std::int64_t>>{
+             {300, 50'000}, {1'000, 50'000}, {1'600, 50'000}, {300, 600'000}, {1'000, 600'000}, {1'600, 600'000}}) {
+        SCOPED_TRACE(pause_ms);
+        SCOPED_TRACE(step_ns);
+        std::int64_t clock = 0;
+        WiredRoute route{{}, [&clock](aa::audio::RouterConfig& config) {
+            config.clock = [&clock] { return aa::core::Nanoseconds{clock}; };
+        }};
+        ASSERT_TRUE(route.router);
+        PausingSink sink{&clock};
+        sink.queue = 10 * kMs;
+        sink.attach(*route.sink);
+        std::int64_t next = 0;
+        std::int64_t latest = INT64_MIN; // after the hold: latest a step started after the last write's end
+        const auto run_to = [&](std::int64_t chunk) {
+            while (next < chunk) {
+                clock = std::max(clock, route.start + next * kA26ChunkNs);
+                do { ASSERT_TRUE(route.submit_media(next * kA26ChunkNs)); }
+                while (++next < chunk && route.start + next * kA26ChunkNs <= clock);
+                bool pending = true;
+                for (int i = 0; pending && i < 1024; ++i) {
+                    clock += step_ns;
+                    if (route.stats().playout_retimes != 0) { latest = std::max(latest, clock - sink.written_end); }
+                    auto stepped = route.router->render_step();
+                    ASSERT_TRUE(stepped);
+                    pending = stepped.value().pending;
+                }
+                ASSERT_FALSE(pending);
+            }
+        };
+        run_to(100);
+        EXPECT_EQ(route.stats().playout_retimes, 0U);
+        // A blocked write in steady media, then the clock settling: 20 ms more
+        // over about 1.7 s, until a step starts about 0.44 ms after the last
+        // write's end (live: 0.03-0.46 ms).
+        sink.pause_next = pause_ms * kMs;
+        sink.drag = 20 * kMs;
+        sink.drag_step = 500'000;
+        run_to(101);
+        run_to(101 + 10'000 / 42); // 10 s
+        EXPECT_EQ(sink.drag, 0);
+        // Its slots passed by about what they did live.
+        EXPECT_GT(latest, 300'000);
+        EXPECT_LT(latest, 500'000);
+        const auto& stats = route.stats();
+        expect_nothing_lost(route);
+        EXPECT_EQ(stats.playout_overflows, 0U);
+        EXPECT_EQ(stats.frames_overflowed, 0U);
+        EXPECT_EQ(stats.playout_underruns, 0U);
+        EXPECT_EQ(stats.playout_retimes, 1U);
+        const auto events = route.router->take_playout_events();
+        std::ostringstream shifts;
+        for (const auto& event : events) { shifts << ' ' << event.late.count << '/' << event.held.count; }
+        ASSERT_EQ(events.size(), 2U) << "late/held:" << shifts.str();
+        EXPECT_EQ(events[1].kind, aa::audio::PlayoutEvent::Kind::retime);
+        // Held whole but for the step's own start.
+        EXPECT_NEAR(static_cast<double>(events[1].held.count), static_cast<double>(events[1].late.count),
+                    2.0 * static_cast<double>(step_ns));
+        EXPECT_EQ(sink.held, events[1].held.count);
+        // The one shift is the hold and its lead: no second lead after it.
+        EXPECT_EQ(stats.playout_retimed, events[1].late);
+        EXPECT_EQ(sink.waited, 0);
+        EXPECT_EQ(sink.dropped, 0);
+        EXPECT_NEAR(static_cast<double>(route.largest_offset()),
+                    static_cast<double>((60 + pause_ms) * kMs), 45.0e6);
+        expect_whole_tone(route, 0);
+        EXPECT_EQ(stats.frames_decoded + stats.frames_stretched,
+                  stats.frames_retained + stats.frames_compressed);
+    }
+}
+
+// Sol re-check of 89875dc (#229): media resumes after a quiet gap, the step
+// that skips the gap returns, and this thread is then held while the sink's
+// clock runs. The refill silence and the media after it are planned again by
+// the clock instead of written in the past, and the silence going in late is
+// no hold: the packet plays, or what is too old by its receipt is cut and
+// counted.
+TEST_F(AudioPipelineRoute, WiredDefaultsPlaceAResumeAgainAfterAPauseThatFollowsItsSkip) {
+    for (const std::int64_t pause_ms : {0, 300, 2'100}) {
+        SCOPED_TRACE(pause_ms);
+        std::int64_t clock = 0;
+        WiredRoute route{{}, [&clock](aa::audio::RouterConfig& config) {
+            config.clock = [&clock] { return aa::core::Nanoseconds{clock}; };
+        }};
+        ASSERT_TRUE(route.router);
+        PausingSink sink{&clock};
+        sink.attach(*route.sink);
+        // Received when stamped, on this clock.
+        const auto submit = [&](std::int64_t offset_ns) {
+            clock = route.start + offset_ns;
+            const auto pcm = tone_pcm(route.media_chunks * kA26Frames, kA26Frames);
+            return route.router->submit(make_message(aa::protocol::ChannelRole::media_audio, ++route.media_chunks,
+                                                     {clock}, pcm), aa::core::Nanoseconds{clock}).has_value();
+        };
+        ASSERT_TRUE(submit(0));
+        ASSERT_TRUE(route.drain());
+        ASSERT_TRUE(submit(600 * kMs));
+        auto stepped = route.router->render_step();
+        ASSERT_TRUE(stepped);
+        ASSERT_TRUE(stepped.value().pending);
+        clock += pause_ms * kMs;
+        ASSERT_TRUE(route.drain());
+        const auto& stats = route.stats();
+        EXPECT_FALSE(route.router->report().render_failure);
+        EXPECT_EQ(sink.dropped, 0);
+        EXPECT_EQ(sink.held, 0);
+        EXPECT_EQ(stats.frames_retained + stats.frames_overflowed, 2 * kA26Frames);
+        EXPECT_EQ(stats.frames_overflowed, pause_ms > 2'000 ? kA26Frames : 0U);
+    }
+}
+
+// What on_write_completed says the piece really plays with: the blocked piece
+// from its return, the next from the retimed slot. Stamps of another clock are
+// not lateness.
+TEST_F(AudioPipelineRoute, WiredDefaultsReportTheEndpointOfABlockedWrite) {
+    std::int64_t clock = 0;
+    WiredRoute route{{}, [&clock](aa::audio::RouterConfig& config) {
+        config.clock = [&clock] { return aa::core::Nanoseconds{clock}; };
+    }};
+    ASSERT_TRUE(route.router);
+    clock = route.start;
+    ASSERT_TRUE(route.media(0));
+    ASSERT_EQ(route.writes.size(), 1U);
+    EXPECT_EQ(route.writes[0].endpoint_offset, route.writes[0].playout_offset);
+    EXPECT_EQ(route.writes[0].endpoint_end_offset, route.writes[0].playout_end_offset);
+    clock = route.start + kA26ChunkNs;
+    route.sink->during_write = [&] { clock += 360 * kMs; }; // 300 ms past its slot
+    ASSERT_TRUE(route.submit_media(kA26ChunkNs));
+    ASSERT_TRUE(route.router->render_step());
+    route.sink->during_write = {};
+    ASSERT_EQ(route.writes.size(), 2U);
+    EXPECT_NEAR(static_cast<double>(route.writes[1].endpoint_offset.count), 360.0e6, 1.0e5);
+    EXPECT_NEAR(static_cast<double>(route.writes[1].endpoint_end_offset.count),
+                380.0e6 - static_cast<double>(kA26ChunkNs), 1.0e5);
+    for (int k = 2; k < 9; ++k) { ASSERT_TRUE(route.submit_media(k * kA26ChunkNs)); }
+    ASSERT_TRUE(route.drain());
+    EXPECT_EQ(route.stats().playout_retimes, 1U);
+    EXPECT_NEAR(static_cast<double>(route.writes[2].playout_offset.count),
+                380.0e6 - static_cast<double>(kA26ChunkNs), 1.0e5);
+    const auto events = route.router->take_playout_events();
+    ASSERT_EQ(events.size(), 2U);
+    EXPECT_EQ(events[1].kind, aa::audio::PlayoutEvent::Kind::retime);
+
+    WiredRoute stale{{}, [&clock](aa::audio::RouterConfig& config) {
+        config.clock = [&clock] { return aa::core::Nanoseconds{clock}; };
+    }};
+    ASSERT_TRUE(stale.router);
+    clock = stale.start + 3'600'000 * kMs;
+    for (int k = 0; k < 4; ++k) { ASSERT_TRUE(stale.media(k * kA26ChunkNs)); }
+    EXPECT_EQ(stale.stats().playout_retimes, 0U);
+    EXPECT_EQ(stale.writes.back().endpoint_offset, stale.writes.back().playout_offset);
+}
+
+// end_stream(): everything submitted plays out, decoder tail included; nothing
+// waits for the role; the next chunk starts a stream of its own.
+TEST_F(AudioPipelineRoute, WiredDefaultsEndOfStreamPlaysOutAndStartsAfresh) {
+    std::int64_t clock = 0;
+    WiredRoute route{{}, [&clock](aa::audio::RouterConfig& config) {
+        config.clock = [&clock] { return aa::core::Nanoseconds{clock}; };
+    }};
+    ASSERT_TRUE(route.router);
+    const auto guidance = aa::protocol::ChannelRole::guidance_audio;
+    clock = route.start;
+    ASSERT_TRUE(route.submit_guidance(0, 12'000));
+    EXPECT_TRUE(route.router->end_stream(guidance));
+    EXPECT_FALSE(route.router->end_stream(aa::protocol::ChannelRole::media_audio));
+    ASSERT_TRUE(route.submit_media(0));
+    // Media is ended too: the prompt does not wait for its next chunk.
+    EXPECT_TRUE(route.router->end_stream(aa::protocol::ChannelRole::media_audio));
+    ASSERT_TRUE(route.drain());
+    EXPECT_GE(route.stats().frames_retained, 9'598U + kA26Frames);
+    EXPECT_EQ(route.stats().frames_decoded, route.stats().frames_retained);
+    EXPECT_FALSE(route.router->end_stream(guidance)); // nothing left to play
+    // 400 ms after the first prompt's end: not an underrun, a new stream.
+    clock = route.start + 660 * kMs;
+    const auto anchors = route.stats().playout_anchors;
+    ASSERT_TRUE(route.submit_guidance(660 * kMs, -12'000));
+    route.sink->writes.clear();
+    ASSERT_TRUE(route.drain());
+    EXPECT_EQ(route.stats().playout_underruns, 0U);
+    EXPECT_EQ(route.stats().playout_anchors, anchors + 1);
+    EXPECT_EQ(route.stats().playout_depth, aa::core::Nanoseconds{60 * kMs});
+    const auto samples = route.left();
+    EXPECT_EQ(std::count_if(samples.begin(), samples.end(), [](auto v) { return v > 1'000; }), 0);
+    // Only lossless playout plays a stopped stream out.
+    auto config = aa::audio::pcm_router_config();
+    config.playout.lossless = false;
+    auto bounded = aa::audio::detail::open_router_with_sink_for_test(
+        config, std::make_unique<RecordingAudioSink>());
+    ASSERT_TRUE(bounded);
+    EXPECT_FALSE(bounded.value().end_stream(guidance));
+}
+
+namespace {
+
+constexpr std::int64_t kBoundNs = 2'000 * kMs; // PlayoutPolicy::emergency_backlog
+constexpr double kFrameNs = 1e9 / 48000.0;
+
+// Nothing is unaccounted for, and every cut sample is an overflow.
+void expect_only_overflow(const WiredRoute& route) {
+    const auto& stats = route.stats();
+    EXPECT_EQ(stats.frames_trimmed, stats.frames_overflowed);
+    EXPECT_EQ(stats.frames_decoded + stats.frames_stretched,
+              stats.frames_retained + stats.frames_compressed + stats.frames_trimmed);
+    EXPECT_FALSE(route.router->report().render_failure);
+}
+
+} // namespace
+
+// Third review of #229, P2: the overflow decision was cached before the retime
+// that moved the run beyond the bound. 07b82f0 placed the second chunk here
+// 2,009 ms after its arrival and cut nothing.
+TEST_F(AudioPipelineRoute, WiredDefaultsBoundAHeadThatARetimeMovesBeyondIt) {
+    std::int64_t clock = 0;
+    WiredRoute route{{}, [&clock](aa::audio::RouterConfig& config) {
+        config.clock = [&clock] { return aa::core::Nanoseconds{clock}; };
+    }};
+    ASSERT_TRUE(route.router);
+    clock = route.start;
+    ASSERT_TRUE(route.media(0));
+    clock = route.start + 1'990 * kMs;
+    ASSERT_TRUE(route.media(1 * kMs));
+    EXPECT_EQ(route.stats().playout_retimes, 1U);
+    // 1,990 + 20 ms of lead, 1 ms after the arrival: 9 ms beyond.
+    EXPECT_NEAR(static_cast<double>(route.stats().frames_overflowed), 432.0, 1.0);
+    EXPECT_EQ(route.stats().playout_overflows, 1U);
+    EXPECT_LE(route.stats().playout_offset.count, kBoundNs + 21'000);
+    expect_only_overflow(route);
+}
+
+// The same with a backlog before the stall: the retimed head itself crosses the
+// bound, after the rate correction had already shortened it, and is not warped
+// again.
+TEST_F(AudioPipelineRoute, WiredDefaultsBoundADeepBacklogThatAStallMovesBeyondIt) {
+    std::int64_t clock = 0;
+    WiredRoute route{{}, [&clock](aa::audio::RouterConfig& config) {
+        config.clock = [&clock] { return aa::core::Nanoseconds{clock}; };
+    }};
+    ASSERT_TRUE(route.router);
+    // A burst 1.8 s deep, then 6 s at the phone's cadence: the window holds nothing
+    // of the burst any more and the rate correction runs.
+    clock = route.start;
+    for (int k = 0; 60 * kMs + k * kA26ChunkNs < 1'800 * kMs; ++k) { ASSERT_TRUE(route.media(0)); }
+    std::int64_t at = 0;
+    for (int k = 1; k <= 140; ++k) {
+        at = k * kA26ChunkNs;
+        clock = route.start + at;
+        ASSERT_TRUE(route.media(at));
+    }
+    EXPECT_EQ(route.stats().frames_overflowed, 0U);
+    const auto compressed = route.stats().frames_compressed;
+    ASSERT_GT(compressed, 0U);
+    // The next chunk's write blocks; the head behind it, 1 ms younger, is then
+    // retimed to 15 ms beyond the bound.
+    at += kA26ChunkNs;
+    clock = route.start + at;
+    bool stall = true;
+    route.sink->during_write = [&] {
+        if (std::exchange(stall, false)) { clock = route.start + at + kMs + kBoundNs + (15 - 20) * kMs; }
+    };
+    ASSERT_TRUE(route.submit_media(at));
+    ASSERT_TRUE(route.submit_media(at + kMs));
+    ASSERT_TRUE(route.drain());
+    EXPECT_EQ(route.stats().playout_retimes, 1U);
+    EXPECT_NEAR(static_cast<double>(route.stats().frames_overflowed), 720.0, 1.0);
+    EXPECT_EQ(route.stats().playout_overflows, 1U);
+    EXPECT_LE(route.stats().playout_offset.count, kBoundNs + 21'000);
+    EXPECT_LE(route.stats().frames_compressed - compressed, 2U * 21U); // each chunk once
+    expect_only_overflow(route);
+}
+
+// A retime in the middle of a placed chunk cuts the rest of it.
+TEST_F(AudioPipelineRoute, WiredDefaultsBoundTheRestOfAPlacedChunkAcrossARetime) {
+    // 250 ms of stall leaves part of the rest, 1,900 ms nothing.
+    for (const std::int64_t stall_ms : {250, 1'900}) {
+        SCOPED_TRACE(stall_ms);
+        std::int64_t clock = 0;
+        WiredRoute route{{}, [&clock](aa::audio::RouterConfig& config) {
+            config.clock = [&clock] { return aa::core::Nanoseconds{clock}; };
+        }};
+        ASSERT_TRUE(route.router);
+        clock = route.start;
+        const auto submit = [&](std::int64_t at) { // 100 ms parents: two pieces each
+            const auto pcm = tone_pcm(route.media_chunks * 4'800, 4'800);
+            return route.router->submit(make_message(aa::protocol::ChannelRole::media_audio,
+                                                     ++route.media_chunks, {route.start + at}, pcm))
+                .has_value();
+        };
+        std::size_t writes = 0;
+        route.sink->during_write = [&] {
+            // The first piece of the 18th parent, whose slot is 1,760 ms.
+            if (++writes == 35) { clock = route.start + (1'760 + 50 + stall_ms) * kMs; }
+        };
+        for (int k = 0; k < 18; ++k) { ASSERT_TRUE(submit(0)); }
+        ASSERT_TRUE(route.drain());
+        EXPECT_EQ(route.stats().playout_retimes, 1U);
+        // Second half: content 50 ms, placed at 1,830 ms + stall.
+        const auto beyond = (1'760 + 50 + stall_ms + 20 - 50) * kMs - kBoundNs;
+        const auto rest = std::min<std::int64_t>(beyond, 50 * kMs);
+        EXPECT_GE(static_cast<double>(route.stats().frames_overflowed) * kFrameNs,
+                  static_cast<double>(rest) - 1e5);
+        EXPECT_LE(static_cast<double>(route.stats().frames_overflowed) * kFrameNs,
+                  static_cast<double>(rest) + 1e5);
+        // The stream goes on where the cut left it.
+        route.sink->during_write = {};
+        clock = std::max(clock, route.start + 1'900 * kMs);
+        ASSERT_TRUE(submit(1'900 * kMs));
+        ASSERT_TRUE(route.drain());
+        EXPECT_EQ(route.stats().playout_underruns, 0U);
+        EXPECT_LE(route.stats().playout_depth.count, kBoundNs);
+        expect_only_overflow(route);
+    }
+}
+
+// Third review of #229, P2: a stream's first run queues behind the stream before
+// it, so stopping after every chunk must not escape the bound. 07b82f0 cut 64,879
+// frames of 80 chunks 1 ms apart in one stream, and none with a stop between any
+// two: the last one was placed 3.4 s after its arrival.
+TEST_F(AudioPipelineRoute, WiredDefaultsBoundFreshStreamsLikeOneStream) {
+    const auto media = aa::protocol::ChannelRole::media_audio;
+    std::array<std::uint64_t, 2> cut{};
+    for (const bool stops : {false, true}) {
+        SCOPED_TRACE(stops);
+        WiredRoute route;
+        ASSERT_TRUE(route.router);
+        for (int k = 0; k < 80; ++k) {
+            ASSERT_TRUE(route.submit_media(k * kMs));
+            if (stops) { EXPECT_TRUE(route.router->end_stream(media)); }
+        }
+        ASSERT_TRUE(route.drain());
+        cut[stops ? 1 : 0] = route.stats().frames_overflowed;
+        EXPECT_GT(route.stats().frames_overflowed, 60'000U);
+        // The last write ends 2 s after the last chunk's end at the latest.
+        const auto last = route.writes.back().scheduled_end.count - route.start - 79 * kMs;
+        EXPECT_LE(last, kBoundNs + kA26ChunkNs + 100'000);
+        EXPECT_LE(route.stats().playout_offset.count, kBoundNs + 21'000);
+        expect_only_overflow(route);
+    }
+    EXPECT_NEAR(static_cast<double>(cut[0]), static_cast<double>(cut[1]), 80.0); // a frame each
+}
+
+// Bot review of #229, P2: what follows a wholly cut chunk is still planned, played
+// and accounted for, through pump() and flush(). 07b82f0 took the next chunks in
+// the same step, before they had a playout decision: their cut was no overflow
+// and what was played had no offset.
+TEST_F(AudioPipelineRoute, WiredDefaultsKeepGoingAfterWhollyCutChunks) {
+    for (const bool flush : {false, true}) {
+        SCOPED_TRACE(flush);
+        WiredRoute route;
+        ASSERT_TRUE(route.router);
+        ASSERT_TRUE(route.media(0)); // the incremental path
+        for (int k = 0; k < 60; ++k) { ASSERT_TRUE(route.submit_media(0)); }
+        ASSERT_TRUE(route.submit_media(600 * kMs)); // 1.4 s deep: kept
+        ASSERT_TRUE(route.submit_media(1'700 * kMs));
+        ASSERT_TRUE(flush ? route.router->flush() : route.router->pump());
+        EXPECT_EQ(route.stats().frames_decoded, 63U * kA26Frames);
+        EXPECT_GT(route.stats().frames_overflowed, 13U * kA26Frames);
+        expect_only_overflow(route);
+        // Both later chunks are whole, and reported at the depth they play with.
+        ASSERT_GE(route.writes.size(), 2U);
+        const auto& last = route.writes.back();
+        EXPECT_EQ(route.stats().playout_depth.count, last.scheduled.count - route.start - 1'700 * kMs);
+        EXPECT_NEAR(static_cast<double>(last.scheduled_end.count - route.start),
+                    static_cast<double>(kBoundNs + 3 * kA26ChunkNs), 1e5);
+        EXPECT_GT(route.stats().playout_offset.count, 1'400 * kMs);
+    }
+}
+
+TEST_F(AudioPipelineRoute, RateCorrectionKernelIsTransparent) {
+    const auto samples_of = [](const std::vector<std::byte>& pcm) {
+        std::vector<std::int16_t> out(pcm.size() / 4);
+        for (std::size_t i = 0; i < out.size(); ++i) { std::memcpy(&out[i], pcm.data() + i * 4, 2); }
+        return out;
+    };
+    // Unity, too short a run, or too large a change: untouched.
+    const auto tone = tone_pcm(0, kA26Frames);
+    EXPECT_EQ(aa::audio::detail::warp_frames(tone, 2, 0), tone);
+    EXPECT_EQ(aa::audio::detail::warp_frames(tone, 2, 22), tone);
+    EXPECT_EQ(aa::audio::detail::warp_frames(tone, 2, -22), tone);
+    const auto short_run = tone_pcm(0, 15);
+    EXPECT_EQ(aa::audio::detail::warp_frames(short_run, 2, -1), short_run);
+    struct Case {
+        std::uint64_t frames;
+        std::int64_t delta;
+        std::size_t edge;
+        double tolerance;
+    };
+    for (const Case c : {Case{kA26Frames, -21, 32, 2.0}, Case{kA26Frames, -10, 32, 2.0},
+                         Case{kA26Frames, -1, 32, 2.0}, Case{kA26Frames, 1, 32, 2.0},
+                         Case{kA26Frames, 21, 32, 2.0}, Case{256, -3, 32, 2.0}, Case{240, -3, 16, 2.0},
+                         Case{240, 1, 16, 2.0}, Case{64, -1, 16, 2.0}, Case{64, 1, 16, 2.0},
+                         Case{63, -1, 4, 12.0}, Case{48, 1, 4, 12.0}, Case{16, -1, 4, 12.0},
+                         Case{16, 1, 4, 12.0}}) {
+        SCOPED_TRACE(std::to_string(c.frames) + (c.delta < 0 ? " " : " +") + std::to_string(c.delta));
+        const auto run = tone_pcm(0, c.frames);
+        const auto constant = samples_of(aa::audio::detail::warp_frames(
+            constant_pcm({12345, c.frames}), 2, c.delta));
+        EXPECT_EQ(constant.size(), c.frames + static_cast<std::uint64_t>(c.delta));
+        EXPECT_TRUE(std::all_of(constant.begin(), constant.end(), [](auto v) { return v == 12345; }));
+        const auto warped = samples_of(aa::audio::detail::warp_frames(run, 2, c.delta));
+        const auto original = samples_of(run);
+        ASSERT_EQ(warped.size(), constant.size());
+        const auto edge = static_cast<std::ptrdiff_t>(c.edge);
+        // Both ends are bit-exact, so neighbouring runs join without a step.
+        EXPECT_TRUE(std::equal(original.begin(), original.begin() + edge, warped.begin()));
+        EXPECT_TRUE(std::equal(original.end() - edge, original.end(), warped.end() - edge));
+        // Between them it is the tone at one constant rate, within rounding.
+        const double rate = static_cast<double>(c.frames - 2 * c.edge)
+            / static_cast<double>(warped.size() - 2 * c.edge);
+        double worst = 0.0;
+        for (std::size_t i = c.edge; i < warped.size() - c.edge; ++i) {
+            const double frame = static_cast<double>(c.edge) + static_cast<double>(i - c.edge) * rate;
+            const double ideal = kToneAmplitude
+                * std::sin(2.0 * 3.14159265358979323846 * kToneHz * frame / 48000.0);
+            worst = std::max(worst, std::abs(ideal - static_cast<double>(warped[i])));
+        }
+        EXPECT_LT(worst, c.tolerance);
+    }
 }

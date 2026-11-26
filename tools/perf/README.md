@@ -239,10 +239,12 @@ diagnostic information only.
 life (`sink_reopens` counts the routes a reopen replaced): `frames_decoded`,
 `frames_trimmed` (drift trims, catch-up included), `frames_caught_up` (the
 catch-up part), `frames_silence` (synthesized gap frames), `frames_skipped`
-(elapsed time advanced without a write: withheld credit or a wireless playout
+(elapsed time advanced without a write: withheld credit or a playout
 underrun's hole) and `frames_idle_skipped` (settled all-role idle), all in
-48 kHz output frames. The wireless receiver adds its playout buffer and
-credit window (owner decision 2026-11-20): `playout_target_ms` (the configured depth),
+48 kHz output frames. When the playout clock is enabled (default on both
+wireless, `120` ms, owner decision 2026-11-20, and wired, `60` ms, owner
+decision 2026-11-23 / #228), `media_timing` adds the playout buffer and
+credit window fields: `playout_target_ms` (the configured depth),
 `playout_depth_ms` (the latest chunk's slot minus its arrival),
 `playout_depth_min_ms` / `playout_depth_max_ms` (that depth's range, anchors
 excluded; `null` before the first steady chunk), `playout_offset_ms` (the
@@ -266,13 +268,36 @@ remaining excess), `credit_window` (the advertised
 accepted and not yet released for ACK: our side, normally 1 because acks go
 out on receipt) and `max_arrival_burst` (the most chunks of one channel that
 arrived within 10 ms of each other: the phone's side, above 1 when it uses
-more than one credit at once). Each underrun also logs
+more than one credit at once). The wired receiver's lossless
+playout (#228) never trims, sheds or pads, so those counters stay `0`; its
+records add `frames_compressed` and `frames_stretched` (output frames the rate
+correction made the decoded runs shorter or longer by: nothing is dropped or
+inserted), `playout_overflows` (chunks cut by the 2 s emergency bound) and
+`frames_overflowed` (what they lost, a subset of `frames_trimmed`, also logged
+as `audio_playout_overflow` with `frames`, `frames_lifetime` and `depth_ms`),
+`playout_retimes` (times everything to come was moved later because a write
+blocked past its slot, each logged as `audio_playout_retime` with `shifted_ms`,
+`held_ms`, `offset_ms` and `retimes_lifetime`; `held_ms` is the part the sink took
+into its own stream because its clock stood still while the write blocked, so it
+plays on contiguously: a pause of the sink is one retime with `held_ms` equal to
+`shifted_ms`, time lost between writes has `held_ms` 0 and moves the sink's
+stamps; nothing after the blocked write is lost while
+the stall plus the depth before it stay within the 2 s bound, beyond which a retime
+makes late audio overflow; the write itself can lose up to ~50 ms inside the sink,
+which no counter shows, #232)
+and `playout_retimed_ms` (their sum). A stopped stream plays out; `audio_stop_discarded` (`role`, `null`
+at shutdown, and `chunks`; at shutdown also `frames`, 48 kHz output frames of all
+roles, where a decoder tail alone is one chunk) reports accepted audio a stop had
+to cancel, or lost to a write that failed during it, including decoder tails whose
+slot passed meanwhile.
+There `playout_offset_ms` and `playout_offset_ns` are the media stream's while
+media plays. Each underrun also logs
 `audio_playout_underrun` with `underruns_lifetime`, `late_ms` (how long after
 its slot the chunk arrived) and `depth_ms` (the depth it re-anchored with),
 and each anchor logs `audio_playout_anchor` with `reason` (`start` or
 `resume`), `skipped_ms` (elapsed time jumped over without a write),
-`depth_ms` and `anchors_lifetime`. The wireless VideoOutlet logs
-`video_hold_capped` (`requested_ms`, `cap_ms` 400, `capped_frames`, counted
+`depth_ms` and `anchors_lifetime`. The VideoOutlet logs
+`video_hold_capped` (`requested_ms`, `cap_ms` 400 wireless or 700 wired, `capped_frames`, counted
 when a capped frame is released) when the offset it follows exceeds its hold
 cap, and `video_release_late` (`late_ms`, `late_releases`, `by`: the path that
 released it, `timer`, `checkpoint`, `arrival` or `service`, and
@@ -285,16 +310,18 @@ a timer that threw or could not start. `playout_reported_offset_ms` keeps its
 last value when the stream stops; only the history the video lookup uses is
 cleared.
 
-On the wireless playout clock `audio_write_completed.scheduled_ns` and
+On the playout clock (default on both wired and wireless) `audio_write_completed.scheduled_ns` and
 `scheduled_end_ns` are the content's arrival-clock times and the additive
 `playout_offset_ns` is how much later the piece was scheduled (the content
 interval never starts before the previous one ended, so after an offset
 increase the end offset briefly exceeds it while content advances at half
 rate), so
 `presented_ns - scheduled_ns` includes the playout buffer and the A/V pairing
-matches a video frame with the audio that arrived with it. The wireless
-receiver holds video for the reported offset (`--video-delay-ms match`), so the
-signed A/V contract is unchanged. Wired records never carry the field. `av_sync_ms` is computed only
+matches a video frame with the audio that arrived with it. Both receivers
+hold video for the reported offset (`--video-delay-ms match`), so the
+signed A/V contract is unchanged (`aa-wired-receiver` logs `wired_media_policy`
+and `aa-wireless-receiver` logs `wireless_media_policy` at startup). Records on
+the legacy arrival model (`--audio-playout-ms 0`) never carry the field. `av_sync_ms` is computed only
 from the cross-stream consumer completion events: the video's retained common
 monotonic timestamp must lie in the audio write's half-open scheduled interval.
 For each pair, skew is `(video completed - video scheduled) - (audio write

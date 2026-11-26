@@ -12,6 +12,7 @@
 #include <aa/config/VideoProfiles.hpp>
 #include <aa/diagnostics/Diagnostics.hpp>
 #include <aa/diagnostics/StdoutLog.hpp>
+#include "../media_playout_options.hpp"
 #include "../wired-receiver/VideoOutlet.hpp"
 #include <atomic>
 #include <chrono>
@@ -80,10 +81,9 @@ private:
 // #155: wireless catch-up is configurable and defaults to off (0). With
 // receiver-arrival timestamps, a normal wireless TCP coalesced burst (e.g.
 // 3 x 50 ms chunks within 5 ms) reaches >90 ms placement phase without a sink
-// stall and would be trimmed by the wired 90 ms phase watermark. Wired keeps
-// the 90 ms default in audio::pcm_router_config(); wireless stays off unless
-// explicitly configured (e.g. --audio-catch-up-watermark-ms), and only on the
-// legacy arrival model (--audio-playout-ms 0).
+// stall and would be trimmed by the former wired 90 ms phase watermark. Both receivers
+// keep it off unless explicitly configured (--audio-catch-up-watermark-ms), and
+// only on the legacy arrival model (--audio-playout-ms 0).
 //
 // Credit window + playout (owner decision 2026-11-20): wireless audio plays on
 // a steady playout clock `playout_depth` (default 120 ms) behind the arrival
@@ -94,10 +94,9 @@ private:
     audio::SinkBackend backend = audio::SinkBackend::pulse,
     core::Nanoseconds catch_up_watermark = core::Nanoseconds{0},
     core::Nanoseconds playout_depth = audio::kWirelessPlayoutDepth) {
-    auto config = audio::pcm_router_config(backend, audio_telemetry());
-    config.live_pcm_drift.catch_up_watermark = catch_up_watermark;
-    config.playout.enabled = playout_depth.count > 0;
-    if (config.playout.enabled) { config.playout.depth = playout_depth; }
+    auto config = audio::pcm_router_config(backend, audio_telemetry(), playout_depth, catch_up_watermark);
+    // Wireless keeps the #182 drift rules; lossless playout is wired's (#228).
+    config.playout.lossless = false;
     return config;
 }
 
@@ -107,7 +106,7 @@ private:
 // it the hold follows the audio playout offset (match_video_to_audio).
 [[nodiscard]] inline std::chrono::milliseconds video_delay(std::optional<std::int64_t> video_delay_ms,
                                                            std::int64_t audio_playout_ms) {
-    return std::chrono::milliseconds{video_delay_ms.value_or(audio_playout_ms)};
+    return aa::tools::video_delay(video_delay_ms, audio_playout_ms);
 }
 
 // The media endpoints outlive every per-link session; callbacks resolve the
@@ -144,10 +143,7 @@ struct Media final {
     // depth) holds video until the first playout audio write and after a
     // second without one (a pause without a stop message).
     void match_video_to_audio(std::chrono::nanoseconds fallback) {
-        video.set_presentation_delay_source([this, fallback](core::Nanoseconds content) {
-            const auto offset = audio.playout_offset_at(content);
-            return offset.count() > 0 ? offset : fallback;
-        });
+        aa::tools::match_video_to_audio(video, audio, fallback);
     }
     core::Result<void> bind(app::WiredSession& session) {
         audio.begin_session();

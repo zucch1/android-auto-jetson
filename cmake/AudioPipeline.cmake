@@ -33,6 +33,7 @@ pkg_check_modules(AA_AUDIO_GST REQUIRED IMPORTED_TARGET
 
 set(AA_AUDIO_SOURCES
     src/audio/AudioMix.cpp
+    src/audio/RateCorrection.cpp
     src/audio/AudioRouter.cpp
     src/audio/gstreamer_adapter/GstAudioDecoder.cpp
     src/audio/gstreamer_adapter/GstAudioSink.cpp)

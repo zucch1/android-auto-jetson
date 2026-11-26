@@ -126,12 +126,14 @@ void log_sink_selected(const SinkReport& selected, std::string_view origin,
 struct MediaTimingContext final {
     // Sink routes replaced so far; the counters cover every route.
     std::uint64_t sink_reopens{};
-    // Set when the playout clock is on (wireless): its target depth.
+    // Set when the playout clock is on: its target depth.
     std::optional<core::Nanoseconds> playout_target{};
     // Advertised max_unacked per audio channel and the most chunks one
     // channel actually had unacknowledged.
     std::uint32_t credit_window{1};
     std::uint64_t max_unacked_held{};
+    // Lossless playout (wired): adds its own counters to the record.
+    bool lossless{};
 };
 // Sum of a receiver's earlier routes (lifetime) and the current one: counters
 // add, maxima fold, the latest observations come from `route`.
@@ -161,11 +163,21 @@ struct MediaTimingContext final {
 [[nodiscard]] std::string audio_rejection_json(const AudioRejectionSnapshot& value);
 
 // Shared router config for both wired and wireless receivers: pulsesink via
-// pipewire-pulse, live-PCM drift policy enabled, and playback-time completion
-// telemetry routed through `telemetry.log_media`.
-[[nodiscard]] RouterConfig pcm_router_config(AudioTelemetryCallbacks telemetry = {},
-                                             SinkBackend backend = SinkBackend::pulse);
-[[nodiscard]] RouterConfig pcm_router_config(SinkBackend backend,
-                                             AudioTelemetryCallbacks telemetry);
+// pipewire-pulse, live-PCM drift policy enabled, playout clock enabled by
+// default, and playback-time completion telemetry routed through
+// `telemetry.log_media`. The defaults are wired's: kWiredPlayoutDepth and
+// lossless (PlayoutPolicy::lossless). Wireless passes kWirelessPlayoutDepth and
+// turns lossless off (its audio_config()). A zero depth restores the legacy
+// arrival model, where catch_up_watermark may be set.
+[[nodiscard]] RouterConfig pcm_router_config(
+    AudioTelemetryCallbacks telemetry = {},
+    SinkBackend backend = SinkBackend::pulse,
+    core::Nanoseconds playout_depth = kWiredPlayoutDepth,
+    core::Nanoseconds catch_up_watermark = core::Nanoseconds{0});
+[[nodiscard]] RouterConfig pcm_router_config(
+    SinkBackend backend,
+    AudioTelemetryCallbacks telemetry,
+    core::Nanoseconds playout_depth = kWiredPlayoutDepth,
+    core::Nanoseconds catch_up_watermark = core::Nanoseconds{0});
 
 } // namespace aa::audio

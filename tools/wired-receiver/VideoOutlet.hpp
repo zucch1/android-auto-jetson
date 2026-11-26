@@ -123,11 +123,12 @@ public:
         return idr_dispatching_.load(std::memory_order_acquire);
     }
 
-    // Wireless playout (credit window + playout, 2026-11-20): video is held this long after it arrives
-    // before it is forwarded, matching the audio playout buffer so audio and
-    // video still leave the receiver together. The frame keeps its arrival
-    // timestamp, so the display's video_presented latency includes the delay
-    // exactly as audio_write_completed's does. Zero (wired) forwards at once.
+    // Playout clock (wireless since 2026-11-20, wired since #228): video is held
+    // this long after it arrives before it is forwarded, matching the audio
+    // playout buffer so audio and video still leave the receiver together. The
+    // frame keeps its arrival timestamp, so the display's video_presented
+    // latency includes the delay exactly as audio_write_completed's does. Zero
+    // (the arrival model, --audio-playout-ms 0) forwards at once.
     void set_presentation_delay(std::chrono::nanoseconds delay) {
         std::lock_guard lock(mutex_);
         delay_ = std::max(std::chrono::nanoseconds{0}, delay);
@@ -136,17 +137,23 @@ public:
     }
 
     // N1: the hold is read per frame from `source`, given the frame's own
-    // timestamp (the wireless receiver passes the audio playout offset
+    // timestamp (both receivers pass the audio playout offset
     // reported for that content time: the delay the audio it pairs with
     // really plays with), so the two stay the same quantity. The applied hold
     // never falls faster than half the time that passes, so t + hold only
     // ever rises and a frame is never pinned behind an earlier one's due
-    // (no freeze, then burst; Neon P1-1). Bounded to kMaxPresentationDelay,
-    // and every capped frame is counted and logged (video_hold_capped).
+    // (no freeze, then burst; Neon P1-1). Bounded to the hold cap
+    // (set_max_presentation_delay), and every capped frame is counted and logged (video_hold_capped).
     void set_presentation_delay_source(std::function<std::chrono::nanoseconds(core::Nanoseconds)> source) {
         std::lock_guard lock(mutex_);
         delay_source_ = std::move(source);
         last_released_.reset();
+    }
+
+    // The longest hold (default kMaxPresentationDelay).
+    void set_max_presentation_delay(std::chrono::milliseconds cap) {
+        std::lock_guard lock(mutex_);
+        max_delay_ = std::max(std::chrono::milliseconds{0}, cap);
     }
 
     [[nodiscard]] std::uint64_t late_releases() const {
@@ -232,13 +239,13 @@ public:
 
     // Window 14: the owner thread's checkpoint is not a clock. It went
     // 35-90 ms without running, every ~2 s, so held frames due in that time
-    // left late (video_release_late, ~270 in 480 s). The wireless receiver
-    // therefore also releases held frames on a thread of its own that sleeps
-    // until the front frame's due (re-checking at least every
+    // left late (video_release_late, ~270 in 480 s). Receivers with video hold
+    // enabled therefore also release held frames on a thread of their own that
+    // sleeps until the front frame's due (re-checking at least every
     // kReleaseTimerSlice, since the hold source can move a due earlier). Like
     // release_held() it needs no session I/O: an IDR request it triggers
     // waits for service_pending(), and a delivery error is returned from the
-    // next release_held(). Wired never starts it.
+    // next release_held().
     void start_release_timer() {
         std::lock_guard lock(mutex_);
         if (release_thread_.joinable()) { return; }
@@ -507,9 +514,11 @@ private:
         std::vector<std::byte> payload{};
         std::chrono::steady_clock::time_point arrived{};
     };
-    // Above this the hold is capped (and logged): it bounds touch latency and
-    // keeps 600 ms of the drive smoke's 1.0 s waiting_idr budget. The router
-    // sheds a backlog above 350 ms so the audio offset stays under it.
+    // Above the cap the hold is clipped (and logged). The default bounds touch
+    // latency and keeps 600 ms of the drive smoke's 1.0 s waiting_idr budget;
+    // the wireless router sheds a backlog above 350 ms so the audio offset stays
+    // under it. Wired keeps every sample and raises the cap instead
+    // (tools/media_playout_options.hpp, kLosslessVideoHoldCap).
     static constexpr std::chrono::milliseconds kMaxPresentationDelay{400};
 
     [[nodiscard]] std::chrono::nanoseconds requested_delay_locked(core::Nanoseconds content) const {
@@ -529,7 +538,7 @@ private:
     };
     [[nodiscard]] FrontHold front_hold_locked(const DelayedMessage& front) const {
         const auto requested = requested_delay_locked(front.header.timestamp);
-        auto hold = std::min(requested, std::chrono::nanoseconds{kMaxPresentationDelay});
+        auto hold = std::min(requested, std::chrono::nanoseconds{max_delay_});
         if (last_released_) {
             const auto spacing = std::chrono::duration_cast<std::chrono::nanoseconds>(
                 front.arrived - last_released_->arrived);
@@ -545,17 +554,18 @@ private:
     // Counts and logs a frame whose requested hold the cap clips (once per
     // frame, when it is released with the capped hold).
     void note_capped_locked(std::chrono::nanoseconds requested) {
-        if (requested <= kMaxPresentationDelay) { return; }
+        if (requested <= max_delay_) { return; }
         ++capped_holds_;
         if (capped_holds_ == 1 || capped_holds_ % 30 == 0) {
             defer_media("video_hold_capped", "{\"event\":\"video_hold_capped\",\"requested_ms\":" +
                   std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(requested).count()) +
-                  ",\"cap_ms\":" + std::to_string(kMaxPresentationDelay.count()) +
+                  ",\"cap_ms\":" + std::to_string(max_delay_.count()) +
                   ",\"capped_frames\":" + std::to_string(capped_holds_) + "}");
         }
     }
 
-    // 400 ms at 60 fps is 24 units; the byte bound covers IDR-heavy bursts.
+    // 700 ms (the longest cap) at 60 fps is 42 units; the byte bound covers
+    // IDR-heavy bursts.
     static constexpr std::size_t kMaxDelayedUnits = 64;
     static constexpr std::size_t kMaxDelayedBytes = std::size_t{32} * 1024 * 1024;
 
@@ -1081,6 +1091,7 @@ private:
     std::optional<std::chrono::steady_clock::time_point> producer_installed_at_{};
     std::deque<PendingAccessUnit> pending_queue_{};
     std::chrono::nanoseconds delay_{0};
+    std::chrono::milliseconds max_delay_{kMaxPresentationDelay};
     std::function<std::chrono::nanoseconds(core::Nanoseconds)> delay_source_{};
     struct ReleasedHold final {
         std::chrono::steady_clock::time_point arrived;

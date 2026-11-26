@@ -52,8 +52,10 @@ late). Window 9 (#180, TCP_NODELAY) still trimmed 5.8% and filled 8.4% with
 silence over 26 s of audio, then ended `late` (~218 ms) right after a Wi-Fi
 spike second of 12 acks at 83 ms.
 
-Policy (wired is unchanged: stop-and-wait and the arrival model with the
-#155 90 ms catch-up):
+Policy (wired uses the same playout clock and `--video-delay-ms match` with a
+smaller `60` ms USB buffer and stop-and-wait `max_unacked 1`, and replaces the
+drift trim, pad and shed below with a lossless rate correction, #228;
+`--audio-playout-ms 0` restores the legacy arrival model on either receiver):
 
 - **Credit window** (`--audio-max-unacked`, default 4): every audio channel
   advertises `max_unacked` 4, so the phone may keep four chunks

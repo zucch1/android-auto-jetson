@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import json
 import random
+import re
 import sys
 from pathlib import Path
 
@@ -40,6 +41,7 @@ DEPTH_NS = 120_000_000
 SINK_NS = 2_000_000    # sink handoff to playback slot
 PAINT_NS = 9_000_000   # decode + paint after release
 START_NS = 1_000_000_000
+HOLD_CAP_NS = 400_000_000  # VideoOutlet::kMaxPresentationDelay (wireless)
 
 
 def one_way_ns(t_ns: int, spike: bool) -> int:
@@ -122,6 +124,43 @@ def step_audio_events(seconds: int, high: int, low: int, drop_at: int, slewed: b
     return events
 
 
+def wired_default_depth(root: Path) -> int:
+    """kWiredPlayoutDepth, so the fixtures follow the production default."""
+    header = (root / "include/aa/audio/AudioRouter.hpp").read_text(encoding="utf-8")
+    found = re.search(r"kWiredPlayoutDepth\{([0-9']+)\}", header)
+    assert found, "kWiredPlayoutDepth not found"
+    return int(found[1].replace("'", ""))
+
+
+def lossless_backlog_audio_events(seconds: int, depth: int, burst: int) -> list[dict]:
+    """Records of a wired route that re-anchors on a `burst`-chunk backlog at 20 s.
+
+    The offset target rises to depth + (burst - 1) chunks, then falls by the
+    lossless rate correction (AudioRouter wanted_rate_ppm: 250 ppm per ms over a
+    10 ms dead band up to 0.5%, plus 50 ppm per ms above 100 ms up to another
+    0.5%); the reported offset follows by at most half the output time.
+    """
+    events, offset, target = [], depth, depth
+    burst_at = START_NS + 20 * 1_000_000_000
+    started = False
+    for k in range(seconds * 1_000_000_000 // CHUNK_NS):
+        content = START_NS + k * CHUNK_NS
+        if not started and content >= burst_at:
+            started, target = True, depth + (burst - 1) * CHUNK_NS
+        elif started:
+            excess = (target - depth) / 1e6
+            ppm = min(5000.0, max(0.0, excess - 10) * 250) + min(5000.0, max(0.0, excess - 100) * 50)
+            target -= int(CHUNK_NS * ppm / 1e6)
+        start_offset = offset
+        end_offset = start_offset + max(-CHUNK_NS // 2, min(CHUNK_NS // 2, target - start_offset))
+        offset = end_offset
+        events.append({"event": "audio_write_completed", "scheduled_ns": content,
+                       "scheduled_end_ns": content + CHUNK_NS, "playout_offset_ns": start_offset,
+                       "completed_ns": content, "presented_ns": content + start_offset + SINK_NS,
+                       "playback_slot_absence": None, "_end_offset": end_offset})
+    return events
+
+
 def offset_at(audio: list[dict], t: int) -> int:
     for a in audio:
         if a["scheduled_ns"] <= t < a["scheduled_end_ns"]:
@@ -130,7 +169,15 @@ def offset_at(audio: list[dict], t: int) -> int:
     return audio[-1]["_end_offset"]
 
 
-def outlet_video(seconds: int, audio: list[dict], new_outlet: bool) -> list[dict]:
+def wired_hold_cap(root: Path) -> int:
+    """kLosslessVideoHoldCap: the wired receiver's hold cap."""
+    header = (root / "tools/media_playout_options.hpp").read_text(encoding="utf-8")
+    found = re.search(r"kLosslessVideoHoldCap\{([0-9]+)\}", header)
+    assert found, "kLosslessVideoHoldCap not found"
+    return int(found[1]) * 1_000_000
+
+
+def outlet_video(seconds: int, audio: list[dict], new_outlet: bool, cap: int = HOLD_CAP_NS) -> list[dict]:
     """video_presented records through a model of VideoOutlet's hold queue.
 
     Old outlet: hold read at arrival, due = max(arrival + hold, previous due),
@@ -141,7 +188,7 @@ def outlet_video(seconds: int, audio: list[dict], new_outlet: bool) -> list[dict
     events, previous_due, previous = [], 0, None
     for n in range(seconds * 1_000_000_000 // FRAME_NS):
         arrival = START_NS + n * FRAME_NS + 10_000_000
-        hold = offset_at(audio, arrival)
+        hold = min(cap, offset_at(audio, arrival))
         if new_outlet:
             if previous is not None:
                 hold = max(hold, previous[1] - (arrival - previous[0]) // 2)
@@ -311,7 +358,69 @@ def main() -> int:
                 "presented_ns": start + offset + SINK_NS, "playback_slot_absence": None}))
         assert (parser.audio_writes == len(records)) == expected_all, (name, parser.audio_writes)
 
-    # Wired records (no playout_offset_ns) keep their meaning.
+    # Wired default playout (#228): the header's depth with video held to match
+    # passes both cap and soak_rate; without the hold the contract sees the lag.
+    wired_depth = wired_default_depth(root)
+    wired_playout_audio = [
+        {"event": "audio_write_completed",
+         "scheduled_ns": START_NS + k * CHUNK_NS,
+         "scheduled_end_ns": START_NS + (k + 1) * CHUNK_NS,
+         "playout_offset_ns": wired_depth,
+         "completed_ns": START_NS + k * CHUNK_NS + wired_depth - 20_000_000,
+         "presented_ns": START_NS + k * CHUNK_NS + wired_depth + SINK_NS,
+         "playback_slot_absence": None}
+        for k in range(70 * 1_000_000_000 // CHUNK_NS)
+    ]
+    wired_matched_video = [
+        {"event": "video_presented",
+         "scheduled_ns": START_NS + n * FRAME_NS,
+         "completed_ns": START_NS + n * FRAME_NS + wired_depth + PAINT_NS}
+        for n in range(66 * 1_000_000_000 // FRAME_NS)
+    ]
+    for clause in ("cap", "soak_rate"):
+        res = judge(smoke, contract, wired_playout_audio, wired_matched_video, clause)
+        assert res["passed"], ("wired_playout", clause, res)
+        assert abs(res["signed_p50_ms"]) < 15, res
+        # #228 asks for at most 50 ms after warm-up (the cap allows 90).
+        assert res["abs_max_ms"] <= 50.0, res
+
+    # A burst after an underrun deepens the lossless buffer to 358 ms and it
+    # drains by rate correction for about 45 s: video held for the reported
+    # offset (VideoOutlet's slew and 400 ms cap) stays within 50 ms all along;
+    # held for the configured depth only, it fails.
+    deep_audio = lossless_backlog_audio_events(70, wired_depth, burst=8)
+    peak = max(a["playout_offset_ns"] for a in deep_audio)
+    assert wired_depth + 6 * CHUNK_NS < peak <= HOLD_CAP_NS, peak
+    assert deep_audio[-1]["_end_offset"] < wired_depth + 15_000_000, deep_audio[-1]
+    for clause in ("cap", "soak_rate"):
+        res = judge(smoke, contract, deep_audio, outlet_video(66, deep_audio, new_outlet=True), clause)
+        assert res["passed"], ("lossless_backlog", clause, res)
+        assert res["abs_max_ms"] <= 50.0, res
+    # A 16-chunk burst (re-review of 4a3f49f) is 700 ms deep: in sync under the
+    # wired hold cap, up to 300 ms apart under wireless's.
+    wired_cap = wired_hold_cap(root)
+    burst_audio = lossless_backlog_audio_events(70, wired_depth, burst=16)
+    assert HOLD_CAP_NS < max(a["playout_offset_ns"] for a in burst_audio) <= wired_cap
+    for clause in ("cap", "soak_rate"):
+        res = judge(smoke, contract, burst_audio,
+                    outlet_video(66, burst_audio, new_outlet=True, cap=wired_cap), clause)
+        assert res["passed"], ("sixteen_chunk_burst", clause, res)
+        assert res["abs_max_ms"] <= 50.0, res
+    clipped = judge(smoke, contract, burst_audio, outlet_video(66, burst_audio, new_outlet=True), "cap")
+    assert not clipped["passed"] and clipped["abs_max_ms"] > 150.0, clipped
+
+    stuck = judge(smoke, contract, deep_audio, wired_matched_video, "cap")
+    assert not stuck["passed"], stuck
+    wired_unheld_video = [
+        {"event": "video_presented",
+         "scheduled_ns": START_NS + n * FRAME_NS,
+         "completed_ns": START_NS + n * FRAME_NS + PAINT_NS}
+        for n in range(66 * 1_000_000_000 // FRAME_NS)
+    ]
+    unheld = judge(smoke, contract, wired_playout_audio, wired_unheld_video, "cap")
+    assert not unheld["passed"] and unheld["signed_p50_ms"] < -40, unheld
+
+    # Legacy arrival-model wired records (--audio-playout-ms 0, no playout_offset_ns) keep their meaning.
     wired = [{"event": "audio_write_completed", "scheduled_ns": START_NS + k * CHUNK_NS,
               "scheduled_end_ns": START_NS + (k + 1) * CHUNK_NS,
               "completed_ns": START_NS + k * CHUNK_NS,
