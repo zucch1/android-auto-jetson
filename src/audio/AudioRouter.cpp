@@ -86,6 +86,12 @@ constexpr std::int64_t kLatePlaybackNs = 20'000'000;
 constexpr std::int64_t kHoldLeadNs = 20'000'000;
 // Two output-clock times computed from the same frame and base.
 constexpr std::int64_t kSameInstantNs = 1'000;
+// Lossless: a slot passed by no more than this was not missed. The sink's clock
+// and this one agree no better: live, as a sink settled after a hold, it took a
+// write 0.03-0.46 ms after its slot while it was full, and each was retimed
+// again with the 20 ms lead (live A26 check of d3c24e3, #229). The smallest real
+// hold measured was 35 ms.
+constexpr std::int64_t kSlotJitterNs = 5'000'000;
 // How much is mixed at a time once such a role is late.
 constexpr std::int64_t kHoldQuantumNs = 10'000'000;
 // A role silent this long no longer holds the others.
@@ -2659,10 +2665,12 @@ core::Result<RenderStep> AudioRouter::render_step() {
         // (or this thread was held up), and samples written behind its read
         // position would never be heard. Play on from here instead. A slot
         // further back than the emergency bound is not a lateness: the stamps
-        // come from another clock.
+        // come from another clock; one passed by no more than kSlotJitterNs is
+        // not either: that is the two clocks' disagreement.
         std::int64_t slot_ns = 0;
         const auto lead = std::min(kHoldLeadNs, impl_->config.playout.depth.count / 2);
-        if (impl_->timeline_base && impl_->frame_time(cursor, base->count, slot_ns) && slot_ns < now_ns
+        if (impl_->timeline_base && impl_->frame_time(cursor, base->count, slot_ns)
+            && now_ns - slot_ns > kSlotJitterNs
             && now_ns - slot_ns <= impl_->config.playout.emergency_backlog.count) {
             const auto late = now_ns - slot_ns;
             // The part of it the write before this piece spent blocked past its

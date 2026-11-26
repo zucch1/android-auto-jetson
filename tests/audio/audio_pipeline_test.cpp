@@ -7103,6 +7103,10 @@ struct PausingSink final {
     std::int64_t waited{};             // silence waited out for jumps
     std::int64_t dropped{};            // stream time written behind its read position
     std::int64_t longest_block{};      // after the pause: longest write past its start
+    std::int64_t queue{};              // how far ahead of its read position it takes a write
+    std::int64_t drag{};               // after the pause: its clock falls behind this much more,
+    std::int64_t drag_step{};          // this much per write (live: its clock settling)
+    std::int64_t written_end{};        // where the last write ends on the router's clock
 
     void attach(RecordingSinkState& state) {
         state.on_hold = [this](aa::core::Nanoseconds by) {
@@ -7124,11 +7128,18 @@ struct PausingSink final {
                 start += jump * 9 / 10;
             }
             const bool paused = pause_next != 0;
+            if (!paused && lag != 0 && drag != 0) {
+                const auto by = std::min(drag, drag_step);
+                lag += by;
+                drag -= by;
+            }
             lag += std::exchange(pause_next, 0);
             end = start + length;
-            // It takes the write when its read position reaches the write's start.
-            const auto taken = std::max(*clock, start + lag);
+            // It takes the write when its read position reaches the write's start
+            // (less what it queues).
+            const auto taken = std::max(*clock, start + lag - queue);
             if (!paused && lag != 0) { longest_block = std::max(longest_block, taken - *clock); }
+            written_end = chunk.timestamp.count + length;
             *clock = taken;
         };
     }
@@ -7260,6 +7271,88 @@ TEST_F(AudioPipelineRoute, WiredDefaultsMoveTheStampsOfASinkThatPlayedOnDry) {
         const auto events = route.router->take_playout_events();
         ASSERT_EQ(events.size(), 2U);
         EXPECT_EQ(events[1].held.count, 0);
+    }
+}
+
+// Live A26 check of d3c24e3 (#229): after each real hold, the sink's clock
+// fell behind a little more over the next seconds as it settled, until it took
+// a write just after its slot. That sub-millisecond lateness was taken for a
+// slot the sink had played through dry: a second retime with little or nothing
+// held, which moved everything on by the 20 ms lead again (1 s stall: 915.9 ms,
+// then 20.0 ms held 0; early: 20.5 ms held 7.7). The sink was full, not dry.
+// One retime per hold, nothing lost.
+TEST_F(AudioPipelineRoute, WiredDefaultsRetimeOnceWhenASinkSettlesAfterAHold) {
+    // The thread starts each step `step_ns` after the last write returned: the
+    // sink took the write after its end (part of the lateness held), or before
+    // it (none held).
+    for (const auto& [pause_ms, step_ns] : std::vector<std::pair<std::int64_t, std::int64_t>>{
+             {300, 50'000}, {1'000, 50'000}, {1'600, 50'000}, {300, 600'000}, {1'000, 600'000}, {1'600, 600'000}}) {
+        SCOPED_TRACE(pause_ms);
+        SCOPED_TRACE(step_ns);
+        std::int64_t clock = 0;
+        WiredRoute route{{}, [&clock](aa::audio::RouterConfig& config) {
+            config.clock = [&clock] { return aa::core::Nanoseconds{clock}; };
+        }};
+        ASSERT_TRUE(route.router);
+        PausingSink sink{&clock};
+        sink.queue = 10 * kMs;
+        sink.attach(*route.sink);
+        std::int64_t next = 0;
+        std::int64_t latest = INT64_MIN; // after the hold: latest a step started after the last write's end
+        const auto run_to = [&](std::int64_t chunk) {
+            while (next < chunk) {
+                clock = std::max(clock, route.start + next * kA26ChunkNs);
+                do { ASSERT_TRUE(route.submit_media(next * kA26ChunkNs)); }
+                while (++next < chunk && route.start + next * kA26ChunkNs <= clock);
+                bool pending = true;
+                for (int i = 0; pending && i < 1024; ++i) {
+                    clock += step_ns;
+                    if (route.stats().playout_retimes != 0) { latest = std::max(latest, clock - sink.written_end); }
+                    auto stepped = route.router->render_step();
+                    ASSERT_TRUE(stepped);
+                    pending = stepped.value().pending;
+                }
+                ASSERT_FALSE(pending);
+            }
+        };
+        run_to(100);
+        EXPECT_EQ(route.stats().playout_retimes, 0U);
+        // A blocked write in steady media, then the clock settling: 20 ms more
+        // over about 1.7 s, until a step starts about 0.44 ms after the last
+        // write's end (live: 0.03-0.46 ms).
+        sink.pause_next = pause_ms * kMs;
+        sink.drag = 20 * kMs;
+        sink.drag_step = 500'000;
+        run_to(101);
+        run_to(101 + 10'000 / 42); // 10 s
+        EXPECT_EQ(sink.drag, 0);
+        // Its slots passed by about what they did live.
+        EXPECT_GT(latest, 300'000);
+        EXPECT_LT(latest, 500'000);
+        const auto& stats = route.stats();
+        expect_nothing_lost(route);
+        EXPECT_EQ(stats.playout_overflows, 0U);
+        EXPECT_EQ(stats.frames_overflowed, 0U);
+        EXPECT_EQ(stats.playout_underruns, 0U);
+        EXPECT_EQ(stats.playout_retimes, 1U);
+        const auto events = route.router->take_playout_events();
+        std::ostringstream shifts;
+        for (const auto& event : events) { shifts << ' ' << event.late.count << '/' << event.held.count; }
+        ASSERT_EQ(events.size(), 2U) << "late/held:" << shifts.str();
+        EXPECT_EQ(events[1].kind, aa::audio::PlayoutEvent::Kind::retime);
+        // Held whole but for the step's own start.
+        EXPECT_NEAR(static_cast<double>(events[1].held.count), static_cast<double>(events[1].late.count),
+                    2.0 * static_cast<double>(step_ns));
+        EXPECT_EQ(sink.held, events[1].held.count);
+        // The one shift is the hold and its lead: no second lead after it.
+        EXPECT_EQ(stats.playout_retimed, events[1].late);
+        EXPECT_EQ(sink.waited, 0);
+        EXPECT_EQ(sink.dropped, 0);
+        EXPECT_NEAR(static_cast<double>(route.largest_offset()),
+                    static_cast<double>((60 + pause_ms) * kMs), 45.0e6);
+        expect_whole_tone(route, 0);
+        EXPECT_EQ(stats.frames_decoded + stats.frames_stretched,
+                  stats.frames_retained + stats.frames_compressed);
     }
 }
 
