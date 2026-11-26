@@ -531,11 +531,12 @@ struct AudioRouter::Impl final {
     // or the run was held back until its stream ended, which can be longer ago than
     // any lateness. It plays with the lead of a retime; what is too old by then goes
     // by its receipt (overflow_beyond).
+    // `stale`: a cached re-anchor whose time passed between writes (render_step()).
     // Not for stamps of another clock: those are placed as they say.
-    [[nodiscard]] std::optional<std::int64_t> overdue_start(const Run& run) const noexcept {
+    [[nodiscard]] std::optional<std::int64_t> overdue_start(const Run& run, bool stale = false) const noexcept {
         const auto depth = config.playout.depth.count;
         const auto arrival = run.timestamp.count;
-        if (!lossless() || (timeline_base && !timeline_unwritten && !run.held_back)
+        if (!lossless() || (timeline_base && !timeline_unwritten && !run.held_back && !stale)
             || arrival > INT64_MAX - depth || arrival + depth >= step_ns) { return {}; }
         const auto bound = config.playout.emergency_backlog.count;
         const auto near = [bound](std::int64_t later, std::int64_t earlier) {
@@ -592,8 +593,17 @@ struct AudioRouter::Impl final {
     // End (output clock) and end offset of the last reported write
     // (WriteCompletion): the reported offset is slewed from it.
     std::optional<std::pair<std::int64_t, std::int64_t>> last_reported{};
-    // Lossless: end (output clock) of the last write and when it returned.
-    std::optional<std::pair<std::int64_t, std::int64_t>> last_write{};
+    // Lossless: the last write: its end (output clock), when it returned and when
+    // it was handed to the sink.
+    struct LastWrite final {
+        std::int64_t end_ns{};
+        std::int64_t returned_ns{};
+        std::int64_t entered_ns{};
+    };
+    std::optional<LastWrite> last_write{};
+    // Lossless: when a step last only skipped an elapsed hole, until the next
+    // write (render_step(): what a cached re-anchor was planned against).
+    std::optional<std::int64_t> skipped_at_ns{};
 
     void reset_playout(std::size_t role) noexcept {
         playout[role] = PlayoutRole{};
@@ -667,7 +677,7 @@ struct AudioRouter::Impl final {
     // decoder still owes); the slot is never before the shared cursor.
     [[nodiscard]] bool plan_playout(std::size_t role, const Run& run, std::uint64_t slot_frame,
                                     std::uint64_t own_frame, std::int64_t base_ns, bool anchored,
-                                    PlayoutPlan& plan) const {
+                                    PlayoutPlan& plan, bool stale = false) const {
         const std::int64_t arrival = run.timestamp.count;
         const std::int64_t depth = config.playout.depth.count;
         std::int64_t slot_ns = 0;
@@ -707,7 +717,7 @@ struct AudioRouter::Impl final {
             plan.late_ns = std::max<std::int64_t>(0, arrival - due_ns);
             if (arrival > INT64_MAX - depth) { return false; }
             plan.target_ns = arrival + depth;
-            if (const auto overdue = overdue_start(run); overdue && slot_ns < step_ns) {
+            if (const auto overdue = overdue_start(run, stale); overdue && slot_ns < step_ns) {
                 plan.target_ns = *overdue;
                 plan.elapsed_ns = step_ns;
             }
@@ -788,7 +798,18 @@ struct AudioRouter::Impl final {
         if (run.sources.empty()) {
             const auto age = start_ns - run.timestamp.count - run.content_ahead_ns
                 - frames_to_ns(content_frame).count;
-            if (age > bound) { cut = std::min(frames, ns_to_frames(core::Nanoseconds{age - bound})); }
+            if (age > bound) {
+                // The first frame kept plays at start_ns: cut until its own content
+                // time is no more than the bound before that (Sol re-check of #229:
+                // the deficit rounded down kept a frame 1 ns over it).
+                const auto late = [&](std::uint64_t c) {
+                    return c < frames && start_ns - run.timestamp.count - run.content_ahead_ns
+                        - frames_to_ns(content_frame + c).count > bound;
+                };
+                cut = std::min(frames, ns_to_frames(core::Nanoseconds{age - bound}));
+                while (late(cut)) { ++cut; }
+                while (cut > 0 && !late(cut - 1)) { --cut; }
+            }
             return true;
         }
         // Each part goes by its own source's receipt, where it plays once the cut
@@ -813,7 +834,15 @@ struct AudioRouter::Impl final {
                 // start_ns, and the rest of the part keeps pace with its receipt.
                 std::uint64_t part = 0;
                 if (received < oldest) {
-                    const auto skip = ns_to_frames(core::Nanoseconds{oldest - received});
+                    // All before it cut, its first frame kept plays at start_ns: that
+                    // frame's own receipt is what is compared, not the deficit rounded
+                    // down to frames (Sol re-check of #229).
+                    const auto stale = [&](std::uint64_t s) {
+                        return s < end - from && span.at_ns + frames_to_ns(from + s - at).count < oldest;
+                    };
+                    auto skip = std::min(end - from, ns_to_frames(core::Nanoseconds{oldest - received}));
+                    while (stale(skip)) { ++skip; }
+                    while (skip > 0 && !stale(skip - 1)) { --skip; }
                     part = skip >= end - from ? end - content_frame : ahead + skip;
                 } else {
                     // Frames kept before the part: as many as still let its first
@@ -2102,6 +2131,7 @@ void AudioRouter::cancel_pending(protocol::ChannelRole role) {
         // (a stop no longer reads as a 0 ms offset in the final media_timing).
         impl_->last_reported.reset();
         impl_->last_write.reset();
+        impl_->skipped_at_ns.reset();
     }
     impl_->role_end_frames[role_index(*index)] = impl_->playback_cursor_frames;
     impl_->role_source_frontier_frames[role_index(*index)] = 0;
@@ -2190,6 +2220,7 @@ void AudioRouter::reset_session_timeline() {
     impl_->newest_arrival = INT64_MIN;
     impl_->last_reported.reset();
     impl_->last_write.reset();
+    impl_->skipped_at_ns.reset();
     impl_->report.stats.playout_reported_offset = {};
     impl_->playback_cursor_frames = 0;
     impl_->role_end_frames.fill(0);
@@ -2286,17 +2317,21 @@ core::Result<RenderStep> AudioRouter::render_step() {
         }
         const auto slot_frame = std::max(at, role_end);
         PlayoutPlan plan;
-        // Lossless: a re-anchor planned against a timeline nothing has been written
-        // to yet goes stale when its time passes before the first write (a step
-        // that only skipped the hole, then a pause): planned again by the current
-        // clock, with its overflow, rather than written in the past (Sol re-check
-        // of #229).
-        const bool expired = run.playout && impl_->lossless() && impl_->timeline_unwritten
-            && run.playout->mode != PlayoutPlan::Mode::steady && run.playout->target_ns < impl_->step_ns;
+        // Lossless: a re-anchor goes stale when its time passes before it is written:
+        // a step that only skipped the hole, then a pause, on a timeline nothing has
+        // been written to yet, or one where it was still ahead when that skip was
+        // made (nothing written since). It is planned again by the current clock,
+        // with its overflow, rather than its refill silence and itself written in the
+        // past (Sol re-checks of #229). Lateness a blocked write left behind it is the
+        // late-slot retime's, as before.
+        const bool expired = run.playout && impl_->lossless()
+            && run.playout->mode != PlayoutPlan::Mode::steady && run.playout->target_ns < impl_->step_ns
+            && (impl_->timeline_unwritten
+                || (impl_->skipped_at_ns && run.playout->target_ns >= *impl_->skipped_at_ns));
         if (run.playout && !expired) {
             plan = *run.playout;
         } else if (!impl_->plan_playout(role, run, slot_frame, role_end + decoder_owed,
-                                        base->count, anchored, plan)) {
+                                        base->count, anchored, plan, expired)) {
             diagnostic.time_conversion_frame = slot_frame;
             return RenderFailureReason::placement_time_conversion;
         } else if (is_head) {
@@ -2641,8 +2676,11 @@ core::Result<RenderStep> AudioRouter::render_step() {
             // sink played through dry, so its stamps move on with the schedule
             // (or what follows lands behind its read position).
             std::int64_t stood = 0;
-            if (impl_->last_write && std::abs(impl_->last_write->first - slot_ns) <= kSameInstantNs) {
-                stood = std::clamp<std::int64_t>(impl_->last_write->second - slot_ns, 0, late);
+            // A write that went in after its own end was late, not held: only
+            // what it spent in the sink counts (Sol re-check of #229).
+            if (impl_->last_write && std::abs(impl_->last_write->end_ns - slot_ns) <= kSameInstantNs) {
+                stood = std::clamp<std::int64_t>(
+                    impl_->last_write->returned_ns - std::max(slot_ns, impl_->last_write->entered_ns), 0, late);
             }
             // Its share of the lead too, so the stamps of a sink that stood
             // still the whole time do not move at all.
@@ -2696,6 +2734,7 @@ core::Result<RenderStep> AudioRouter::render_step() {
                 const auto skipped = std::min(range.last, next_start) - cursor;
                 impl_->timeline_base = base;
                 impl_->playback_cursor_frames = cursor + skipped;
+                impl_->skipped_at_ns = impl_->step_ns;
                 impl_->source_frontier_frames =
                     std::max(impl_->source_frontier_frames, impl_->playback_cursor_frames);
                 if (range.idle) { impl_->report.stats.frames_idle_skipped += skipped; }
@@ -2716,6 +2755,7 @@ core::Result<RenderStep> AudioRouter::render_step() {
                 const auto skipped = limit - cursor;
                 impl_->timeline_base = base;
                 impl_->playback_cursor_frames = cursor + skipped;
+                impl_->skipped_at_ns = impl_->step_ns;
                 impl_->source_frontier_frames =
                     std::max(impl_->source_frontier_frames, impl_->playback_cursor_frames);
                 impl_->report.stats.frames_skipped += skipped;
@@ -2890,6 +2930,7 @@ core::Result<RenderStep> AudioRouter::render_step() {
     } else {
         lock.unlock();
     }
+    const auto entered = impl_->config.clock ? impl_->now_ns() : steady_now_ns();
     const auto written = impl_->sink->write(MixedChunk{
         impl_->config.output_format, core::Nanoseconds{scheduled_ns}, output});
     const auto done = steady_now_ns();
@@ -2959,7 +3000,8 @@ core::Result<RenderStep> AudioRouter::render_step() {
     } else { stats.frames_silence += frames; }
     lock.lock();
     if (impl_->lossless()) {
-        impl_->last_write = std::pair{end_ns, impl_->config.clock ? impl_->now_ns() : done};
+        impl_->last_write = Impl::LastWrite{end_ns, impl_->config.clock ? impl_->now_ns() : done, entered};
+        impl_->skipped_at_ns.reset();
     }
     std::erase_if(result.completed, [&](const auto& header) {
         const auto role = role_of(header.channel);

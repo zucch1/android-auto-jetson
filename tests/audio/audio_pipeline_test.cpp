@@ -7263,6 +7263,46 @@ TEST_F(AudioPipelineRoute, WiredDefaultsMoveTheStampsOfASinkThatPlayedOnDry) {
     }
 }
 
+// Sol re-check of 89875dc (#229): media resumes after a quiet gap, the step
+// that skips the gap returns, and this thread is then held while the sink's
+// clock runs. The refill silence and the media after it are planned again by
+// the clock instead of written in the past, and the silence going in late is
+// no hold: the packet plays, or what is too old by its receipt is cut and
+// counted.
+TEST_F(AudioPipelineRoute, WiredDefaultsPlaceAResumeAgainAfterAPauseThatFollowsItsSkip) {
+    for (const std::int64_t pause_ms : {0, 300, 2'100}) {
+        SCOPED_TRACE(pause_ms);
+        std::int64_t clock = 0;
+        WiredRoute route{{}, [&clock](aa::audio::RouterConfig& config) {
+            config.clock = [&clock] { return aa::core::Nanoseconds{clock}; };
+        }};
+        ASSERT_TRUE(route.router);
+        PausingSink sink{&clock};
+        sink.attach(*route.sink);
+        // Received when stamped, on this clock.
+        const auto submit = [&](std::int64_t offset_ns) {
+            clock = route.start + offset_ns;
+            const auto pcm = tone_pcm(route.media_chunks * kA26Frames, kA26Frames);
+            return route.router->submit(make_message(aa::protocol::ChannelRole::media_audio, ++route.media_chunks,
+                                                     {clock}, pcm), aa::core::Nanoseconds{clock}).has_value();
+        };
+        ASSERT_TRUE(submit(0));
+        ASSERT_TRUE(route.drain());
+        ASSERT_TRUE(submit(600 * kMs));
+        auto stepped = route.router->render_step();
+        ASSERT_TRUE(stepped);
+        ASSERT_TRUE(stepped.value().pending);
+        clock += pause_ms * kMs;
+        ASSERT_TRUE(route.drain());
+        const auto& stats = route.stats();
+        EXPECT_FALSE(route.router->report().render_failure);
+        EXPECT_EQ(sink.dropped, 0);
+        EXPECT_EQ(sink.held, 0);
+        EXPECT_EQ(stats.frames_retained + stats.frames_overflowed, 2 * kA26Frames);
+        EXPECT_EQ(stats.frames_overflowed, pause_ms > 2'000 ? kA26Frames : 0U);
+    }
+}
+
 // What on_write_completed says the piece really plays with: the blocked piece
 // from its return, the next from the retimed slot. Stamps of another clock are
 // not lateness.
