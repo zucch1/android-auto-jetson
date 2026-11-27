@@ -37,7 +37,10 @@ comes from the Jetson software stack managed by the operator.
 For local verification on an x86-64 Ubuntu builder, run the same build and
 staging steps, then pass `--arch amd64` to the assembler. From either native
 architecture, CTest can exercise package assembly with small ELF fixtures
-without building the receiver binaries:
+without building the receiver binaries. With Debian staging enabled and
+`receiver-deb-binaries` built, `deb_package_staged` also installs the CMake
+component into a temporary directory, assembles it, and checks the resulting
+package. The tests skip on hosts missing the Debian or ELF tools.
 
 ```sh
 ctest --preset host-release -R '^deb_package_' --output-on-failure
@@ -83,8 +86,9 @@ and starting the system helper, run
 `systemctl --user enable --now aa-receiver.service` as the intended receiver
 user. If that user already enabled the unit when it used
 `graphical-session.target`, run `systemctl --user reenable aa-receiver.service`
-to replace the old enablement link, then
-`systemctl --user start aa-receiver.service` to start it in the current session.
+to replace the old enablement link. After refreshing the digest and restarting
+the helper, run `systemctl --user restart aa-receiver.service` so any running
+pre-upgrade receiver is replaced by the newly installed binary.
 
 On removal, `prerm` stops a running `aa-system-helper.service` before its
 default-deny policy is removed, and `postrm` reloads udev. After an upgrade,
@@ -95,13 +99,27 @@ covers the session UID, receiver executable digest, and per-user D-Bus
 permission. [NetworkManager AP setup](networkmanager-ap.md) and
 [TLS credential handling](tls-credentials.md) cover operator-owned
 configuration. Calculate the helper digest from the **installed** receiver
-after each upgrade or rollback. Set `HU_KEY_PATH` in the receiver service
-environment. The packaged command accepts runtime mode changes through the
-[integration contract](INTEGRATION-CONTRACT.md). The historical standalone
-USB-policy installer may have left a rule under `/etc/udev/rules.d` with the
-same name. Check that override during deployment because udev gives it
-precedence over the packaged rule.
+after each upgrade or rollback. The packaged command accepts runtime mode
+changes through the [integration contract](INTEGRATION-CONTRACT.md); a per-user
+systemd drop-in can still replace `ExecStart` with custom receiver arguments if
+needed. In a per-user systemd drop-in, set the operator-owned PEM path under
+`[Service]`, for example
+`Environment=HU_KEY_PATH=%h/.config/android-auto-receiver/hu.pem`. The user
+manager then supplies the path on Xfce, SSH and linger starts without relying on
+shell login scripts. The historical standalone USB-policy installer may have
+left a rule under `/etc/udev/rules.d` with the same name. Check that override
+during deployment because udev gives it precedence over the packaged rule.
 
 Jetson install, upgrade, and rollback are documented in [deploy.md](deploy.md)
 (tracked in [#190](https://github.com/zucch1/android-auto-jetson/issues/190)).
 Installed-system qualification is tracked in [#191](https://github.com/zucch1/android-auto-jetson/issues/191).
+
+## Refreshing the USB rule
+
+Package configuration warns when the local override is present, including a
+masking symlink. For manual installs, back up and move an obsolete override
+out of the rules directory before installing, or reload udev and reconnect
+the affected device after moving it. The deployment tool backs up and removes
+the legacy rule during migration. Package configuration reloads the rules and
+triggers only the approved USB devices, their USB interfaces, and their tty
+children.
