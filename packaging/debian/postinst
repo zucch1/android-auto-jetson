@@ -7,10 +7,21 @@ set -eu
 # running udev, or when udevadm is absent; a failed reload never fails dpkg.
 reload_udev() {
     [ -z "${DPKG_ROOT:-}" ] || return 0
-    [ -d /run/udev ] || return 0
+    [ -d "/run/udev" ] || return 0
     command -v udevadm >/dev/null 2>&1 || return 0
-    udevadm control --reload || true
-    udevadm trigger --subsystem-match=usb --action=change || true
+    udevadm control --reload || return 0
+    # Keep these IDs aligned with 70-android-auto-receiver.rules. A parent
+    # match includes the USB device itself and its USB interface and tty children.
+    for device in "/sys/bus/usb/devices/"*; do
+        IFS= read -r vendor 2>/dev/null < "$device/idVendor" || continue
+        IFS= read -r product 2>/dev/null < "$device/idProduct" || continue
+        case "$vendor:$product" in
+            04e8:6860|18d1:2d00|18d1:2d01)
+                udevadm trigger --action=change --parent-match="$device" \
+                    --subsystem-match=usb --subsystem-match=tty || true
+                ;;
+        esac
+    done
 }
 
 if [ "$1" = configure ]; then
@@ -18,6 +29,10 @@ if [ "$1" = configure ]; then
     if [ ! -s "$policy" ]; then
         echo "android-auto-receiver: missing packaged system-helper D-Bus policy" >&2
         exit 1
+    fi
+    override="${DPKG_ROOT:-}/etc/udev/rules.d/70-android-auto-receiver.rules"
+    if [ -e "$override" ] || [ -L "$override" ]; then
+        echo "android-auto-receiver: $override shadows the packaged udev rule; review the local override (see debian-package.md)" >&2
     fi
     reload_udev
 fi

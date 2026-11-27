@@ -29,8 +29,15 @@ if(NOT CMAKE_CROSSCOMPILING)
     add_test(NAME deb_package_lintian
         COMMAND "${Python3_EXECUTABLE}" -B "${CMAKE_SOURCE_DIR}/tests/packaging/test_deb.py"
                 "${CMAKE_C_COMPILER}" "${CMAKE_AR}" --lintian)
-    set_tests_properties(deb_package_layout deb_package_lintian PROPERTIES TIMEOUT 90)
-    set_tests_properties(deb_package_lintian PROPERTIES SKIP_RETURN_CODE 77)
+    set_tests_properties(deb_package_layout deb_package_lintian PROPERTIES
+        TIMEOUT 90 SKIP_RETURN_CODE 77)
+    if(AA_ENABLE_DEB_PACKAGE)
+        add_test(NAME deb_package_staged
+            COMMAND "${Python3_EXECUTABLE}" -B "${CMAKE_SOURCE_DIR}/tests/packaging/test_deb.py"
+                    "${CMAKE_C_COMPILER}" "${CMAKE_AR}"
+                    --cmake "${CMAKE_COMMAND}" --build-dir "${CMAKE_BINARY_DIR}")
+        set_tests_properties(deb_package_staged PROPERTIES TIMEOUT 180 SKIP_RETURN_CODE 77)
+    endif()
     add_test(NAME deploy_ssh_harness
         COMMAND "${Python3_EXECUTABLE}" -B -m unittest discover
                 -s "${CMAKE_SOURCE_DIR}/tests/deploy" -v)
