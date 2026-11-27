@@ -256,6 +256,41 @@ TEST(UsbAoaWorld, PersistentAccessoryModeNeverReachesAdmission) {
     EXPECT_FALSE(contains(log, "libusb_claim_interface"));
 }
 
+TEST(UsbAoaWorld, PersistentAccessoryTimesOutAtFiveSecondCapWithUnboundedCaller) {
+    set_scenario("persistent-accessory");
+    auto fake_now = aa::core::Deadline::Clock::time_point{std::chrono::seconds{100}};
+    const auto start_now = fake_now;
+    unsigned waits = 0;
+    ua::LibusbClock clock{
+        [&] { return fake_now; },
+        [&](aa::core::Deadline::Clock::time_point until, const aa::core::CancellationToken &) {
+            ++waits;
+            fake_now = until;
+        },
+    };
+    auto factory = ua::make_libusb_link_factory_with_clock(std::move(clock));
+    ASSERT_TRUE(factory.has_value());
+
+    // Unbounded caller deadline (matches managed wired worker startup_budget).
+    const aa::core::Deadline unbounded{aa::core::Deadline::Clock::time_point::max(), {}};
+    auto link = ua::connect_aoa(
+        std::move(factory.value()), tr::UsbDeviceSelector{"1-2.1"}, {},
+        [](const auto &) {
+            ADD_FAILURE() << "accessory descriptors reached admission";
+            return true;
+        },
+        unbounded);
+
+    ASSERT_FALSE(link.has_value());
+    EXPECT_EQ(link.error().code(), ErrorCode::timeout);
+    EXPECT_EQ(fake_now - start_now, std::chrono::milliseconds{ua::kResetReenumWaitMs.count});
+    EXPECT_GE(waits, 1U);
+    const auto log = read_log();
+    EXPECT_EQ(count_of(log, "libusb_reset_device"), 1);
+    EXPECT_FALSE(contains(log, "libusb_control_transfer:53:0"));
+    EXPECT_FALSE(contains(log, "libusb_claim_interface"));
+}
+
 TEST(UsbAoaWorld, FailedStartupResetReturnsTypedError) {
     set_scenario("reset-fails");
     const auto link = tr::connect_usb_aoa(tr::UsbDeviceSelector{"1-2.1"}, {}, admit_all());

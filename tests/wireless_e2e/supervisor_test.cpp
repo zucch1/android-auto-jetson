@@ -2,11 +2,17 @@
 // The packaged supervisor loop (#221, #240 review P3-7) driven through its
 // ports: a real ControlService, fake wired worker, fake wireless run and a
 // scripted USB scan.
+#include "../../tools/wired-receiver/VideoOutlet.hpp"
+#include "../../tools/wireless-receiver/ManagedVideo.hpp"
 #include "../../tools/wireless-receiver/Supervisor.hpp"
 #include "../dbus/fakes.hpp"
 
+#include <aa/ipc/VideoChannel.hpp>
 #include <gtest/gtest.h>
 
+#include <cstdlib>
+#include <filesystem>
+#include <poll.h>
 #include <thread>
 
 namespace {
@@ -561,18 +567,401 @@ TEST(ManagedSupervisor, QuickWiredExitWithWirelessDisabledRetriesAfterBackoffAnd
     EXPECT_EQ(h.worker_starts, 4U);
     EXPECT_EQ(h.video_releases, 0U);
 
-    // A healthy run (>= 30 s) clears failures and releases the video handle on exit.
+    // A healthy run (>= 30 s) clears failures and still keeps the supervisor's
+    // video connection open while projection remains requested.
     h.fake_now += 35s;
     h.worker_running = false;
     h.step();
     EXPECT_EQ(h.supervisor.arbiter().wired_failures({7}), 0U);
-    EXPECT_EQ(h.video_releases, 1U);
+    EXPECT_EQ(h.video_releases, 0U);
 
     // StopProjection releases video and stops retrying.
     ASSERT_TRUE(h.service.stop_projection(h.owner));
     h.step();
-    EXPECT_EQ(h.video_releases, 2U);
+    EXPECT_EQ(h.video_releases, 1U);
     EXPECT_EQ(h.worker_starts, 4U);
+}
+
+namespace {
+
+struct VideoScratch final {
+    VideoScratch() {
+        char name[] = "/tmp/aa-sup-video-XXXXXX";
+        if (const auto* directory = ::mkdtemp(name)) path = directory;
+    }
+    ~VideoScratch() {
+        if (!path.empty()) {
+            std::error_code error;
+            std::filesystem::remove_all(path, error);
+        }
+    }
+    std::filesystem::path path;
+};
+
+std::vector<std::byte> idr_au(std::uint8_t tag) {
+    return {std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x01},
+            std::byte{0x65}, std::byte{tag}};
+}
+
+std::vector<std::byte> delta_au(std::uint8_t tag) {
+    return {std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x01},
+            std::byte{0x41}, std::byte{tag}};
+}
+
+aa::core::Result<ipc::ReceiveStatus> recv_complete(ipc::VideoConsumer& consumer) {
+    for (int i = 0; i < 16; ++i) {
+        auto step = consumer.receive(aa::core::Milliseconds{2000});
+        if (!step) return step;
+        if (step.value() == ipc::ReceiveStatus::complete) return step;
+    }
+    return aa::Error{aa::ErrorCode::timeout};
+}
+
+// Connects a real VideoConsumer against the supervisor's real VideoServer by
+// stepping the supervisor (no timed polling sleeps).
+aa::core::Result<ipc::VideoConsumer> connect_via_supervisor(
+    const ipc::VideoSocketPath& video_path, ipc::VideoServer& server,
+    wr::ManagedVideoBroker& broker, const std::function<void()>& step_fn) {
+    const auto before = broker.generation();
+    aa::core::Result<ipc::VideoConsumer> consumer{aa::Error{aa::ErrorCode::timeout}};
+    std::thread connector([&] {
+        consumer = ipc::connect_video_consumer(
+            video_path, {{}, ipc::current_uid(), aa::core::Milliseconds{2000}});
+    });
+    while (broker.generation() == before) {
+        if (!broker.has_pending_handshake(server)) {
+            pollfd pfd{server.native_handle(), POLLIN, 0};
+            (void)::poll(&pfd, 1, 500);
+        }
+        step_fn();
+    }
+    connector.join();
+    return consumer;
+}
+
+struct RealVideoHarness final {
+    VideoScratch scratch{};
+    ipc::VideoSocketPath video_path{
+        (scratch.path / "android-auto-receiver" / "video.sock").string()};
+    std::optional<ipc::VideoServer> server{};
+    wr::ManagedVideoBroker broker{};
+    ipc::test::FakePeerCredentials credentials{};
+    ipc::test::RecordingEventSink events{};
+    ipc::test::SequencePairingIds ids{};
+    ipc::test::RecordingPhoneDirectory phones{};
+    ipc::ProjectionPolicy policy{};
+    ipc::ControlService service{{kUid}, {credentials, events, ids, phones, nullptr, {},
+                                         [this] { return worker_running; }, &policy}};
+    const ipc::BusName owner{":1.41"};
+    const ipc::BusName name{"org.custom.Consumer"};
+
+    std::vector<aa::trust::ApprovedPhone> approved{};
+    std::vector<wr::WiredCandidate> attached{};
+    bool worker_running{};
+    unsigned worker_starts{};
+    unsigned wireless_runs{};
+    bool wireless_idle{true};
+    wr::Supervisor::Clock::time_point fake_now{100s};
+    std::optional<aa::wired_receiver::VideoOutlet> wired_outlet{};
+    std::uint64_t wired_video_gen{0};
+    std::function<int(const wr::WirelessKeep&)> wireless_fn{};
+    wr::Supervisor supervisor;
+
+    RealVideoHarness()
+        : supervisor(wr::SupervisorPorts{
+              [](aa::core::Milliseconds) -> aa::core::Result<void> { return {}; },
+              [this]() -> ipc::ControlService& { return service; },
+              policy,
+              [this]() -> const std::vector<aa::trust::ApprovedPhone>& { return approved; },
+              [this](const std::optional<wr::WiredCandidate>&) { return attached; },
+              [this](const wr::WiredCandidate&) {
+                  ++worker_starts;
+                  worker_running = true;
+                  wired_outlet.emplace([](const std::string&) {});
+                  wired_video_gen = 0;
+                  sync_wired();
+                  return true;
+              },
+              [this] { return worker_running; },
+              [this] {
+                  worker_running = false;
+                  wired_outlet.reset();
+              },
+              [] {},
+              [this](const wr::WirelessKeep& keep) {
+                  ++wireless_runs;
+                  return wireless_fn ? wireless_fn(keep) : 0;
+              },
+              [this] { return wireless_idle; },
+              [this] {
+                  broker.release_connection(server ? &*server : nullptr);
+                  server.reset();
+              },
+              [] { return true; },
+              [](const char*, ErrorCode) {},
+              [this] { return fake_now; },
+              [this] {
+                  if (!server) return;
+                  (void)broker.poll(*server);
+                  sync_wired();
+              },
+              [this] {
+                  broker.release_connection(server ? &*server : nullptr);
+                  wired_video_gen = broker.generation();
+              },
+          }, wr::ArbitrationPolicy{}) {
+        credentials.add_connection(owner, kUid);
+        credentials.set_owner(name, owner);
+        policy.check_ready = [this]() -> aa::core::Result<void> {
+            if (!server) {
+                auto opened = ipc::VideoServer::listen(video_path, {{}, ipc::current_uid()});
+                if (!opened) return opened.error();
+                server.emplace(std::move(opened.value()));
+            }
+            return {};
+        };
+    }
+
+    void sync_wired() {
+        if (!worker_running || !wired_outlet) return;
+        const auto gen = broker.generation();
+        if (gen == wired_video_gen) return;
+        if (broker.has_connection()) {
+            auto borrowed = broker.borrow();
+            if (borrowed) {
+                wired_outlet->install(std::move(borrowed.value()));
+                wired_video_gen = gen;
+            }
+        } else {
+            wired_outlet->clear_producer();
+            wired_video_gen = gen;
+        }
+    }
+
+    void start() {
+        ASSERT_TRUE(service.register_consumer(owner, name));
+        ASSERT_TRUE(service.set_projection_mode(owner, "projection_ready"));
+        ASSERT_TRUE(service.start_projection(owner));
+    }
+
+    void step() { EXPECT_FALSE(supervisor.step(aa::core::Milliseconds{0}).has_value()); }
+
+    void exit_wired() {
+        worker_running = false;
+        wired_outlet.reset();  // closes borrowed VideoProducer without SHUT_WR
+    }
+};
+
+} // namespace
+
+TEST(ManagedSupervisor, LateConnectSurvivesFailedFirstWiredWorkerAndDeliversSecondWorkerIdr) {
+    RealVideoHarness h;
+    h.approved.push_back({{7}, kWiredIdentity, aa::trust::IdentityStrength::serial_backed});
+    h.attached = {{{7}, "1-2"}};
+    h.start();
+    ASSERT_TRUE(h.service.set_transport_enabled(h.owner, "wireless", false));
+
+    // Step 1 spawns worker 1 BEFORE the display connects to video.sock (P1-1).
+    h.step();
+    ASSERT_EQ(h.worker_starts, 1U);
+    ASSERT_TRUE(h.worker_running);
+    ASSERT_FALSE(h.broker.has_connection());
+
+    // Display connects while worker 1 is running; supervisor owns the socket.
+    auto consumer = connect_via_supervisor(h.video_path, *h.server, h.broker, [&] { h.step(); });
+    ASSERT_TRUE(consumer);
+    ASSERT_TRUE(h.broker.has_connection());
+
+    // Worker 1 fails USB startup after 1.4 s without sending frames.
+    h.fake_now += 1400ms;
+    h.exit_wired();
+    h.step();
+    ASSERT_EQ(h.supervisor.arbiter().wired_failures({7}), 1U);
+    EXPECT_TRUE(h.broker.has_connection());
+
+    // After 1 s backoff, worker 2 spawns, borrows the original connection, and
+    // sends an IDR that arrives on the original VideoConsumer.
+    h.fake_now += 1s;
+    h.step();
+    ASSERT_EQ(h.worker_starts, 2U);
+    aa::protocol::MessageHeader hdr{};
+    hdr.timestamp = aa::core::Nanoseconds{1'000'000};
+    ASSERT_TRUE(h.wired_outlet->on_message({hdr, idr_au(0x51)}));
+
+    ASSERT_TRUE(recv_complete(consumer.value()));
+    EXPECT_EQ(consumer.value().access_unit().frame, 1U);
+    EXPECT_EQ(consumer.value().access_unit().payload.back(), 0x51U);
+    EXPECT_EQ(consumer.value().rejected(), 0U);
+}
+
+TEST(ManagedSupervisor, ShortStreamingWiredHandsOffToRetryAndWirelessWithMonotonicIds) {
+    RealVideoHarness h;
+    h.approved.push_back({{7}, kWiredIdentity, aa::trust::IdentityStrength::serial_backed});
+    h.approved.push_back({{9}, kWirelessA, aa::trust::IdentityStrength::serial_backed});
+    h.attached = {{{7}, "1-2"}};
+    h.start();
+
+    // Pre-connect consumer, then start worker 1.
+    auto consumer = connect_via_supervisor(h.video_path, *h.server, h.broker, [&] {
+        (void)h.broker.poll(*h.server);
+    });
+    ASSERT_TRUE(consumer);
+
+    // Worker 1 sends a real IDR + delta, then exits within 30 s.
+    h.step();
+    ASSERT_EQ(h.worker_starts, 1U);
+    aa::protocol::MessageHeader hdr{};
+    hdr.timestamp = aa::core::Nanoseconds{1'000'000};
+    ASSERT_TRUE(h.wired_outlet->on_message({hdr, idr_au(0x11)}));
+    hdr.timestamp = aa::core::Nanoseconds{34'000'000};
+    ASSERT_TRUE(h.wired_outlet->on_message({hdr, delta_au(0x12)}));
+    h.fake_now += 2s;
+    h.exit_wired();
+    h.step();
+
+    ASSERT_TRUE(recv_complete(consumer.value()));
+    const auto f1 = consumer.value().access_unit().frame;
+    const auto s1 = consumer.value().access_unit().sequence;
+    EXPECT_EQ(consumer.value().access_unit().payload.back(), 0x11U);
+    ASSERT_TRUE(recv_complete(consumer.value()));
+    const auto f2 = consumer.value().access_unit().frame;
+    const auto s2 = consumer.value().access_unit().sequence;
+    EXPECT_GT(f2, f1);
+    EXPECT_GT(s2, s1);
+
+    // During backoff, wireless runs and borrows the SAME connection via a fresh
+    // VideoOutlet, sending an IDR with monotonic frame/sequence and 0 rejects.
+    h.wireless_fn = [&](const wr::WirelessKeep&) {
+        aa::wired_receiver::VideoOutlet wireless_outlet{[](const std::string&) {}};
+        auto borrowed = h.broker.borrow();
+        EXPECT_TRUE(borrowed);
+        if (borrowed) {
+            wireless_outlet.install(std::move(borrowed.value()));
+            aa::protocol::MessageHeader whdr{};
+            whdr.timestamp = aa::core::Nanoseconds{200'000'000};
+            EXPECT_TRUE(wireless_outlet.on_message({whdr, idr_au(0x22)}));
+        }
+        wireless_outlet.close();  // borrowed close: must NOT send SHUT_WR
+        return 0;
+    };
+    h.step();
+    ASSERT_EQ(h.wireless_runs, 1U);
+
+    ASSERT_TRUE(recv_complete(consumer.value()));
+    const auto f3 = consumer.value().access_unit().frame;
+    const auto s3 = consumer.value().access_unit().sequence;
+    EXPECT_GT(f3, f2);
+    EXPECT_GT(s3, s2);
+    EXPECT_EQ(consumer.value().access_unit().payload.back(), 0x22U);
+    EXPECT_EQ(consumer.value().rejected(), 0U);
+
+    // Backoff expires: wired worker 2 borrows the SAME connection and sends IDR.
+    h.fake_now += 1s;
+    h.step();
+    ASSERT_EQ(h.worker_starts, 2U);
+    hdr.timestamp = aa::core::Nanoseconds{400'000'000};
+    ASSERT_TRUE(h.wired_outlet->on_message({hdr, idr_au(0x33)}));
+
+    ASSERT_TRUE(recv_complete(consumer.value()));
+    EXPECT_GT(consumer.value().access_unit().frame, f3);
+    EXPECT_GT(consumer.value().access_unit().sequence, s3);
+    EXPECT_EQ(consumer.value().access_unit().payload.back(), 0x33U);
+    EXPECT_EQ(consumer.value().rejected(), 0U);
+
+    // StopProjection sends SHUT_WR -> consumer sees clean EOF.
+    ASSERT_TRUE(h.service.stop_projection(h.owner));
+    h.step();
+    const auto eof = consumer.value().receive(aa::core::Milliseconds{500});
+    ASSERT_FALSE(eof);
+    EXPECT_EQ(eof.error().code(), ErrorCode::transport_closed);
+}
+
+TEST(ManagedSupervisor, ConsumerDisconnectAndReconnectReplacedUnderOneRegistration) {
+    RealVideoHarness h;
+    h.approved.push_back({{7}, kWiredIdentity, aa::trust::IdentityStrength::serial_backed});
+    h.attached = {{{7}, "1-2"}};
+    h.start();
+    ASSERT_TRUE(h.service.set_transport_enabled(h.owner, "wireless", false));
+
+    h.step();
+    ASSERT_EQ(h.worker_starts, 1U);
+
+    auto consumer1 = connect_via_supervisor(h.video_path, *h.server, h.broker, [&] { h.step(); });
+    ASSERT_TRUE(consumer1);
+    aa::protocol::MessageHeader hdr{};
+    hdr.timestamp = aa::core::Nanoseconds{1'000'000};
+    ASSERT_TRUE(h.wired_outlet->on_message({hdr, idr_au(0x61)}));
+    ASSERT_TRUE(recv_complete(consumer1.value()));
+    EXPECT_EQ(consumer1.value().access_unit().payload.back(), 0x61U);
+
+    // Consumer 1 disconnects while the D-Bus registration stays live.
+    consumer1.value().close();
+    h.step();
+    EXPECT_FALSE(h.broker.has_connection());
+
+    // Consumer 2 reconnects under the same registration; supervisor detects the
+    // new peer and forwards it to the running worker (and future retries).
+    auto consumer2 = connect_via_supervisor(h.video_path, *h.server, h.broker, [&] { h.step(); });
+    ASSERT_TRUE(consumer2);
+    ASSERT_TRUE(h.broker.has_connection());
+
+    hdr.timestamp = aa::core::Nanoseconds{100'000'000};
+    ASSERT_TRUE(h.wired_outlet->on_message({hdr, idr_au(0x62)}));
+    ASSERT_TRUE(recv_complete(consumer2.value()));
+    EXPECT_EQ(consumer2.value().access_unit().payload.back(), 0x62U);
+    EXPECT_EQ(consumer2.value().rejected(), 0U);
+}
+
+TEST(ManagedSupervisor, IdleWirelessPreemptionAndAudioFailurePreserveConsumerForWired) {
+    RealVideoHarness h;
+    h.approved.push_back({{7}, kWiredIdentity, aa::trust::IdentityStrength::serial_backed});
+    h.approved.push_back({{9}, kWirelessA, aa::trust::IdentityStrength::serial_backed});
+    h.start();
+
+    // Consumer connects while wireless is about to wait (no wired phone yet).
+    auto consumer = connect_via_supervisor(h.video_path, *h.server, h.broker, [&] {
+        (void)h.broker.poll(*h.server);
+    });
+    ASSERT_TRUE(consumer);
+
+    // First wireless run simulates audio-router startup failure (exit 3) before
+    // installing a producer: consumer connection must stay alive.
+    h.wireless_fn = [&](const wr::WirelessKeep&) { return 3; };
+    h.step();
+    ASSERT_EQ(h.wireless_runs, 1U);
+    EXPECT_TRUE(h.broker.has_connection());
+
+    // Second wireless run borrows the connection while idle, then a wired phone
+    // is plugged in and preempts idle wireless.
+    h.fake_now += 1s;
+    h.wireless_idle = true;
+    h.wireless_fn = [&](const wr::WirelessKeep& keep) {
+        aa::wired_receiver::VideoOutlet wireless_outlet{[](const std::string&) {}};
+        auto borrowed = h.broker.borrow();
+        EXPECT_TRUE(borrowed);
+        if (borrowed) wireless_outlet.install(std::move(borrowed.value()));
+        EXPECT_TRUE(keep(h.service.state(), std::nullopt));
+        h.attached = {{{7}, "1-2"}};  // wired phone plugged in!
+        h.fake_now += 250ms;          // advance past ArbitrationPolicy::scan_interval
+        EXPECT_FALSE(keep(h.service.state(), std::nullopt));
+        wireless_outlet.close();  // borrowed close: must NOT send SHUT_WR
+        return 0;
+    };
+    h.step();
+    ASSERT_EQ(h.wireless_runs, 2U);
+    EXPECT_TRUE(h.broker.has_connection());
+
+    // Next step starts the wired worker, which borrows the original connection
+    // and delivers the first IDR to the original VideoConsumer.
+    h.step();
+    ASSERT_EQ(h.worker_starts, 1U);
+    aa::protocol::MessageHeader hdr{};
+    hdr.timestamp = aa::core::Nanoseconds{1'000'000};
+    ASSERT_TRUE(h.wired_outlet->on_message({hdr, idr_au(0x77)}));
+
+    ASSERT_TRUE(recv_complete(consumer.value()));
+    EXPECT_EQ(consumer.value().access_unit().payload.back(), 0x77U);
+    EXPECT_EQ(consumer.value().rejected(), 0U);
 }
 
 } // namespace

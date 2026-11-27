@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 #include "AdmissionEvents.hpp"
+#include "ManagedVideo.hpp"
 #include "Media.hpp"
 #include <aa/app/WirelessReceiver.hpp>
 #include <aa/ipc/ControlBusService.hpp>
@@ -50,8 +51,35 @@ struct Runtime final {
     // A managed projection stops its media and leaves the shared bus alive.
     std::function<bool(ipc::StateSnapshot, const std::optional<trust::TransportIdentity>&)>
         keep_running{};
+    // Non-null when running under the supervisor: borrows the supervisor-owned
+    // consumer video connection instead of owning/closing it on wireless exit.
+    ManagedVideoBroker* managed_video{};
+    std::uint64_t managed_video_generation_{0};
     // The phone the current attempt admitted (the fixed identity, or the one observed).
     std::optional<trust::TransportIdentity> admitted{};
+
+    void service_video_consumer(bool may_install) {
+        if (managed_video != nullptr) {
+            (void)managed_video->poll(video_server);
+            if (!may_install) return;
+            const auto gen = managed_video->generation();
+            if (gen != managed_video_generation_) {
+                if (managed_video->has_connection()) {
+                    if (auto borrowed = managed_video->borrow()) {
+                        media.video.install(std::move(borrowed.value()));
+                        managed_video_generation_ = gen;
+                    }
+                } else {
+                    media.video.clear_producer();
+                    managed_video_generation_ = gen;
+                }
+            }
+            return;
+        }
+        if (!may_install) return;
+        auto producer = video_server.accept_consumer(core::Milliseconds{0});
+        if (producer) media.video.install(std::move(producer.value()));
+    }
 
     // Ends this projection. A managed projection's failure stays contained to
     // this transport: only a process-level cause (signal, deadline, stdout log
@@ -194,10 +222,7 @@ struct Runtime final {
         if (stopping || (state.consumer.value && state.projection == ipc::ProjectionState::stopped)) {
             if (auto* session = receiver.session()) session->request_stop();
         }
-        if (!recovery_session || !recovery_session->outbound_in_progress()) {
-            auto producer = video_server.accept_consumer(core::Milliseconds{0});
-            if (producer) media.video.install(std::move(producer.value()));
-        }
+        service_video_consumer(!recovery_session || !recovery_session->outbound_in_progress());
         if (!input) {
             auto accepted = input_server.accept_sender(core::Milliseconds{0});
             if (accepted) input.emplace(std::move(accepted.value()));

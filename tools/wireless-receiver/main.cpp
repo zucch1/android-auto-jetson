@@ -25,7 +25,7 @@ int run_wireless_projection(const Options& options, app::WirelessReceiver& recei
                             const std::optional<trust::TransportIdentity>& identity,
                             Runtime::Clock::time_point deadline, ipc::VideoServer& video,
                             ipc::InputServer& input, WirelessKeep keep_running = {},
-                            std::optional<ipc::VideoProducer> pre_accepted_video = {}) {
+                            ManagedVideoBroker* managed_video = nullptr) {
     aa::audio::AudioRenderWorker audio_sink{
         audio_config(options.audio_backend,
                      aa::core::Nanoseconds{options.audio_catch_up_watermark_ms * 1'000'000LL},
@@ -101,13 +101,10 @@ int run_wireless_projection(const Options& options, app::WirelessReceiver& recei
         },
         options.idr_recovery,
     });
-    if (pre_accepted_video) {
-        media.video.install(std::move(*pre_accepted_video));
-        pre_accepted_video.reset();
-    }
     Runtime runtime{receiver, helper, bus, video, input,
                     media, identity, deadline, std::nullopt, {}, std::nullopt};
     runtime.keep_running = std::move(keep_running);
+    runtime.managed_video = managed_video;
     runtime.offered_video_profiles = options.video_profiles.size();
     log_line("{\"event\":\"ready\",\"state\":\"waiting_for_consumer\"}");
     return runtime.run();
@@ -126,7 +123,8 @@ core::Result<void> check_projection_credentials() {
 struct ProjectionSockets final {
     ipc::VideoServer video;
     ipc::InputServer input;
-    std::optional<ipc::VideoProducer> pending_video{};
+    ManagedVideoBroker video_broker{};
+    std::uint64_t wired_video_generation{0};
 
     static core::Result<ProjectionSockets> listen(const Options& options) {
         auto video = ipc::VideoServer::listen({options.video_socket}, {{}, ipc::current_uid()});
@@ -174,6 +172,20 @@ int run_managed(const Options& options, trust::ApprovedPhoneStore& store, helper
     }
     const auto store_path = options.store_dir / "approved-phones.json";
     app::WirelessReceiver* const live_receiver = &receiver;
+    const auto sync_wired_video = [&] {
+        if (!sockets || !wired.running()) return;
+        const auto gen = sockets->video_broker.generation();
+        if (gen == sockets->wired_video_generation) return;
+        if (sockets->video_broker.has_connection()) {
+            if (wired.send_video_client(sockets->video_broker.client_fd(),
+                                        sockets->video_broker.state_fd(),
+                                        sockets->video_broker.limits())) {
+                sockets->wired_video_generation = gen;
+            }
+        } else if (wired.clear_video_client()) {
+            sockets->wired_video_generation = gen;
+        }
+    };
     Supervisor supervisor{SupervisorPorts{
         [&](core::Milliseconds wait) -> core::Result<void> {
             if (auto step = bus.value().cycle(wait); !step) return step.error();
@@ -188,25 +200,28 @@ int run_managed(const Options& options, trust::ApprovedPhoneStore& store, helper
         },
         [&](const WiredCandidate& candidate) {
             if (!sockets) return false;
-            const int client_fd =
-                sockets->pending_video ? sockets->pending_video->native_handle() : -1;
-            const auto client_limits =
-                sockets->pending_video ? std::optional{sockets->pending_video->limits()}
-                                       : std::nullopt;
-            return wired.start(wired_executable, candidate, store_path,
-                               sockets->video.native_handle(),
-                               sockets->input.native_handle(), client_fd, client_limits);
+            if (!wired.start(wired_executable, candidate, store_path,
+                             sockets->input.native_handle())) {
+                return false;
+            }
+            sockets->wired_video_generation = 0;
+            if (sockets->video_broker.has_connection()) {
+                if (wired.send_video_client(sockets->video_broker.client_fd(),
+                                            sockets->video_broker.state_fd(),
+                                            sockets->video_broker.limits())) {
+                    sockets->wired_video_generation = sockets->video_broker.generation();
+                }
+            }
+            return true;
         },
         [&] { return wired.running(); },
         [&] { wired.stop(); },
         [&] { wired.request_idr(); },
         [&](const WirelessKeep& keep) {
             if (!sockets) return 3;
-            auto pre_accepted = std::move(sockets->pending_video);
-            sockets->pending_video.reset();
             return run_wireless_projection(options, receiver, helper, bus.value(), std::nullopt,
                                            deadline, sockets->video, sockets->input, keep,
-                                           std::move(pre_accepted));
+                                           &sockets->video_broker);
         },
         [live_receiver] { return !live_receiver->session() && !live_receiver->bootstrapping(); },
         [&] { sockets.reset(); },
@@ -214,20 +229,23 @@ int run_managed(const Options& options, trust::ApprovedPhoneStore& store, helper
         [](const char* what, ErrorCode code) { report(what, code); },
         Supervisor::Clock::now,
         [&] {
-            if (!sockets || sockets->pending_video) return;
-            if (auto accepted = sockets->video.accept_consumer(core::Milliseconds{0})) {
-                sockets->pending_video.emplace(std::move(accepted.value()));
-            }
+            if (!sockets) return;
+            (void)sockets->video_broker.poll(sockets->video);
+            sync_wired_video();
         },
         [&] {
-            if (sockets) sockets->pending_video.reset();
+            if (!sockets) return;
+            sockets->video_broker.release_connection(&sockets->video);
+            sockets->wired_video_generation = sockets->video_broker.generation();
         },
     }};
     log_line("{\"event\":\"ready\",\"state\":\"pairing_only\"}");
     while (running.load() && Runtime::Clock::now() < deadline) {
         const auto remaining = std::chrono::ceil<std::chrono::milliseconds>(
             deadline - Runtime::Clock::now()).count();
-        const core::Milliseconds wait{std::clamp<std::int64_t>(remaining, 0, 50)};
+        const std::int64_t slice_cap =
+            (sockets && sockets->video_broker.has_pending_handshake(sockets->video)) ? 5 : 50;
+        const core::Milliseconds wait{std::clamp<std::int64_t>(remaining, 0, slice_cap)};
         if (const auto exit = supervisor.step(wait)) {
             wired.stop();
             return *exit;

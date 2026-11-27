@@ -757,3 +757,182 @@ TEST(VideoChannel, AbandonPartialSendForcesWaitingIdrWithoutPartialEscape) {
     ASSERT_TRUE(pair.value().consumer.receive(aa::core::Milliseconds{500}));
     EXPECT_EQ(pair.value().consumer.access_unit().frame, 3U);
 }
+
+TEST(VideoChannel, ZeroTimeoutAcceptPreservesPendingHandshakeUntilClientSendsLimits) {
+    NegotiatedLimits limits{};
+    const auto runtime = videotest::private_runtime_dir();
+    ASSERT_FALSE(runtime.empty());
+    const auto path = video_socket_path_in(runtime);
+    auto server = VideoServer::listen(path, VideoServerOptions{limits, current_uid()});
+    ASSERT_TRUE(server);
+
+    // Connect a raw SEQPACKET client and hold before sending its AAL1 record
+    // (simulating a client preempted between connect() and send()).
+    const int client_fd = ::socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
+    ASSERT_GE(client_fd, 0);
+    sockaddr_un addr{};
+    addr.sun_family = AF_UNIX;
+    std::memcpy(addr.sun_path, path.value.c_str(), path.value.size() + 1);
+    ASSERT_EQ(::connect(client_fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)), 0);
+
+    // A 0 ms poll accepts the socket, sends the server's AAL1 record, and
+    // returns timeout immediately without closing the pending peer.
+    const auto start = std::chrono::steady_clock::now();
+    const auto first = server.value().accept_consumer(aa::core::Milliseconds{0});
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - start);
+    ASSERT_FALSE(first);
+    EXPECT_EQ(first.error().code(), aa::ErrorCode::timeout);
+    EXPECT_LT(elapsed.count(), 250);
+    EXPECT_TRUE(server.value().has_pending_handshake());
+
+    // The server already sent its AAL1 record; read it on the client side, then
+    // release the client's AAL1 record.
+    std::array<std::uint8_t, kLimitsRecordBytes> server_record{};
+    ASSERT_EQ(::recv(client_fd, server_record.data(), server_record.size(), 0),
+              static_cast<ssize_t>(kLimitsRecordBytes));
+    ASSERT_TRUE(decode_limits_record(server_record));
+
+    std::array<std::uint8_t, kLimitsRecordBytes> client_record{};
+    encode_limits_record(client_record, limits);
+    ASSERT_EQ(::send(client_fd, client_record.data(), client_record.size(), MSG_NOSIGNAL),
+              static_cast<ssize_t>(kLimitsRecordBytes));
+
+    // The next 0 ms poll completes the pending handshake and can stream frames.
+    auto accepted = server.value().accept_consumer(aa::core::Milliseconds{0});
+    ASSERT_TRUE(accepted);
+    EXPECT_FALSE(server.value().has_pending_handshake());
+
+    const std::vector<std::uint8_t> payload{0x00, 0x00, 0x01, 0x65, 0xaa};
+    ASSERT_TRUE(accepted.value().send_access_unit({1, 100, true, payload}));
+    std::array<std::uint8_t, kFrameHeaderBytes + 64> rx{};
+    const ssize_t got = ::recv(client_fd, rx.data(), rx.size(), 0);
+    ASSERT_EQ(got, static_cast<ssize_t>(kFrameHeaderBytes + payload.size()));
+
+    ::close(client_fd);
+    accepted.value().close();
+    server.value().close();
+    ::unlink(path.value.c_str());
+    videotest::remove_startup_lock(path.value);
+    ::rmdir((runtime + "/android-auto-receiver").c_str());
+    ::rmdir(runtime.c_str());
+}
+
+TEST(VideoChannel, ZeroTimeoutPendingHandshakeExpiresAndAdmitsNextClient) {
+    NegotiatedLimits limits{};
+    const auto runtime = videotest::private_runtime_dir();
+    ASSERT_FALSE(runtime.empty());
+    const auto path = video_socket_path_in(runtime);
+    auto server = VideoServer::listen(path, VideoServerOptions{limits, current_uid()});
+    ASSERT_TRUE(server);
+
+    const int silent_fd = ::socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
+    ASSERT_GE(silent_fd, 0);
+    sockaddr_un addr{};
+    addr.sun_family = AF_UNIX;
+    std::memcpy(addr.sun_path, path.value.c_str(), path.value.size() + 1);
+    ASSERT_EQ(::connect(silent_fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)), 0);
+
+    // Use a short custom handshake deadline (40 ms) with a 0 ms accept poll.
+    ASSERT_FALSE(server.value().accept_consumer(aa::core::Milliseconds{0},
+                                                aa::core::Milliseconds{40}));
+    EXPECT_TRUE(server.value().has_pending_handshake());
+
+    // Driving the pending handshake with a call budget larger than the
+    // remaining handshake deadline expires cleanly at 40 ms without sleeping.
+    const auto expired =
+        server.value().accept_consumer(aa::core::Milliseconds{500}, aa::core::Milliseconds{40});
+    ASSERT_FALSE(expired);
+    EXPECT_EQ(expired.error().code(), aa::ErrorCode::timeout);
+    EXPECT_FALSE(server.value().has_pending_handshake());
+    ::close(silent_fd);
+
+    // A healthy consumer connects cleanly afterwards.
+    aa::core::Result<VideoConsumer> consumer{aa::Error{aa::ErrorCode::timeout}};
+    std::thread connector([&] {
+        consumer = connect_video_consumer(
+            path, VideoClientOptions{limits, current_uid(), aa::core::Milliseconds{2000}});
+    });
+    auto producer = server.value().accept_consumer(aa::core::Milliseconds{2000});
+    connector.join();
+    ASSERT_TRUE(producer);
+    ASSERT_TRUE(consumer);
+
+    producer.value().close();
+    consumer.value().close();
+    server.value().close();
+    ::unlink(path.value.c_str());
+    videotest::remove_startup_lock(path.value);
+    ::rmdir((runtime + "/android-auto-receiver").c_str());
+    ::rmdir(runtime.c_str());
+}
+
+TEST(VideoChannel, BorrowedProducersPreserveMonotonicCountersAcrossHandoffAndInterruptedAu) {
+    NegotiatedLimits limits{};
+    limits.max_datagram_payload = 1024;
+    auto pair = videotest::make_pair(limits);
+    ASSERT_TRUE(pair);
+    auto& owner = pair.value().producer;
+    auto& consumer = pair.value().consumer;
+
+    // Producer 1 borrows the supervisor-owned connection, sends IDR frame 1,
+    // delta frame 2, and then fails mid-AU after fragment 0 of multi-fragment
+    // frame 3 (simulating a worker crash mid-access-unit).
+    auto borrowed1 = owner.borrow();
+    ASSERT_TRUE(borrowed1);
+    const std::vector<std::uint8_t> idr1{0x00, 0x00, 0x01, 0x65, 0x11};
+    const std::vector<std::uint8_t> delta2{0x00, 0x00, 0x01, 0x41, 0x22};
+    ASSERT_EQ(borrowed1.value().try_send_access_unit({1, 100, true, idr1}).value(),
+              TrySendStatus::sent);
+    ASSERT_EQ(borrowed1.value().try_send_access_unit({2, 200, false, delta2}).value(),
+              TrySendStatus::sent);
+
+    std::vector<std::uint8_t> partial3(2500, 0x33);
+    unsigned frag_calls = 0;
+    borrowed1.value().set_datagram_send_for_test(
+        [&](int fd, const void* buf, std::size_t len, int flags, int& out_errno) -> std::ptrdiff_t {
+            if (++frag_calls == 2) {
+                out_errno = EAGAIN;
+                return -1;
+            }
+            const auto sent = ::send(fd, buf, len, flags);
+            out_errno = (sent < 0) ? errno : 0;
+            return sent;
+        });
+    ASSERT_EQ(borrowed1.value().try_send_access_unit({3, 300, false, partial3}).value(),
+              TrySendStatus::would_block);
+    // Closing borrowed producer 1 must not send SHUT_WR on the shared connection.
+    borrowed1.value().close();
+
+    // Producer 2 borrows the SAME connection and sees the updated monotonic
+    // counters past the interrupted frame 3.
+    auto borrowed2 = owner.borrow();
+    ASSERT_TRUE(borrowed2);
+    EXPECT_GE(borrowed2.value().last_frame_id(), 3U);
+    EXPECT_GE(borrowed2.value().next_sequence(), 3U);
+
+    const std::uint64_t next_frame = borrowed2.value().last_frame_id() + 1;
+    const std::vector<std::uint8_t> idr2{0x00, 0x00, 0x01, 0x65, 0x44};
+    ASSERT_EQ(borrowed2.value().try_send_access_unit({next_frame, 400, true, idr2}).value(),
+              TrySendStatus::sent);
+
+    // Consumer receives frame 1, frame 2, drops interrupted frame 3 cleanly,
+    // and accepts producer 2's IDR with ZERO rejected records.
+    ASSERT_EQ(drain_until_complete(consumer, 4).value(), ReceiveStatus::complete);
+    EXPECT_EQ(consumer.access_unit().frame, 1U);
+    EXPECT_EQ(consumer.access_unit().payload, idr1);
+
+    ASSERT_EQ(drain_until_complete(consumer, 4).value(), ReceiveStatus::complete);
+    EXPECT_EQ(consumer.access_unit().frame, 2U);
+    EXPECT_EQ(consumer.access_unit().payload, delta2);
+
+    ASSERT_EQ(drain_until_complete(consumer, 8).value(), ReceiveStatus::complete);
+    EXPECT_EQ(consumer.access_unit().frame, next_frame);
+    EXPECT_EQ(consumer.access_unit().payload, idr2);
+    EXPECT_EQ(consumer.rejected(), 0U);
+    EXPECT_FALSE(owner.peer_closed());
+
+    // Closing the consumer is detected immediately by owner.peer_closed().
+    consumer.close();
+    EXPECT_TRUE(owner.peer_closed());
+}

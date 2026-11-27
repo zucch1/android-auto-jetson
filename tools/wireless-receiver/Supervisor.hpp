@@ -179,7 +179,7 @@ struct SupervisorPorts final {
     std::function<bool()> process_running;
     std::function<void(const char*, ErrorCode)> report;
     std::function<TransportArbiter::Clock::time_point()> now = TransportArbiter::Clock::now;
-    std::function<void()> accept_video{};
+    std::function<void()> service_video{};
     std::function<void()> release_video{};
 };
 
@@ -210,10 +210,14 @@ public:
             return std::nullopt;
         }
         if (request_ != state.consumer) {
+            if (request_.has_value() && ports_.release_video) {
+                ports_.release_video();
+            }
             request_ = state.consumer;
             arbiter_.reset();
             next_scan_ = {};
         }
+        if (ports_.service_video) ports_.service_video();
         const auto& approved = ports_.approved();
         if (wired_) {
             if (!approved_phone(approved, wired_->phone)) ports_.stop_wired();
@@ -222,18 +226,15 @@ public:
                 return std::nullopt;
             }
             // The worker ended on its own (or for revocation). Projection stays
-            // requested and arbitration picks the next transport.
-            const auto exited_phone = wired_->phone;
+            // requested, the supervisor keeps owning the video connection (with
+            // shared monotonic frame/sequence counters), and arbitration picks
+            // the next transport.
             arbiter_.wired_exited(now());
-            if (arbiter_.wired_failures(exited_phone) == 0 && ports_.release_video) {
-                ports_.release_video();
-            }
             wired_.reset();
             policy.active_transport.reset();
             return std::nullopt;
         }
 
-        if (ports_.accept_video) ports_.accept_video();
         if (start_wired_if_allowed(approved)) return std::nullopt;
 
         if (policy.wireless && arbiter_.wireless_allowed(now()) && has_wireless(approved)) {
@@ -246,6 +247,13 @@ public:
                 });
             policy.active_transport.reset();
             arbiter_.wireless_finished(result != 0, now());
+            const auto after = ports_.service().state();
+            const bool wants_after = after.consumer.value && policy.ready &&
+                                     after.projection == ipc::ProjectionState::projecting;
+            if (!wants_after) {
+                if (ports_.release_video) ports_.release_video();
+                request_.reset();
+            }
             if (!policy.ready) ports_.release_media();
             if (result != 0 && !ports_.process_running()) return result;
         }

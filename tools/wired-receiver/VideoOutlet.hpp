@@ -479,10 +479,33 @@ public:
         had_producer_ = true;
         had_backpressure_ = false;
         producer_installed_at_ = now_locked();
+        sequence_ = std::max(sequence_, producer.last_frame_id());
         producer_.emplace(std::move(producer));
         if (profile_) {
             configure_buffer_locked(*profile_);
         }
+    }
+
+    // Clear the currently installed consumer producer without shutting down
+    // the outlet itself (used when the supervisor detects peer disconnect).
+    void clear_producer() noexcept {
+        std::unique_lock lock(mutex_);
+        const DeferredMedia logs{*this, lock};
+        if (!producer_.has_value()) {
+            return;
+        }
+        clear_delayed_locked("consumer_disconnected");
+        clear_pending_locked(/*abandon_partial=*/false, "consumer_disconnected");
+        release_error_.reset();
+        deferred_idr_reason_.reset();
+        last_released_.reset();
+        producer_->close();
+        producer_.reset();
+        idr_coordinator_.reset();
+        startup_idr_wait_ = false;
+        had_backpressure_ = false;
+        armed_late_consumer_ = false;
+        producer_installed_at_.reset();
     }
 
     void close() noexcept {
