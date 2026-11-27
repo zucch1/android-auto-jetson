@@ -56,11 +56,12 @@ public:
         return changed;
     }
 
-    // End the current consumer connection (sends SHUT_WR -> clean EOF) and
-    // abort any pending half-completed handshake from the stopped request.
+    // End the current consumer connection (marks retired + sends SHUT_WR -> clean
+    // EOF), abort any pending half-completed handshake, and drain any connections
+    // already queued in the listener's kernel accept queue from the stopped request.
     void release_connection(ipc::VideoServer* server = nullptr) noexcept {
         if (server != nullptr) {
-            server->cancel_pending_handshake();
+            (void)server->drain_queued_connections();
         }
         if (connection_.has_value()) {
             connection_->close();

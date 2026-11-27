@@ -3,6 +3,7 @@
 #include "Runtime.hpp"
 #include "Supervisor.hpp"
 #include "WiredWorker.hpp"
+#include "WirelessStartup.hpp"
 #include <aa/tls/Credentials.hpp>
 #include <aa/trust/PairingPolicy.hpp>
 #include <algorithm>
@@ -35,7 +36,24 @@ int run_wireless_projection(const Options& options, app::WirelessReceiver& recei
         aa::audio::AudioRenderWorker::monotonic_now,
         aa::audio::AudioRenderWorker::kDefaultAckReleaseDrainTimeout,
         aa::audio::AudioCreditPolicy{options.audio_max_unacked}};
-    const auto opened = audio_sink.ready();
+    const auto startup = wait_for_wireless_audio_ready(
+        audio_sink,
+        [&bus](core::Milliseconds wait) -> core::Result<void> {
+            if (auto step = bus.cycle(wait); !step) return step.error();
+            return {};
+        },
+        [&bus] { return bus.service().state(); },
+        video, managed_video, keep_running, deadline, running);
+    if (startup.bus_error) {
+        report("session bus dispatch", startup.bus_error->code());
+        running.store(false);
+        return 1;
+    }
+    if (startup.stopped || !startup.opened) {
+        audio_sink.stop();
+        return 0;
+    }
+    const auto& opened = *startup.opened;
     if (const auto report_sink = audio_sink.sink_report();
         opened || !report_sink.cause.empty() || !report_sink.candidates.empty()) {
         aa::audio::log_sink_selected(report_sink, "open", audio_telemetry());
@@ -152,6 +170,11 @@ int run_managed(const Options& options, trust::ApprovedPhoneStore& store, helper
         }
         sockets.emplace(std::move(opened.value()));
         return {};
+    };
+    policy.before_start_projection = [&] {
+        if (!sockets) return;
+        sockets->video_broker.release_connection(&sockets->video);
+        sockets->wired_video_generation = sockets->video_broker.generation();
     };
     WiredWorker wired;
     auto bus = ipc::ControlBusService::start({ipc::current_uid()},

@@ -192,6 +192,10 @@ struct ProjectionPolicy final {
     bool wireless{true};
     // Validate operator provisioning before entering projection-ready.
     std::function<core::Result<void>()> check_ready{};
+    // Invoked on StartProjection before acknowledging the request, so the
+    // supervisor can invalidate stale queued connections at the request
+    // boundary while keeping the projection-ready listener open.
+    std::function<void()> before_start_projection{};
     std::optional<ProjectionTransport> active_transport{};
 };
 

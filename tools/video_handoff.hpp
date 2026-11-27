@@ -34,8 +34,8 @@ enum class VideoHandoffKind : std::uint32_t {
 
 struct VideoHandoffPacket final {
     std::uint32_t kind{};
-    std::uint32_t max_access_unit_bytes{};
     std::uint32_t max_datagram_payload{};
+    std::uint32_t max_access_unit_bytes{};
     std::uint32_t socket_budget_bytes{};
 };
 
@@ -60,14 +60,15 @@ struct VideoHandoffEvent final {
 
 [[nodiscard]] inline bool send_video_handoff_install(int channel_fd, int client_fd, int state_fd,
                                                      const ipc::NegotiatedLimits& limits) noexcept {
-    if (channel_fd < 0 || client_fd < 0 || state_fd < 0) {
+    if (channel_fd < 0 || client_fd < 0 || state_fd < 0 ||
+        !ipc::valid_negotiated_limits(limits)) {
         return false;
     }
     VideoHandoffPacket packet{
-        static_cast<std::uint32_t>(VideoHandoffKind::install),
-        limits.max_access_unit_bytes,
-        limits.max_datagram_payload,
-        limits.socket_budget_bytes,
+        .kind = static_cast<std::uint32_t>(VideoHandoffKind::install),
+        .max_datagram_payload = limits.max_datagram_payload,
+        .max_access_unit_bytes = limits.max_access_unit_bytes,
+        .socket_budget_bytes = limits.socket_budget_bytes,
     };
     iovec iov{&packet, sizeof(packet)};
     alignas(cmsghdr) std::array<char, CMSG_SPACE(sizeof(int) * 2)> control{};
@@ -205,10 +206,14 @@ struct VideoHandoffEvent final {
         return Error{ErrorCode::transport_io};
     }
     const ipc::NegotiatedLimits limits{
-        packet.max_access_unit_bytes,
-        packet.max_datagram_payload,
-        packet.socket_budget_bytes,
+        .max_datagram_payload = packet.max_datagram_payload,
+        .max_access_unit_bytes = packet.max_access_unit_bytes,
+        .socket_budget_bytes = packet.socket_budget_bytes,
     };
+    if (!ipc::valid_negotiated_limits(limits)) {
+        close_all();
+        return Error{ErrorCode::protocol_negotiation_failed};
+    }
     auto adopted = ipc::VideoProducer::adopt_accepted(received_fds[0], limits, received_fds[1]);
     if (!adopted) {
         close_all();

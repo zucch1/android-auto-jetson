@@ -147,28 +147,39 @@ public:
     void set_observer(VideoEndpointObserver observer);
 
     // Take an already-accepted consumer socket from the receiver supervisor.
-    // When `state_fd >= 0`, attaches the supervisor's shared stream-counter
-    // memfd so frame IDs and fragment sequence numbers remain monotonic across
-    // producer changes on the same consumer connection. On error, the caller
-    // retains ownership of `fd` and `state_fd`.
+    // When `state_fd >= 0`, attaches the supervisor's size-sealed shared
+    // stream-counter memfd so frame IDs and fragment sequence numbers remain
+    // monotonic across serial producer changes on the same consumer connection.
+    // Exclusivity: active producers sharing a counter file MUST be serialized
+    // (at most one active sender at a time); sequence numbers are cached locally
+    // and the shared memfd holds restart high-water marks plus owner-retirement
+    // state, so concurrent borrowers could emit duplicate sequence numbers.
+    // On error, the caller retains ownership of `fd` and `state_fd`.
     // Closing an inherited producer closes only its descriptors without
     // shutting down the underlying connection for the supervisor.
     [[nodiscard]] static core::Result<VideoProducer> adopt_accepted(
         int fd, const NegotiatedLimits& limits, int state_fd = -1);
 
-    // Ensure a shared stream-counter memfd backs this producer and return its
-    // descriptor (still owned by this VideoProducer) for cross-process handoff.
+    // Ensure a size-sealed (0600, F_SEAL_SHRINK|F_SEAL_GROW|F_SEAL_SEAL) shared
+    // stream-counter memfd backs this producer and return its descriptor (still
+    // owned by this VideoProducer) for cross-process handoff. Active producers
+    // using this counter file must be mutually exclusive (serial handoff only).
     [[nodiscard]] core::Result<int> prepare_shared_state();
 
     // Create a borrowed (inherited) VideoProducer referencing the same
     // underlying socket and shared stream-counter state. Closing the borrowed
-    // producer closes only its duplicated descriptors without SHUT_WR.
+    // producer closes only its duplicated descriptors without SHUT_WR. Callers
+    // must ensure only one producer actively sends on a connection at a time.
     [[nodiscard]] core::Result<VideoProducer> borrow();
 
     // shutdown(SHUT_WR) + close; idempotent; the consumer then sees a clean
-    // end of stream. For an inherited (borrowed) producer created via
-    // adopt_accepted() or borrow(), closes only this producer's descriptors
-    // without calling shutdown(SHUT_WR), keeping the supervisor's connection open.
+    // end of stream. When backed by shared stream-counter state, the owning
+    // producer marks the connection retired before SHUT_WR so any still-live
+    // borrowed producer observes an expected transport_closed disconnect instead
+    // of an unexpected EPIPE I/O fault. For an inherited (borrowed) producer
+    // created via adopt_accepted() or borrow(), closes only this producer's
+    // descriptors without calling shutdown(SHUT_WR) or marking retired, keeping
+    // the supervisor's connection open.
     void close() noexcept;
 
     [[nodiscard]] core::Result<SocketBufferResult> configure_send_buffer(
@@ -176,6 +187,7 @@ public:
 
     [[nodiscard]] bool closed() const noexcept;
     [[nodiscard]] bool peer_closed() const noexcept;
+    [[nodiscard]] bool retired() const noexcept;
     [[nodiscard]] bool waiting_idr() const noexcept;
     [[nodiscard]] const NegotiatedLimits& limits() const noexcept;
     [[nodiscard]] std::uint64_t last_frame_id() const noexcept;
@@ -292,6 +304,11 @@ public:
 
     [[nodiscard]] bool has_pending_handshake() const noexcept;
     void cancel_pending_handshake() noexcept;
+    // Cancel any pending handshake and perform a bounded nonblocking drain of
+    // connections already queued in the listener's kernel accept backlog,
+    // closing them without sending AAL1. Used at projection request boundaries
+    // so stale queued peers cannot cross StopProjection into a new request.
+    std::size_t drain_queued_connections() noexcept;
 
     // Closes the listener and unlinks the endpoint node only while it is
     // still the node bound at listen() time and only while holding the

@@ -831,23 +831,32 @@ private:
     }
 
     [[nodiscard]] bool handle_transport_error_locked(const Error& err, std::size_t extra_drops) {
-        // Error erases errno; confirm peer hangup rather than hiding every I/O failure.
-        if (err.code() != ErrorCode::transport_io || !producer_.has_value()) {
+        // Error erases errno; confirm either explicit supervisor retirement of
+        // a borrowed connection (in-place consumer replacement / stop) or peer
+        // hangup rather than hiding every I/O failure.
+        if (!producer_.has_value()) {
             return false;
         }
-        pollfd peer{producer_->native_handle(), 0, 0};
-        int ready;
-        do {
-            ready = ::poll(&peer, 1, 0);
-        } while (ready < 0 && errno == EINTR);
-        if (ready <= 0 || (peer.revents & POLLHUP) == 0) {
-            return false;
+        const bool retired = err.code() == ErrorCode::transport_closed && producer_->retired();
+        if (!retired) {
+            if (err.code() != ErrorCode::transport_io) {
+                return false;
+            }
+            pollfd peer{producer_->native_handle(), 0, 0};
+            int ready;
+            do {
+                ready = ::poll(&peer, 1, 0);
+            } while (ready < 0 && errno == EINTR);
+            if (ready <= 0 || (peer.revents & POLLHUP) == 0) {
+                return false;
+            }
         }
+        const char* drop_reason = retired ? "consumer_replaced" : "consumer_disconnected";
         const std::size_t lost_units = pending_queue_.size() + extra_drops;
         reset_pending_state_locked();
         // Frames held for the playout delay go with the consumer, and so does
         // any IDR request deferred for it.
-        clear_delayed_locked("consumer_disconnected");
+        clear_delayed_locked(drop_reason);
         deferred_idr_reason_.reset();
         last_released_.reset();
         producer_->close();
@@ -859,7 +868,7 @@ private:
         producer_installed_at_.reset();
         const auto cadence = frame_cadence(profile_);
         for (std::size_t i = 0; i < lost_units; ++i) {
-            record_drop("consumer_disconnected", cadence);
+            record_drop(drop_reason, cadence);
         }
         return true;
     }

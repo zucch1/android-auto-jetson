@@ -317,6 +317,17 @@ core::Result<void> AudioRenderWorker::ready() {
     return {};
 }
 
+std::optional<core::Result<void>>
+AudioRenderWorker::wait_ready_for(std::chrono::milliseconds timeout) {
+    std::unique_lock lock(mutex_);
+    if (!cv_.wait_for(lock, std::max(std::chrono::milliseconds{0}, timeout),
+                      [&] { return initialized_; })) {
+        return std::nullopt;
+    }
+    if (failure_) { return *failure_; }
+    return core::Result<void>{};
+}
+
 SinkReport AudioRenderWorker::sink_report() {
     std::lock_guard lock(mutex_);
     return sink_report_;

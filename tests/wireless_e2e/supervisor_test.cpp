@@ -2,18 +2,28 @@
 // The packaged supervisor loop (#221, #240 review P3-7) driven through its
 // ports: a real ControlService, fake wired worker, fake wireless run and a
 // scripted USB scan.
+#include "../../src/audio/AudioSinkFactory.hpp"
 #include "../../tools/wired-receiver/VideoOutlet.hpp"
 #include "../../tools/wireless-receiver/ManagedVideo.hpp"
 #include "../../tools/wireless-receiver/Supervisor.hpp"
+#include "../../tools/wireless-receiver/WirelessStartup.hpp"
 #include "../dbus/fakes.hpp"
 
+#include <aa/audio/AudioRenderWorker.hpp>
 #include <aa/ipc/VideoChannel.hpp>
 #include <gtest/gtest.h>
 
+#include <atomic>
+#include <condition_variable>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
+#include <mutex>
 #include <poll.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <thread>
+#include <unistd.h>
 
 namespace {
 
@@ -609,7 +619,7 @@ std::vector<std::byte> delta_au(std::uint8_t tag) {
 }
 
 aa::core::Result<ipc::ReceiveStatus> recv_complete(ipc::VideoConsumer& consumer) {
-    for (int i = 0; i < 16; ++i) {
+    for (int i = 0; i < 64; ++i) {
         auto step = consumer.receive(aa::core::Milliseconds{2000});
         if (!step) return step;
         if (step.value() == ipc::ReceiveStatus::complete) return step;
@@ -618,26 +628,48 @@ aa::core::Result<ipc::ReceiveStatus> recv_complete(ipc::VideoConsumer& consumer)
 }
 
 // Connects a real VideoConsumer against the supervisor's real VideoServer by
-// stepping the supervisor (no timed polling sleeps).
+// stepping the supervisor with a bounded wait that surfaces connector errors
+// instead of spinning indefinitely on a failed handshake.
 aa::core::Result<ipc::VideoConsumer> connect_via_supervisor(
     const ipc::VideoSocketPath& video_path, ipc::VideoServer& server,
-    wr::ManagedVideoBroker& broker, const std::function<void()>& step_fn) {
+    wr::ManagedVideoBroker& broker, const std::function<void()>& step_fn,
+    aa::core::Milliseconds client_timeout = aa::core::Milliseconds{2000},
+    std::chrono::milliseconds limit = 5s) {
     const auto before = broker.generation();
     aa::core::Result<ipc::VideoConsumer> consumer{aa::Error{aa::ErrorCode::timeout}};
+    std::atomic<bool> connector_done{false};
     std::thread connector([&] {
         consumer = ipc::connect_video_consumer(
-            video_path, {{}, ipc::current_uid(), aa::core::Milliseconds{2000}});
+            video_path, {{}, ipc::current_uid(), client_timeout});
+        connector_done.store(true, std::memory_order_release);
     });
-    while (broker.generation() == before) {
+    const auto deadline = std::chrono::steady_clock::now() + limit;
+    while (broker.generation() == before && !connector_done.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < deadline) {
         if (!broker.has_pending_handshake(server)) {
             pollfd pfd{server.native_handle(), POLLIN, 0};
-            (void)::poll(&pfd, 1, 500);
+            (void)::poll(&pfd, 1, 20);
+        } else {
+            std::this_thread::yield();
         }
         step_fn();
     }
+    if (broker.generation() == before) {
+        step_fn();
+    }
     connector.join();
+    if (!consumer) return consumer;
+    if (broker.generation() == before) return aa::Error{aa::ErrorCode::timeout};
     return consumer;
 }
+
+class NullAudioSink final : public aa::audio::detail::ObservedAudioSink {
+public:
+    aa::core::Result<void> write(const aa::audio::MixedChunk&) override { return {}; }
+    aa::core::Result<void> drain(aa::core::Milliseconds) override { return {}; }
+    [[nodiscard]] aa::audio::SinkProbeStats probe_stats() const override { return {}; }
+    [[nodiscard]] aa::audio::RenderBarrierStats render_stats() const override { return {}; }
+};
 
 struct RealVideoHarness final {
     VideoScratch scratch{};
@@ -719,6 +751,10 @@ struct RealVideoHarness final {
                 server.emplace(std::move(opened.value()));
             }
             return {};
+        };
+        policy.before_start_projection = [this] {
+            broker.release_connection(server ? &*server : nullptr);
+            wired_video_gen = broker.generation();
         };
     }
 
@@ -962,6 +998,217 @@ TEST(ManagedSupervisor, IdleWirelessPreemptionAndAudioFailurePreserveConsumerFor
     ASSERT_TRUE(recv_complete(consumer.value()));
     EXPECT_EQ(consumer.value().access_unit().payload.back(), 0x77U);
     EXPECT_EQ(consumer.value().rejected(), 0U);
+}
+
+TEST(ManagedSupervisor, ReplacingStillOpenConsumerRetiresOldProducerWithoutSessionError) {
+    RealVideoHarness h;
+    h.approved.push_back({{7}, kWiredIdentity, aa::trust::IdentityStrength::serial_backed});
+    h.attached = {{{7}, "1-2"}};
+    h.start();
+    ASSERT_TRUE(h.service.set_transport_enabled(h.owner, "wireless", false));
+
+    h.step();
+    ASSERT_EQ(h.worker_starts, 1U);
+
+    // Consumer 1 connects, receives an IDR, and stays OPEN.
+    auto consumer1 = connect_via_supervisor(h.video_path, *h.server, h.broker, [&] { h.step(); });
+    ASSERT_TRUE(consumer1);
+    aa::protocol::MessageHeader hdr{};
+    hdr.timestamp = aa::core::Nanoseconds{1'000'000};
+    ASSERT_TRUE(h.wired_outlet->on_message({hdr, idr_au(0x81)}));
+    ASSERT_TRUE(recv_complete(consumer1.value()));
+    EXPECT_EQ(consumer1.value().access_unit().payload.back(), 0x81U);
+
+    // Consumer 2 completes AAL1 in the broker while Consumer 1 is STILL OPEN,
+    // and we deliberately DO NOT sync/install Consumer 2 into wired_outlet yet
+    // (reproducing both the wired SCM_RIGHTS handoff gap and wireless's
+    // outbound_in_progress() deferred-install window).
+    auto consumer2 = connect_via_supervisor(h.video_path, *h.server, h.broker, [&] {
+        (void)h.broker.poll(*h.server);
+    });
+    ASSERT_TRUE(consumer2);
+
+    // A frame sent on the superseded outlet before install is applied must
+    // return success (cleanly retiring the old producer) instead of failing the
+    // active phone session with transport_io.
+    hdr.timestamp = aa::core::Nanoseconds{34'000'000};
+    const auto gap_send = h.wired_outlet->on_message({hdr, idr_au(0x82)});
+    EXPECT_TRUE(gap_send) << "superseded send failed active session";
+
+    // Consumer 1 sees clean EOF on its still-open socket.
+    const auto eof = consumer1.value().receive(aa::core::Milliseconds{500});
+    ASSERT_FALSE(eof);
+    EXPECT_EQ(eof.error().code(), ErrorCode::transport_closed);
+
+    // Once the worker installs Consumer 2, frames flow cleanly with 0 rejects.
+    h.sync_wired();
+    hdr.timestamp = aa::core::Nanoseconds{67'000'000};
+    ASSERT_TRUE(h.wired_outlet->on_message({hdr, idr_au(0x83)}));
+    ASSERT_TRUE(recv_complete(consumer2.value()));
+    EXPECT_EQ(consumer2.value().access_unit().payload.back(), 0x83U);
+    EXPECT_EQ(consumer2.value().rejected(), 0U);
+}
+
+TEST(ManagedSupervisor, QueuedConnectionBeforeStopProjectionCannotCrossIntoNextRequest) {
+    RealVideoHarness h;
+    h.approved.push_back({{7}, kWiredIdentity, aa::trust::IdentityStrength::serial_backed});
+    h.attached = {{{7}, "1-2"}};
+    h.start();
+    ASSERT_TRUE(h.service.set_transport_enabled(h.owner, "wireless", false));
+    h.step();
+    ASSERT_EQ(h.worker_starts, 1U);
+
+    // Queue a raw client in the listener backlog BEFORE StopProjection and
+    // BEFORE the broker polls/accepts it.
+    const int stale_fd = ::socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
+    ASSERT_GE(stale_fd, 0);
+    sockaddr_un addr{};
+    addr.sun_family = AF_UNIX;
+    ASSERT_LT(h.video_path.value.size(), sizeof(addr.sun_path));
+    std::memcpy(addr.sun_path, h.video_path.value.c_str(), h.video_path.value.size() + 1);
+    ASSERT_EQ(::connect(stale_fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)), 0);
+
+    // Stop projection, unregister Consumer 1, register Consumer 2, and start a
+    // fresh projection request (test both stop-step and request-boundary drain).
+    ASSERT_TRUE(h.service.stop_projection(h.owner));
+    h.step();
+    ASSERT_FALSE(h.broker.has_connection());
+    ASSERT_TRUE(h.service.unregister_consumer(h.owner));
+    h.step();
+
+    // Queue a SECOND stale client right before the new consumer registers and
+    // calls StartProjection (without an intermediate supervisor step) to verify
+    // the pre-StartProjection boundary drain as well.
+    const int stale_fd2 = ::socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
+    ASSERT_GE(stale_fd2, 0);
+    ASSERT_EQ(::connect(stale_fd2, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)), 0);
+
+    const ipc::BusName owner2{":1.42"};
+    const ipc::BusName name2{"org.custom.ConsumerTwo"};
+    h.credentials.add_connection(owner2, kUid);
+    h.credentials.set_owner(name2, owner2);
+    ASSERT_TRUE(h.service.register_consumer(owner2, name2));
+    ASSERT_TRUE(h.service.start_projection(owner2));
+
+    // Neither stale socket received AAL1 or survived into the new request.
+    std::array<std::uint8_t, ipc::kLimitsRecordBytes> rx{};
+    EXPECT_EQ(::recv(stale_fd, rx.data(), rx.size(), 0), 0);
+    EXPECT_EQ(::recv(stale_fd2, rx.data(), rx.size(), 0), 0);
+    ::close(stale_fd);
+    ::close(stale_fd2);
+
+    h.step();
+    EXPECT_FALSE(h.broker.has_connection());
+
+    // The new registration's legitimate client connects cleanly and gets video.
+    auto fresh_consumer =
+        connect_via_supervisor(h.video_path, *h.server, h.broker, [&] { h.step(); });
+    ASSERT_TRUE(fresh_consumer);
+    aa::protocol::MessageHeader hdr{};
+    hdr.timestamp = aa::core::Nanoseconds{1'000'000};
+    ASSERT_TRUE(h.wired_outlet->on_message({hdr, idr_au(0x91)}));
+    ASSERT_TRUE(recv_complete(fresh_consumer.value()));
+    EXPECT_EQ(fresh_consumer.value().access_unit().payload.back(), 0x91U);
+    EXPECT_EQ(fresh_consumer.value().rejected(), 0U);
+}
+
+TEST(ManagedSupervisor, WirelessStartupServicesBrokerAndControlBusWhileAudioOpens) {
+    RealVideoHarness h;
+    h.approved.push_back({{9}, kWirelessA, aa::trust::IdentityStrength::serial_backed});
+    h.start();
+    ASSERT_TRUE(h.service.set_transport_enabled(h.owner, "wired", false));
+
+    // Gate AudioRenderWorker's OpenRouter callback so audio initialization stays
+    // pending while the consumer connects and performs a real AAL1 exchange.
+    std::mutex gate_mu;
+    std::condition_variable gate_cv;
+    bool open_entered = false;
+    bool release_open = false;
+
+    aa::audio::RouterConfig cfg = aa::audio::pcm_router_config();
+    aa::audio::AudioRenderWorker audio_sink{
+        cfg, {},
+        [&](const aa::audio::RouterConfig& config) -> aa::core::Result<aa::audio::AudioRouter> {
+            {
+                std::unique_lock lock(gate_mu);
+                open_entered = true;
+                gate_cv.notify_all();
+                gate_cv.wait_for(lock, 5s, [&] { return release_open; });
+            }
+            return aa::audio::detail::open_router_with_sink_for_test(
+                config, std::make_unique<NullAudioSink>());
+        }};
+
+    {
+        std::unique_lock lock(gate_mu);
+        ASSERT_TRUE(gate_cv.wait_for(lock, 3s, [&] { return open_entered; }));
+    }
+
+    std::atomic<unsigned> bus_cycles{0};
+    std::atomic<bool> running_flag{true};
+    wr::WirelessAudioStartupResult startup{};
+    std::thread startup_thread([&] {
+        startup = wr::wait_for_wireless_audio_ready(
+            audio_sink,
+            [&](aa::core::Milliseconds) -> aa::core::Result<void> {
+                bus_cycles.fetch_add(1, std::memory_order_relaxed);
+                return {};
+            },
+            [&] { return h.service.state(); },
+            *h.server, &h.broker,
+            [&](ipc::StateSnapshot current, const std::optional<aa::trust::TransportIdentity>&) {
+                return current.projection == ipc::ProjectionState::projecting;
+            },
+            std::chrono::steady_clock::now() + 5s,
+            running_flag);
+    });
+
+    // Drive a real AAL1 handshake while audio initialization is STILL blocked.
+    auto consumer = ipc::connect_video_consumer(
+        h.video_path, {{}, ipc::current_uid(), aa::core::Milliseconds{1500}});
+    ASSERT_TRUE(consumer) << "AAL1 handshake blocked by pending audio initialization";
+    EXPECT_TRUE(h.broker.has_connection());
+    EXPECT_GT(bus_cycles.load(std::memory_order_relaxed), 0U);
+
+    // Release audio open and verify startup completes cleanly and can borrow
+    // the already-negotiated connection to deliver an IDR.
+    {
+        std::lock_guard lock(gate_mu);
+        release_open = true;
+    }
+    gate_cv.notify_all();
+    startup_thread.join();
+
+    ASSERT_FALSE(startup.stopped);
+    ASSERT_FALSE(startup.bus_error.has_value());
+    ASSERT_TRUE(startup.opened.has_value());
+    ASSERT_TRUE(startup.opened->has_value());
+
+    aa::wired_receiver::VideoOutlet wireless_outlet{[](const std::string&) {}};
+    auto borrowed = h.broker.borrow();
+    ASSERT_TRUE(borrowed);
+    wireless_outlet.install(std::move(borrowed.value()));
+    aa::protocol::MessageHeader hdr{};
+    hdr.timestamp = aa::core::Nanoseconds{1'000'000};
+    ASSERT_TRUE(wireless_outlet.on_message({hdr, idr_au(0xA5)}));
+    ASSERT_TRUE(recv_complete(consumer.value()));
+    EXPECT_EQ(consumer.value().access_unit().payload.back(), 0xA5U);
+    EXPECT_EQ(consumer.value().rejected(), 0U);
+    wireless_outlet.close();
+}
+
+TEST(ManagedSupervisor, ConnectHelperFailsBoundedWhenServerNeverAccepts) {
+    RealVideoHarness h;
+    ASSERT_TRUE(h.policy.check_ready());
+    // Step callback intentionally does not poll the server; connect_via_supervisor
+    // must return timeout cleanly rather than spinning forever.
+    const auto started = std::chrono::steady_clock::now();
+    auto res = connect_via_supervisor(
+        h.video_path, *h.server, h.broker, [] {}, aa::core::Milliseconds{100}, 1000ms);
+    const auto elapsed = std::chrono::steady_clock::now() - started;
+    ASSERT_FALSE(res);
+    EXPECT_EQ(res.error().code(), ErrorCode::timeout);
+    EXPECT_LT(elapsed, 2000ms);
 }
 
 } // namespace

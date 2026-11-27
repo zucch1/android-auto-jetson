@@ -201,6 +201,7 @@ class ObservedSessionMutex {
 
 #include "harness.hpp"
 #include "../../tools/wired-enrol/EnrolFlow.hpp"
+#include "../../tools/wireless-receiver/ManagedVideo.hpp"
 #include <aa/ipc/ControlBusClient.hpp>
 #include "../session/Fakes.hpp"
 #include "../video_socket/pair.hpp"
@@ -11424,4 +11425,342 @@ TEST(WiredReceiver, StdoutLogFinishAbandonsStalledSinkWithParkedRecords) {
         EXPECT_EQ(owned_probe.bytes.find("log_complete"), std::string::npos);
     }
     LogWriteProbe::active = nullptr;
+}
+
+TEST(WiredReceiver, ManagedWiredEntryPointDeliversFragmentedIdrAndSurvivesInPlaceReplacement) {
+    // Exercise the REAL production wired_receiver_main managed dispatch path
+    // (fd 3 video handoff + fd 4 input listener + --managed-by + fake USB):
+    // 1. Deliver a 32 KiB+ fragmented IDR under unequal negotiated limits.
+    // 2. Replace the consumer while consumer 1 is STILL OPEN and push a frame
+    //    before sending the replacement handoff over fd 3; verify the active
+    //    phone session does not fail or reconnect USB, then deliver a second
+    //    fragmented IDR to consumer 2.
+    // Re-exec self via fork()+execve() so earlier tests' detached threads never
+    // leave mutexes held across fork() (matching run_admission_child above).
+    if (std::getenv("AA_TEST_MANAGED_WIRED_CHILD") != nullptr) {
+        char directory[] = "/tmp/wired-managed-e2e-XXXXXX";
+        const char *created = ::mkdtemp(directory);
+        if (!created) { ::_exit(10); }
+        const std::filesystem::path root{created};
+        const auto store_path = root / "approved.json";
+        aa::trust::ApprovedPhoneStore store{store_path};
+        if (!store.load().has_value()) { ::_exit(11); }
+        const aa::trust::WiredIdentity identity{
+            "04e8", "6860", "SYNTHETIC", "TEST", "TEST", "SYNTHETIC", "1-2.1"};
+        const auto approved = store.approve(aa::trust::TransportIdentity{identity});
+        if (!approved.has_value()) { ::_exit(12); }
+
+        int handoff[2]{-1, -1};
+        if (::socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, handoff) != 0) {
+            ::_exit(13);
+        }
+        auto input_server = aa::ipc::InputServer::listen(
+            aa::ipc::InputSocketPath{(root / "input.sock").string()},
+            aa::ipc::InputServerOptions{aa::ipc::current_uid()});
+        if (!input_server.has_value()) { ::_exit(14); }
+
+        // Move parent-side handoff[0] and temporary duplicates above fd 4 before
+        // installing child fd 3 (handoff) and fd 4 (input listener).
+        const int handoff_parent = ::fcntl(handoff[0], F_DUPFD_CLOEXEC, 10);
+        const int handoff_child = ::fcntl(handoff[1], F_DUPFD_CLOEXEC, 10);
+        const int input_child = ::fcntl(input_server.value().native_handle(), F_DUPFD_CLOEXEC, 10);
+        ::close(handoff[0]);
+        ::close(handoff[1]);
+        if (handoff_parent < 0 || handoff_child < 0 || input_child < 0) { ::_exit(15); }
+        if (::dup2(handoff_child, 3) != 3 || ::dup2(input_child, 4) != 4) { ::_exit(16); }
+        ::close(handoff_child);
+        ::close(input_child);
+
+        const aa::ipc::VideoSocketPath video_path{(root / "video.sock").string()};
+        auto video_server = aa::ipc::VideoServer::listen(
+            video_path, aa::ipc::VideoServerOptions{{}, aa::ipc::current_uid()});
+        if (!video_server.has_value()) { ::_exit(17); }
+        aa::wireless_receiver::ManagedVideoBroker broker{};
+
+        const auto connect_consumer =
+            [&](aa::ipc::NegotiatedLimits limits) -> aa::core::Result<aa::ipc::VideoConsumer> {
+            const auto before = broker.generation();
+            aa::core::Result<aa::ipc::VideoConsumer> consumer{aa::Error{aa::ErrorCode::timeout}};
+            std::atomic<bool> done{false};
+            std::thread connector([&] {
+                consumer = aa::ipc::connect_video_consumer(
+                    video_path, {limits, aa::ipc::current_uid(), Milliseconds{2000}});
+                done.store(true, std::memory_order_release);
+            });
+            const auto deadline = LogClock::now() + std::chrono::seconds{4};
+            while (broker.generation() == before && !done.load(std::memory_order_acquire) &&
+                   LogClock::now() < deadline) {
+                if (!broker.has_pending_handshake(video_server.value())) {
+                    pollfd pfd{video_server.value().native_handle(), POLLIN, 0};
+                    (void)::poll(&pfd, 1, 20);
+                } else {
+                    std::this_thread::yield();
+                }
+                (void)broker.poll(video_server.value());
+            }
+            if (broker.generation() == before) {
+                (void)broker.poll(video_server.value());
+            }
+            connector.join();
+            if (!consumer) { return consumer; }
+            if (broker.generation() == before) { return aa::Error{aa::ErrorCode::timeout}; }
+            return consumer;
+        };
+
+        const auto recv_complete = [](aa::ipc::VideoConsumer &c) -> bool {
+            for (int i = 0; i < 64; ++i) {
+                auto step = c.receive(Milliseconds{2000});
+                if (!step.has_value()) { return false; }
+                if (step.value() == aa::ipc::ReceiveStatus::complete) { return true; }
+            }
+            return false;
+        };
+
+        runtime_phone = aa::app::wired_phone_identity(identity).value();
+        runtime_recovers = false;
+        runtime_quiet = false;
+        runtime_send_audio = false;
+        runtime_send_video = false;
+        runtime_connects.store(0);
+        runtime_ciphers.store(0);
+        g_shutdown.store(false);
+        g_running.store(true);
+        auto state = std::make_shared<AdmissionState>();
+        admission_link_state = state;
+
+        std::vector<std::string> args{
+            "aa-wired-receiver", "--no-bus",
+            "--managed-by", std::to_string(::getppid()),
+            "--port", "1-2.1",
+            "--managed-phone-id", std::to_string(approved.value().value),
+            "--store", store_path.string(),
+            "--audio-playout-ms", "0",
+            "--require-video-consumer",
+            "--duration-ms", "15000"};
+        std::vector<char *> argv;
+        for (auto &arg : args) { argv.push_back(arg.data()); }
+
+        int receiver_code = -1;
+        std::thread receiver([&] {
+            receiver_code = wired_receiver_main(static_cast<int>(argv.size()), argv.data());
+        });
+
+        auto fail_child = [&](int code) {
+            g_running.store(false);
+            {
+                std::lock_guard lock(state->mutex);
+                state->closed = true;
+                state->cv.notify_all();
+            }
+            ::close(handoff_parent);
+            if (receiver.joinable()) { receiver.join(); }
+            admission_link_state.reset();
+            broker.release_connection(&video_server.value());
+            video_server.value().close();
+            input_server.value().close();
+            std::filesystem::remove_all(root);
+            ::_exit(code);
+        };
+
+        {
+            std::unique_lock lock(state->mutex);
+            if (!state->cv.wait_for(lock, std::chrono::seconds{3},
+                                    [&] { return state->created; })) {
+                fail_child(20);
+            }
+        }
+
+        // Connect Consumer 1 with unequal limits (4 KiB datagram, 128 KiB AU)
+        // and send the handoff over fd 3.
+        aa::ipc::NegotiatedLimits custom{};
+        custom.max_datagram_payload = 4096U;
+        custom.max_access_unit_bytes = 128U * 1024U;
+        custom.socket_budget_bytes = 192U * 1024U;
+        auto consumer1 = connect_consumer(custom);
+        if (!consumer1.has_value()) { fail_child(21); }
+        if (!aa::tools::send_video_handoff_install(
+                handoff_parent, broker.client_fd(), broker.state_fd(), broker.limits())) {
+            fail_child(22);
+        }
+
+        // Negotiate fake USB session to active.
+        auto cipher = active_test_cipher();
+        const auto push_plain = [&](const std::vector<std::byte> &frame) {
+            std::lock_guard lock(state->mutex);
+            state->inbound.push_back(frame);
+            state->cv.notify_all();
+        };
+        const auto push_channel = [&](std::uint8_t channel, std::vector<std::byte> payload) {
+            auto frames = aa::transport::encode_message(
+                {channel, aa::transport::MessageKind::specific, std::move(payload)},
+                aa::transport::Encryption::encrypted, cipher.get());
+            if (!frames.has_value()) { fail_child(23); }
+            std::lock_guard lock(state->mutex);
+            for (auto &f : frames.value()) { state->inbound.push_back(std::move(f)); }
+            state->cv.notify_all();
+        };
+
+        namespace p = aa::protocol;
+        push_plain(wiredtest::control_frame(p::encode(p::VersionResponse{1, 6, 0}).value()));
+        push_plain(wiredtest::control_frame(p::encode(p::EncapsulatedSsl{{std::byte{1}}}).value()));
+        push_plain(wiredtest::discovery_request_frame());
+        push_plain(wiredtest::open_request_frame(99));
+        push_channel(99, p::encode(p::AvSinkSetup{p::AvSinkCodec::h264}).value());
+        push_channel(99, p::encode(p::AvSinkStart{-7, 0}).value());
+
+        // Build a 32 KiB+ fragmented H.264 IDR (9 datagrams at 4 KiB).
+        const auto make_idr = [](std::size_t size, std::uint8_t seed) {
+            std::vector<std::byte> body(size);
+            body[0] = std::byte{0x00};
+            body[1] = std::byte{0x00};
+            body[2] = std::byte{0x00};
+            body[3] = std::byte{0x01};
+            body[4] = std::byte{0x65};
+            for (std::size_t i = 5; i < size; ++i) {
+                body[i] = static_cast<std::byte>((i * 29U + seed) & 0xFFU);
+            }
+            return body;
+        };
+        const auto idr1 = make_idr(32U * 1024U + 111U, 0x17U);
+        push_channel(99, av_data_message(0x1000, idr1));
+
+        if (!recv_complete(consumer1.value())) { fail_child(24); }
+        if (consumer1.value().access_unit().payload.size() != idr1.size() ||
+            consumer1.value().rejected() != 0U) {
+            fail_child(25);
+        }
+        for (std::size_t i = 0; i < idr1.size(); ++i) {
+            if (consumer1.value().access_unit().payload[i] != std::to_integer<std::uint8_t>(idr1[i])) {
+                fail_child(26);
+            }
+        }
+
+        // Connect Consumer 2 while Consumer 1 is STILL OPEN. Broker retires
+        // Consumer 1 immediately, BEFORE we forward Consumer 2 over fd 3.
+        auto consumer2 = connect_consumer(custom);
+        if (!consumer2.has_value()) { fail_child(27); }
+
+        // Push a frame over fake USB in the gap before fd 3 handoff is sent
+        // and wait until AvSink emits its channel-99 media ACK in state->sent,
+        // proving video_outlet.on_message() actually ran against the retired
+        // borrowed producer, returned success, and kept the phone session live.
+        const auto count_ch99_sends = [&] {
+            std::size_t count = 0;
+            for (const auto &raw : state->sent) {
+                const auto f = aa::transport::decode_frame(raw);
+                if (f.has_value() && f.value().header.channel == 99) { ++count; }
+            }
+            return count;
+        };
+        std::size_t ch99_before = 0;
+        {
+            std::lock_guard lock(state->mutex);
+            ch99_before = count_ch99_sends();
+        }
+        const auto gap_idr = make_idr(8192U, 0x44U);
+        push_channel(99, av_data_message(0x2000, gap_idr));
+        {
+            std::unique_lock lock(state->mutex);
+            if (!state->cv.wait_for(lock, std::chrono::seconds{3},
+                                    [&] { return count_ch99_sends() > ch99_before; })) {
+                fail_child(28);
+            }
+        }
+        const auto eof1 = consumer1.value().receive(Milliseconds{500});
+        if (eof1.has_value() || eof1.error().code() != aa::ErrorCode::transport_closed) {
+            fail_child(29);
+        }
+        if (!g_running.load() || runtime_connects.load() != 1) { fail_child(30); }
+
+        // Now forward Consumer 2 over fd 3 and send a second 32 KiB+ fragmented
+        // IDR. Consumer 2 receives it cleanly on the SAME phone session.
+        if (!aa::tools::send_video_handoff_install(
+                handoff_parent, broker.client_fd(), broker.state_fd(), broker.limits())) {
+            fail_child(31);
+        }
+        const auto idr2 = make_idr(32U * 1024U + 222U, 0x5BU);
+        const auto sent_deadline = LogClock::now() + std::chrono::seconds{3};
+        bool got_idr2 = false;
+        while (!got_idr2 && LogClock::now() < sent_deadline) {
+            push_channel(99, av_data_message(0x3000, idr2));
+            for (int step = 0; step < 32; ++step) {
+                auto rx = consumer2.value().receive(Milliseconds{50});
+                if (!rx.has_value()) {
+                    if (rx.error().code() == aa::ErrorCode::timeout) { break; }
+                    fail_child(32);
+                }
+                if (rx.value() == aa::ipc::ReceiveStatus::complete) {
+                    got_idr2 = true;
+                    break;
+                }
+            }
+        }
+        if (!got_idr2) { fail_child(33); }
+        if (consumer2.value().access_unit().payload.size() != idr2.size() ||
+            consumer2.value().rejected() != 0U) {
+            fail_child(34);
+        }
+        for (std::size_t i = 0; i < idr2.size(); ++i) {
+            if (consumer2.value().access_unit().payload[i] != std::to_integer<std::uint8_t>(idr2[i])) {
+                fail_child(35);
+            }
+        }
+        if (runtime_connects.load() != 1) { fail_child(36); }
+
+        // Closing the supervisor side of the handoff channel cleanly ends the
+        // managed wired worker with exit code 0.
+        ::close(handoff_parent);
+        receiver.join();
+        admission_link_state.reset();
+        broker.release_connection(&video_server.value());
+        video_server.value().close();
+        input_server.value().close();
+        std::filesystem::remove_all(root);
+        ::_exit(receiver_code == 0 ? 0 : (40 + receiver_code));
+    }
+
+    std::string child_env = "AA_TEST_MANAGED_WIRED_CHILD=1";
+    std::vector<char *> environment;
+    for (char **entry = ::environ; *entry != nullptr; ++entry) {
+        environment.push_back(*entry);
+    }
+    environment.push_back(child_env.data());
+    environment.push_back(nullptr);
+    std::string executable = "/proc/self/exe";
+    std::string filter =
+        "--gtest_filter=WiredReceiver.ManagedWiredEntryPointDeliversFragmentedIdrAndSurvivesInPlaceReplacement";
+    std::string repeat = "--gtest_repeat=1";
+    char *child_argv[]{executable.data(), filter.data(), repeat.data(), nullptr};
+    std::fflush(nullptr);
+    const pid_t child = ::fork();
+    ASSERT_GE(child, 0);
+    if (child == 0) {
+        const int devnull = ::open("/dev/null", O_WRONLY);
+        if (devnull >= 0) {
+            (void)::dup2(devnull, STDOUT_FILENO);
+            ::close(devnull);
+        }
+        ::execve(executable.c_str(), child_argv, environment.data());
+        ::_exit(91);
+    }
+
+    int status = 0;
+    const auto deadline = LogClock::now() + std::chrono::seconds{15};
+    bool reaped = false;
+    while (LogClock::now() < deadline) {
+        const pid_t w = ::waitpid(child, &status, WNOHANG);
+        if (w == child) {
+            reaped = true;
+            break;
+        }
+        if (w < 0 && errno != EINTR) { break; }
+        std::this_thread::sleep_for(std::chrono::milliseconds{10});
+    }
+    if (!reaped) {
+        (void)::kill(child, SIGKILL);
+        while (::waitpid(child, &status, 0) < 0 && errno == EINTR) {}
+        FAIL() << "ManagedWiredEntryPoint child timed out";
+    }
+    ASSERT_TRUE(WIFEXITED(status)) << "child terminated abnormally, status=" << status;
+    EXPECT_EQ(WEXITSTATUS(status), 0) << "child failed at checkpoint " << WEXITSTATUS(status);
 }

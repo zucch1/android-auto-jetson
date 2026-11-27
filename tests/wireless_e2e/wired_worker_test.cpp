@@ -7,10 +7,13 @@
 #include <aa/ipc/VideoChannel.hpp>
 
 #include <array>
+#include <atomic>
 #include <cerrno>
+#include <chrono>
 #include <cstdlib>
 #include <fcntl.h>
 #include <gtest/gtest.h>
+#include <poll.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <thread>
@@ -44,13 +47,61 @@ std::vector<std::byte> to_bytes(std::initializer_list<std::uint8_t> values) {
 }
 
 aa::core::Result<aa::ipc::ReceiveStatus> receive_complete(aa::ipc::VideoConsumer& consumer,
-                                                          int max_steps = 16) {
+                                                          int max_steps = 64) {
     for (int i = 0; i < max_steps; ++i) {
         auto step = consumer.receive(aa::core::Milliseconds{2000});
         if (!step) return step;
         if (step.value() == aa::ipc::ReceiveStatus::complete) return step;
     }
     return aa::Error{aa::ErrorCode::timeout};
+}
+
+// Bounded helper that connects a VideoConsumer while polling ManagedVideoBroker.
+// Exits promptly with the connector's error if admission fails instead of spinning.
+aa::core::Result<aa::ipc::VideoConsumer> connect_broker_consumer(
+    const aa::ipc::VideoSocketPath& video_path, aa::ipc::VideoServer& server,
+    wr::ManagedVideoBroker& broker,
+    aa::ipc::NegotiatedLimits client_limits = {},
+    std::chrono::milliseconds limit = 5s) {
+    const auto before = broker.generation();
+    aa::core::Result<aa::ipc::VideoConsumer> consumer{aa::Error{aa::ErrorCode::timeout}};
+    std::atomic<bool> connector_done{false};
+    std::thread connector([&] {
+        consumer = aa::ipc::connect_video_consumer(
+            video_path, {client_limits, aa::ipc::current_uid(), aa::core::Milliseconds{2000}});
+        connector_done.store(true, std::memory_order_release);
+    });
+    const auto deadline = std::chrono::steady_clock::now() + limit;
+    while (broker.generation() == before && !connector_done.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < deadline) {
+        if (!broker.has_pending_handshake(server)) {
+            pollfd pfd{server.native_handle(), POLLIN, 0};
+            (void)::poll(&pfd, 1, 20);
+        } else {
+            std::this_thread::yield();
+        }
+        (void)broker.poll(server);
+    }
+    if (broker.generation() == before) {
+        (void)broker.poll(server);
+    }
+    connector.join();
+    if (!consumer) return consumer;
+    if (broker.generation() == before) return aa::Error{aa::ErrorCode::timeout};
+    return consumer;
+}
+
+std::vector<std::byte> make_fragmented_idr(std::size_t total_bytes, std::uint8_t seed) {
+    std::vector<std::byte> out(total_bytes);
+    out[0] = std::byte{0x00};
+    out[1] = std::byte{0x00};
+    out[2] = std::byte{0x00};
+    out[3] = std::byte{0x01};
+    out[4] = std::byte{0x65};
+    for (std::size_t i = 5; i < total_bytes; ++i) {
+        out[i] = static_cast<std::byte>((i * 31U + seed) & 0xFFU);
+    }
+    return out;
 }
 
 TEST(ManagedWiredWorker, FindsApprovedSerialOnAnotherPortAndRemembersAccessoryLocation) {
@@ -111,22 +162,27 @@ TEST(ManagedWiredWorker, StopReapsWorkerAndKeepsTheTwoSupervisorListeners) {
 
     const auto worker_script = scratch.path / "fake-receiver";
     const auto ready_fifo = scratch.path / "ready";
-    const auto wait_fifo = scratch.path / "wait";
     ASSERT_EQ(::mkfifo(ready_fifo.c_str(), 0600), 0);
-    ASSERT_EQ(::mkfifo(wait_fifo.c_str(), 0600), 0);
     // Open reader side nonblocking before spawn so writer never deadlocks on startup.
     const int ready_rd = ::open(ready_fifo.c_str(), O_RDONLY | O_NONBLOCK | O_CLOEXEC);
     ASSERT_GE(ready_rd, 0);
     {
+        // Use a backgrounded sleep + `wait` (POSIX-interruptible by trapped
+        // SIGTERM, unlike `read -t` which defers traps in bash 5.2) and a
+        // builtin redirect in the trap so SIGTERM writes the marker without
+        // spawning an external binary under CI load.
         std::ofstream fixture{worker_script};
         fixture << "#!/bin/bash\n"
                    "set -eu\n"
                    "[[ -S /proc/self/fd/3 && -S /proc/self/fd/4 ]]\n"
                    "dir=${0%/*}\n"
-                   "trap 'touch \"$dir/stopped\"; exit 0' TERM\n"
+                   "sleeper=''\n"
+                   "trap 'printf stopped > \"$dir/stopped\"; "
+                   "[[ -n \"$sleeper\" ]] && kill \"$sleeper\" 2>/dev/null || true; exit 0' TERM\n"
+                   "sleep 5 &\n"
+                   "sleeper=$!\n"
                    "printf 'ready\\n' > \"$dir/ready\"\n"
-                   "exec 5<>\"$dir/wait\"\n"
-                   "read -r -t 5 -u 5\n";
+                   "wait \"$sleeper\" || true\n";
         ASSERT_TRUE(fixture);
     }
     ASSERT_EQ(::chmod(worker_script.c_str(), 0700), 0);
@@ -134,18 +190,43 @@ TEST(ManagedWiredWorker, StopReapsWorkerAndKeepsTheTwoSupervisorListeners) {
     wr::WiredWorker worker;
     ASSERT_TRUE(worker.start(worker_script, {{17}, "1-2.3"}, scratch.path / "store",
                              input.value().native_handle()));
-    // Synchronize on the ready FIFO via poll (no timed sleep loop).
-    pollfd pfd{ready_rd, POLLIN, 0};
-    int poll_rc;
-    do {
-        poll_rc = ::poll(&pfd, 1, 5000);
-    } while (poll_rc < 0 && errno == EINTR);
-    ASSERT_GT(poll_rc, 0);
+    // Synchronize on the ready FIFO via poll and drain the readiness line
+    // before signalling SIGTERM.
+    {
+        std::array<char, 32> buf{};
+        std::string ready_msg;
+        const auto deadline = std::chrono::steady_clock::now() + 5s;
+        while (ready_msg.find("ready\n") == std::string::npos) {
+            const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
+                deadline - std::chrono::steady_clock::now());
+            ASSERT_GT(left.count(), 0) << "worker fixture never signalled ready";
+            pollfd pfd{ready_rd, POLLIN, 0};
+            int poll_rc;
+            do {
+                poll_rc = ::poll(&pfd, 1, static_cast<int>(left.count()));
+            } while (poll_rc < 0 && errno == EINTR);
+            ASSERT_GT(poll_rc, 0);
+            const ssize_t n = ::read(ready_rd, buf.data(), buf.size());
+            if (n > 0) {
+                ready_msg.append(buf.data(), static_cast<std::size_t>(n));
+            } else if (n == 0) {
+                break;
+            }
+        }
+        ASSERT_NE(ready_msg.find("ready\n"), std::string::npos);
+    }
     ::close(ready_rd);
 
+    const auto stop_started = std::chrono::steady_clock::now();
     worker.stop();
+    const auto stop_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - stop_started);
     EXPECT_FALSE(worker.running());
-    EXPECT_TRUE(std::filesystem::exists(scratch.path / "stopped"));
+    EXPECT_TRUE(std::filesystem::exists(scratch.path / "stopped"))
+        << "worker did not run SIGTERM trap before reap (stop took " << stop_elapsed.count()
+        << " ms)";
+    EXPECT_LT(stop_elapsed.count(), 700)
+        << "worker.stop() appears to have fallen through to SIGKILL";
     auto inherited_video = aa::ipc::VideoServer::adopt_listener(
         ::dup(video.value().native_handle()), {{}, aa::ipc::current_uid()});
     auto inherited_input = aa::ipc::InputServer::adopt_listener(
@@ -208,19 +289,7 @@ TEST(ManagedWiredWorker, LateClientConnectSurvivesFailedFirstWorkerAndReceivesFr
 
     // Display connects AFTER worker 1 is already running. The supervisor (not
     // the worker) accepts the consumer and hands it off over fd 3.
-    aa::core::Result<aa::ipc::VideoConsumer> consumer{aa::Error{aa::ErrorCode::timeout}};
-    std::thread connector([&] {
-        consumer = aa::ipc::connect_video_consumer(
-            {video_path.string()}, {{}, aa::ipc::current_uid(), aa::core::Milliseconds{2000}});
-    });
-    while (!broker.has_connection()) {
-        pollfd pfd{video.value().native_handle(), POLLIN, 0};
-        if (!broker.has_pending_handshake(video.value())) {
-            (void)::poll(&pfd, 1, 500);
-        }
-        (void)broker.poll(video.value());
-    }
-    connector.join();
+    auto consumer = connect_broker_consumer({video_path.string()}, video.value(), broker);
     ASSERT_TRUE(consumer);
     ASSERT_TRUE(worker1.send_video_client(broker.client_fd(), broker.state_fd(), broker.limits()));
 
@@ -293,19 +362,7 @@ TEST(ManagedWiredWorker, ShortStreamingWorkerHandsOffMonotonicIdsToReplacementCh
     ASSERT_TRUE(video);
     wr::ManagedVideoBroker broker;
 
-    aa::core::Result<aa::ipc::VideoConsumer> consumer{aa::Error{aa::ErrorCode::timeout}};
-    std::thread connector([&] {
-        consumer = aa::ipc::connect_video_consumer(
-            {video_path.string()}, {{}, aa::ipc::current_uid(), aa::core::Milliseconds{2000}});
-    });
-    while (!broker.has_connection()) {
-        pollfd pfd{video.value().native_handle(), POLLIN, 0};
-        if (!broker.has_pending_handshake(video.value())) {
-            (void)::poll(&pfd, 1, 500);
-        }
-        (void)broker.poll(video.value());
-    }
-    connector.join();
+    auto consumer = connect_broker_consumer({video_path.string()}, video.value(), broker);
     ASSERT_TRUE(consumer);
 
     // Child process 1 sends a real IDR + delta through VideoOutlet and exits
@@ -364,6 +421,122 @@ TEST(ManagedWiredWorker, ShortStreamingWorkerHandsOffMonotonicIdsToReplacementCh
     EXPECT_GT(consumer.value().access_unit().sequence, seq2);
     EXPECT_EQ(consumer.value().access_unit().payload.back(), 0x22U);
     EXPECT_EQ(consumer.value().rejected(), 0U);
+}
+
+TEST(ManagedWiredWorker, ChildHandoffPreservesUnequalLimitsAndDeliversFragmentedIdr) {
+    Scratch scratch;
+    ASSERT_FALSE(scratch.path.empty());
+    const auto video_path = scratch.path / "video.sock";
+    auto video = aa::ipc::VideoServer::listen({video_path.string()}, {{}, aa::ipc::current_uid()});
+    ASSERT_TRUE(video);
+    wr::ManagedVideoBroker broker;
+
+    // Negotiate explicitly unequal limits (4 KiB datagram, 128 KiB AU, 192 KiB
+    // socket budget) and send a 32 KiB IDR (8+ fragments) through a real child
+    // SCM_RIGHTS handoff to catch any datagram/AU field swap.
+    aa::ipc::NegotiatedLimits custom{};
+    custom.max_datagram_payload = 4096U;
+    custom.max_access_unit_bytes = 128U * 1024U;
+    custom.socket_budget_bytes = 192U * 1024U;
+    auto consumer = connect_broker_consumer({video_path.string()}, video.value(), broker, custom);
+    ASSERT_TRUE(consumer);
+    ASSERT_EQ(broker.limits(), custom);
+
+    constexpr std::size_t kIdrBytes = 32U * 1024U + 137U;
+    const auto expected_idr = make_fragmented_idr(kIdrBytes, 0x3AU);
+
+    int handoff[2]{-1, -1};
+    ASSERT_EQ(::socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, handoff), 0);
+    ASSERT_TRUE(aa::tools::send_video_handoff_install(
+        handoff[0], broker.client_fd(), broker.state_fd(), broker.limits()));
+
+    const pid_t child = ::fork();
+    ASSERT_GE(child, 0);
+    if (child == 0) {
+        ::close(handoff[0]);
+        auto event = aa::tools::receive_video_handoff(handoff[1], aa::core::Milliseconds{2000});
+        if (!event.has_value() || event.value().kind != aa::tools::VideoHandoffKind::install ||
+            !event.value().producer.has_value()) {
+            ::_exit(10);
+        }
+        if (event.value().producer->limits() != custom) {
+            ::_exit(11);
+        }
+        wired_rx::VideoOutlet outlet{[](const std::string&) {}};
+        outlet.install(std::move(*event.value().producer));
+        aa::protocol::MessageHeader hdr{};
+        hdr.timestamp = aa::core::Nanoseconds{1'000'000};
+        if (!outlet.on_message({hdr, expected_idr}).has_value()) {
+            ::_exit(12);
+        }
+        outlet.close();
+        ::close(handoff[1]);
+        ::_exit(0);
+    }
+    ::close(handoff[1]);
+    int status = 0;
+    while (::waitpid(child, &status, 0) < 0 && errno == EINTR) {}
+    ::close(handoff[0]);
+    ASSERT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0) << "child status=" << status;
+
+    const auto rx = receive_complete(consumer.value());
+    ASSERT_TRUE(rx);
+    ASSERT_EQ(consumer.value().access_unit().payload.size(), expected_idr.size());
+    for (std::size_t i = 0; i < expected_idr.size(); ++i) {
+        ASSERT_EQ(consumer.value().access_unit().payload[i],
+                  std::to_integer<std::uint8_t>(expected_idr[i]))
+            << "mismatch at byte " << i;
+    }
+    EXPECT_EQ(consumer.value().rejected(), 0U);
+
+    // Also verify default limits (16 KiB datagram, 4 MiB AU) deliver a 32 KiB+
+    // fragmented IDR through handoff without swapping the two caps.
+    auto default_consumer =
+        connect_broker_consumer({video_path.string()}, video.value(), broker);
+    ASSERT_TRUE(default_consumer);
+    ASSERT_EQ(broker.limits(), aa::ipc::NegotiatedLimits{});
+    ASSERT_EQ(::socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, handoff), 0);
+    ASSERT_TRUE(aa::tools::send_video_handoff_install(
+        handoff[0], broker.client_fd(), broker.state_fd(), broker.limits()));
+    const pid_t child2 = ::fork();
+    ASSERT_GE(child2, 0);
+    if (child2 == 0) {
+        ::close(handoff[0]);
+        auto event = aa::tools::receive_video_handoff(handoff[1], aa::core::Milliseconds{2000});
+        if (!event.has_value() || !event.value().producer.has_value() ||
+            event.value().producer->limits() != aa::ipc::NegotiatedLimits{}) {
+            ::_exit(20);
+        }
+        wired_rx::VideoOutlet outlet{[](const std::string&) {}};
+        outlet.install(std::move(*event.value().producer));
+        aa::protocol::MessageHeader hdr{};
+        hdr.timestamp = aa::core::Nanoseconds{2'000'000};
+        if (!outlet.on_message({hdr, expected_idr}).has_value()) {
+            ::_exit(21);
+        }
+        outlet.close();
+        ::close(handoff[1]);
+        ::_exit(0);
+    }
+    ::close(handoff[1]);
+    status = 0;
+    while (::waitpid(child2, &status, 0) < 0 && errno == EINTR) {}
+    ::close(handoff[0]);
+    ASSERT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0) << "child2 status=" << status;
+
+    ASSERT_TRUE(receive_complete(default_consumer.value()));
+    EXPECT_EQ(default_consumer.value().access_unit().payload.size(), expected_idr.size());
+    EXPECT_EQ(default_consumer.value().rejected(), 0U);
+
+    // Sender and receiver reject invalid/swapped limits.
+    aa::ipc::NegotiatedLimits swapped{};
+    swapped.max_datagram_payload = static_cast<std::uint32_t>(aa::ipc::kMaxAccessUnitBytes);
+    swapped.max_access_unit_bytes = static_cast<std::uint32_t>(aa::ipc::kMaxDatagramPayload);
+    ASSERT_EQ(::socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, handoff), 0);
+    EXPECT_FALSE(aa::tools::send_video_handoff_install(
+        handoff[0], broker.client_fd(), broker.state_fd(), swapped));
+    ::close(handoff[0]);
+    ::close(handoff[1]);
 }
 
 } // namespace

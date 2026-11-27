@@ -199,6 +199,9 @@ core::Result<void> ControlService::start_projection(const BusName& caller) {
                                 (!projection_policy_->wired && !projection_policy_->wireless)))) {
         return Error{ErrorCode::session_illegal_transition};
     }
+    if (projection_policy_ && projection_policy_->before_start_projection) {
+        projection_policy_->before_start_projection();
+    }
     projection_ = ProjectionState::projecting;
     events_.emit(StateChanged{ProjectionState::projecting, active.value().consumer});
     events_.emit(DiagnosticEmitted{DiagnosticSeverity::info, "projection_started",
