@@ -206,6 +206,26 @@ core::Result<State> BusClient::reconnect(const trust::TransportIdentity& identit
     if (result.value() != static_cast<std::uint64_t>(State::active)) return Error{ErrorCode::helper_rejected};
     return State::active;
 }
+core::Result<trust::TransportIdentity> BusClient::reconnect_observed() {
+    const auto until = Clock::now() + std::chrono::milliseconds(1000);
+    // Runs on the store owner thread, so the approvals can be read here.
+    const auto approved = approved_bonds(impl_->store);
+    if (approved.empty()) return Error{ErrorCode::trust_unknown_phone};
+    std::unique_lock lock{impl_->mutex, std::defer_lock};
+    if (!lock.try_lock_until(until) || Clock::now() >= until) return Error{ErrorCode::timeout};
+    if (const auto reconciled = impl_->reconcile(approved, false, until); !reconciled) return reconciled.error();
+    const auto peer = impl_->observe(until);
+    if (!peer) return peer.error();
+    const trust::TransportIdentity observed{trust::WirelessIdentity{peer.value().identity.address, peer.value().identity.adapter}};
+    const auto key = trust::validated_key(observed);
+    if (!key || impl_->store.lookup(trust::PhoneIdentity{key.value()}) != trust::Decision::approved)
+        return Error{ErrorCode::trust_unknown_phone};
+    MessageWriter writer; writer.put_u64(peer.value().handle);
+    const auto result = impl_->rpc("ReconnectPeerV1", "t", writer, until);
+    if (!result) return result.error();
+    if (result.value() != static_cast<std::uint64_t>(State::active)) return Error{ErrorCode::helper_rejected};
+    return observed;
+}
 core::Result<std::optional<PeerIdentity>> BusClient::prepare(core::ConsumerId generation, core::PairingRequestId source) {
     const auto until = Clock::now() + std::chrono::milliseconds(1000);
     std::unique_lock lock{impl_->mutex, std::defer_lock};

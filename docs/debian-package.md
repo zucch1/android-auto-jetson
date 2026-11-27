@@ -75,8 +75,8 @@ Once enabled, the receiver starts with the systemd user manager's
 provisioned system helper. It runs without a display. An SSH or other
 non-graphical login can start the user manager, and enabling linger starts it
 at boot and keeps it running after logout. The packaged pairing-only command
-serves enrolment and control without starting an AP or projection. A wireless
-projection override waits for a consumer before starting either.
+serves enrolment and control. The registered consumer can switch to
+projection-ready and start wired or wireless projection over the session bus.
 
 Package configuration checks that the shipped default-deny helper policy
 is present and reloads udev so the packaged USB rule applies without a reboot.
@@ -99,14 +99,16 @@ covers the session UID, receiver executable digest, and per-user D-Bus
 permission. [NetworkManager AP setup](networkmanager-ap.md) and
 [TLS credential handling](tls-credentials.md) cover operator-owned
 configuration. Calculate the helper digest from the **installed** receiver
-after each upgrade or rollback. A per-user systemd drop-in can replace
-`ExecStart` with the intended receiver CLI and its arguments once provisioning
-is complete. In the same drop-in, set the operator-owned PEM path under
-`[Service]`, for example `Environment=HU_KEY_PATH=%h/.config/android-auto-receiver/hu.pem`.
-The user manager then supplies the path on Xfce, SSH and linger starts without
-relying on shell login scripts. The historical standalone USB-policy installer may have left a
-rule under `/etc/udev/rules.d` with the same name. Check that override during
-deployment because udev gives it precedence over the packaged rule.
+after each upgrade or rollback. The packaged command accepts runtime mode
+changes through the [integration contract](INTEGRATION-CONTRACT.md); a per-user
+systemd drop-in can still replace `ExecStart` with custom receiver arguments if
+needed. In a per-user systemd drop-in, set the operator-owned PEM path under
+`[Service]`, for example
+`Environment=HU_KEY_PATH=%h/.config/android-auto-receiver/hu.pem`. The user
+manager then supplies the path on Xfce, SSH and linger starts without relying on
+shell login scripts. The historical standalone USB-policy installer may have
+left a rule under `/etc/udev/rules.d` with the same name. Check that override
+during deployment because udev gives it precedence over the packaged rule.
 
 Jetson install, upgrade, and rollback are documented in [deploy.md](deploy.md)
 (tracked in [#190](https://github.com/zucch1/android-auto-jetson/issues/190)).

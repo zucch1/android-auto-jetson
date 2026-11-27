@@ -471,7 +471,7 @@ TEST(BusBoundary, PropertiesGetUsesVariantWireEncoding) {
     ASSERT_EQ(reply.value().type, bus::MessageType::method_return);
     ASSERT_EQ(reply.value().signature, "v");
     const std::vector<std::uint8_t> expected{0x01, 0x73, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00,
-                                             0x31, 0x2e, 0x32, 0x2e, 0x30, 0x00};
+                                             0x31, 0x2e, 0x33, 0x2e, 0x30, 0x00};
     EXPECT_EQ(reply.value().body, expected);
     bus::Cursor cursor(reply.value().body);
     const auto contained = cursor.read_signature();
@@ -479,7 +479,7 @@ TEST(BusBoundary, PropertiesGetUsesVariantWireEncoding) {
     ASSERT_TRUE(contained.has_value());
     EXPECT_EQ(contained.value(), "s");
     ASSERT_TRUE(value.has_value());
-    EXPECT_EQ(value.value(), "1.2.0");
+    EXPECT_EQ(value.value(), "1.3.0");
     EXPECT_TRUE(cursor.done());
 }
 
@@ -503,7 +503,7 @@ TEST(BusBoundary, PropertiesGetAllUsesVariantDictionaryEncoding) {
     const std::vector<std::uint8_t> expected{
         0x22, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0e, 0x00, 0x00, 0x00, 0x43,
         0x6f, 0x6e, 0x74, 0x72, 0x61, 0x63, 0x74, 0x53, 0x65, 0x6d, 0x56, 0x65, 0x72,
-        0x00, 0x01, 0x73, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00, 0x31, 0x2e, 0x32,
+        0x00, 0x01, 0x73, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00, 0x31, 0x2e, 0x33,
         0x2e, 0x30, 0x00};
     EXPECT_EQ(reply.value().body, expected);
     bus::Cursor cursor(reply.value().body);
@@ -521,7 +521,7 @@ TEST(BusBoundary, PropertiesGetAllUsesVariantDictionaryEncoding) {
     EXPECT_EQ(contained.value(), "s");
     const auto value = cursor.read_string();
     ASSERT_TRUE(value.has_value());
-    EXPECT_EQ(value.value(), "1.2.0");
+    EXPECT_EQ(value.value(), "1.3.0");
     EXPECT_TRUE(cursor.done());
 }
 
@@ -544,7 +544,7 @@ TEST(BusBoundary, PropertiesSetReturnsPropertyReadOnly) {
     ASSERT_TRUE(reply.has_value());
     EXPECT_EQ(reply.value().type, bus::MessageType::error_reply);
     EXPECT_EQ(reply.value().error_name, "org.freedesktop.DBus.Error.PropertyReadOnly");
-    EXPECT_EQ(bus_state.service->capabilities().at("contract.semver"), "1.2.0");
+    EXPECT_EQ(bus_state.service->capabilities().at("contract.semver"), "1.3.0");
 }
 
 TEST(BusBoundary, OversizeCallIsDrainedAndTheNextCallSurvives) {
@@ -652,6 +652,47 @@ TEST(BusBoundary, DropDiagnosticsAggregateAtMostOncePerInterval) {
     EXPECT_EQ(throttle.record(start + std::chrono::seconds(100)), 1U);
 }
 
+TEST(BusBoundary, RuntimeProjectionControlsRoundTripOverRealSessionBus) {
+    aa::ipc::test::SequencePairingIds ids;
+    aa::ipc::test::RecordingPhoneDirectory phones;
+    aa::ipc::ProjectionPolicy policy{};
+    auto service = aa::ipc::ControlBusService::start(
+        {static_cast<std::uint32_t>(::getuid())}, {ids, phones, nullptr, {}, &policy});
+    ASSERT_TRUE(service);
+    std::jthread server_thread([&](std::stop_token stop) {
+        while (!stop.stop_requested() && service.value().cycle(aa::core::Milliseconds{10})) {}
+    });
+    auto client = aa::ipc::ControlBusClient::connect();
+    ASSERT_TRUE(client);
+    auto caps = client.value().get_capabilities();
+    ASSERT_TRUE(caps);
+    EXPECT_EQ(caps.value().at("transport.control"), "true");
+    EXPECT_FALSE(client.value().set_projection_mode("projection_ready"));
+
+    const auto registered = client.value().register_consumer(BusName{kConsumerName});
+    ASSERT_TRUE(registered);
+    ASSERT_TRUE(client.value().set_transport_enabled("wired", false));
+    ASSERT_TRUE(client.value().set_projection_mode("projection_ready"));
+    ASSERT_TRUE(client.value().start_projection());
+
+    auto standby = aa::ipc::ControlBusClient::connect();
+    ASSERT_TRUE(standby);
+    const auto denied = standby.value().set_transport_enabled("wireless", false);
+    ASSERT_FALSE(denied);
+    EXPECT_EQ(denied.error().code(), ErrorCode::ipc_peer_unauthorized);
+
+    ASSERT_TRUE(client.value().set_transport_enabled("wireless", false));
+    const auto state = client.value().get_state();
+    ASSERT_TRUE(state);
+    EXPECT_EQ(state.value().consumer, registered.value());
+    EXPECT_EQ(state.value().projection, aa::ipc::ProjectionState::stopped);
+    caps = client.value().get_capabilities();
+    ASSERT_TRUE(caps);
+    EXPECT_EQ(caps.value().at("projection.mode.current"), "projection_ready");
+    EXPECT_EQ(caps.value().at("transport.wired.enabled"), "false");
+    EXPECT_EQ(caps.value().at("transport.wireless.enabled"), "false");
+}
+
 TEST(BusBoundary, ListPhonesAndPairingOutcomeRoundTripOverRealSessionBus) {
     aa::ipc::test::SequencePairingIds ids;
     aa::ipc::test::RecordingPhoneDirectory phones;
@@ -683,7 +724,7 @@ TEST(BusBoundary, ListPhonesAndPairingOutcomeRoundTripOverRealSessionBus) {
 
     const auto caps = client.value().get_capabilities();
     ASSERT_TRUE(caps.has_value());
-    EXPECT_EQ(caps.value().at("contract.semver"), "1.2.0");
+    EXPECT_EQ(caps.value().at("contract.semver"), "1.3.0");
     EXPECT_EQ(caps.value().at("phones.list"), "true");
     EXPECT_EQ(caps.value().at("pairing.outcomes"), "true");
 

@@ -443,7 +443,7 @@ TEST(CallBoundary, PropertiesGetReturnsStringVariant) {
     ASSERT_TRUE(reply.has_value());
     ASSERT_FALSE(reply->is_error);
     ASSERT_TRUE(std::holds_alternative<aa::ipc::StringPropertyValue>(reply->body));
-    EXPECT_EQ(std::get<aa::ipc::StringPropertyValue>(reply->body).value, "1.2.0");
+    EXPECT_EQ(std::get<aa::ipc::StringPropertyValue>(reply->body).value, "1.3.0");
     EXPECT_EQ(fixture.service.state().consumer, aa::core::ConsumerId{});
 }
 
@@ -470,7 +470,7 @@ TEST(CallBoundary, PropertiesGetAllReturnsContractMetadata) {
         ASSERT_TRUE(std::holds_alternative<aa::ipc::PropertyDictionary>((*reply)->body));
         const auto& dictionary = std::get<aa::ipc::PropertyDictionary>((*reply)->body);
         ASSERT_EQ(dictionary.entries.size(), 1U);
-        EXPECT_EQ(dictionary.entries.at("ContractSemVer"), "1.2.0");
+        EXPECT_EQ(dictionary.entries.at("ContractSemVer"), "1.3.0");
     }
 }
 
@@ -492,7 +492,7 @@ TEST(CallBoundary, PropertiesSetRejectsReadOnlyProperty) {
     ASSERT_TRUE(reply.has_value());
     EXPECT_TRUE(reply->is_error);
     EXPECT_EQ(reply->error_name, "org.freedesktop.DBus.Error.PropertyReadOnly");
-    EXPECT_EQ(aa::ipc::contract_semver(), "1.2.0");
+    EXPECT_EQ(aa::ipc::contract_semver(), "1.3.0");
 }
 
 TEST(CallBoundary, PropertiesRejectInvalidArguments) {
@@ -630,6 +630,21 @@ TEST(CallBoundary, DispatchesRequestIdrRecoveryAndPingDistinctly) {
     ASSERT_TRUE(while_projecting.has_value());
     EXPECT_FALSE(while_projecting->is_error);
     EXPECT_TRUE(fixture.service.consume_idr_recovery_request());
+}
+
+TEST(CallBoundary, RejectsMalformedRuntimeProjectionArguments) {
+    BoundaryFixture fixture;
+    auto invalid_bool = marshal_string("wired");
+    pad_to(invalid_bool, 4);
+    append_u32(invalid_bool, 2);
+    const auto transport = fixture.dispatcher.handle(
+        call_from(":1.70", "SetTransportEnabled", "sb", invalid_bool));
+    ASSERT_TRUE(transport);
+    EXPECT_EQ(transport->error_name, "org.freedesktop.DBus.Error.InvalidArgs");
+    const auto mode = fixture.dispatcher.handle(
+        call_from(":1.70", "SetProjectionMode", "s", {}));
+    ASSERT_TRUE(mode);
+    EXPECT_EQ(mode->error_name, "org.freedesktop.DBus.Error.InvalidArgs");
 }
 
 TEST(CallBoundary, DispatchesListPhonesAndGetPairingOutcomeWithAuthorization) {

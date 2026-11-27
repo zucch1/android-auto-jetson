@@ -1320,6 +1320,8 @@ std::atomic<bool> runtime_open_wait_cancelled{false};
 std::chrono::milliseconds runtime_reenumeration_delay{0};
 std::chrono::steady_clock::time_point runtime_link_lost_at;
 bool runtime_quiet = false;
+// Every open attempt gets a fresh link (resumed sessions, #240 review P2-1).
+bool runtime_links_every_attempt = false;
 std::atomic<bool> runtime_waiting{false};
 std::atomic<bool> runtime_closed{false};
 std::mutex runtime_owner_mutex;
@@ -1772,7 +1774,7 @@ runtime_open_link(const aa::transport::UsbDeviceSelector &selector,
         runtime_open_wait_cancelled.store(cancelled);
         return aa::Error{cancelled ? aa::ErrorCode::cancelled : aa::ErrorCode::timeout};
     }
-    if (attempt == 1 ||
+    if (attempt == 1 || runtime_links_every_attempt ||
         (runtime_recovers && attempt >= 4 &&
          std::chrono::steady_clock::now() - runtime_link_lost_at >= runtime_reenumeration_delay)) {
         const auto &phone = attempt >= 4 && !runtime_reconnect_phone.key.empty()
@@ -10037,6 +10039,146 @@ TEST(WiredReceiver, DbusIdrPartialFocusRestoreFailureExitsImmediatelyWithoutLate
     EXPECT_NE(run.output.find("\"to_state\":\"failed\""), std::string::npos) << run.output;
     EXPECT_NE(run.output.find("\"error_code\":406"), std::string::npos) << run.output;
     EXPECT_EQ(run.output.find("\"to_state\":\"reconnecting\""), std::string::npos) << run.output;
+}
+
+// #240 review P2-1 / P3-4: a consumer stop ends the standalone wired session
+// but keeps the bus and the registration; StartProjection opens a new session.
+TEST(WiredReceiver, ConsumerStopEndsSessionAndStartProjectionResumes) {
+    namespace bus = aa::ipc::dbus_adapter;
+    char directory[] = "/tmp/wired-resume-XXXXXX";
+    const std::filesystem::path root{::mkdtemp(directory)};
+    const auto path = root / "approved.json";
+    aa::trust::ApprovedPhoneStore initial{path};
+    ASSERT_TRUE(initial.load().has_value());
+    const aa::trust::WiredIdentity identity{
+        "04e8", "6860", "SYNTHETIC", "TEST", "TEST", "SYNTHETIC", "1-2.1"};
+    ASSERT_TRUE(initial.approve(aa::trust::TransportIdentity{identity}).has_value());
+    runtime_phone = aa::app::wired_phone_identity(identity).value();
+    runtime_quiet = true;
+    runtime_links_every_attempt = true;
+    runtime_recovers = false;
+    runtime_connects.store(0);
+    runtime_ciphers.store(0);
+    runtime_waiting.store(false);
+    runtime_closed.store(false);
+    g_shutdown.store(false);
+    g_running.store(true);
+    std::vector<std::string> args{"receiver", "--port", "1-2.1", "--store", path.string(),
+        "--video-socket", (root / "video").string(), "--input-socket", (root / "input").string(),
+        "--duration-ms", "20000"};
+    std::vector<char *> argv;
+    for (auto &arg : args) { argv.push_back(arg.data()); }
+
+    capture_receiver_stdout();
+    int code = -1;
+    std::thread receiver([&] { code = wired_receiver_main(static_cast<int>(argv.size()), argv.data()); });
+    std::atomic<bool> watchdog_fired{false};
+    std::jthread watchdog([&](const std::stop_token &stop) {
+        std::mutex mutex;
+        std::condition_variable_any cv;
+        std::unique_lock lock(mutex);
+        cv.wait_for(lock, stop, std::chrono::seconds{15}, [] { return false; });
+        if (!stop.stop_requested()) {
+            watchdog_fired.store(true);
+            g_shutdown.store(true);
+            g_running.store(false);
+        }
+    });
+    const auto wait_for = [](const std::function<bool()> &done) {
+        const auto until = std::chrono::steady_clock::now() + std::chrono::seconds{4};
+        while (!done() && std::chrono::steady_clock::now() < until) {
+            std::this_thread::sleep_for(std::chrono::milliseconds{2});
+        }
+        return done();
+    };
+
+    const bool first_session = wait_for([] { return runtime_waiting.load(); });
+    bool registered = false, stopped = false, first_closed = false, listed = false;
+    bool owner_kept = false, started = false, second_session = false, second_closed = false;
+    bool restarted = false, third_session = false;
+    std::string state_after_stop;
+    auto client = bus::BusConnection::connect_session();
+    if (client && first_session) {
+        const aa::ipc::BusName consumer{"org.custom.AndroidAutoReceiverTest.Resume"};
+        const aa::ipc::BusName service{"org.custom.AndroidAutoReceiver"};
+        (void)client.value().request_name(consumer);
+        auto owner = client.value().get_name_owner(service);
+        const auto call = [&](const char *member,
+                              const std::function<void(bus::MessageWriter &)> &fill = {})
+            -> std::optional<bus::ParsedMessage> {
+            bus::MessageWriter writer;
+            writer.destination(service.value).path("/org/custom/AndroidAutoReceiver")
+                .interface_name("org.custom.AndroidAutoReceiver1").member(member);
+            if (fill) { fill(writer); }
+            auto serial = client.value().send_message(bus::MessageType::method_call, writer);
+            if (!serial) { return std::nullopt; }
+            auto reply = client.value().await_reply(serial.value(), owner.value());
+            if (!reply || reply.value().type != bus::MessageType::method_return) { return std::nullopt; }
+            return std::move(reply.value());
+        };
+        if (owner) {
+            registered = call("RegisterConsumer", [&](bus::MessageWriter &w) {
+                w.body_signature("s").put_string(consumer.value);
+            }).has_value();
+        }
+        if (registered) {
+            runtime_waiting.store(false);
+            stopped = call("StopProjection").has_value();
+            first_closed = wait_for([] { return runtime_closed.load(); });
+            // The bus, the registration and ListPhones survive between sessions.
+            std::this_thread::sleep_for(std::chrono::milliseconds{100});
+            listed = call("ListPhones").has_value();
+            const auto renewed = client.value().get_name_owner(service);
+            owner_kept = renewed && renewed.value().value == owner.value().value;
+            if (auto state = call("GetState")) {
+                bus::Cursor cursor{state->body};
+                if (auto text = cursor.read_string()) state_after_stop = text.value();
+            }
+            runtime_closed.store(false);
+            started = call("StartProjection").has_value();
+            second_session = wait_for([] {
+                return runtime_waiting.load() && runtime_connects.load() >= 2;
+            });
+            // Unregistering a started projection ends the session too (P3-4).
+            runtime_waiting.store(false);
+            (void)call("UnregisterConsumer");
+            second_closed = wait_for([] { return runtime_closed.load(); });
+            runtime_closed.store(false);
+            restarted = call("RegisterConsumer", [&](bus::MessageWriter &w) {
+                w.body_signature("s").put_string(consumer.value);
+            }).has_value() && call("StartProjection").has_value();
+            third_session = wait_for([] {
+                return runtime_waiting.load() && runtime_connects.load() >= 3;
+            });
+        }
+    }
+    g_shutdown.store(true);
+    g_running.store(false);
+    receiver.join();
+    watchdog.request_stop();
+    watchdog.join();
+    const auto output = captured_receiver_stdout();
+    runtime_links_every_attempt = false;
+    runtime_quiet = false;
+    g_shutdown.store(false);
+    std::filesystem::remove_all(root);
+
+    EXPECT_FALSE(watchdog_fired.load()) << output;
+    EXPECT_TRUE(first_session) << output;
+    EXPECT_TRUE(registered);
+    EXPECT_TRUE(stopped) << output;
+    EXPECT_TRUE(first_closed) << output;
+    EXPECT_TRUE(listed) << output;
+    EXPECT_TRUE(owner_kept);
+    EXPECT_EQ(state_after_stop, "stopped");
+    EXPECT_TRUE(started) << output;
+    EXPECT_TRUE(second_session) << output;
+    EXPECT_TRUE(second_closed) << output;
+    EXPECT_TRUE(restarted) << output;
+    EXPECT_TRUE(third_session) << output;
+    EXPECT_EQ(runtime_connects.load(), 3);
+    EXPECT_EQ(code, 0) << output;
+    EXPECT_NE(output.find("\"state\":\"waiting_for_start\""), std::string::npos) << output;
 }
 
 TEST(WiredReceiver, DbusIdrFirstSendFailureKeepsSessionActiveWithoutTeardown) {

@@ -8,6 +8,7 @@
 #include "fakes.hpp"
 
 #include <cstdint>
+#include <utility>
 
 #include <gtest/gtest.h>
 
@@ -78,10 +79,89 @@ TEST(ControlService, StateCapabilitiesAndPingStayOpenToAnyCaller) {
     EXPECT_EQ(snapshot.projection, ProjectionState::stopped);
     EXPECT_EQ(snapshot.consumer, aa::core::ConsumerId{});
     EXPECT_EQ(caps.at("contract.interface"), aa::ipc::kContractInterface);
-    EXPECT_EQ(caps.at("contract.semver"), "1.2.0");
+    EXPECT_EQ(caps.at("contract.semver"), "1.3.0");
     EXPECT_EQ(caps.at("phones.list"), "true");
     EXPECT_EQ(caps.at("pairing.outcomes"), "true");
     EXPECT_GT(stamp, 0U);
+}
+
+TEST(ControlService, RuntimeProjectionPolicyPreservesRegistrationAndChecksAuthority) {
+    Fixture fixture;
+    bool provisioned = false;
+    aa::ipc::ProjectionPolicy policy{};
+    policy.check_ready = [&]() -> aa::core::Result<void> {
+        if (provisioned) return {};
+        return aa::Error{ErrorCode::session_illegal_transition};
+    };
+    ControlService service{{kSessionUid}, {fixture.credentials, fixture.events, fixture.ids,
+                                          fixture.phones, nullptr, {}, {}, &policy}};
+    const BusName owner{":1.51"};
+    const BusName same_uid{":1.52"};
+    const BusName wrong_uid{":1.53"};
+    const BusName name{"org.custom.ConsumerA"};
+    fixture.credentials.add_connection(owner, kSessionUid);
+    fixture.credentials.add_connection(same_uid, kSessionUid);
+    fixture.credentials.add_connection(wrong_uid, kSessionUid + 1);
+    fixture.credentials.set_owner(name, owner);
+
+    EXPECT_FALSE(fixture.service.capabilities().contains("projection.mode"));
+    EXPECT_EQ(service.capabilities().at("projection.mode.current"), "pairing_only");
+    EXPECT_EQ(service.set_projection_mode(owner, "projection_ready").error().code(),
+              ErrorCode::ipc_consumer_rejected);
+    const auto registered = service.register_consumer(owner, name);
+    ASSERT_TRUE(registered);
+    for (const auto& outsider : {same_uid, wrong_uid}) {
+        EXPECT_EQ(service.set_projection_mode(outsider, "projection_ready").error().code(),
+                  ErrorCode::ipc_peer_unauthorized);
+        EXPECT_EQ(service.set_transport_enabled(outsider, "wired", false).error().code(),
+                  ErrorCode::ipc_peer_unauthorized);
+    }
+    EXPECT_FALSE(service.start_projection(owner));
+    EXPECT_FALSE(service.set_projection_mode(owner, "projection_ready"));
+    EXPECT_FALSE(policy.ready);
+    provisioned = true;
+    ASSERT_TRUE(service.set_projection_mode(owner, "projection_ready"));
+    ASSERT_TRUE(service.set_projection_mode(owner, "projection_ready"));
+    ASSERT_TRUE(service.set_transport_enabled(owner, "wired", false));
+    EXPECT_EQ(service.capabilities().at("transport.wired.enabled"), "false");
+    EXPECT_EQ(service.capabilities().at("transport.wireless.enabled"), "true");
+    ASSERT_TRUE(service.start_projection(owner));
+    policy.active_transport = aa::ipc::ProjectionTransport::wireless;
+
+    ASSERT_TRUE(service.set_transport_enabled(owner, "wired", true));
+    EXPECT_EQ(service.state().projection, ProjectionState::projecting);
+    ASSERT_TRUE(service.set_transport_enabled(owner, "wireless", false));
+    EXPECT_EQ(service.state().projection, ProjectionState::stopped);
+    EXPECT_EQ(service.state().consumer, registered.value());
+
+    ASSERT_TRUE(service.start_projection(owner));
+    ASSERT_TRUE(service.set_projection_mode(owner, "pairing_only"));
+    EXPECT_EQ(service.state().projection, ProjectionState::stopped);
+    EXPECT_EQ(service.state().consumer, registered.value());
+
+    ASSERT_TRUE(service.set_projection_mode(owner, "projection_ready"));
+    ASSERT_TRUE(service.set_transport_enabled(owner, "wired", false));
+    EXPECT_FALSE(service.start_projection(owner));
+}
+
+TEST(ControlService, StopProjectionRetiresStandaloneWiredLinkWithoutPriorStart) {
+    Fixture fixture;
+    bool link_live = true;
+    ControlService service{{kSessionUid}, {fixture.credentials, fixture.events, fixture.ids,
+                                          fixture.phones, nullptr, {}, {}, nullptr,
+                                          [&] { return std::exchange(link_live, false); }}};
+    const BusName owner{":1.61"};
+    const BusName name{"org.custom.ConsumerA"};
+    fixture.credentials.add_connection(owner, kSessionUid);
+    fixture.credentials.set_owner(name, owner);
+
+    EXPECT_FALSE(service.stop_projection(owner));
+    EXPECT_TRUE(link_live);
+    ASSERT_TRUE(service.register_consumer(owner, name));
+    ASSERT_TRUE(service.stop_projection(owner));
+    EXPECT_FALSE(link_live);
+    EXPECT_EQ(service.state().projection, ProjectionState::stopped);
+    EXPECT_FALSE(service.stop_projection(owner));
 }
 
 TEST(ControlService, ProjectionTransitionsEmitStateChangedEvents) {

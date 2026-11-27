@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <poll.h>
+#include <fcntl.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
@@ -468,6 +469,7 @@ struct InputServer::Impl final {
     InputServerOptions options{};
     std::uint64_t unauthorized{};
     bool closed{false};
+    bool inherited{false};
 
     Impl() = default;
     ~Impl() { release(); }
@@ -485,7 +487,7 @@ struct InputServer::Impl final {
             ::close(fd);
             fd = -1;
         }
-        unlink_owned_endpoint(path.value, identity);
+        if (!inherited) unlink_owned_endpoint(path.value, identity);
     }
 };
 
@@ -524,6 +526,25 @@ core::Result<InputServer> InputServer::listen(const InputSocketPath& path,
     impl->path = path;
     impl->identity = bound.value();
     impl->options = options;
+    return InputServer{std::move(impl)};
+}
+
+core::Result<InputServer> InputServer::adopt_listener(int fd, const InputServerOptions& options) {
+    int accepting{}, type{};
+    sockaddr_un address{};
+    socklen_t address_size = sizeof(address);
+    socklen_t size = sizeof(type);
+    if (::getsockname(fd, reinterpret_cast<sockaddr*>(&address), &address_size) != 0 ||
+        address.sun_family != AF_UNIX ||
+        ::getsockopt(fd, SOL_SOCKET, SO_TYPE, &type, &size) != 0 || type != SOCK_SEQPACKET ||
+        ::getsockopt(fd, SOL_SOCKET, SO_ACCEPTCONN, &accepting, &size) != 0 || !accepting ||
+        ::fcntl(fd, F_SETFD, FD_CLOEXEC) != 0) {
+        return io_error();
+    }
+    auto impl = std::make_unique<Impl>();
+    impl->fd = fd;
+    impl->options = options;
+    impl->inherited = true;
     return InputServer{std::move(impl)};
 }
 

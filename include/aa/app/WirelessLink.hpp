@@ -20,6 +20,10 @@ public:
     void close_admission();
     core::Result<bool> poll(HandoffEligibilityCoordinator&, std::function<void()> checkpoint = {});
     void stop();
+    void configure(Config config) {
+        stop();
+        config_ = std::move(config);
+    }
     void set_io_checkpoint_interval(std::chrono::milliseconds interval) noexcept;
     [[nodiscard]] bool listening() const;
     [[nodiscard]] WiredSession* session() const { return session_.get(); }

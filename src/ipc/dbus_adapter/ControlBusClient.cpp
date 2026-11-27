@@ -240,10 +240,11 @@ core::Result<ControlBusClient> ControlBusClient::connect(Signals signals) {
         if (!matched.has_value()) {
             return matched.error();
         }
-    } else if (signals == Signals::pairing_results) {
+    } else if (signals != Signals::ignore) {
         // The daemon resolves a well-known sender to its current owner, so
         // broadcasts from any other connection never reach this socket.
-        for (const std::string_view member : {"PairingClosed", "PairingCompleted"}) {
+        for (const std::string_view member : {"PairingClosed", "PairingCompleted", "StateChanged"}) {
+            if (member == "StateChanged" && signals == Signals::pairing_results) continue;
             const std::string rule = "type='signal',sender='" + std::string{kContractBusName} +
                                      "',path='" + std::string{kContractObjectPath} +
                                      "',interface='" + std::string{kContractInterface} +
@@ -359,6 +360,20 @@ core::Result<void> ControlBusClient::stop_projection() {
     }
     MessageWriter body;
     return impl_->exchange_void("StopProjection", "", body);
+}
+
+core::Result<void> ControlBusClient::set_projection_mode(std::string_view mode) {
+    if (!impl_) return Error{ErrorCode::transport_closed};
+    MessageWriter body;
+    body.put_string(mode);
+    return impl_->exchange_void("SetProjectionMode", "s", body);
+}
+
+core::Result<void> ControlBusClient::set_transport_enabled(std::string_view transport, bool enabled) {
+    if (!impl_) return Error{ErrorCode::transport_closed};
+    MessageWriter body;
+    body.put_string(transport).put_u32(enabled ? 1U : 0U);
+    return impl_->exchange_void("SetTransportEnabled", "sb", body);
 }
 
 core::Result<void> ControlBusClient::request_idr_recovery() {

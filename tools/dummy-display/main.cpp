@@ -23,6 +23,7 @@
 #include "test_control.hpp"
 
 #include <QApplication>
+#include <QShortcut>
 #include <QTimer>
 
 #include <chrono>
@@ -176,6 +177,7 @@ constexpr const char* kUsage =
                "\n"
                "TEST-ONLY Android Auto projection consumer.\n"
                "  F5 start projection   F6 stop projection\n"
+               "  F7 toggle projection mode   F8 toggle wired   F9 toggle wireless (1.3+)\n"
                "  F1 toggle HUD         F11 toggle full screen\n"
                "  arrows/enter/letters  forwarded as keys; left mouse button = touch\n";
 
@@ -300,6 +302,7 @@ int display_main(int argc, char** argv) {
 
     bool contract_phones_list = false;
     bool contract_pairing_outcomes = false;
+    bool contract_projection_mode = false;
     aa::display::DecodeLossTelemetry decode_loss;
     auto factory = [errors, decoder_backend, &decode_loss, &telemetry,
                     inner = aa::display::helper_decode_sessions()](
@@ -371,7 +374,7 @@ int display_main(int argc, char** argv) {
         if (client_disconnected || !owner.value()) {
             return;
         }
-        auto connected = ControlBusClient::connect(ControlBusClient::Signals::pairing_results);
+        auto connected = ControlBusClient::connect(ControlBusClient::Signals::projection_and_pairing_results);
         if (!connected.has_value()) {
             errors->report("attach", connected.error().code());
             return;
@@ -394,6 +397,7 @@ int display_main(int argc, char** argv) {
         // Feature-detect contract 1.2.0 capabilities; fall back cleanly to 1.1.0 when absent.
         contract_phones_list = false;
         contract_pairing_outcomes = false;
+        contract_projection_mode = false;
         if (const auto caps = client->get_capabilities(); caps.has_value()) {
             const auto has_cap = [&caps](const char* key) {
                 const auto it = caps.value().find(key);
@@ -401,6 +405,7 @@ int display_main(int argc, char** argv) {
             };
             contract_phones_list = has_cap("phones.list");
             contract_pairing_outcomes = has_cap("pairing.outcomes");
+            contract_projection_mode = has_cap("projection.mode");
             if (contract_phones_list) {
                 if (const auto phones = client->list_phones(); phones.has_value()) {
                     // Keep phone_id out of telemetry/evidence exports; emit only the count.
@@ -427,9 +432,44 @@ int display_main(int argc, char** argv) {
     ControlWiring controls{controller, video_path, widget, *errors, diagnostics};
     widget.set_projection_control(&controls);
 
+    const auto toggle_receiver_option = [&](std::string_view transport) {
+        if (!client || !controller) return;
+        const auto caps = client->get_capabilities();
+        if (!caps) {
+            errors->report("capabilities", caps.error().code());
+            return;
+        }
+        const auto value = [&](const std::string& key) -> std::string_view {
+            const auto entry = caps.value().find(key);
+            return entry != caps.value().end() ? std::string_view{entry->second} : std::string_view{};
+        };
+        const bool mode = transport.empty();
+        if (value(mode ? "projection.mode" : "transport.control") != "true") {
+            widget.set_error("Receiver does not support this control");
+            return;
+        }
+        const auto result = mode
+            ? client->set_projection_mode(value("projection.mode.current") == "projection_ready"
+                                              ? "pairing_only" : "projection_ready")
+            : client->set_transport_enabled(transport,
+                                           value("transport." + std::string{transport} + ".enabled") != "true");
+        if (result) {
+            widget.set_error({});
+        } else {
+            errors->report(mode ? "projection_mode" : "transport_enabled", result.error().code());
+            widget.set_error("Receiver rejected the setting");
+        }
+    };
+    QShortcut mode_shortcut{QKeySequence{Qt::Key_F7}, &widget};
+    QObject::connect(&mode_shortcut, &QShortcut::activated, [&] { toggle_receiver_option({}); });
+    QShortcut wired_shortcut{QKeySequence{Qt::Key_F8}, &widget};
+    QObject::connect(&wired_shortcut, &QShortcut::activated, [&] { toggle_receiver_option("wired"); });
+    QShortcut wireless_shortcut{QKeySequence{Qt::Key_F9}, &widget};
+    QObject::connect(&wireless_shortcut, &QShortcut::activated, [&] { toggle_receiver_option("wireless"); });
+
     QObject::connect(&pump_timer, &QTimer::timeout,
                      [errors, &telemetry, &widget, &decode_loss, &controller, &client,
-                      &contract_pairing_outcomes,
+                      &contract_pairing_outcomes, &contract_projection_mode,
                       telemetry_reported = false]() mutable {
         // A full queue or failed write loses measurement events: show it once.
         // Only on screen: a stream write here could block on the same stdout
@@ -445,7 +485,15 @@ int display_main(int argc, char** argv) {
                     if (!sig.has_value()) {
                         break;
                     }
-                    if (contract_pairing_outcomes && sig.value().member == "PairingCompleted") {
+                    if (contract_projection_mode && sig.value().member == "StateChanged" &&
+                        sig.value().projection == aa::ipc::ProjectionState::stopped &&
+                        controller->state() == DisplayState::projecting) {
+                        // A queued registration/stop signal may predate a newer StartProjection.
+                        if (const auto snapshot = client->get_state(); snapshot) {
+                            controller->observe_projection_state(snapshot.value());
+                            widget.set_status(controller->state());
+                        }
+                    } else if (contract_pairing_outcomes && sig.value().member == "PairingCompleted") {
                         static_cast<void>(telemetry.enqueue(
                             "{\"event\":\"pairing_completed\",\"request_id\":" +
                             std::to_string(sig.value().request.value) + ",\"outcome\":\"" +

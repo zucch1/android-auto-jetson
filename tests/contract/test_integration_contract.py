@@ -131,6 +131,21 @@ class IntegrationContractTests(unittest.TestCase):
             self.assertEqual(res.returncode, 1, msg=res.stdout + res.stderr)
             self.assertIn("INTEGRATION_CONTRACT_RECEIVER_METHOD_DRIFT", res.stdout)
 
+    def test_runtime_capability_drift_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            stage_tree(root)
+            doc = root / "docs/INTEGRATION-CONTRACT.md"
+            doc.write_text(
+                doc.read_text(encoding="utf-8").replace(
+                    "| `transport.control` |", "| `transport.controls` |"
+                ),
+                encoding="utf-8",
+            )
+            res = run_checker(root)
+            self.assertEqual(res.returncode, 1, msg=res.stdout + res.stderr)
+            self.assertIn("INTEGRATION_CONTRACT_RUNTIME_CAPABILITIES", res.stdout)
+
     def test_runtime_receiver_object_path_drift_fails(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

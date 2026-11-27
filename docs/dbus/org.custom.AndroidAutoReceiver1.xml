@@ -21,7 +21,7 @@
 -->
 <node name="/org/custom/AndroidAutoReceiver">
   <interface name="org.custom.AndroidAutoReceiver1">
-    <annotation name="org.custom.AndroidAutoReceiver1.ContractSemVer" value="1.2.0"/>
+    <annotation name="org.custom.AndroidAutoReceiver1.ContractSemVer" value="1.3.0"/>
 
     <!-- Registers caller as THE session consumer. Caller must own
          consumer_name and match the active session user; only one consumer
@@ -74,7 +74,7 @@
       <arg name="consumer_id" type="t" direction="out"/>
     </method>
 
-    <!-- Static capability map (name/value strings, low-rate). -->
+    <!-- Capability map with runtime mode and transport status when supported. -->
     <method name="GetCapabilities">
       <arg name="capabilities" type="a{ss}" direction="out"/>
     </method>
@@ -144,6 +144,16 @@
     <method name="GetPairingOutcome">
       <arg name="request_id" type="t" direction="in"/>
       <arg name="outcome" type="s" direction="out"/>
+    </method>
+
+    <!-- Since 1.3.0, registered consumer only. Feature-detect projection.mode
+         and transport.control via GetCapabilities. -->
+    <method name="SetProjectionMode">
+      <arg name="mode" type="s" direction="in"/>
+    </method>
+    <method name="SetTransportEnabled">
+      <arg name="transport" type="s" direction="in"/>
+      <arg name="enabled" type="b" direction="in"/>
     </method>
 
     <!-- One-time pairing request id awaiting ConfirmPhonePairing. -->
