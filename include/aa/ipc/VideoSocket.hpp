@@ -111,6 +111,15 @@ struct NegotiatedLimits final {
                                                    const NegotiatedLimits&) noexcept = default;
 };
 
+[[nodiscard]] constexpr bool valid_negotiated_limits(const NegotiatedLimits& limits) noexcept {
+    return limits.max_datagram_payload >= kMinDatagramPayload &&
+           limits.max_datagram_payload <= kMaxDatagramPayload &&
+           limits.max_access_unit_bytes > 0 &&
+           limits.max_access_unit_bytes <= kMaxAccessUnitBytes &&
+           limits.socket_budget_bytes > 0 &&
+           limits.socket_budget_bytes <= static_cast<std::uint32_t>(kSocketBudgetBytes);
+}
+
 // Limits-exchange record: fixed 32-byte big-endian record sent by each side
 // immediately after the peer-credential gate passes, before any data record.
 //   offset  0: magic (kVideoLimitsMagic)

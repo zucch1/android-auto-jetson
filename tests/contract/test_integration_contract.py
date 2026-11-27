@@ -82,6 +82,8 @@ COPIED_FILES = (
     "tools/wireless-receiver/ServiceDescription.hpp",
     "tools/wireless-receiver/AdmissionEvents.hpp",
     "tools/wireless-receiver/Options.hpp",
+    "tools/wireless-receiver/WiredWorker.hpp",
+    "tools/wireless-receiver/ManagedVideo.hpp",
 )
 
 

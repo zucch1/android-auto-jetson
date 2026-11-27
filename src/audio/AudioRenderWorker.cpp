@@ -317,6 +317,28 @@ core::Result<void> AudioRenderWorker::ready() {
     return {};
 }
 
+std::optional<core::Result<void>>
+AudioRenderWorker::wait_ready_for(std::chrono::milliseconds timeout) {
+    std::unique_lock lock(mutex_);
+    if (!cv_.wait_for(lock, std::max(std::chrono::milliseconds{0}, timeout),
+                      [&] { return initialized_; })) {
+        return std::nullopt;
+    }
+    if (failure_) { return *failure_; }
+    return core::Result<void>{};
+}
+
+bool AudioRenderWorker::thread_exited() const noexcept {
+    std::lock_guard lock(mutex_);
+    return stopped_;
+}
+
+bool AudioRenderWorker::wait_exited_for(std::chrono::milliseconds timeout) {
+    std::unique_lock lock(mutex_);
+    return cv_.wait_for(lock, std::max(std::chrono::milliseconds{0}, timeout),
+                        [&] { return stopped_; });
+}
+
 SinkReport AudioRenderWorker::sink_report() {
     std::lock_guard lock(mutex_);
     return sink_report_;
@@ -1134,6 +1156,7 @@ void AudioRenderWorker::run(RouterConfig config, const OpenRouter& open) {
         std::lock_guard lock(mutex_);
         initialized_ = true;
         latch(opened.error(), AudioFailureOrigin::open);
+        stopped_ = true;
         cv_.notify_all();
         return;
     }

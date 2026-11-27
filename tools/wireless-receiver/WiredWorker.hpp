@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
+#include "../video_handoff.hpp"
+
+#include <aa/ipc/VideoSocket.hpp>
 #include <aa/trust/Store.hpp>
 
 #include <algorithm>
@@ -14,6 +17,7 @@
 #include <optional>
 #include <spawn.h>
 #include <string>
+#include <sys/socket.h>
 #include <sys/wait.h>
 #include <thread>
 #include <unistd.h>
@@ -106,11 +110,20 @@ public:
     WiredWorker& operator=(const WiredWorker&) = delete;
     ~WiredWorker() { stop(); }
 
+    // Spawns the managed wired worker with:
+    //   fd 3: supervisor -> worker video handoff AF_UNIX SOCK_SEQPACKET channel
+    //   fd 4: inherited input listener
+    // The supervisor remains the sole acceptor on video.sock so the worker
+    // never owns the consumer connection or closes it on startup failure.
     [[nodiscard]] bool start(const std::filesystem::path& executable,
                              const WiredCandidate& candidate,
                              const std::filesystem::path& store,
-                             int video, int input) {
+                             int input) {
         if (pid_ > 0) return false;
+        int handoff[2]{-1, -1};
+        if (::socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, handoff) != 0) {
+            return false;
+        }
         std::vector<std::string> arguments{
             executable.string(), "--no-bus", "--managed-by", std::to_string(::getpid()),
             "--port", candidate.port, "--managed-phone-id", std::to_string(candidate.phone.value),
@@ -122,8 +135,12 @@ public:
         // The worker installs its handler before unblocking SIGUSR1. A
         // request sent during startup cannot terminate it via the default action.
         posix_spawnattr_t attributes;
-        if (::posix_spawnattr_init(&attributes) != 0) return false;
-        const int video_source = ::fcntl(video, F_DUPFD_CLOEXEC, 5);
+        if (::posix_spawnattr_init(&attributes) != 0) {
+            ::close(handoff[0]);
+            ::close(handoff[1]);
+            return false;
+        }
+        const int handoff_source = ::fcntl(handoff[1], F_DUPFD_CLOEXEC, 5);
         const int input_source = ::fcntl(input, F_DUPFD_CLOEXEC, 5);
         posix_spawn_file_actions_t actions;
         const bool actions_ready = ::posix_spawn_file_actions_init(&actions) == 0;
@@ -131,26 +148,59 @@ public:
         ::sigemptyset(&mask);
         ::sigaddset(&mask, SIGUSR1);
         pid_t child{};
-        const bool started = actions_ready && video_source >= 0 && input_source >= 0 &&
-                             ::posix_spawn_file_actions_adddup2(&actions, video_source, 3) == 0 &&
+        const bool started = actions_ready && handoff_source >= 0 && input_source >= 0 &&
+                             ::posix_spawn_file_actions_adddup2(&actions, handoff_source, 3) == 0 &&
                              ::posix_spawn_file_actions_adddup2(&actions, input_source, 4) == 0 &&
                              ::posix_spawnattr_setsigmask(&attributes, &mask) == 0 &&
                              ::posix_spawnattr_setflags(&attributes, POSIX_SPAWN_SETSIGMASK) == 0 &&
                              ::posix_spawn(&child, executable.c_str(), &actions, &attributes,
                                            argv.data(), environ) == 0;
         if (actions_ready) ::posix_spawn_file_actions_destroy(&actions);
-        if (video_source >= 0) ::close(video_source);
+        if (handoff_source >= 0) ::close(handoff_source);
         if (input_source >= 0) ::close(input_source);
+        ::close(handoff[1]);
         ::posix_spawnattr_destroy(&attributes);
-        if (started) pid_ = child;
+        if (started) {
+            pid_ = child;
+            video_handoff_fd_ = handoff[0];
+        } else {
+            ::close(handoff[0]);
+        }
         return started;
+    }
+
+    [[nodiscard]] bool send_video_client(int client_fd, int state_fd,
+                                         const ipc::NegotiatedLimits& limits) const noexcept {
+        if (pid_ <= 0 || video_handoff_fd_ < 0) return false;
+        return tools::send_video_handoff_install(video_handoff_fd_, client_fd, state_fd, limits);
+    }
+
+    [[nodiscard]] bool clear_video_client() const noexcept {
+        if (pid_ <= 0 || video_handoff_fd_ < 0) return false;
+        return tools::send_video_handoff_clear(video_handoff_fd_);
     }
 
     bool running() {
         if (pid_ <= 0) return false;
         const auto result = ::waitpid(pid_, nullptr, WNOHANG);
-        if (result == pid_ || (result < 0 && errno == ECHILD)) pid_ = 0;
+        if (result == pid_ || (result < 0 && errno == ECHILD)) {
+            pid_ = 0;
+            close_handoff();
+        }
         return pid_ > 0;
+    }
+
+    // Blocking reap for synchronized tests without timed polling loops.
+    [[nodiscard]] bool wait_exit() {
+        if (pid_ <= 0) return true;
+        int status = 0;
+        pid_t result;
+        do {
+            result = ::waitpid(pid_, &status, 0);
+        } while (result < 0 && errno == EINTR);
+        pid_ = 0;
+        close_handoff();
+        return result > 0;
     }
 
     void request_idr() const {
@@ -158,7 +208,11 @@ public:
     }
 
     void stop() {
-        if (!running()) return;
+        if (!running()) {
+            close_handoff();
+            return;
+        }
+        close_handoff();
         (void)::kill(pid_, SIGTERM);
         using namespace std::chrono_literals;
         const auto until = std::chrono::steady_clock::now() + 750ms;
@@ -173,7 +227,15 @@ public:
     }
 
 private:
+    void close_handoff() noexcept {
+        if (video_handoff_fd_ >= 0) {
+            ::close(video_handoff_fd_);
+            video_handoff_fd_ = -1;
+        }
+    }
+
     pid_t pid_{};
+    int video_handoff_fd_{-1};
 };
 
 } // namespace aa::wireless_receiver

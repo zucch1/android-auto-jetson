@@ -2,6 +2,7 @@
 #include "../json_stdout.hpp"
 #include "../media_playout_options.hpp"
 #include "../video_capabilities.hpp"
+#include "../video_handoff.hpp"
 //
 // Wired end-to-end receiver entry point (task 30 phase-B harness driver): the
 // composed receiver for the real approved phone over USB/AOA. It wires the
@@ -719,7 +720,7 @@ int receiver_session(int argc, char **argv, ResumableControl &resumable) {
     }
     if (port.empty() || duration_ms < 0 || (wired_enrolment && no_bus) ||
         (supervisor_pid ? (!no_bus || !managed_phone.value || !required_usb_serial.empty())
-                        : managed_phone.value != 0) ||
+                        : (managed_phone.value != 0)) ||
         !aa::tools::validate_playout_options(playout)) {
         std::fputs(kUsage, stderr);
         return 2;
@@ -831,11 +832,32 @@ int receiver_session(int argc, char **argv, ResumableControl &resumable) {
 
     const aa::ipc::VideoServerOptions video_options{{}, aa::ipc::current_uid()};
     const aa::ipc::InputServerOptions input_options{aa::ipc::current_uid()};
-    auto video = supervisor_pid ? aa::ipc::VideoServer::adopt_listener(3, video_options)
-                                : aa::ipc::VideoServer::listen({video_socket}, video_options);
+    std::optional<aa::ipc::VideoServer> video{};
+    int video_handoff_fd = -1;
+    struct HandoffFdGuard final {
+        int fd{-1};
+        ~HandoffFdGuard() {
+            if (fd >= 0) ::close(fd);
+        }
+    } video_handoff_guard{};
+    if (supervisor_pid) {
+        if (!aa::tools::validate_video_handoff_fd(3)) {
+            log_line("{\"event\":\"err\",\"detail\":\"socket\"}");
+            return 3;
+        }
+        video_handoff_fd = 3;
+        video_handoff_guard.fd = 3;
+    } else {
+        auto opened_video = aa::ipc::VideoServer::listen({video_socket}, video_options);
+        if (!opened_video.has_value()) {
+            log_line("{\"event\":\"err\",\"detail\":\"socket\"}");
+            return 3;
+        }
+        video.emplace(std::move(opened_video.value()));
+    }
     auto input_server = supervisor_pid ? aa::ipc::InputServer::adopt_listener(4, input_options)
                                        : aa::ipc::InputServer::listen({input_socket}, input_options);
-    if (!video.has_value() || !input_server.has_value()) {
+    if (!input_server.has_value()) {
         log_line("{\"event\":\"err\",\"detail\":\"socket\"}");
         return 3;
     }
@@ -1053,6 +1075,43 @@ int receiver_session(int argc, char **argv, ResumableControl &resumable) {
     std::atomic<bool> admitted{false};
     std::mutex gate_mutex;
     std::condition_variable gate_cv;
+    const auto drain_video_handoff = [&](Milliseconds first_timeout) {
+        if (video_handoff_fd < 0) return;
+        std::optional<aa::tools::VideoHandoffEvent> latest;
+        Milliseconds wait = first_timeout;
+        for (;;) {
+            auto event = aa::tools::receive_video_handoff(video_handoff_fd, wait);
+            wait = Milliseconds{0};
+            if (!event.has_value()) {
+                if (event.error().code() == aa::ErrorCode::transport_closed) {
+                    g_running.store(false);
+                }
+                break;
+            }
+            latest.emplace(std::move(event.value()));
+        }
+        if (!latest.has_value() || !g_running.load() ||
+            std::chrono::steady_clock::now() >= deadline) {
+            return;
+        }
+        if (latest->kind == aa::tools::VideoHandoffKind::install && latest->producer.has_value()) {
+            log_line_nonblocking("{\"event\":\"video_accepted\"}");
+            video_outlet.install(std::move(*latest->producer));
+            {
+                std::lock_guard gate_lock(gate_mutex);
+                if (!g_running.load() || std::chrono::steady_clock::now() >= deadline) {
+                    return;
+                }
+                admitted.store(true);
+            }
+            gate_cv.notify_all();
+        } else if (latest->kind == aa::tools::VideoHandoffKind::clear) {
+            video_outlet.clear_producer();
+        }
+    };
+    if (video_handoff_fd >= 0) {
+        drain_video_handoff(Milliseconds{0});
+    }
     aa::core::CancellationSource reconnect_stop;
     aa::transport::AoaRecovery recovery;
     recovery.reset_status = log_reset;
@@ -1452,6 +1511,10 @@ int receiver_session(int argc, char **argv, ResumableControl &resumable) {
     // UnregisterConsumer, owner loss) ends this session (#240 review P3-4).
     bool projection_started = false;
     while (g_running.load() && std::chrono::steady_clock::now() < deadline) {
+        if (video_handoff_fd >= 0) {
+            drain_video_handoff(runtime_slice());
+            continue;
+        }
         if (bus) {
             auto step = bus->cycle(runtime_slice());
             if (!step.has_value()) {
@@ -1539,7 +1602,9 @@ int receiver_session(int argc, char **argv, ResumableControl &resumable) {
 
     video_outlet.close();
     input_server.value().close();
-    video.value().close();
+    if (video.has_value()) {
+        video.value().close();
+    }
 
     const auto total = std::chrono::duration_cast<std::chrono::milliseconds>(
                            std::chrono::steady_clock::now() - started)

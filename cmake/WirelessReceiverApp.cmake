@@ -36,7 +36,7 @@ if(NOT CMAKE_CROSSCOMPILING)
     add_executable(aa_wireless_receiver_cli_prod_test
         tests/wireless_e2e/receiver_cli_test.cpp tests/wireless_e2e/wired_worker_test.cpp
         tests/wireless_e2e/supervisor_test.cpp)
-    target_link_libraries(aa_wireless_receiver_cli_prod_test PRIVATE aa_ipc_control aa_trust)
+    target_link_libraries(aa_wireless_receiver_cli_prod_test PRIVATE aa_ipc_control aa_trust aa_audio_worker)
     add_executable(aa_wireless_receiver_cli_dev_test tests/wireless_e2e/receiver_cli_test.cpp)
     target_compile_definitions(aa_wireless_receiver_cli_prod_test PRIVATE
         AA_WIRELESS_ALLOW_HELPER_BUS_ADDRESS=0)

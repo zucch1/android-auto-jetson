@@ -179,6 +179,9 @@ struct SupervisorPorts final {
     std::function<bool()> process_running;
     std::function<void(const char*, ErrorCode)> report;
     std::function<TransportArbiter::Clock::time_point()> now = TransportArbiter::Clock::now;
+    std::function<void()> service_video{};
+    std::function<void()> release_video{};
+    std::function<void()> reap_wireless_audio{};
 };
 
 class Supervisor final {
@@ -190,6 +193,7 @@ public:
 
     // One dispatch turn. Returns an exit status when the supervisor must end.
     std::optional<int> step(core::Milliseconds wait) {
+        if (ports_.reap_wireless_audio) ports_.reap_wireless_audio();
         if (auto cycled = ports_.cycle(wait); !cycled) {
             ports_.report("session bus dispatch", cycled.error().code());
             return 1;
@@ -200,6 +204,7 @@ public:
                            state.projection == ipc::ProjectionState::projecting;
         if (!wants) {
             ports_.stop_wired();
+            if (ports_.release_video) ports_.release_video();
             wired_.reset();
             request_.reset();
             policy.active_transport.reset();
@@ -207,10 +212,14 @@ public:
             return std::nullopt;
         }
         if (request_ != state.consumer) {
+            if (request_.has_value() && ports_.release_video) {
+                ports_.release_video();
+            }
             request_ = state.consumer;
             arbiter_.reset();
             next_scan_ = {};
         }
+        if (ports_.service_video) ports_.service_video();
         const auto& approved = ports_.approved();
         if (wired_) {
             if (!approved_phone(approved, wired_->phone)) ports_.stop_wired();
@@ -219,7 +228,9 @@ public:
                 return std::nullopt;
             }
             // The worker ended on its own (or for revocation). Projection stays
-            // requested and arbitration picks the next transport.
+            // requested, the supervisor keeps owning the video connection (with
+            // shared monotonic frame/sequence counters), and arbitration picks
+            // the next transport.
             arbiter_.wired_exited(now());
             wired_.reset();
             policy.active_transport.reset();
@@ -238,6 +249,13 @@ public:
                 });
             policy.active_transport.reset();
             arbiter_.wireless_finished(result != 0, now());
+            const auto after = ports_.service().state();
+            const bool wants_after = after.consumer.value && policy.ready &&
+                                     after.projection == ipc::ProjectionState::projecting;
+            if (!wants_after) {
+                if (ports_.release_video) ports_.release_video();
+                request_.reset();
+            }
             if (!policy.ready) ports_.release_media();
             if (result != 0 && !ports_.process_running()) return result;
         }

@@ -3,6 +3,7 @@
 #include "Runtime.hpp"
 #include "Supervisor.hpp"
 #include "WiredWorker.hpp"
+#include "WirelessStartup.hpp"
 #include <aa/tls/Credentials.hpp>
 #include <aa/trust/PairingPolicy.hpp>
 #include <algorithm>
@@ -24,17 +25,40 @@ int run_wireless_projection(const Options& options, app::WirelessReceiver& recei
                             helper::BusClient& helper, ipc::ControlBusService& bus,
                             const std::optional<trust::TransportIdentity>& identity,
                             Runtime::Clock::time_point deadline, ipc::VideoServer& video,
-                            ipc::InputServer& input, WirelessKeep keep_running = {}) {
-    aa::audio::AudioRenderWorker audio_sink{
-        audio_config(options.audio_backend,
-                     aa::core::Nanoseconds{options.audio_catch_up_watermark_ms * 1'000'000LL},
-                     aa::core::Nanoseconds{options.audio_playout_ms * 1'000'000LL}),
-        audio_telemetry(),
-        aa::audio::AudioRouter::open,
-        aa::audio::AudioRenderWorker::monotonic_now,
-        aa::audio::AudioRenderWorker::kDefaultAckReleaseDrainTimeout,
-        aa::audio::AudioCreditPolicy{options.audio_max_unacked}};
-    const auto opened = audio_sink.ready();
+                            ipc::InputServer& input, WirelessKeep keep_running = {},
+                            ManagedVideoBroker* managed_video = nullptr,
+                            WirelessAudioLifecycle* audio_lifecycle = nullptr) {
+    WirelessAudioLifecycle local_lifecycle;
+    auto& lifecycle = audio_lifecycle != nullptr ? *audio_lifecycle : local_lifecycle;
+    auto startup = start_wireless_audio_ready(
+        lifecycle,
+        [&options] {
+            return std::make_unique<aa::audio::AudioRenderWorker>(
+                audio_config(options.audio_backend,
+                             aa::core::Nanoseconds{options.audio_catch_up_watermark_ms * 1'000'000LL},
+                             aa::core::Nanoseconds{options.audio_playout_ms * 1'000'000LL}),
+                audio_telemetry(),
+                aa::audio::AudioRouter::open,
+                aa::audio::AudioRenderWorker::monotonic_now,
+                aa::audio::AudioRenderWorker::kDefaultAckReleaseDrainTimeout,
+                aa::audio::AudioCreditPolicy{options.audio_max_unacked});
+        },
+        [&bus](core::Milliseconds wait) -> core::Result<void> {
+            if (auto step = bus.cycle(wait); !step) return step.error();
+            return {};
+        },
+        [&bus] { return bus.service().state(); },
+        video, managed_video, keep_running, deadline, running);
+    if (startup.bus_error) {
+        report("session bus dispatch", startup.bus_error->code());
+        running.store(false);
+        return 1;
+    }
+    if (startup.stopped || !startup.opened || !startup.worker) {
+        return 0;
+    }
+    auto& audio_sink = *startup.worker;
+    const auto& opened = *startup.opened;
     if (const auto report_sink = audio_sink.sink_report();
         opened || !report_sink.cause.empty() || !report_sink.candidates.empty()) {
         aa::audio::log_sink_selected(report_sink, "open", audio_telemetry());
@@ -103,6 +127,7 @@ int run_wireless_projection(const Options& options, app::WirelessReceiver& recei
     Runtime runtime{receiver, helper, bus, video, input,
                     media, identity, deadline, std::nullopt, {}, std::nullopt};
     runtime.keep_running = std::move(keep_running);
+    runtime.managed_video = managed_video;
     runtime.offered_video_profiles = options.video_profiles.size();
     log_line("{\"event\":\"ready\",\"state\":\"waiting_for_consumer\"}");
     return runtime.run();
@@ -121,9 +146,13 @@ core::Result<void> check_projection_credentials() {
 struct ProjectionSockets final {
     ipc::VideoServer video;
     ipc::InputServer input;
+    ManagedVideoBroker video_broker{};
+    std::uint64_t wired_video_generation{0};
 
-    static core::Result<ProjectionSockets> listen(const Options& options) {
-        auto video = ipc::VideoServer::listen({options.video_socket}, {{}, ipc::current_uid()});
+    static core::Result<ProjectionSockets> listen(const Options& options,
+                                                  bool managed = false) {
+        auto video = ipc::VideoServer::listen(
+            {options.video_socket}, {{}, ipc::current_uid(), managed});
         if (!video) return video.error();
         auto input = ipc::InputServer::listen({options.input_socket}, {ipc::current_uid()});
         if (!input) return input.error();
@@ -134,19 +163,42 @@ struct ProjectionSockets final {
 int run_managed(const Options& options, trust::ApprovedPhoneStore& store, helper::BusClient& helper,
                 app::WirelessReceiver& receiver, ipc::PairingIdSource& ids, ipc::PhoneDirectory& phones,
                 Runtime::Clock::time_point deadline) {
+    WirelessAudioLifecycle wireless_audio;
     std::optional<ProjectionSockets> sockets;
+    ipc::ControlBusService* bus_ptr = nullptr;
     ipc::ProjectionPolicy policy{};
     policy.check_ready = [&]() -> core::Result<void> {
         if (auto credentials = check_projection_credentials(); !credentials) return credentials.error();
         // A quick pairing_only -> projection_ready toggle can arrive before the
         // loop has released the listeners: keep the ones already open.
         if (sockets) return {};
-        auto opened = ProjectionSockets::listen(options);
+        auto opened = ProjectionSockets::listen(options, /*managed=*/true);
         if (!opened) {
             report("projection sockets", opened.error().code());
             return Error{ErrorCode::session_illegal_transition};
         }
         sockets.emplace(std::move(opened.value()));
+        sockets->video_broker.set_error_reporter([&bus_ptr](const char* what, ErrorCode code) {
+            report(what, code);
+            log_line_nonblocking(
+                "{\"event\":\"video_consumer_setup_failed\",\"operation\":\"" +
+                std::string{what} + "\",\"error\":\"" + std::string{to_string(code)} + "\"}");
+            if (bus_ptr != nullptr) {
+                bus_ptr->service().emit_diagnostic(
+                    ipc::DiagnosticSeverity::error, "video_consumer_setup_failed",
+                    bus_ptr->service().registered_consumer().value);
+            }
+        });
+        return {};
+    };
+    policy.before_start_projection = [&]() -> core::Result<void> {
+        if (!sockets) return {};
+        auto released = sockets->video_broker.release_connection(&sockets->video);
+        sockets->wired_video_generation = sockets->video_broker.generation();
+        if (!released) {
+            report("video listener drain", released.error().code());
+            return released.error();
+        }
         return {};
     };
     WiredWorker wired;
@@ -157,6 +209,7 @@ int run_managed(const Options& options, trust::ApprovedPhoneStore& store, helper
         report("session control bus", bus.error().code());
         return 3;
     }
+    bus_ptr = &bus.value();
 
     std::error_code path_error;
     const auto wired_executable = std::filesystem::read_symlink("/proc/self/exe", path_error)
@@ -168,6 +221,20 @@ int run_managed(const Options& options, trust::ApprovedPhoneStore& store, helper
     }
     const auto store_path = options.store_dir / "approved-phones.json";
     app::WirelessReceiver* const live_receiver = &receiver;
+    const auto sync_wired_video = [&] {
+        if (!sockets || !wired.running()) return;
+        const auto gen = sockets->video_broker.generation();
+        if (gen == sockets->wired_video_generation) return;
+        if (sockets->video_broker.has_connection()) {
+            if (wired.send_video_client(sockets->video_broker.client_fd(),
+                                        sockets->video_broker.state_fd(),
+                                        sockets->video_broker.limits())) {
+                sockets->wired_video_generation = gen;
+            }
+        } else if (wired.clear_video_client()) {
+            sockets->wired_video_generation = gen;
+        }
+    };
     Supervisor supervisor{SupervisorPorts{
         [&](core::Milliseconds wait) -> core::Result<void> {
             if (auto step = bus.value().cycle(wait); !step) return step.error();
@@ -181,9 +248,20 @@ int run_managed(const Options& options, trust::ApprovedPhoneStore& store, helper
                                    : std::vector<WiredCandidate>{};
         },
         [&](const WiredCandidate& candidate) {
-            return sockets && wired.start(wired_executable, candidate, store_path,
-                                          sockets->video.native_handle(),
-                                          sockets->input.native_handle());
+            if (!sockets) return false;
+            if (!wired.start(wired_executable, candidate, store_path,
+                             sockets->input.native_handle())) {
+                return false;
+            }
+            sockets->wired_video_generation = 0;
+            if (sockets->video_broker.has_connection()) {
+                if (wired.send_video_client(sockets->video_broker.client_fd(),
+                                            sockets->video_broker.state_fd(),
+                                            sockets->video_broker.limits())) {
+                    sockets->wired_video_generation = sockets->video_broker.generation();
+                }
+            }
+            return true;
         },
         [&] { return wired.running(); },
         [&] { wired.stop(); },
@@ -191,18 +269,36 @@ int run_managed(const Options& options, trust::ApprovedPhoneStore& store, helper
         [&](const WirelessKeep& keep) {
             if (!sockets) return 3;
             return run_wireless_projection(options, receiver, helper, bus.value(), std::nullopt,
-                                           deadline, sockets->video, sockets->input, keep);
+                                           deadline, sockets->video, sockets->input, keep,
+                                           &sockets->video_broker, &wireless_audio);
         },
         [live_receiver] { return !live_receiver->session() && !live_receiver->bootstrapping(); },
         [&] { sockets.reset(); },
         [] { return running.load(); },
         [](const char* what, ErrorCode code) { report(what, code); },
+        Supervisor::Clock::now,
+        [&] {
+            if (!sockets) return;
+            (void)sockets->video_broker.poll(sockets->video);
+            sync_wired_video();
+        },
+        [&] {
+            if (!sockets) return;
+            if (auto released = sockets->video_broker.release_connection(&sockets->video);
+                !released) {
+                report("video listener drain", released.error().code());
+            }
+            sockets->wired_video_generation = sockets->video_broker.generation();
+        },
+        [&] { wireless_audio.reap(); },
     }};
     log_line("{\"event\":\"ready\",\"state\":\"pairing_only\"}");
     while (running.load() && Runtime::Clock::now() < deadline) {
         const auto remaining = std::chrono::ceil<std::chrono::milliseconds>(
             deadline - Runtime::Clock::now()).count();
-        const core::Milliseconds wait{std::clamp<std::int64_t>(remaining, 0, 50)};
+        const std::int64_t slice_cap =
+            (sockets && sockets->video_broker.has_pending_handshake(sockets->video)) ? 5 : 50;
+        const core::Milliseconds wait{std::clamp<std::int64_t>(remaining, 0, slice_cap)};
         if (const auto exit = supervisor.step(wait)) {
             wired.stop();
             return *exit;

@@ -47,6 +47,7 @@ enum class Mode { phone, accessory };
 Mode g_mode = Mode::phone;
 std::size_t g_bulk_read_offset = 0;
 int g_enumerations_until_present = 0;
+int g_open_failures_remaining = 0;
 char g_slots[6][256] = {};
 std::mutex g_mutex;
 
@@ -73,6 +74,7 @@ enum class Scenario {
     claim_fail_always,
     replacement,
     stuck_accessory,
+    reset_transient_open_error,
     unknown_accessory,
     persistent_accessory,
     persistent_accessory_new_address,
@@ -108,6 +110,9 @@ enum class Scenario {
     }
     if (text == "stuck-accessory") {
         return Scenario::stuck_accessory;
+    }
+    if (text == "reset-transient-open-error") {
+        return Scenario::reset_transient_open_error;
     }
     if (text == "unknown-accessory") {
         return Scenario::unknown_accessory;
@@ -261,7 +266,9 @@ int libusb_init(ua::LibusbContext **ctx) {
     std::lock_guard lock(g_mutex);
     log_line("libusb_init");
     const auto current = scenario();
-    g_mode = (current == Scenario::stuck_accessory || current == Scenario::unknown_accessory ||
+    g_mode = (current == Scenario::stuck_accessory ||
+              current == Scenario::reset_transient_open_error ||
+              current == Scenario::unknown_accessory ||
               current == Scenario::persistent_accessory ||
               current == Scenario::persistent_accessory_new_address ||
               current == Scenario::reset_fails || current == Scenario::unsupported_accessory ||
@@ -276,6 +283,7 @@ int libusb_init(ua::LibusbContext **ctx) {
     }
     g_bulk_read_offset = 0;
     g_enumerations_until_present = 0;
+    g_open_failures_remaining = 0;
     *ctx = reinterpret_cast<ua::LibusbContext *>(&g_device_storage);
     return ua::kLibusbSuccess;
 }
@@ -355,6 +363,11 @@ int libusb_get_port_numbers(ua::LibusbDevice *dev, std::uint8_t *ports, int port
 int libusb_open(ua::LibusbDevice *dev, ua::LibusbDeviceHandle **handle) {
     (void)dev;
     log_line("libusb_open");
+    std::lock_guard lock(g_mutex);
+    if (g_open_failures_remaining > 0) {
+        --g_open_failures_remaining;
+        return ua::kLibusbErrorAccess;
+    }
     *handle = reinterpret_cast<ua::LibusbDeviceHandle *>(std::malloc(sizeof(FakeHandle)));
     return ua::kLibusbSuccess;
 }
@@ -557,6 +570,12 @@ int libusb_reset_device(ua::LibusbDeviceHandle *handle) {
     if (scenario() == Scenario::stuck_accessory) {
         g_enumerations_until_present = 1;
         become_scenario("happy");
+    }
+    if (scenario() == Scenario::reset_transient_open_error) {
+        g_enumerations_until_present = 1;
+        g_open_failures_remaining = 1;
+        become_scenario("happy");
+        return ua::kLibusbErrorNotFound;
     }
     if (scenario() == Scenario::unknown_accessory) {
         g_enumerations_until_present = 1;

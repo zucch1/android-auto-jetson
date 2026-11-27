@@ -192,6 +192,11 @@ struct ProjectionPolicy final {
     bool wireless{true};
     // Validate operator provisioning before entering projection-ready.
     std::function<core::Result<void>()> check_ready{};
+    // Invoked on StartProjection before acknowledging the request, so the
+    // supervisor can invalidate stale queued connections at the request
+    // boundary while keeping the projection-ready listener open. A non-OK
+    // result aborts StartProjection before entering projecting.
+    std::function<core::Result<void>()> before_start_projection{};
     std::optional<ProjectionTransport> active_transport{};
 };
 
@@ -253,6 +258,14 @@ public:
     void refresh_consumer_owner();
     void shutdown() {
         if (registered_) teardown("consumer_unregistered", DiagnosticSeverity::info);
+    }
+    // Emit a structured receiver diagnostic event onto the control bus.
+    void emit_diagnostic(DiagnosticSeverity severity, std::string_view event,
+                         std::uint64_t subject = 0) {
+        events_.emit(DiagnosticEmitted{severity, event, subject});
+    }
+    [[nodiscard]] core::ConsumerId registered_consumer() const noexcept {
+        return registered_.has_value() ? registered_->consumer : core::ConsumerId{};
     }
 
     // StartProjection / StopProjection / RequestIdrRecovery.

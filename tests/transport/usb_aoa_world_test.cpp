@@ -195,6 +195,29 @@ TEST(UsbAoaWorld, AlreadyInAccessoryModeResetsAndAdmitsTheFreshPhoneIdentity) {
     EXPECT_LT(log.find("libusb_reset_device"), log.find("libusb_control_transfer:53:0"));
 }
 
+TEST(UsbAoaWorld, ResetReturningNotFoundWaitsForReenumerationAndRetriesTransientOpenError) {
+    set_scenario("reset-transient-open-error");
+    const aa::trust::WiredIdentity approved{
+        "04e8", "6860", "TEST-SERIAL-001", "Android", "Android Auto", "HU-AAAAAA001", "1-2.1"};
+    std::vector<std::string> statuses;
+    tr::AoaRecovery recovery;
+    recovery.reset_status = [&](std::string_view status) { statuses.emplace_back(status); };
+
+    auto link = tr::connect_usb_aoa(
+        tr::UsbDeviceSelector{"1-2.1"}, {},
+        [&](const auto &identity) { return identity == approved; }, {}, nullptr, &recovery);
+
+    ASSERT_TRUE(link.has_value());
+    EXPECT_EQ(link.value().identity, approved);
+    EXPECT_EQ(link.value().pre_switch.vendor_id, 0x04E8);
+    EXPECT_TRUE(link.value().switch_report.started);
+    EXPECT_EQ(statuses, (std::vector<std::string>{"issued", "transport_unavailable"}));
+    const auto log = read_log();
+    EXPECT_EQ(count_of(log, "libusb_reset_device"), 1);
+    EXPECT_GE(count_of(log, "libusb_open"), 3);
+    EXPECT_LT(log.find("libusb_reset_device"), log.find("libusb_control_transfer:53:0"));
+}
+
 TEST(UsbAoaWorld, UnapprovedAccessoryWithTheSameAoaStringsIsRefusedAfterReset) {
     set_scenario("unknown-accessory");
     const aa::trust::WiredIdentity approved{
@@ -227,6 +250,41 @@ TEST(UsbAoaWorld, PersistentAccessoryModeNeverReachesAdmission) {
 
     ASSERT_FALSE(link.has_value());
     EXPECT_EQ(link.error().code(), ErrorCode::timeout);
+    const auto log = read_log();
+    EXPECT_EQ(count_of(log, "libusb_reset_device"), 1);
+    EXPECT_FALSE(contains(log, "libusb_control_transfer:53:0"));
+    EXPECT_FALSE(contains(log, "libusb_claim_interface"));
+}
+
+TEST(UsbAoaWorld, PersistentAccessoryTimesOutAtFiveSecondCapWithUnboundedCaller) {
+    set_scenario("persistent-accessory");
+    auto fake_now = aa::core::Deadline::Clock::time_point{std::chrono::seconds{100}};
+    const auto start_now = fake_now;
+    unsigned waits = 0;
+    ua::LibusbClock clock{
+        [&] { return fake_now; },
+        [&](aa::core::Deadline::Clock::time_point until, const aa::core::CancellationToken &) {
+            ++waits;
+            fake_now = until;
+        },
+    };
+    auto factory = ua::make_libusb_link_factory_with_clock(std::move(clock));
+    ASSERT_TRUE(factory.has_value());
+
+    // Unbounded caller deadline (matches managed wired worker startup_budget).
+    const aa::core::Deadline unbounded{aa::core::Deadline::Clock::time_point::max(), {}};
+    auto link = ua::connect_aoa(
+        std::move(factory.value()), tr::UsbDeviceSelector{"1-2.1"}, {},
+        [](const auto &) {
+            ADD_FAILURE() << "accessory descriptors reached admission";
+            return true;
+        },
+        unbounded);
+
+    ASSERT_FALSE(link.has_value());
+    EXPECT_EQ(link.error().code(), ErrorCode::timeout);
+    EXPECT_EQ(fake_now - start_now, std::chrono::milliseconds{ua::kResetReenumWaitMs.count});
+    EXPECT_GE(waits, 1U);
     const auto log = read_log();
     EXPECT_EQ(count_of(log, "libusb_reset_device"), 1);
     EXPECT_FALSE(contains(log, "libusb_control_transfer:53:0"));
