@@ -95,10 +95,12 @@ covers the session UID, receiver executable digest, and per-user D-Bus
 permission. [NetworkManager AP setup](networkmanager-ap.md) and
 [TLS credential handling](tls-credentials.md) cover operator-owned
 configuration. Calculate the helper digest from the **installed** receiver
-after each upgrade or rollback. Set `HU_KEY_PATH` in the receiver service environment. The packaged command
-accepts runtime mode changes through the [integration contract](INTEGRATION-CONTRACT.md). The historical standalone USB-policy installer may have left a
-rule under `/etc/udev/rules.d` with the same name. Check that override during
-deployment because udev gives it precedence over the packaged rule.
+after each upgrade or rollback. Set `HU_KEY_PATH` in the receiver service
+environment. The packaged command accepts runtime mode changes through the
+[integration contract](INTEGRATION-CONTRACT.md). The historical standalone
+USB-policy installer may have left a rule under `/etc/udev/rules.d` with the
+same name. Check that override during deployment because udev gives it
+precedence over the packaged rule.
 
 Jetson install, upgrade, and rollback are documented in [deploy.md](deploy.md)
 (tracked in [#190](https://github.com/zucch1/android-auto-jetson/issues/190)).

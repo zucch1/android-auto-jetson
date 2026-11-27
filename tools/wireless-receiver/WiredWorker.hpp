@@ -3,6 +3,8 @@
 
 #include <aa/trust/Store.hpp>
 
+#include <algorithm>
+
 #include <cerrno>
 #include <chrono>
 #include <csignal>
@@ -35,12 +37,26 @@ inline std::string usb_attribute(const std::filesystem::path& device, const char
 
 // Discovery is read-only. A serial can find its phone on any port. The worker
 // still performs the full AOA identity check with the current approved store.
-inline std::optional<WiredCandidate> find_wired_candidate(
+// A phone already in accessory mode is matched on its enrolment port, on the
+// port this supervisor last used for it, or on any port when its accessory
+// identity is unique among the approved phones: after a supervisor restart the
+// phone can still be in accessory mode on another port (#240 review P3-6).
+// Candidates are ordered by phone id, then port.
+inline std::vector<WiredCandidate> find_wired_candidates(
     const std::vector<trust::ApprovedPhone>& phones,
     const std::optional<WiredCandidate>& last_candidate = {},
     const std::filesystem::path& usb_devices = "/sys/bus/usb/devices") {
+    const auto accessory_unique = [&](const trust::WiredIdentity& wired) {
+        if (wired.aoa_serial.empty()) return false;
+        return std::count_if(phones.begin(), phones.end(), [&](const auto& other) {
+                   const auto* identity = std::get_if<trust::WiredIdentity>(&other.identity);
+                   return identity && identity->aoa_serial == wired.aoa_serial &&
+                          identity->aoa_model == wired.aoa_model &&
+                          identity->aoa_manufacturer == wired.aoa_manufacturer;
+               }) == 1;
+    };
     std::error_code error;
-    std::optional<WiredCandidate> selected;
+    std::vector<WiredCandidate> found;
     for (std::filesystem::directory_iterator device{usb_devices, error}, end;
          !error && device != end; device.increment(error)) {
         const auto port = device->path().filename().string();
@@ -60,18 +76,27 @@ inline std::optional<WiredCandidate> find_wired_candidate(
             const bool known_port = port == wired->port_context ||
                                     (last_candidate && last_candidate->phone == phone.phone_id &&
                                      last_candidate->port == port);
-            const bool accessory = known_port && vendor == "18d1" &&
-                                   (product == "2d00" || product == "2d01") &&
+            const bool accessory = vendor == "18d1" && (product == "2d00" || product == "2d01") &&
                                    serial == wired->aoa_serial &&
+                                   (known_port || accessory_unique(*wired)) &&
                                    usb_attribute(device->path(), "product") == wired->aoa_model &&
                                    usb_attribute(device->path(), "manufacturer") == wired->aoa_manufacturer;
-            if ((native || accessory) && (!selected || phone.phone_id.value < selected->phone.value ||
-                (phone.phone_id == selected->phone && port < selected->port))) {
-                selected = WiredCandidate{phone.phone_id, port};
-            }
+            if (native || accessory) found.push_back(WiredCandidate{phone.phone_id, port});
         }
     }
-    return selected;
+    std::sort(found.begin(), found.end(), [](const auto& a, const auto& b) {
+        return a.phone.value != b.phone.value ? a.phone.value < b.phone.value : a.port < b.port;
+    });
+    return found;
+}
+
+inline std::optional<WiredCandidate> find_wired_candidate(
+    const std::vector<trust::ApprovedPhone>& phones,
+    const std::optional<WiredCandidate>& last_candidate = {},
+    const std::filesystem::path& usb_devices = "/sys/bus/usb/devices") {
+    auto found = find_wired_candidates(phones, last_candidate, usb_devices);
+    if (found.empty()) return std::nullopt;
+    return found.front();
 }
 
 class WiredWorker final {

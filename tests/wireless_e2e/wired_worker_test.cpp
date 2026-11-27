@@ -54,8 +54,23 @@ TEST(ManagedWiredWorker, FindsApprovedSerialOnAnotherPortAndRemembersAccessoryLo
     attribute("manufacturer", "Android");
     attribute("product", "Android Auto");
     attribute("serial", "approved-accessory-serial");
-    EXPECT_FALSE(wr::find_wired_candidate(approved, {}, scratch.path));
+    // A unique accessory identity is found on any port, such as after a
+    // supervisor restart left the phone in accessory mode (#240 review P3-6).
+    EXPECT_TRUE(wr::find_wired_candidate(approved, {}, scratch.path));
     EXPECT_TRUE(wr::find_wired_candidate(approved, found, scratch.path));
+
+    // Two approved phones that share the accessory identity: only the
+    // enrolment port or the last-used port identifies the phone.
+    auto twin = identity;
+    twin.usb_serial = "other-native-serial";
+    const std::vector<aa::trust::ApprovedPhone> twins{
+        {{17}, identity, aa::trust::IdentityStrength::serial_backed},
+        {{18}, twin, aa::trust::IdentityStrength::serial_backed}};
+    EXPECT_FALSE(wr::find_wired_candidate(twins, {}, scratch.path));
+    const auto remembered = wr::find_wired_candidate(twins, found, scratch.path);
+    ASSERT_TRUE(remembered);
+    EXPECT_EQ(remembered->phone.value, 17U);
+    EXPECT_EQ(wr::find_wired_candidates(twins, found, scratch.path).size(), 1U);
 }
 
 TEST(ManagedWiredWorker, StopReapsWorkerAndKeepsTheTwoSupervisorListeners) {

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "Options.hpp"
 #include "Runtime.hpp"
+#include "Supervisor.hpp"
 #include "WiredWorker.hpp"
 #include <aa/tls/Credentials.hpp>
 #include <aa/trust/PairingPolicy.hpp>
@@ -13,6 +14,7 @@
 #include <string>
 #include <system_error>
 #include <thread>
+#include <unistd.h>
 #include <variant>
 #include <vector>
 
@@ -20,10 +22,9 @@ namespace aa::wireless_receiver {
 
 int run_wireless_projection(const Options& options, app::WirelessReceiver& receiver,
                             helper::BusClient& helper, ipc::ControlBusService& bus,
-                            const trust::TransportIdentity& identity,
+                            const std::optional<trust::TransportIdentity>& identity,
                             Runtime::Clock::time_point deadline, ipc::VideoServer& video,
-                            ipc::InputServer& input,
-                            std::function<bool(ipc::StateSnapshot)> keep_running = {}) {
+                            ipc::InputServer& input, WirelessKeep keep_running = {}) {
     aa::audio::AudioRenderWorker audio_sink{
         audio_config(options.audio_backend,
                      aa::core::Nanoseconds{options.audio_catch_up_watermark_ms * 1'000'000LL},
@@ -137,6 +138,9 @@ int run_managed(const Options& options, trust::ApprovedPhoneStore& store, helper
     ipc::ProjectionPolicy policy{};
     policy.check_ready = [&]() -> core::Result<void> {
         if (auto credentials = check_projection_credentials(); !credentials) return credentials.error();
+        // A quick pairing_only -> projection_ready toggle can arrive before the
+        // loop has released the listeners: keep the ones already open.
+        if (sockets) return {};
         auto opened = ProjectionSockets::listen(options);
         if (!opened) {
             report("projection sockets", opened.error().code());
@@ -157,84 +161,51 @@ int run_managed(const Options& options, trust::ApprovedPhoneStore& store, helper
     std::error_code path_error;
     const auto wired_executable = std::filesystem::read_symlink("/proc/self/exe", path_error)
                                       .parent_path() / "aa-wired-receiver";
+    const bool wired_available = !path_error && ::access(wired_executable.c_str(), X_OK) == 0;
+    if (!wired_available) {
+        // Reported once: wired projection is unavailable for this run.
+        report("wired projection worker executable", ErrorCode::transport_unavailable);
+    }
     const auto store_path = options.store_dir / "approved-phones.json";
-    std::optional<core::PhoneId> wired_phone;
-    std::optional<WiredCandidate> last_wired_candidate;
-    Runtime::Clock::time_point next_usb_scan{};
+    app::WirelessReceiver* const live_receiver = &receiver;
+    Supervisor supervisor{SupervisorPorts{
+        [&](core::Milliseconds wait) -> core::Result<void> {
+            if (auto step = bus.value().cycle(wait); !step) return step.error();
+            return {};
+        },
+        [&]() -> ipc::ControlService& { return bus.value().service(); },
+        policy,
+        [&]() -> const std::vector<trust::ApprovedPhone>& { return store.phones(); },
+        [&](const std::optional<WiredCandidate>& last) {
+            return wired_available ? find_wired_candidates(store.phones(), last)
+                                   : std::vector<WiredCandidate>{};
+        },
+        [&](const WiredCandidate& candidate) {
+            return sockets && wired.start(wired_executable, candidate, store_path,
+                                          sockets->video.native_handle(),
+                                          sockets->input.native_handle());
+        },
+        [&] { return wired.running(); },
+        [&] { wired.stop(); },
+        [&] { wired.request_idr(); },
+        [&](const WirelessKeep& keep) {
+            if (!sockets) return 3;
+            return run_wireless_projection(options, receiver, helper, bus.value(), std::nullopt,
+                                           deadline, sockets->video, sockets->input, keep);
+        },
+        [live_receiver] { return !live_receiver->session() && !live_receiver->bootstrapping(); },
+        [&] { sockets.reset(); },
+        [] { return running.load(); },
+        [](const char* what, ErrorCode code) { report(what, code); },
+    }};
     log_line("{\"event\":\"ready\",\"state\":\"pairing_only\"}");
     while (running.load() && Runtime::Clock::now() < deadline) {
         const auto remaining = std::chrono::ceil<std::chrono::milliseconds>(
             deadline - Runtime::Clock::now()).count();
         const core::Milliseconds wait{std::clamp<std::int64_t>(remaining, 0, 50)};
-        if (auto step = bus.value().cycle(wait); !step) {
-            report("session bus dispatch", step.error().code());
-            return 1;
-        }
-        const auto state = bus.value().service().state();
-        const bool wants_projection = state.consumer.value && policy.ready &&
-                                      state.projection == ipc::ProjectionState::projecting;
-        if (!wants_projection) {
+        if (const auto exit = supervisor.step(wait)) {
             wired.stop();
-            wired_phone.reset();
-            policy.active_transport.reset();
-            next_usb_scan = {};
-            if (!policy.ready) sockets.reset();
-            continue;
-        }
-        const auto& approved = store.phones();
-        if (wired_phone) {
-            if (std::none_of(approved.begin(), approved.end(), [&](const auto& phone) {
-                    return phone.phone_id == *wired_phone;
-                })) {
-                wired.stop();
-            }
-            if (wired.running()) {
-                if (bus.value().service().consume_idr_recovery_request()) wired.request_idr();
-                continue;
-            }
-            wired_phone.reset();
-            policy.active_transport.reset();
-            bus.value().service().projection_ended();
-            continue;
-        }
-
-        const auto now = Runtime::Clock::now();
-        if (policy.wired && !path_error && now >= next_usb_scan) {
-            next_usb_scan = now + std::chrono::milliseconds{250};
-            if (const auto candidate = find_wired_candidate(approved, last_wired_candidate)) {
-                if (wired.start(wired_executable, *candidate, store_path,
-                                sockets->video.native_handle(), sockets->input.native_handle())) {
-                    wired_phone = candidate->phone;
-                    last_wired_candidate = candidate;
-                    policy.active_transport = ipc::ProjectionTransport::wired;
-                    continue;
-                }
-                report("wired projection worker", ErrorCode::transport_unavailable);
-            }
-        }
-
-        if (policy.wireless) {
-            const auto phone = std::find_if(approved.begin(), approved.end(), [](const auto& candidate) {
-                return std::holds_alternative<trust::WirelessIdentity>(candidate.identity);
-            });
-            if (phone != approved.end()) {
-                const auto phone_id = phone->phone_id;
-                const auto identity = phone->identity;
-                policy.active_transport = ipc::ProjectionTransport::wireless;
-                const auto result = run_wireless_projection(options, receiver, helper, bus.value(),
-                    identity, deadline, sockets->video, sockets->input, [&](ipc::StateSnapshot current) {
-                        const auto& current_phones = store.phones();
-                        return policy.wireless && current.consumer == state.consumer &&
-                               current.projection == ipc::ProjectionState::projecting &&
-                               std::any_of(current_phones.begin(), current_phones.end(), [&](const auto& entry) {
-                                   return entry.phone_id == phone_id;
-                               });
-                    });
-                policy.active_transport.reset();
-                bus.value().service().projection_ended();
-                if (!policy.ready) sockets.reset();
-                if (result != 0 && !running.load()) return result;
-            }
+            return *exit;
         }
     }
     wired.stop();

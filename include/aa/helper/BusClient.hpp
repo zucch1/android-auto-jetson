@@ -28,6 +28,9 @@ public:
     core::Result<State> status(Action action);
     [[nodiscard]] bool connected() const;
     core::Result<State> reconnect(const trust::TransportIdentity& identity);
+    // Reconnect whichever phone the helper observes, provided the store
+    // approves it as a wireless identity. Returns the admitted identity.
+    core::Result<trust::TransportIdentity> reconnect_observed();
     core::Result<State> acquire_ap(Source source, std::uint32_t channel = 36);
     core::Result<ObservedPeer> poll_bootstrap(Source, HandoffFailure&);
     // GetBootstrapWaitV1 (1.5.0). A 1.4 helper rejects the unknown member: callers treat any

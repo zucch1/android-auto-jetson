@@ -24,7 +24,8 @@ struct Runtime final {
     ipc::VideoServer& video_server;
     ipc::InputServer& input_server;
     Media& media;
-    trust::TransportIdentity identity;
+    // nullopt: admit whichever approved wireless phone the helper observes.
+    std::optional<trust::TransportIdentity> identity;
     Clock::time_point deadline;
     std::optional<ipc::InputEndpoint> input;
     std::deque<ipc::InputEvent> queued_input;
@@ -47,11 +48,17 @@ struct Runtime final {
         on_after_audio_completions_for_test{};
 
     // A managed projection stops its media and leaves the shared bus alive.
-    std::function<bool(ipc::StateSnapshot)> keep_running{};
+    std::function<bool(ipc::StateSnapshot, const std::optional<trust::TransportIdentity>&)>
+        keep_running{};
+    // The phone the current attempt admitted (the fixed identity, or the one observed).
+    std::optional<trust::TransportIdentity> admitted{};
 
-    void stop_runtime() {
+    // Ends this projection. A managed projection's failure stays contained to
+    // this transport: only a process-level cause (signal, deadline, stdout log
+    // or bus failure) clears the process-wide flag the supervisor runs on.
+    void stop_runtime(bool process = false) {
         stopping = true;
-        running.store(false);
+        if (process || !keep_running) running.store(false);
     }
 
     bool service_audio_failure() {
@@ -131,10 +138,10 @@ struct Runtime final {
                 ? std::chrono::milliseconds{5}
                 : std::chrono::milliseconds{25});
         if (auto step = bus.cycle(core::Milliseconds{0}); !step) {
-            report("session bus dispatch", step.error().code()); failed = true; stop_runtime();
+            report("session bus dispatch", step.error().code()); failed = true; stop_runtime(true);
         }
         const auto state = bus.service().state();
-        if (stopping || (keep_running && !keep_running(state))) {
+        if (stopping || (keep_running && !keep_running(state, admitted))) {
             stopping = true;
             if (auto* session = receiver.session()) session->request_stop();
             return;
@@ -211,14 +218,23 @@ struct Runtime final {
     void defer() {
         pending_ack_error_.reset();
         receiver.stop(); media.video.reset(); configured = nullptr; attempting = false; acquisition.reset(); queued_input.clear();
+        if (!identity) admitted.reset();
         retry = Clock::now() + backoff;
         backoff = std::min(backoff * 2, std::chrono::milliseconds{5000});
     }
     core::Result<void> admit(ipc::StateSnapshot state) {
         // reconnect() stops the previous epoch and settles its denial before contacting the helper.
-        const auto result = receiver.reconnect(bus.service(), identity);
-        media.video.reset(); configured = nullptr;
-        if (!result) return result.error();
+        if (identity) {
+            const auto result = receiver.reconnect(bus.service(), *identity);
+            media.video.reset(); configured = nullptr;
+            if (!result) return result.error();
+            admitted = identity;
+        } else {
+            auto result = receiver.reconnect_observed(bus.service());
+            media.video.reset(); configured = nullptr;
+            if (!result) return result.error();
+            admitted = std::move(result.value());
+        }
         auto status = helper.status(helper::Action::ap_status);
         if (!status) return status.error();
         if (status.value() != helper::State::active) {

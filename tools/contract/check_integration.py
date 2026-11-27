@@ -507,14 +507,19 @@ def check_contract(root: Path) -> list[Violation]:
 
         control_service = root / CONTROL_SERVICE_REL
         if control_service.is_file():
+            # Any dotted projection./transport. string literal in the service is
+            # a runtime capability key, however capabilities() builds its map.
             runtime_caps = set(re.findall(
-                r'result\.emplace\("((?:projection|transport)\.[a-z.]+)"',
+                r'"((?:projection|transport)\.[a-z_]+(?:\.[a-z_]+)*)"',
                 control_service.read_text(encoding="utf-8"),
             ))
             documented_caps = {
                 unquote_code(row[0]) for row in parse_markdown_table(doc, "Runtime Capability Keys")
             }
-            if not runtime_caps or runtime_caps != documented_caps:
+            if not runtime_caps:
+                fail("INTEGRATION_CONTRACT_RUNTIME_CAPABILITIES",
+                     f"no projection.*/transport.* key literals found in {CONTROL_SERVICE_REL}")
+            elif runtime_caps != documented_caps:
                 fail("INTEGRATION_CONTRACT_RUNTIME_CAPABILITIES",
                      f"doc={sorted(documented_caps)!r} code={sorted(runtime_caps)!r}")
         else:

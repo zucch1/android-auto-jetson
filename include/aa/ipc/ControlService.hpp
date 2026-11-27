@@ -204,7 +204,8 @@ struct ControlServiceDeps final {
     std::function<std::chrono::steady_clock::time_point()> clock{};
     std::function<bool()> session_active{};
     ProjectionPolicy* projection_policy{};
-    // Standalone wired can project before a consumer registers.
+    // Standalone wired can project before a consumer registers. Called on
+    // StopProjection, and when unregister or owner loss ends a started projection.
     std::function<bool()> stop_legacy_projection{};
 };
 
@@ -261,8 +262,6 @@ public:
     [[nodiscard]] core::Result<void> set_projection_mode(const BusName& caller, std::string_view mode);
     [[nodiscard]] core::Result<void> set_transport_enabled(const BusName& caller,
                                                            std::string_view transport, bool enabled);
-    // Receiver-side transport exit, while keeping the consumer registered.
-    void projection_ended();
     [[nodiscard]] bool consume_idr_recovery_request() noexcept {
         return idr_recovery_requested_.exchange(false);
     }

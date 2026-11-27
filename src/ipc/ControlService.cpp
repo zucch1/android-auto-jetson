@@ -28,6 +28,9 @@ void ControlService::teardown(std::string_view reason, DiagnosticSeverity severi
         confirmation_->teardown(consumer);
     }
     if (projection_ == ProjectionState::projecting) {
+        // Unregister and owner loss end a started projection the same way
+        // StopProjection does, standalone wired included (#240 review P3-4).
+        if (stop_legacy_projection_) (void)stop_legacy_projection_();
         projection_ = ProjectionState::stopped;
         events_.emit(StateChanged{ProjectionState::stopped, consumer});
     }
@@ -268,12 +271,6 @@ core::Result<void> ControlService::set_transport_enabled(const BusName& caller,
         publish_projection_stop(active.value().consumer);
     }
     return {};
-}
-
-void ControlService::projection_ended() {
-    if (registered_ && projection_ == ProjectionState::projecting) {
-        publish_projection_stop(registered_->consumer);
-    }
 }
 
 core::Result<void> ControlService::request_idr_recovery(const BusName& caller) {
