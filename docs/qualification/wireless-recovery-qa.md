@@ -313,7 +313,25 @@ the deepest phone burst (589 ms) and 300 ms at the 700 ms cap. The producer's ID
 two extra requests while a recovery IDR is held, and the focus-transition
 escalation (after three nudges or 1.0 s) has one hold less margin. Windows 10-12 had no
 mid-session recovery episode to measure this (only startup episodes). The
-next drive smoke must show recovery episodes under 1.0 s with the hold.
+next drive smoke must show recovery episodes under 1.0 s with the hold. Since
+#230 the deepest hold follows a drought, so the live run must force one: a
+Wi-Fi drought long enough to underrun, followed by an IDR recovery (the
+consumer requesting one, or the producer's own after loss) while the backlog
+it brought is still queued. Report that episode's waiting_idr time against the
+1.0 s budget, the peak `playout_reported_offset_ms`, and how long latency
+stays raised: the time from the drought until the reported offset is back
+within 15 ms of where it was before it.
+
+Live result (#230 sink-stall run, owner-accepted): forced pulsesink stalls on
+the lossless wireless receiver each produced exactly one
+`audio_playout_retime`, and every stall up to 1 s played with zero
+`frames_trimmed`, `frames_shed` and `frames_padded` (no
+`audio_playout_overflow`). Two stalls back to back, 1 s then 1.6 s, took the
+offset to a peak of 2112 ms, past the 2 s emergency bound, and cost one
+counted cut of 110 ms (`frames_overflowed` 5301, one
+`audio_playout_overflow`). **The owner accepted it**: the cut only happens
+beyond the bound and is counted, and the bound stays at 2 s. Outside the
+stalls the offset held steady at 185-236 ms.
 On wireless, video setup sends the initial focus notification. The receiver
 requests an IDR at the first accepted video start for the stream, after any
 staged codec-config ACK. This can precede the transition to active. With a
@@ -392,7 +410,8 @@ What a live window should check:
    `checkpoint_gap_ms` say whether the timer itself was late. Record its
    result as measured, including the first seconds after audio starts and
    any pair over 90 ms with its cause. Every waiting_idr episode should
-   stay under 1.0 s with the hold.
+   stay under 1.0 s with the hold, including one forced right after a Wi-Fi
+   drought (see the IDR budgets above), with how long latency stayed raised.
 
 ## Run
 

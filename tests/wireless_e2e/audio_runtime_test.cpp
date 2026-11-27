@@ -453,6 +453,9 @@ struct RuntimeFixture final {
     // tests of the withheld credit a blocked write causes without lossless
     // playout, which grants on receipt instead.
     bool drift_rules{false};
+    // The phone's credit window (AudioCreditPolicy). 1 (stop-and-wait) unless a
+    // test sets it; the wireless receiver's default is audio::kWirelessCreditWindow.
+    std::uint32_t credit_window{1};
 
     void start(
         Clock::time_point deadline = Clock::now() + 20s,
@@ -502,8 +505,12 @@ struct RuntimeFixture final {
         audio_worker = std::make_unique<audio::AudioRenderWorker>(
             std::move(audio_policy),
             wr::audio_telemetry(),
-            custom_open ? custom_open : make_gated_router(gate));
+            custom_open ? custom_open : make_gated_router(gate),
+            audio::AudioRenderWorker::monotonic_now,
+            audio::AudioRenderWorker::kDefaultAckReleaseDrainTimeout,
+            audio::AudioCreditPolicy{credit_window});
         ASSERT_TRUE(audio_worker->ready());
+        ASSERT_EQ(audio_worker->credit_window(), credit_window);
 
         diag_out = std::make_unique<wr::DiagnosticOutput>(true);
         diagnostics = std::make_unique<aa::diagnostics::Diagnostics>(*diag_out);
@@ -734,6 +741,190 @@ TEST(WirelessAudioRuntime, ReconnectWithInFlightSessionOneSinkWriteIsolatesEpoch
     EXPECT_GE(opened, 2U);
     EXPECT_EQ(entered, 2U);
     EXPECT_EQ(completed, 1U);
+    EXPECT_EQ(output.find("\"event\":\"err\""), std::string::npos) << output;
+}
+
+// #230 review P3-1: the production wireless worker (lossless playout, credit
+// window 4) through the real runtime. The phone keeps 4 chunks in flight; each
+// is acknowledged on receipt while the sink blocks, since the lossless queue
+// has room for them.
+constexpr std::uint32_t kLosslessWindow = audio::kWirelessCreditWindow;
+
+// Sends `count` 50 ms chunks from `first_ns` without waiting, as a phone holding
+// that many permits may, then waits for all their acks.
+void send_window(PhonePeer& phone, std::uint64_t first_ns, std::uint32_t count,
+                 std::int32_t session_id = -7) {
+    for (std::uint32_t k = 0; k < count; ++k) {
+        ASSERT_TRUE(phone.send_msg(100, av_data_msg(first_ns + k * 50'000'000ULL, pcm_50ms())));
+    }
+    for (std::uint32_t k = 0; k < count; ++k) {
+        ASSERT_TRUE(phone.wait_audio_ack(session_id)) << "ack " << k + 1 << " of " << count;
+    }
+}
+
+// A write that fails (after blocking) drops and reopens the sink (#60) while the
+// phone holds the whole window; the window keeps flowing after the reopen.
+TEST(WirelessAudioRuntime, LosslessWindowFourWriteErrorBypassReopensAndResumes) {
+    StdoutCapture capture;
+    std::string output;
+    int exit_code = -1;
+    std::size_t opened = 0;
+    std::size_t completed = 0;
+    bool failed = true;
+    bool lossless = false;
+    {
+        RuntimeFixture f;
+        f.credit_window = kLosslessWindow;
+        f.gate->block_first_write = true;
+        f.gate->fail_first_write = true;
+        f.gate->populate_playback_slot = true;
+        ASSERT_NO_FATAL_FAILURE(f.start(Clock::now() + 20s));
+        lossless = f.audio_worker->lossless();
+        ASSERT_TRUE(f.backend->wait_authorized(1));
+        auto phone_res = PhonePeer::connect(f.port);
+        ASSERT_TRUE(phone_res);
+        auto phone = std::move(phone_res).value();
+        ASSERT_NO_FATAL_FAILURE(phone->handshake_and_open_av(-7));
+
+        // The whole window while write 1 blocks: every chunk acknowledged on receipt.
+        ASSERT_NO_FATAL_FAILURE(send_window(*phone, 1'000'000'000ULL, kLosslessWindow));
+        ASSERT_TRUE(f.gate->wait_entered(1));
+        f.gate->release(); // write 1 fails: bypass, reopen
+        {
+            std::unique_lock lock(f.gate->mutex);
+            ASSERT_TRUE(f.gate->cv.wait_for(lock, 5s, [&] { return f.gate->sinks_opened >= 2U; }));
+        }
+        // After the reopen the phone sends a whole window again, and it plays.
+        ASSERT_NO_FATAL_FAILURE(send_window(*phone, 2'000'000'000ULL, kLosslessWindow));
+        ASSERT_TRUE(f.audio_worker->wait_idle(Clock::now() + 3s));
+        {
+            std::unique_lock lock(f.gate->mutex);
+            (void)f.gate->cv.wait_for(lock, 2s, [&] { return f.gate->writes_completed >= 1U; });
+            opened = f.gate->sinks_opened;
+            completed = f.gate->writes_completed;
+        }
+        failed = f.audio_worker->failure().has_value();
+        EXPECT_TRUE(f.consumer_client->stop_projection());
+        phone->close();
+        exit_code = f.stop_and_join();
+    }
+    output = capture.stop();
+    maybe_dump_jsonl("lossless_w4_bypass", output);
+
+    EXPECT_TRUE(lossless);
+    EXPECT_EQ(exit_code, 0) << output;
+    EXPECT_FALSE(failed);
+    EXPECT_GE(opened, 2U);
+    EXPECT_GE(completed, 1U);
+    EXPECT_NE(output.find("\"event\":\"audio_stall_bypass\""), std::string::npos) << output;
+    EXPECT_EQ(output.find("ipc_queue_full"), std::string::npos) << output;
+    EXPECT_EQ(output.find("\"event\":\"err\""), std::string::npos) << output;
+}
+
+// A reconnect while session 1's window is queued behind a blocked (then failing)
+// write: session 2 starts with the whole window again and none of it is refused.
+TEST(WirelessAudioRuntime, LosslessWindowFourReconnectGivesTheNewSessionItsWholeWindow) {
+    StdoutCapture capture;
+    std::string output;
+    int exit_code = -1;
+    std::size_t opened = 0;
+    std::size_t completed = 0;
+    bool failed = true;
+    {
+        RuntimeFixture f;
+        f.credit_window = kLosslessWindow;
+        f.gate->block_first_write = true;
+        f.gate->fail_first_write = true;
+        f.gate->populate_playback_slot = true;
+        ASSERT_NO_FATAL_FAILURE(f.start(Clock::now() + 20s));
+        ASSERT_TRUE(f.audio_worker->lossless());
+        ASSERT_TRUE(f.backend->wait_authorized(1));
+        {
+            auto p1_res = PhonePeer::connect(f.port);
+            ASSERT_TRUE(p1_res);
+            auto p1 = std::move(p1_res).value();
+            ASSERT_NO_FATAL_FAILURE(p1->handshake_and_open_av(-7));
+            ASSERT_NO_FATAL_FAILURE(send_window(*p1, 2'000'000'000ULL, kLosslessWindow));
+            ASSERT_TRUE(f.gate->wait_entered(1));
+            p1->close();
+        }
+        ASSERT_TRUE(f.backend->wait_authorized(2));
+        auto p2_res = PhonePeer::connect(f.port);
+        ASSERT_TRUE(p2_res);
+        auto p2 = std::move(p2_res).value();
+        ASSERT_NO_FATAL_FAILURE(p2->handshake_and_open_av(-7));
+        // Earlier timestamps than session 1's, the whole window, while its write still blocks.
+        ASSERT_NO_FATAL_FAILURE(send_window(*p2, 1'000'000'000ULL, kLosslessWindow));
+        f.gate->release();
+        ASSERT_TRUE(f.audio_worker->wait_idle(Clock::now() + 3s));
+        {
+            std::unique_lock lock(f.gate->mutex);
+            ASSERT_TRUE(f.gate->cv.wait_for(lock, 2s, [&] { return f.gate->writes_completed >= 1U; }));
+            opened = f.gate->sinks_opened;
+            completed = f.gate->writes_completed;
+        }
+        failed = f.audio_worker->failure().has_value();
+        EXPECT_TRUE(f.consumer_client->stop_projection());
+        p2->close();
+        exit_code = f.stop_and_join();
+    }
+    output = capture.stop();
+    maybe_dump_jsonl("lossless_w4_reconnect", output);
+
+    EXPECT_EQ(exit_code, 0) << output;
+    EXPECT_FALSE(failed);
+    EXPECT_GE(opened, 2U);
+    EXPECT_GE(completed, 1U);
+    EXPECT_EQ(output.find("ipc_queue_full"), std::string::npos) << output;
+    EXPECT_EQ(output.find("\"event\":\"err\""), std::string::npos) << output;
+}
+
+// AV_STOP while the window is queued behind a blocked write: the accepted audio
+// plays out (#228), nothing is discarded, and the next stream gets its whole
+// window back at once, also acknowledged on receipt (review P2-1).
+TEST(WirelessAudioRuntime, LosslessWindowFourStopPlaysOutAndTheNextStreamGetsItsWindow) {
+    StdoutCapture capture;
+    std::string output;
+    int exit_code = -1;
+    bool failed = true;
+    std::size_t completed = 0;
+    {
+        RuntimeFixture f;
+        f.credit_window = kLosslessWindow;
+        f.gate->block_first_write = true;
+        f.gate->populate_playback_slot = true;
+        ASSERT_NO_FATAL_FAILURE(f.start(Clock::now() + 20s));
+        ASSERT_TRUE(f.audio_worker->lossless());
+        ASSERT_TRUE(f.backend->wait_authorized(1));
+        auto phone_res = PhonePeer::connect(f.port);
+        ASSERT_TRUE(phone_res);
+        auto phone = std::move(phone_res).value();
+        ASSERT_NO_FATAL_FAILURE(phone->handshake_and_open_av(-7));
+        ASSERT_NO_FATAL_FAILURE(send_window(*phone, 1'000'000'000ULL, kLosslessWindow));
+        ASSERT_TRUE(f.gate->wait_entered(1));
+        ASSERT_TRUE(phone->send_msg(100, proto::encode(proto::AvSinkStop{}).value()));
+        ASSERT_TRUE(phone->send_msg(100, proto::encode(proto::AvSinkStart{-7, 0}).value()));
+        ASSERT_NO_FATAL_FAILURE(send_window(*phone, 2'000'000'000ULL, kLosslessWindow));
+        f.gate->release();
+        ASSERT_TRUE(f.audio_worker->wait_idle(Clock::now() + 3s));
+        {
+            std::unique_lock lock(f.gate->mutex);
+            ASSERT_TRUE(f.gate->cv.wait_for(lock, 2s, [&] { return f.gate->writes_completed >= 2U; }));
+            completed = f.gate->writes_completed;
+        }
+        failed = f.audio_worker->failure().has_value();
+        EXPECT_TRUE(f.consumer_client->stop_projection());
+        phone->close();
+        exit_code = f.stop_and_join();
+    }
+    output = capture.stop();
+    maybe_dump_jsonl("lossless_w4_stop", output);
+
+    EXPECT_EQ(exit_code, 0) << output;
+    EXPECT_FALSE(failed);
+    EXPECT_GE(completed, 2U);
+    EXPECT_EQ(output.find("\"event\":\"audio_stop_discarded\""), std::string::npos) << output;
+    EXPECT_EQ(output.find("ipc_queue_full"), std::string::npos) << output;
     EXPECT_EQ(output.find("\"event\":\"err\""), std::string::npos) << output;
 }
 

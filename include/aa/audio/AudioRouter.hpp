@@ -306,7 +306,8 @@ private:
 //   the offset (the window's largest depth) is above min(depth + 230 ms,
 //   350 ms), the backlog is shed at 30% of each chunk - audible as a ~23 Hz
 //   gating for the fraction of a second it runs - keeping the offset under
-//   the wireless video hold cap (400 ms).
+//   the 400 ms video hold cap these rules pair with (no receiver's default
+//   since #230; lossless playout uses kLosslessVideoHoldCap, 700 ms).
 // - offset: the depth of the least-delayed recent arrival, i.e. how long
 //   after on-time content audio plays (depth + (group - 1) chunk periods with
 //   grouped delivery). WriteCompletion reports it slewed: it moves toward

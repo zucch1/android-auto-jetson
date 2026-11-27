@@ -506,12 +506,17 @@ void AudioRenderWorker::invalidate(protocol::ChannelRole role, std::uint64_t gen
     // stop right after the final ACK must not take it back.
     // So must the session's own teardown not, which resets every channel right
     // after stop(): nothing more is accepted then, so no room is needed.
+    // The next stream gets the whole window back at once (seed_credits_locked):
+    // the phone may send credit_window_ envelopes before any ACK, and each must
+    // be admitted (submit() reserves the rest of the window on every one), so the
+    // play-out must leave room for all of them plus one, never just two (#230).
     const auto room = envelope(*index);
+    const auto reserve = std::max<std::size_t>(kStopReserveScale, std::size_t{credit_window_} + 1);
     const bool play_out = drain_until_ ||
         (lossless_ && router_ && !stopping_ && !bypass_since_ &&
-         role_slots_[*index] + kStopReserveScale <= role_slot_cap() &&
-         role_bytes_[*index] + kStopReserveScale * room.bytes <= role_capacity(*index).bytes &&
-         role_units_[*index] + kStopReserveScale * room.units <= role_capacity(*index).units);
+         role_slots_[*index] + reserve <= role_slot_cap() &&
+         role_bytes_[*index] + reserve * room.bytes <= role_capacity(*index).bytes &&
+         role_units_[*index] + reserve * room.units <= role_capacity(*index).units);
     std::optional<std::string> discarded;
     if (play_out) {
         stream_end_pending_[*index] = true;
