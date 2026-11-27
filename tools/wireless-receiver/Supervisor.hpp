@@ -32,7 +32,10 @@ namespace aa::wireless_receiver {
 //   `wired_attempts` such failures in a row the phone is parked: it no longer
 //   holds wireless back. A parked phone is tried again once it has been absent
 //   from USB for `absent_reset` (it was unplugged and plugged in again), on a
-//   new StartProjection, or at `max_backoff` while wireless cannot run at all.
+//   new StartProjection, or on a bounded periodic re-probe every `max_backoff`
+//   whenever no wireless session or bootstrap is live (a live wireless session
+//   is never preempted). When wireless cannot run at all, wired keeps retrying
+//   under its normal exponential backoff up to `max_backoff`.
 // - A wireless run that fails backs off the same way, and wired keeps its turn.
 // - While wireless waits for a phone with no session or bootstrap in progress,
 //   the supervisor keeps scanning USB. An attached wired phone that is allowed
@@ -79,8 +82,10 @@ public:
         const auto found = wired_.find(candidate.phone.value);
         if (found == wired_.end()) return true;
         const auto& state = found->second;
-        if (now < state.retry) return false;
-        return state.failures < policy_.wired_attempts || !wireless_possible;
+        if (state.failures >= policy_.wired_attempts && wireless_possible) {
+            return now >= state.parked_retry;
+        }
+        return now >= state.retry;
     }
 
     void wired_started(const WiredCandidate& candidate, Clock::time_point now) {
@@ -102,6 +107,7 @@ public:
         if (now - state.started >= policy_.healthy_run) {
             state.failures = 0;
             state.retry = now + policy_.first_backoff;
+            state.parked_retry = {};
         } else {
             fail(state, now);
         }
@@ -127,6 +133,7 @@ private:
     struct Wired final {
         unsigned failures{};
         Clock::time_point retry{};
+        Clock::time_point parked_retry{};
         Clock::time_point started{};
         std::optional<Clock::time_point> absent_since{};
     };
@@ -139,6 +146,7 @@ private:
     void fail(Wired& state, Clock::time_point now) {
         ++state.failures;
         state.retry = now + backoff(state.failures);
+        state.parked_retry = now + policy_.max_backoff;
     }
 
     ArbitrationPolicy policy_;
@@ -170,6 +178,7 @@ struct SupervisorPorts final {
     std::function<void()> release_media;
     std::function<bool()> process_running;
     std::function<void(const char*, ErrorCode)> report;
+    std::function<TransportArbiter::Clock::time_point()> now = TransportArbiter::Clock::now;
 };
 
 class Supervisor final {
@@ -211,7 +220,7 @@ public:
             }
             // The worker ended on its own (or for revocation). Projection stays
             // requested and arbitration picks the next transport.
-            arbiter_.wired_exited(Clock::now());
+            arbiter_.wired_exited(now());
             wired_.reset();
             policy.active_transport.reset();
             return std::nullopt;
@@ -219,7 +228,7 @@ public:
 
         if (start_wired_if_allowed(approved)) return std::nullopt;
 
-        if (policy.wireless && arbiter_.wireless_allowed(Clock::now()) && has_wireless(approved)) {
+        if (policy.wireless && arbiter_.wireless_allowed(now()) && has_wireless(approved)) {
             policy.active_transport = ipc::ProjectionTransport::wireless;
             const auto consumer = state.consumer;
             const auto result = ports_.run_wireless(
@@ -228,7 +237,7 @@ public:
                     return keep_wireless(consumer, current, admitted);
                 });
             policy.active_transport.reset();
-            arbiter_.wireless_finished(result != 0, Clock::now());
+            arbiter_.wireless_finished(result != 0, now());
             if (!policy.ready) ports_.release_media();
             if (result != 0 && !ports_.process_running()) return result;
         }
@@ -239,6 +248,9 @@ public:
     [[nodiscard]] const std::optional<WiredCandidate>& wired() const noexcept { return wired_; }
 
 private:
+    [[nodiscard]] Clock::time_point now() const {
+        return ports_.now ? ports_.now() : Clock::now();
+    }
     static bool approved_phone(const std::vector<trust::ApprovedPhone>& approved, core::PhoneId phone) {
         return std::any_of(approved.begin(), approved.end(),
                            [&](const auto& entry) { return entry.phone_id == phone; });
@@ -261,14 +273,14 @@ private:
 
     // Scans at most every scan_interval. Returns the allowed candidate, if any.
     std::optional<WiredCandidate> allowed_candidate(const std::vector<trust::ApprovedPhone>& approved) {
-        const auto now = Clock::now();
-        if (!ports_.policy.wired || now < next_scan_) return std::nullopt;
-        next_scan_ = now + arbiter_.policy().scan_interval;
+        const auto current_time = now();
+        if (!ports_.policy.wired || current_time < next_scan_) return std::nullopt;
+        next_scan_ = current_time + arbiter_.policy().scan_interval;
         const auto candidates = ports_.scan_wired(last_wired_);
-        arbiter_.observe_scan(candidates, now);
+        arbiter_.observe_scan(candidates, current_time);
         const bool fallback = wireless_possible(approved);
         for (const auto& candidate : candidates) {
-            if (arbiter_.wired_allowed(candidate, now, fallback)) return candidate;
+            if (arbiter_.wired_allowed(candidate, current_time, fallback)) return candidate;
         }
         return std::nullopt;
     }
@@ -276,16 +288,16 @@ private:
     bool start_wired_if_allowed(const std::vector<trust::ApprovedPhone>& approved) {
         const auto candidate = allowed_candidate(approved);
         if (!candidate) return false;
-        const auto now = Clock::now();
+        const auto current_time = now();
         if (!ports_.start_wired(*candidate)) {
             // Backoff limits the retry rate and with it this report.
-            arbiter_.wired_spawn_failed(*candidate, now);
+            arbiter_.wired_spawn_failed(*candidate, current_time);
             ports_.report("wired projection worker", ErrorCode::transport_unavailable);
             return false;
         }
         wired_ = candidate;
         last_wired_ = candidate;
-        arbiter_.wired_started(*candidate, now);
+        arbiter_.wired_started(*candidate, current_time);
         ports_.policy.active_transport = ipc::ProjectionTransport::wired;
         return true;
     }

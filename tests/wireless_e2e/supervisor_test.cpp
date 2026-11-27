@@ -59,38 +59,43 @@ struct Harness final {
     bool process_running{true};
     bool wireless_idle{true};
     std::vector<std::string> reports{};
+    wr::Supervisor::Clock::time_point fake_now{100s};
+    bool use_fake_clock{false};
     // The wireless run: returns its status after `keep` says stop, or at once.
     std::function<int(const wr::WirelessKeep&)> wireless = [](const wr::WirelessKeep&) { return 0; };
 
-    wr::Supervisor supervisor{wr::SupervisorPorts{
-        [](aa::core::Milliseconds) -> aa::core::Result<void> { return {}; },
-        [this]() -> ipc::ControlService& { return service; },
-        policy,
-        [this]() -> const std::vector<aa::trust::ApprovedPhone>& { return approved; },
-        [this](const std::optional<wr::WiredCandidate>&) { return attached; },
-        [this](const wr::WiredCandidate&) {
-            if (spawn_fails) return false;
-            ++worker_starts;
-            worker_running = true;
-            return true;
-        },
-        [this] { return worker_running; },
-        [this] {
-            if (worker_running) ++worker_stops;
-            worker_running = false;
-        },
-        [this] { ++idr_requests; },
-        [this](const wr::WirelessKeep& keep) {
-            ++wireless_runs;
-            return wireless(keep);
-        },
-        [this] { return wireless_idle; },
-        [this] { ++releases; },
-        [this] { return process_running; },
-        [this](const char* what, ErrorCode) { reports.emplace_back(what); },
-    }, fast_policy()};
+    wr::Supervisor supervisor;
 
-    Harness() {
+    explicit Harness(wr::ArbitrationPolicy arbitration = fast_policy(), bool fake_clock = false)
+        : use_fake_clock(fake_clock),
+          supervisor(wr::SupervisorPorts{
+              [](aa::core::Milliseconds) -> aa::core::Result<void> { return {}; },
+              [this]() -> ipc::ControlService& { return service; },
+              policy,
+              [this]() -> const std::vector<aa::trust::ApprovedPhone>& { return approved; },
+              [this](const std::optional<wr::WiredCandidate>&) { return attached; },
+              [this](const wr::WiredCandidate&) {
+                  if (spawn_fails) return false;
+                  ++worker_starts;
+                  worker_running = true;
+                  return true;
+              },
+              [this] { return worker_running; },
+              [this] {
+                  if (worker_running) ++worker_stops;
+                  worker_running = false;
+              },
+              [this] { ++idr_requests; },
+              [this](const wr::WirelessKeep& keep) {
+                  ++wireless_runs;
+                  return wireless(keep);
+              },
+              [this] { return wireless_idle; },
+              [this] { ++releases; },
+              [this] { return process_running; },
+              [this](const char* what, ErrorCode) { reports.emplace_back(what); },
+              [this] { return use_fake_clock ? fake_now : wr::Supervisor::Clock::now(); },
+          }, arbitration) {
         credentials.add_connection(owner, kUid);
         credentials.set_owner(name, owner);
         policy.check_ready = [] { return aa::core::Result<void>{}; };
@@ -210,7 +215,9 @@ TEST(ManagedSupervisor, WirelessFailureKeepsRegistrationModeAndTransports) {
 }
 
 TEST(ManagedSupervisor, FailingWiredPhoneFallsBackToWirelessThenRetriesAfterReplug) {
-    Harness h;
+    auto policy = fast_policy();
+    policy.max_backoff = 250ms;
+    Harness h{policy};
     h.approve_wired();
     h.approve_wireless(9, kWirelessA);
     h.attach();
@@ -336,26 +343,160 @@ TEST(ManagedSupervisor, SpawnFailureBacksOffAndReportsRarely) {
 }
 
 TEST(ManagedSupervisor, BackoffArbiterParksAndResetsOnANewRequest) {
-    wr::TransportArbiter arbiter{fast_policy()};
+    wr::TransportArbiter arbiter{wr::ArbitrationPolicy{}};
     const wr::WiredCandidate phone{{7}, "1-2"};
-    auto now = std::chrono::steady_clock::now();
+    auto now = wr::TransportArbiter::Clock::time_point{100s};
     for (int i = 0; i < 3; ++i) {
         ASSERT_TRUE(arbiter.wired_allowed(phone, now, true));
         arbiter.wired_started(phone, now);
-        arbiter.wired_exited(now + 1ms);
-        now += 1s;
+        arbiter.wired_exited(now + 1s);
+        now += 5s;
     }
+    // Parked after 3 failures: yields to wireless before max_backoff (30 s),
+    // but still allowed when wireless cannot run once normal backoff (4 s) elapsed.
     EXPECT_FALSE(arbiter.wired_allowed(phone, now, true));
     EXPECT_TRUE(arbiter.wired_allowed(phone, now, false)) << "no wireless to fall back to";
+    // Bounded periodic re-probe opens at max_backoff (30 s) after the last failure.
+    EXPECT_FALSE(arbiter.wired_allowed(phone, now + 25s, true));
+    EXPECT_TRUE(arbiter.wired_allowed(phone, now + 26s, true));
+    // A new StartProjection resets parked state immediately.
     arbiter.reset();
     EXPECT_TRUE(arbiter.wired_allowed(phone, now, true));
 
     // A healthy run clears the failures.
     arbiter.wired_started(phone, now);
-    arbiter.wired_exited(now + 1ms);
-    arbiter.wired_started(phone, now + 1s);
-    arbiter.wired_exited(now + 2s);
+    arbiter.wired_exited(now + 1s);
+    arbiter.wired_started(phone, now + 2s);
+    arbiter.wired_exited(now + 35s);
     EXPECT_EQ(arbiter.wired_failures(phone.phone), 0U);
+}
+
+TEST(ManagedSupervisor, ParkedWiredPhoneRecoversPeriodicallyWhenWirelessFailsOrIsUnreachable) {
+    Harness h{wr::ArbitrationPolicy{}, /*fake_clock=*/true};
+    h.approve_wired();
+    h.approve_wireless(9, kWirelessA);
+    h.attach();
+    h.start();
+
+    // Three short wired failures park the attached phone without unplugging it.
+    // Backoffs between attempts 1->2 and 2->3 are 1 s and 2 s.
+    for (unsigned attempt = 1; attempt <= 3; ++attempt) {
+        h.step();
+        ASSERT_EQ(h.worker_starts, attempt);
+        h.fake_now += 1s;
+        h.worker_running = false;
+        h.step();
+        if (attempt == 1) h.fake_now += 1s;
+        if (attempt == 2) h.fake_now += 2s;
+    }
+    ASSERT_EQ(h.supervisor.arbiter().wired_failures({7}), 3U);
+
+    // Phase 1: approved wireless phone keeps failing (e.g. audio setup error).
+    h.wireless = [](const wr::WirelessKeep&) { return 3; };
+    h.step();
+    EXPECT_EQ(h.wireless_runs, 1U);
+    EXPECT_EQ(h.worker_starts, 3U);
+
+    // During the 30 s parked window, wireless retries after backoff but wired stays parked.
+    h.fake_now += 10s;
+    h.step();
+    EXPECT_EQ(h.wireless_runs, 2U);
+    EXPECT_EQ(h.worker_starts, 3U);
+
+    h.fake_now += 15s;  // 25 s since 3rd wired failure (< 30 s max_backoff)
+    h.step();
+    EXPECT_EQ(h.wireless_runs, 3U);
+    EXPECT_EQ(h.worker_starts, 3U);
+
+    // At 30 s, the parked wired phone gets a bounded periodic re-probe.
+    h.fake_now += 5s;
+    h.step();
+    EXPECT_EQ(h.worker_starts, 4U);
+    EXPECT_EQ(h.policy.active_transport, ipc::ProjectionTransport::wired);
+
+    // Suppose the 4th probe still fails; next probe is pushed out by another 30 s.
+    h.fake_now += 1s;
+    h.worker_running = false;
+    h.step();
+    ASSERT_EQ(h.supervisor.arbiter().wired_failures({7}), 4U);
+
+    // Phase 2: approved wireless phone is unreachable / helper cannot admit (#244),
+    // so wireless sits idle (`wireless_idle == true`).
+    unsigned idle_checks = 0;
+    h.wireless_idle = true;
+    h.wireless = [&](const wr::WirelessKeep& keep) {
+        while (keep(h.service.state(), std::nullopt)) {
+            ++idle_checks;
+            h.fake_now += 5s;
+            if (idle_checks > 20) return 9;
+        }
+        return 0;
+    };
+    // Advance past wireless backoff (4 s after 3 failures) without reaching 30 s.
+    h.fake_now += 5s;
+    h.step();
+    // Checks at 5s, 10s, 15s, 20s, 25s stay true; at 30s the parked probe ends the idle wait.
+    EXPECT_EQ(idle_checks, 5U);
+    EXPECT_EQ(h.worker_starts, 4U);
+
+    // Next step starts the wired phone with NO replug; this time it stays healthy.
+    h.step();
+    EXPECT_EQ(h.worker_starts, 5U);
+    EXPECT_TRUE(h.worker_running);
+    EXPECT_EQ(h.policy.active_transport, ipc::ProjectionTransport::wired);
+
+    // Running past healthy_run clears the failure count on eventual exit.
+    h.fake_now += 35s;
+    h.step();
+    EXPECT_TRUE(h.worker_running);
+    h.worker_running = false;
+    h.step();
+    EXPECT_EQ(h.supervisor.arbiter().wired_failures({7}), 0U);
+}
+
+TEST(ManagedSupervisor, LiveWirelessSessionNeverPreemptedByParkedWiredProbe) {
+    Harness h{wr::ArbitrationPolicy{}, /*fake_clock=*/true};
+    h.approve_wired();
+    h.approve_wireless(9, kWirelessA);
+    h.attach();
+    h.start();
+
+    // Park the attached wired phone after 3 short failures.
+    for (unsigned attempt = 1; attempt <= 3; ++attempt) {
+        h.step();
+        ASSERT_EQ(h.worker_starts, attempt);
+        h.fake_now += 1s;
+        h.worker_running = false;
+        h.step();
+        if (attempt == 1) h.fake_now += 1s;
+        if (attempt == 2) h.fake_now += 2s;
+    }
+    ASSERT_EQ(h.supervisor.arbiter().wired_failures({7}), 3U);
+
+    // Wireless enters bootstrap and then a live session (`wireless_idle == false`).
+    // Advancing well past the 30 s parked probe interval must never preempt it.
+    std::vector<bool> kept;
+    h.wireless_idle = false;
+    h.wireless = [&](const wr::WirelessKeep& keep) {
+        // Bootstrap in progress past 30 s: never preempted.
+        h.fake_now += 35s;
+        kept.push_back(keep(h.service.state(), std::nullopt));
+        // Live admitted session past 60 s and 120 s: never preempted.
+        h.fake_now += 30s;
+        kept.push_back(keep(h.service.state(), kWirelessA));
+        h.fake_now += 60s;
+        kept.push_back(keep(h.service.state(), kWirelessA));
+        return 0;
+    };
+    h.step();
+    EXPECT_EQ(h.wireless_runs, 1U);
+    EXPECT_EQ(kept, (std::vector<bool>{true, true, true}));
+    EXPECT_EQ(h.worker_starts, 3U);
+
+    // Once the live wireless session ends on its own, the parked wired phone may probe.
+    h.step();
+    EXPECT_EQ(h.worker_starts, 4U);
+    EXPECT_EQ(h.policy.active_transport, ipc::ProjectionTransport::wired);
 }
 
 } // namespace
