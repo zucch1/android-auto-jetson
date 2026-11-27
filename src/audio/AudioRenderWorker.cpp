@@ -181,7 +181,7 @@ AudioRenderWorker::AudioRenderWorker(RouterConfig config,
       ack_release_timeout_(std::max(std::chrono::milliseconds{1}, ack_release_timeout)),
       credit_window_(std::clamp<std::uint32_t>(credit.window, 1, AudioCreditPolicy::kMaxWindow)),
       lossless_(config.playout.enabled && config.playout.lossless),
-      capacity_scale_(lossless_ ? std::max<std::size_t>(credit_window_, lossless_scale(config))
+      capacity_scale_(lossless_ ? lossless_scale(config) + (credit_window_ > 1 ? credit_window_ : 0)
                                 : credit_window_),
       playout_depth_ns_(config.playout.enabled ? config.playout.depth.count : 0),
       emergency_backlog_ns_(config.playout.emergency_backlog.count),
@@ -506,12 +506,19 @@ void AudioRenderWorker::invalidate(protocol::ChannelRole role, std::uint64_t gen
     // stop right after the final ACK must not take it back.
     // So must the session's own teardown not, which resets every channel right
     // after stop(): nothing more is accepted then, so no room is needed.
+    // The next stream gets the whole window back at once (seed_credits_locked):
+    // the phone may send credit_window_ envelopes before any ACK, and each must
+    // be admitted (submit() reserves the remaining permits plus the incoming
+    // envelope, and grant_deferred() only grants another permit when room
+    // remains), so play-out must leave room for credit_window_ envelopes (or
+    // kStopReserveScale for unwindowed stop-and-wait, #230).
     const auto room = envelope(*index);
+    const auto reserve = std::max<std::size_t>(kStopReserveScale, std::size_t{credit_window_});
     const bool play_out = drain_until_ ||
         (lossless_ && router_ && !stopping_ && !bypass_since_ &&
-         role_slots_[*index] + kStopReserveScale <= role_slot_cap() &&
-         role_bytes_[*index] + kStopReserveScale * room.bytes <= role_capacity(*index).bytes &&
-         role_units_[*index] + kStopReserveScale * room.units <= role_capacity(*index).units);
+         role_slots_[*index] + reserve <= role_slot_cap() &&
+         role_bytes_[*index] + reserve * room.bytes <= role_capacity(*index).bytes &&
+         role_units_[*index] + reserve * room.units <= role_capacity(*index).units);
     std::optional<std::string> discarded;
     if (play_out) {
         stream_end_pending_[*index] = true;

@@ -96,8 +96,8 @@ public:
     // write returns: the value then keeps that content's due just ahead of now.
     // The newest write's end offset (0 when none).
     [[nodiscard]] std::chrono::nanoseconds current_playout_offset() const;
-    // Lossless playout (wired): the video hold may follow it further than
-    // wireless's cap (tools/media_playout_options.hpp).
+    // Lossless playout (both receivers' default since #230): the video hold may
+    // follow it further than the arrival-model cap (tools/media_playout_options.hpp).
     [[nodiscard]] bool lossless() const noexcept { return lossless_; }
     [[nodiscard]] SinkReport sink_report();
 
@@ -236,7 +236,17 @@ private:
     // stall the sink recovers from, whatever the packet size, so the phone never
     // has to hold audio back (its capture buffer is 341 ms).
     //
-    // Memory is bounded by one slot (job) per kSlotNs of that time, 4,400 a role.
+    // A credit window of N > 1 (wireless, #230) adds N capacity units on top: the
+    // N permits the phone holds each reserve a whole envelope (100 ms of media,
+    // 200 ms of voice), and without them those reservations ate into the time
+    // above: credits were acknowledged on receipt for 4.0 s of 100 ms media
+    // packets and 3.6 s of guidance, at most the 4 s a stall the sink recovers
+    // from can queue, against wired's 4.3 and 4.2 s. With them each role keeps
+    // at least wired's margin. At wireless's window of 4 that is 5.2 s and 5,200
+    // slots a role (job records at all three slot limits: 11.9 MiB, not 10.1).
+    //
+    // Memory is bounded by one slot (job) per kSlotNs of that time, 4,400 a role
+    // at N = 1 (wired; 5,200 at wireless's N = 4).
     // Packets shorter than kSlotNs share one while they wait here (coalesce_locked,
     // up to kCoalesceNs of PCM), so the slots last as long as the time does: a job
     // shorter than kSlotNs only opens behind one too full to take the packet (over
@@ -244,8 +254,9 @@ private:
     // envelope a credit reserves covers).
     //
     // A job is 800 bytes without its PCM, mostly the failure forensics of its
-    // admission. At all three roles' slot limits (4.4 s of 1 ms packets on each)
-    // the job records are 13,200 x 800 bytes = 10.1 MiB, plus 1.1 MB of PCM and its
+    // admission. At all three roles' slot limits at N = 1 (4.4 s of 1 ms packets
+    // on each; 11.9 MiB at N = 4, see above) the job records are 13,200 x 800
+    // bytes = 10.1 MiB, plus 1.1 MB of PCM and its
     // heap allocations. A shared job adds 40 bytes a packet: 0.6 MB a role for 4.4 s
     // of 64-byte media packets, at the very most (single frames on all three roles)
     // 14 MB, or twice that while its vector grows. A26 media (42.67 ms packets) takes
@@ -264,7 +275,9 @@ private:
     // packets holds hundreds. The rest waits here, as before its decode.
     static constexpr std::size_t kRouterParents = 64;
     // A stopped stream plays out unless that leaves a new one less than this
-    // many envelopes (its largest message); then it is cancelled and reported (audio_stop_discarded).
+    // many envelopes (its largest message), or less than its credit window when
+    // that is more (the phone gets the whole window back at the stop); then it
+    // is cancelled and reported (audio_stop_discarded).
     static constexpr std::size_t kStopReserveScale = 2;
     // Longest a lossless stop takes: writes and the sink's end of stream together.
     static constexpr std::chrono::milliseconds kStopDrain{2000};

@@ -268,8 +268,9 @@ remaining excess), `credit_window` (the advertised
 accepted and not yet released for ACK: our side, normally 1 because acks go
 out on receipt) and `max_arrival_burst` (the most chunks of one channel that
 arrived within 10 ms of each other: the phone's side, above 1 when it uses
-more than one credit at once). The wired receiver's lossless
-playout (#228) never trims, sheds or pads, so those counters stay `0`; its
+more than one credit at once). Lossless playout, both receivers' default
+(wired #228, wireless #230), never trims, sheds or pads, so those counters stay
+`0` (the shed and drift-pad fields describe the #182 drift rules); its
 records add `frames_compressed` and `frames_stretched` (output frames the rate
 correction made the decoded runs shorter or longer by: nothing is dropped or
 inserted), `playout_overflows` (chunks cut by the 2 s emergency bound) and
@@ -297,7 +298,7 @@ its slot the chunk arrived) and `depth_ms` (the depth it re-anchored with),
 and each anchor logs `audio_playout_anchor` with `reason` (`start` or
 `resume`), `skipped_ms` (elapsed time jumped over without a write),
 `depth_ms` and `anchors_lifetime`. The VideoOutlet logs
-`video_hold_capped` (`requested_ms`, `cap_ms` 400 wireless or 700 wired, `capped_frames`, counted
+`video_hold_capped` (`requested_ms`, `cap_ms` 700 behind lossless audio, both receivers' default, or 400, `capped_frames`, counted
 when a capped frame is released) when the offset it follows exceeds its hold
 cap, and `video_release_late` (`late_ms`, `late_releases`, `by`: the path that
 released it, `timer`, `checkpoint`, `arrival` or `service`, and

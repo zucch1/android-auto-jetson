@@ -270,30 +270,55 @@ std::vector<std::string> split_lines(const std::string& text) {
     return lines;
 }
 
-// #228: lossless playout is wired's default only; wireless keeps the #182
-// playout clock, drift rules and credit accounting.
-TEST(WirelessAudioWorker, WirelessConfigKeepsTheBoundedDriftRules) {
+// The #182 drift rules (lossless off), wireless's default before #230. No
+// receiver flag selects them any more, but stop-and-wait credit accounting, the
+// 250 ms credit-wait bypass and cancel-on-stop are still what the router and
+// worker do without lossless playout (and, for a cancel, what a lossless stop
+// falls back to without room), so the tests of those paths keep them. Lossless
+// wireless: WirelessConfigIsLossless and the Lossless* tests below.
+[[nodiscard]] audio::RouterConfig wireless_drift_rules_config() {
+    auto config = wr::audio_config(audio::SinkBackend::pulse);
+    config.playout.lossless = false;
+    return config;
+}
+
+// #230 (owner rule 2026-11-23: audio must not drop sound on either transport):
+// wireless plays lossless like wired, at its own 120 ms depth, with the drift
+// policy enabled (playout requires it) but never trimming, and catch-up off.
+TEST(WirelessAudioWorker, WirelessConfigIsLossless) {
     const auto config = wr::audio_config(audio::SinkBackend::pulse);
     EXPECT_TRUE(config.playout.enabled);
-    EXPECT_FALSE(config.playout.lossless);
+    EXPECT_TRUE(config.playout.lossless);
     EXPECT_EQ(config.playout.depth, audio::kWirelessPlayoutDepth);
+    EXPECT_EQ(config.playout.emergency_backlog, aa::core::Nanoseconds{2'000'000'000LL});
     EXPECT_TRUE(config.live_pcm_drift.enabled);
     EXPECT_EQ(config.live_pcm_drift.catch_up_watermark, aa::core::Nanoseconds{0});
-    // Its media_timing record has no lossless field.
+    // The worker reports it, so the video hold may follow it to the lossless cap.
+    auto gate = std::make_shared<SinkGate>();
+    audio::AudioRenderWorker worker{config, {}, fake_router(gate),
+                                    audio::AudioRenderWorker::monotonic_now,
+                                    audio::AudioRenderWorker::kDefaultAckReleaseDrainTimeout,
+                                    audio::AudioCreditPolicy{audio::kWirelessCreditWindow}};
+    EXPECT_TRUE(worker.lossless());
+    worker.stop();
+    (void)worker.finish();
+    // Its media_timing record carries the lossless fields.
     audio::MediaTimingContext context;
     context.playout_target = config.playout.depth;
-    EXPECT_EQ(audio::media_timing_json({}, context).find("frames_compressed"), std::string::npos);
     context.lossless = true;
     EXPECT_NE(audio::media_timing_json({}, context).find("\"frames_compressed\":0,\"frames_stretched\":0,"
                                                          "\"playout_overflows\":0,\"frames_overflowed\":0"),
               std::string::npos);
+    // The arrival model (--audio-playout-ms 0) is still there to opt into.
+    EXPECT_FALSE(wr::audio_config(audio::SinkBackend::pulse, aa::core::Nanoseconds{0},
+                                  aa::core::Nanoseconds{0}).playout.enabled);
 }
 
 TEST(WirelessAudioWorker, StalledSinkDoesNotBlockSessionThreadOrIngress) {
     auto gate = std::make_shared<SinkGate>();
     gate->block_write_index = 1;
 
-    audio::AudioRenderWorker audio{wr::audio_config(audio::SinkBackend::pulse),
+    audio::AudioRenderWorker audio{wireless_drift_rules_config(),
                                    wr::audio_telemetry(), fake_router(gate)};
     ASSERT_TRUE(audio.ready());
 
@@ -402,7 +427,7 @@ TEST(WirelessAudioWorker, StallBypassTriggersAndReopensOnWriteError) {
         StdoutCapture capture;
         diag::StdoutLogScope logging{wr::running};
         audio::AudioRenderWorker audio{
-            wr::audio_config(audio::SinkBackend::pulse), wr::audio_telemetry(),
+            wireless_drift_rules_config(), wr::audio_telemetry(),
             fake_router(gate)};
         ready_ok = audio.ready().has_value();
         if (ready_ok) {
@@ -746,7 +771,7 @@ TEST(WirelessAudioWorker, SessionResetClearsPriorBypassAndProtectsNewPcmFromLate
             StdoutCapture capture;
             diag::StdoutLogScope logging{wr::running};
             audio::AudioRenderWorker audio{
-                wr::audio_config(audio::SinkBackend::pulse), wr::audio_telemetry(),
+                wireless_drift_rules_config(), wr::audio_telemetry(),
                 fake_router(gate)};
             ready_ok = audio.ready().has_value();
             if (ready_ok) {
@@ -813,7 +838,7 @@ TEST(WirelessAudioWorker, SessionResetClearsPriorBypassAndProtectsNewPcmFromLate
             StdoutCapture capture;
             diag::StdoutLogScope logging{wr::running};
             audio::AudioRenderWorker audio{
-                wr::audio_config(audio::SinkBackend::pulse), wr::audio_telemetry(),
+                wireless_drift_rules_config(), wr::audio_telemetry(),
                 fake_router(gate)};
             ready_ok = audio.ready().has_value();
             if (ready_ok) {
@@ -1115,6 +1140,15 @@ struct CollectedTelemetry final {
     return config;
 }
 
+// The same with the #182 drift rules (see wireless_drift_rules_config()): the
+// history tests below exercise cancel-on-stop, which a lossless stop replaces
+// by playing out what was accepted.
+[[nodiscard]] audio::RouterConfig quiet_drift_rules_config() {
+    auto config = quiet_wireless_config();
+    config.playout.lossless = false;
+    return config;
+}
+
 TEST(WirelessAudioWorker, CreditWindowAdvertisesFourAndKeepsFourChunksInFlight) {
     auto gate = std::make_shared<SinkGate>();
     gate->block_write_index = 1;
@@ -1177,6 +1211,7 @@ struct WorkerReplay final {
     std::vector<std::string> anchors{};
     std::uint64_t max_unacked_held{};
     std::int64_t playout_offset{};
+    std::uint64_t capped_holds{};
     // Every write's report, and (content time, hold the video source gave)
     // for a frame arriving with each chunk.
     std::vector<audio::WriteCompletion> completions{};
@@ -1238,7 +1273,14 @@ template <typename RoundTrip>
                                    audio::AudioCreditPolicy{audio::kWirelessCreditWindow}};
     if (!audio.ready()) { replay.failure = aa::ErrorCode::audio_sink_unavailable; return replay; }
     wr::Media media{audio};
-    media.match_video_to_audio(std::chrono::milliseconds{120});
+    // As the receiver's main() wires it: the hold follows the audio offset, up to
+    // the cap for the policy (#230: kLosslessVideoHoldCap).
+    {
+        std::chrono::milliseconds fallback{};
+        bool follow = false;
+        aa::tools::configure_video_hold(media.video, audio,
+            {audio::kWirelessPlayoutDepth.count / 1'000'000, 0, std::nullopt}, follow, fallback);
+    }
     SessionHarness h;
     h.start(media);
     const auto chunk = pcm_chunk_2048();
@@ -1311,6 +1353,7 @@ template <typename RoundTrip>
     if (!replay.failure) { (void)service(); }
     replay.max_unacked_held = audio.max_unacked_held();
     replay.playout_offset = audio.current_playout_offset().count();
+    replay.capped_holds = media.video.capped_holds();
     for (std::size_t i = 1; i < completions->size(); ++i) {
         const auto& a = (*completions)[i - 1];
         const auto& b = (*completions)[i];
@@ -1481,22 +1524,34 @@ TEST(WirelessAudioWorker, PlayoutResumeSkipsAreLoggedWithTheirSize) {
 // (6400 B = one 200 ms envelope), media bytes (19200 B envelopes) and the
 // media slot cap (small chunks) with a phone that sends exactly what its
 // permits allow and counts the acks it gets back.
+//
+// Guidance and media bytes run the production (lossless, #230) policy, which
+// grants on receipt until the time-based queue is full (5.2 s: 26 prompts, 52
+// 100 ms packets, both under the 64 sent). The slot cap only binds under the
+// #182 drift rules: lossless playout coalesces small packets and sizes its slots
+// by time, so 400 B packets run into its byte limit first (2,496 of them) and
+// would never reach a slot limit. That case is pinned to the drift rules, whose
+// per-packet slots and stop-and-wait credit it was written for. Every case must
+// end with the phone out of permits, so the queue really was saturated.
 TEST(WirelessAudioWorker, CreditWindowSaturationWithABlockedSinkNeverRefusesALegalChunk) {
     struct Case final {
         proto::ChannelRole role;
         std::size_t bytes;
         const char* label;
+        bool drift_rules;
     };
-    for (const auto& c : {Case{proto::ChannelRole::guidance_audio, 6400, "guidance"},
-                          Case{proto::ChannelRole::media_audio, 19200, "media bytes"},
-                          Case{proto::ChannelRole::media_audio, 400, "media slots"}}) {
+    for (const auto& c : {Case{proto::ChannelRole::guidance_audio, 6400, "guidance", false},
+                          Case{proto::ChannelRole::media_audio, 19200, "media bytes", false},
+                          Case{proto::ChannelRole::media_audio, 400, "media slots", true}}) {
         auto gate = std::make_shared<SinkGate>();
         gate->block_write_index = 1;
-        audio::AudioRenderWorker audio{quiet_wireless_config(), {}, fake_router(gate),
+        audio::AudioRenderWorker audio{c.drift_rules ? quiet_drift_rules_config() : quiet_wireless_config(),
+                                       {}, fake_router(gate),
                                        audio::AudioRenderWorker::monotonic_now,
                                        audio::AudioRenderWorker::kDefaultAckReleaseDrainTimeout,
                                        audio::AudioCreditPolicy{audio::kWirelessCreditWindow}};
         ASSERT_TRUE(audio.ready());
+        EXPECT_EQ(audio.lossless(), !c.drift_rules) << c.label;
         const std::vector<std::byte> payload(c.bytes, std::byte{0x10});
         std::uint64_t permits = audio::kWirelessCreditWindow;
         std::uint64_t sent = 0;
@@ -1511,8 +1566,10 @@ TEST(WirelessAudioWorker, CreditWindowSaturationWithABlockedSinkNeverRefusesALeg
             while (audio.take_completion()) { ++permits; }
         }
         EXPECT_FALSE(refused) << c.label << ": legal chunk " << sent + 1 << " refused";
-        // The phone used its whole window before it stalled on withheld credit.
+        // The phone used its whole window before it stalled on withheld credit:
+        // the queue was full, not the loop's end.
         EXPECT_GE(sent, audio::kWirelessCreditWindow) << c.label;
+        EXPECT_EQ(permits, 0U) << c.label << ": " << sent << " sent without saturating the queue";
         gate->release();
         ASSERT_TRUE(audio.wait_idle(std::chrono::steady_clock::now() + std::chrono::seconds{2}));
         audio.stop();
@@ -1520,6 +1577,292 @@ TEST(WirelessAudioWorker, CreditWindowSaturationWithABlockedSinkNeverRefusesALeg
     }
 }
 
+
+// #230: the production wireless worker queues lossless playout by time with the
+// credit window's permits on top. While the sink is blocked the phone sends as
+// fast as its permits allow; every packet must be acknowledged on receipt until
+// the queue holds a stall the sink recovers from (emergency bound + write
+// deadline, 4 s) plus wired's margin (one 200 ms envelope). Before, the four
+// reserved permits ate into that: credits went out on receipt for 97 A26 chunks
+// (4.14 s), 40 packets of 100 ms media (4.0 s) and 18 prompts (3.6 s).
+TEST(WirelessAudioWorker, LosslessQueueKeepsTheWholeStallBudgetUnderTheCreditWindow) {
+    struct Case final {
+        proto::ChannelRole role;
+        std::size_t bytes;
+        std::int64_t packet_ns;
+        const char* label;
+    };
+    for (const auto& c : {Case{proto::ChannelRole::media_audio, 8192, kChunkNs, "A26 media"},
+                          Case{proto::ChannelRole::media_audio, 19200, 100'000'000, "100 ms media"},
+                          Case{proto::ChannelRole::guidance_audio, 6400, 200'000'000, "guidance"}}) {
+        SCOPED_TRACE(c.label);
+        auto gate = std::make_shared<SinkGate>();
+        gate->block_write_index = 1;
+        const auto config = quiet_wireless_config();
+        audio::AudioRenderWorker audio{config, {}, fake_router(gate),
+                                       audio::AudioRenderWorker::monotonic_now,
+                                       audio::AudioRenderWorker::kDefaultAckReleaseDrainTimeout,
+                                       audio::AudioCreditPolicy{audio::kWirelessCreditWindow}};
+        ASSERT_TRUE(audio.ready());
+        ASSERT_TRUE(audio.lossless());
+        const std::vector<std::byte> payload(c.bytes, std::byte{0x10});
+        const auto base = audio::AudioRenderWorker::monotonic_now().count;
+        std::uint64_t permits = audio::kWirelessCreditWindow;
+        std::uint64_t sent = 0;
+        std::uint64_t granted = 0;
+        for (std::uint64_t k = 0; k < 400 && permits > 0; ++k) {
+            const proto::MessageHeader header{c.role, k, aa::core::Nanoseconds{base}};
+            ASSERT_TRUE(audio.submit({header, payload}, {c.role, 0, k + 1, 1})) << "packet " << k;
+            ++sent;
+            --permits;
+            if (k == 0) { ASSERT_TRUE(gate->wait_entered(1)); }
+            while (audio.take_completion()) { ++permits; ++granted; }
+            // Granted on receipt: the phone never waits while the queue has room.
+            if (permits == 0) { break; }
+        }
+        const auto budget = config.playout.emergency_backlog.count
+            + std::int64_t{config.sink_write_timeout.count} * 1'000'000 + 200'000'000;
+        EXPECT_GE(static_cast<std::int64_t>(granted) * c.packet_ns, budget)
+            << granted << " of " << sent << " acknowledged";
+        gate->release();
+        audio.stop();
+        EXPECT_TRUE(audio.finish());
+    }
+}
+
+// #230 review P2-1: a lossless stop plays out what was accepted only if that
+// leaves the next stream room. The phone gets its whole credit window (4) back
+// at the stop and may send 4 envelopes before any ACK, and each one is admitted
+// only with room for the rest of the window reserved; a stop that kept room for
+// just 2 refused the new stream's first legal chunk (ipc_queue_full, which ends
+// the session) with 4.4 to 4.8 s of guidance queued. At every depth up to a
+// full queue, all 4 must be admitted, and the old stream must be preserved
+// whenever at least credit_window_ envelopes remain free (exact-fit boundary)
+// and discarded when one fewer envelope remains (exact-fit minus one).
+TEST(WirelessAudioWorker, LosslessStopLeavesTheNextStreamItsWholeCreditWindow) {
+    struct Case final {
+        proto::ChannelRole role;
+        std::size_t bytes;
+        std::uint64_t full; // packets the 5.2 s queue holds
+        const char* label;
+    };
+    for (const auto& c : {Case{proto::ChannelRole::guidance_audio, 6400, 26, "guidance"},
+                          Case{proto::ChannelRole::media_audio, 19200, 52, "100 ms media"}}) {
+        const auto exact_fit = c.full - audio::kWirelessCreditWindow;
+        for (std::uint64_t depth = c.full - 10; depth <= c.full; ++depth) {
+            SCOPED_TRACE(std::string{c.label} + ", " + std::to_string(depth) + " packets queued");
+            auto gate = std::make_shared<SinkGate>();
+            gate->block_write_index = 1;
+            CollectedTelemetry telemetry;
+            audio::AudioRenderWorker audio{quiet_wireless_config(), telemetry.callbacks(),
+                                           fake_router(gate),
+                                           audio::AudioRenderWorker::monotonic_now,
+                                           audio::AudioRenderWorker::kDefaultAckReleaseDrainTimeout,
+                                           audio::AudioCreditPolicy{audio::kWirelessCreditWindow}};
+            ASSERT_TRUE(audio.ready());
+            ASSERT_TRUE(audio.lossless());
+            const std::vector<std::byte> payload(c.bytes, std::byte{0x10});
+            const auto base = audio::AudioRenderWorker::monotonic_now().count;
+            std::uint64_t permits = audio::kWirelessCreditWindow;
+            std::uint64_t sequence = 0;
+            for (std::uint64_t k = 0; k < depth && permits > 0; ++k) {
+                const proto::MessageHeader header{c.role, ++sequence, aa::core::Nanoseconds{base}};
+                ASSERT_TRUE(audio.submit({header, payload}, {c.role, 0, sequence, 1})) << "packet " << k;
+                --permits;
+                if (k == 0) { ASSERT_TRUE(gate->wait_entered(1)); }
+                while (audio.take_completion()) { ++permits; }
+            }
+            ASSERT_EQ(sequence, depth);
+            // AV_STOP, then the next stream at once: the phone holds the whole window again.
+            audio.invalidate(c.role, 1);
+            const auto discarded = telemetry.of("audio_stop_discarded");
+            if (depth <= exact_fit) {
+                EXPECT_TRUE(discarded.empty())
+                    << "stop discarded old stream with " << (c.full - depth)
+                    << " envelopes free: " << discarded.front();
+            } else {
+                ASSERT_EQ(discarded.size(), 1U)
+                    << "stop kept old stream with only " << (c.full - depth) << " envelopes free";
+                EXPECT_NE(discarded.front().find("\"chunks\":" + std::to_string(depth) + "}"),
+                          std::string::npos)
+                    << discarded.front();
+            }
+            std::uint64_t admitted = 0;
+            for (std::uint64_t k = 0; k < audio::kWirelessCreditWindow; ++k) {
+                const proto::MessageHeader header{c.role, ++sequence, aa::core::Nanoseconds{base}};
+                const auto submitted = audio.submit({header, payload}, {c.role, 1, sequence, 1});
+                EXPECT_TRUE(submitted) << "legal chunk " << k + 1 << " of the next stream: "
+                                       << aa::to_string(submitted.error().code());
+                if (!submitted) { break; }
+                ++admitted;
+            }
+            EXPECT_EQ(admitted, audio::kWirelessCreditWindow);
+            gate->release();
+            audio.stop();
+            EXPECT_TRUE(audio.finish());
+        }
+    }
+}
+
+// #230: Wi-Fi delivers in bursts. A drought longer than the buffer underruns;
+// the phone's backlog then arrives at once. The production wireless policy plays
+// every sample of it (nothing trimmed, shed, padded or caught up, and nothing
+// past the emergency bound): the buffer deepens instead, the writes report the
+// deeper offset and it drains by the rate correction. The #182 drift rules shed
+// the backlog at 30% of each chunk.
+TEST(WirelessAudioWorker, LosslessPlayoutKeepsEveryFrameOfABurstAfterADrought) {
+    for (const std::int64_t drought_ms : {300, 600}) {
+        for (const std::uint64_t group : {1U, 4U}) {
+            SCOPED_TRACE(std::to_string(drought_ms) + " ms drought, groups of " + std::to_string(group));
+            const auto replay = replay_through_worker(40, [&](std::int64_t second) {
+                return second == 8 ? drought_ms : std::int64_t{20};
+            }, group);
+            ASSERT_FALSE(replay.failure) << aa::to_string(*replay.failure);
+            const auto& stats = replay.stats;
+            EXPECT_EQ(stats.frames_decoded, replay.chunks * 2048U);
+            EXPECT_EQ(stats.frames_trimmed, 0U);
+            EXPECT_EQ(stats.frames_shed, 0U);
+            EXPECT_EQ(stats.frames_padded, 0U);
+            EXPECT_EQ(stats.frames_caught_up, 0U);
+            EXPECT_EQ(stats.playout_overflows, 0U);
+            EXPECT_EQ(stats.frames_overflowed, 0U);
+            // Every decoded frame was written, only played at another rate.
+            EXPECT_EQ(stats.frames_decoded + stats.frames_stretched,
+                      stats.frames_retained + stats.frames_compressed);
+            EXPECT_GE(stats.playout_underruns, 1U);
+            // The backlog became latency, which the writes report ...
+            std::int64_t deepest = 0;
+            for (const auto& c : replay.completions) {
+                deepest = std::max({deepest, c.playout_offset.count, c.playout_end_offset.count});
+            }
+            EXPECT_GT(deepest, audio::kWirelessPlayoutDepth.count + 2 * kChunkNs) << deepest;
+            // ... and the rate correction drains it while the phone plays on.
+            EXPECT_GT(stats.frames_compressed, 0U);
+            EXPECT_LT(replay.playout_offset, deepest);
+            ASSERT_FALSE(replay.media_timing.empty());
+            const auto& timing = replay.media_timing.back();
+            EXPECT_NE(timing.find("\"frames_trimmed\":0,"), std::string::npos) << timing;
+            EXPECT_NE(timing.find("\"frames_shed\":0,"), std::string::npos) << timing;
+            EXPECT_NE(timing.find("\"frames_padded\":0,"), std::string::npos) << timing;
+            EXPECT_NE(timing.find("\"playout_overflows\":0,\"frames_overflowed\":0"), std::string::npos) << timing;
+            // The video hold is the offset of the audio each frame pairs with,
+            // the deeper one included.
+            std::size_t compared = 0;
+            for (const auto& [content, hold] : replay.holds) {
+                const auto reported = reported_offset_at(replay.completions, content);
+                if (!reported) { continue; }
+                ++compared;
+                EXPECT_NEAR(static_cast<double>(hold.count()), static_cast<double>(*reported), 2e6) << content;
+            }
+            EXPECT_GT(compared, replay.holds.size() / 2);
+        }
+    }
+}
+
+// #230: the emergency bound is wireless's too. A burst whose last frames would
+// play more than 2 s after their content time loses exactly those, counted as
+// overflow and nothing else; up to the bound nothing is lost. The router with the
+// production wireless policy; chunk n of a burst is 120 ms + n x 42.67 ms deep.
+TEST(WirelessAudioWorker, LosslessPlayoutCutsOnlyBeyondTheEmergencyBound) {
+    auto config = quiet_wireless_config();
+    ASSERT_EQ(config.playout.emergency_backlog, aa::core::Nanoseconds{2'000'000'000LL});
+    auto gate = std::make_shared<SinkGate>();
+    auto opened = audio::detail::open_router_with_sink_for_test(config, std::make_unique<GatedAudioSink>(gate));
+    ASSERT_TRUE(opened);
+    auto router = std::move(opened).value();
+    // Current stamps: overdue audio is placed on the current clock.
+    const auto arrival = audio::AudioRenderWorker::monotonic_now().count + 3'600'000'000'000LL;
+    const auto chunk = pcm_chunk_2048();
+    std::uint64_t sequence = 0;
+    const auto media = [&] {
+        const proto::MessageHeader header{proto::ChannelRole::media_audio, ++sequence, aa::core::Nanoseconds{arrival}};
+        if (!router.submit({header, chunk})) { return false; }
+        for (int i = 0; i < 1024; ++i) {
+            auto stepped = router.render_step();
+            if (!stepped) { return false; }
+            if (!stepped.value().pending) { return true; }
+        }
+        return false;
+    };
+    // 120 + 43 x 42.67 = 1,955 ms: the 44th chunk still ends within 2 s.
+    for (int k = 0; k < 44; ++k) { ASSERT_TRUE(media()) << k; }
+    EXPECT_EQ(router.report().stats.playout_overflows, 0U);
+    EXPECT_EQ(router.report().stats.frames_trimmed, 0U);
+    EXPECT_EQ(router.report().stats.frames_shed, 0U);
+    for (int k = 0; k < 8; ++k) { ASSERT_TRUE(media()) << k; }
+    const auto& stats = router.report().stats;
+    EXPECT_GT(stats.playout_overflows, 0U);
+    EXPECT_GT(stats.frames_overflowed, 6U * 2048U);
+    EXPECT_EQ(stats.frames_trimmed, stats.frames_overflowed);
+    EXPECT_EQ(stats.frames_shed, 0U);
+    EXPECT_EQ(stats.frames_padded, 0U);
+    EXPECT_EQ(stats.frames_caught_up, 0U);
+    EXPECT_EQ(stats.frames_decoded, stats.frames_retained + stats.frames_trimmed);
+    // What is kept is two seconds deep at most.
+    // (2 s less the 120 ms depth the burst started from, at 48 kHz).
+    EXPECT_GT(stats.frames_output, 90'000U);
+    EXPECT_LE(*stats.playout_depth_max, aa::core::Nanoseconds{2'000'000'000LL + kChunkNs});
+}
+
+// #230, A/V: the deepest burst the phone can deliver over Wi-Fi is what it held
+// back, its credit window (4 chunks) and its 341 ms capture buffer (8): 12 chunks
+// at once, 120 ms + 11 x 42.67 ms = 589 ms deep. Lossless audio keeps them all,
+// so the hold follows to that depth under the 700 ms cap and a frame waits for
+// its audio. The production wireless worker, outlet and video hold wiring. The
+// drift rules shed it toward 350 ms and capped the hold at 400 ms.
+TEST(WirelessAudioWorker, LosslessVideoHoldFollowsTheDeepestPhoneBurst) {
+    auto gate = std::make_shared<SinkGate>();
+    audio::AudioRenderWorker audio{quiet_wireless_config(), {}, fake_router(gate),
+                                   audio::AudioRenderWorker::monotonic_now,
+                                   audio::AudioRenderWorker::kDefaultAckReleaseDrainTimeout,
+                                   audio::AudioCreditPolicy{audio::kWirelessCreditWindow}};
+    ASSERT_TRUE(audio.ready());
+    wr::Media media{audio};
+    auto now = std::chrono::steady_clock::time_point{} + std::chrono::seconds{400};
+    aa::wired_receiver::VideoOutlet::IdrRecoveryHooks hooks;
+    hooks.clock = [&] { return now; };
+    media.video.set_idr_recovery(std::move(hooks));
+    auto pair = videotest::make_pair(ipc::NegotiatedLimits{});
+    ASSERT_TRUE(pair);
+    media.video.install(std::move(pair.value().producer));
+    std::chrono::milliseconds fallback{};
+    bool follow = false;
+    aa::tools::configure_video_hold(media.video, audio,
+        {audio::kWirelessPlayoutDepth.count / 1'000'000, 0, std::nullopt}, follow, fallback);
+    ASSERT_TRUE(follow);
+    EXPECT_EQ(fallback, std::chrono::milliseconds{120});
+    const auto chunk = pcm_chunk_2048();
+    const auto role = proto::ChannelRole::media_audio;
+    const auto arrival = audio::AudioRenderWorker::monotonic_now().count;
+    for (std::uint64_t seq = 1; seq <= 12; ++seq) {
+        ASSERT_TRUE(audio.submit({{role, seq, {arrival + static_cast<std::int64_t>(seq) * 1'000'000}}, chunk},
+                                 {role, 0, seq, 7}));
+    }
+    ASSERT_TRUE(audio.wait_idle(std::chrono::steady_clock::now() + std::chrono::seconds{2}));
+    // On-cadence chunks let the slewed report reach the full depth.
+    std::int64_t content = 0;
+    for (std::uint64_t seq = 13; seq <= 60; ++seq) {
+        content = arrival + 12'000'000 + static_cast<std::int64_t>(seq - 12) * kChunkNs;
+        ASSERT_TRUE(audio.submit({{role, seq, {content}}, chunk}, {role, 0, seq, 7}));
+        ASSERT_TRUE(audio.wait_idle(std::chrono::steady_clock::now() + std::chrono::seconds{2}));
+        if (audio.playout_offset_at({content}) > std::chrono::milliseconds{560}) { break; }
+    }
+    ASSERT_GT(audio.playout_offset_at({content}), std::chrono::milliseconds{560});
+    ASSERT_LT(audio.playout_offset_at({content}), std::chrono::milliseconds{600});
+    ASSERT_TRUE(media.video.on_message({{proto::ChannelRole::video, 1, {content}}, wiredtest::kVideoIdr}));
+    now += std::chrono::milliseconds{540};
+    ASSERT_TRUE(media.video.release_held());
+    EXPECT_EQ(media.video.delayed_units(), 1U); // still held: its audio plays later
+    now += std::chrono::milliseconds{60};
+    ASSERT_TRUE(media.video.release_held());
+    EXPECT_EQ(media.video.delayed_units(), 0U);
+    EXPECT_EQ(media.video.capped_holds(), 0U);
+    audio.stop();
+    ASSERT_TRUE(audio.finish());
+    ASSERT_TRUE(audio.final_report());
+    EXPECT_EQ(audio.final_report()->stats.frames_shed, 0U);
+    EXPECT_EQ(audio.final_report()->stats.frames_trimmed, 0U);
+}
 
 // R3 / Neon P2-5: the hold must be the offset of the audio the frame pairs
 // with (the write whose content interval holds the frame's timestamp), also
@@ -1605,7 +1948,7 @@ TEST(WirelessAudioWorker, PlayoutOffsetLookupAcrossALongPauseFallsBackToTheDepth
 // keeps guidance's.
 TEST(WirelessAudioWorker, PlayoutHistoryClearsWhenNoStreamIsAnchored) {
     auto gate = std::make_shared<SinkGate>();
-    audio::AudioRenderWorker audio{quiet_wireless_config(), {}, fake_router(gate)};
+    audio::AudioRenderWorker audio{quiet_drift_rules_config(), {}, fake_router(gate)};
     ASSERT_TRUE(audio.ready());
     const auto guidance = proto::ChannelRole::guidance_audio;
     const auto media = proto::ChannelRole::media_audio;
@@ -1635,7 +1978,7 @@ TEST(WirelessAudioWorker, PlayoutHistoryClearsWhenNoStreamIsAnchored) {
 TEST(WirelessAudioWorker, PlayoutWriteCompletingAfterTheLastStreamStopsLeavesNoHistory) {
     auto gate = std::make_shared<SinkGate>();
     gate->block_write_index = 1;
-    audio::AudioRenderWorker audio{quiet_wireless_config(), {}, fake_router(gate)};
+    audio::AudioRenderWorker audio{quiet_drift_rules_config(), {}, fake_router(gate)};
     ASSERT_TRUE(audio.ready());
     const auto guidance = proto::ChannelRole::guidance_audio;
     const std::vector<std::byte> voice(6400, std::byte{0x10});
@@ -1659,7 +2002,7 @@ TEST(WirelessAudioWorker, PlayoutWriteCompletesWhenCancelledRoleHasAnAnchoredPee
     using namespace std::chrono_literals;
     auto gate = std::make_shared<SinkGate>();
     gate->block_write_index = 2;
-    audio::AudioRenderWorker audio{quiet_wireless_config(), {}, fake_router(gate)};
+    audio::AudioRenderWorker audio{quiet_drift_rules_config(), {}, fake_router(gate)};
     ASSERT_TRUE(audio.ready());
     const auto media = proto::ChannelRole::media_audio;
     const auto guidance = proto::ChannelRole::guidance_audio;

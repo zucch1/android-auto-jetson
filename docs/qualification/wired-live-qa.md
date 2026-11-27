@@ -166,7 +166,7 @@ for a stream start, a resume or a real underrun; the cost is latency:
   clock up). Time lost between writes, which the sink played through dry, moves
   its stamps instead (`held_ms` 0): written on at slots that had passed, the rest
   would be lost behind the ring buffer's read position;
-- video is held with the audio up to `700` ms (wireless `400`): a 16-chunk burst
+- video is held with the audio up to `700` ms (wireless too since `#230`): a 16-chunk burst
   or a stall of about `600` ms, leaving ~`300` ms of the `1.0` s budget. Deeper,
   the hold is clipped (`video_hold_capped`) and A/V parts by the rest until it
   drains;

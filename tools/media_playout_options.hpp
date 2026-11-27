@@ -20,15 +20,20 @@ inline constexpr std::int64_t kMaxAudioPlayoutMs =
 inline constexpr std::int64_t kMinCatchUpWatermarkMs = 20;
 inline constexpr std::int64_t kMaxCatchUpWatermarkMs = 200;
 
-// The longest video hold behind lossless (wired) audio. Wired audio keeps every
-// sample, so after a burst or a stall the hold has to follow it deeper than
-// wireless's 400 ms cap, or A/V parts by the difference for the half minute the
-// rate correction needs. 700 ms covers a 16-chunk burst (60 ms + 15 x 42.67 ms =
-// 700 ms, twice the phone's 341 ms capture buffer) and a sink stall of up to
-// about 600 ms, and leaves 300 ms of the drive smoke's 1.0 s waiting_idr budget
-// for the keyframe itself (requests are at most 250 ms apart). Deeper than that
-// a lagging touch screen is judged worse than lip sync: the hold is clipped,
-// video_hold_capped says so, and A/V parts by the rest until it drains.
+// The longest video hold behind lossless audio (both receivers' default: wired
+// #228, wireless #230). Lossless audio keeps every sample, so after a burst or a
+// stall the hold has to follow it deeper than the drift rules' 400 ms cap, or
+// A/V parts by the difference for the half minute the rate correction needs.
+// Wired: 700 ms covers a 16-chunk burst (60 ms + 15 x 42.67 ms = 700 ms, twice
+// the phone's 341 ms capture buffer) and a sink stall of up to about 600 ms.
+// Wireless: the most one Wi-Fi burst can bring after a drought is what the phone
+// held back, its 4-chunk credit window (170 ms) plus its capture buffer (341 ms),
+// 12 chunks: 120 ms + 11 x 42.67 ms = 589 ms, under the cap with 111 ms to spare
+// (it also covers a sink stall of up to about 580 ms). Either way 300 ms of the
+// drive smoke's 1.0 s waiting_idr budget is left for the keyframe itself
+// (requests are at most 250 ms apart). Deeper than that a lagging touch screen
+// is judged worse than lip sync: the hold is clipped, video_hold_capped says so,
+// and A/V parts by the rest until it drains.
 inline constexpr std::chrono::milliseconds kLosslessVideoHoldCap{700};
 
 struct PlayoutOptions final {
