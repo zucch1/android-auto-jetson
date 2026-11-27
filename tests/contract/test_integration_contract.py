@@ -370,6 +370,8 @@ class IntegrationContractTests(unittest.TestCase):
             (unit, "PartOf", "[Unit]", "[Unit]\nPartOf=graphical-session.target"),
             ("docs/INTEGRATION-CONTRACT.md", "WantedBy",
              "WantedBy=default.target", "WantedBy=graphical-session.target"),
+            ("docs/INTEGRATION-CONTRACT.md", "PartOf",
+             "`WantedBy=default.target`", "`WantedBy=default.target`, `PartOf=graphical-session.target`"),
         ):
             with self.subTest(relative=relative, directive=directive), tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp)

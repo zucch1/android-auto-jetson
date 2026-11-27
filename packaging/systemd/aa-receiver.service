@@ -2,6 +2,8 @@
 [Unit]
 Description=Android Auto receiver in the user session
 Documentation=file:/usr/share/doc/android-auto-receiver/debian-package.md
+Wants=dbus.socket
+After=dbus.socket
 StartLimitIntervalSec=60
 StartLimitBurst=5
 
