@@ -609,6 +609,14 @@ class DeployHarnessTest(unittest.TestCase):
         self.assertFalse(current.exists())
 
         archive.write_bytes(original)
+        result = self.adopt(self.pkg_v1)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("unit overrides: /etc/systemd/system/aa-system-helper.service", result.stderr)
+        self.assertFalse(current.exists())
+        saved_unit, = state.glob("runs/*-deploy/legacy/aa-system-helper.service")
+        self.assertEqual(saved_unit.read_bytes(), unit.read_bytes())
+        unit.unlink()
+
         before = self.event_log.read_text()
         result = self.adopt(self.pkg_v1)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -628,7 +636,6 @@ class DeployHarnessTest(unittest.TestCase):
             self.assertIn("android-auto-receiver\t1.0.0", inventory.read_text())
             self.assertEqual(inventory.stat().st_mode & 0o777, 0o600)
         self.assertEqual(backup.read_bytes(), legacy_helper)
-        self.assertTrue(unit.exists())
         self.assertNotIn("apt-get", self.event_log.read_text()[len(before):])
         result = self.install()
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -720,6 +727,41 @@ class DeployHarnessTest(unittest.TestCase):
             self.assertIn(f"/{path.relative_to(self.target)}", result.stderr)
         self.assertFalse(current.exists())
         self.assertFalse(list(state.glob("runs/*-adopt")))
+
+    def test_adopt_rejects_control_dropins_and_shadowing_units(self) -> None:
+        result = self.install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        state = self.target / "var/lib/android-auto-receiver/deploy"
+        current = state / "current.env"
+        current.unlink()
+        overrides = []
+        for base in ("etc/systemd/system.control", "run/systemd/system.control"):
+            overrides.append(self.target / base / "aa-system-helper.service.d/50-MemoryMax.conf")
+        overrides.append(self.target / "etc/systemd/system/aa-system-helper.service")
+        overrides.append(self.target / "run/systemd/system/aa-system-helper.service")
+        overrides.append(self.target / "etc/systemd/user/aa-receiver.service")
+        for path in overrides:
+            with self.subTest(path=path):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                if path.name.endswith(".conf") or path.parts[-3] == "user":
+                    path.write_text("[Service]\n")
+                else:
+                    path.symlink_to("/dev/null")
+                result = self.adopt(self.pkg_v1)
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn("unexpected machine-wide systemd drop-ins or unit overrides", result.stderr)
+                self.assertIn(f"/{path.relative_to(self.target)}", result.stderr)
+                self.assertFalse(current.exists())
+                path.unlink()
+        shadow = self.target / "etc/systemd/system/aa-system-helper.service"
+        shadow.write_text("[Service]\nExecStart=/usr/libexec/aa-system-helper\n")
+        result = self.adopt(self.pkg_v1)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn(f"/{shadow.relative_to(self.target)}", result.stderr)
+        shadow.unlink()
+        result = self.adopt(self.pkg_v1)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(current.exists())
 
     def test_identical_redeploy_repairs_archive_but_upgrade_refuses(self) -> None:
         result = self.install()
@@ -814,6 +856,48 @@ class DeployHarnessTest(unittest.TestCase):
                 self.assertTrue(unit.exists())
                 self.assertTrue(receiver.exists())
         self.assertNotIn("apt-get install", self.event_log.read_text())
+
+    def test_deploy_refuses_legacy_helper_chained_through_package_paths(self) -> None:
+        helper, unit = self.legacy_helper()
+        legacy = self.target / "opt/legacy/legacy-helper"
+        legacy.parent.mkdir(parents=True)
+        helper.rename(legacy)
+        receiver = self.target / "usr/bin/aa-wireless-receiver"
+        alias = self.target / "home/zucchi/helper-alias"
+        layouts = {
+            # alias -> /usr/bin/aa-wireless-receiver -> /opt/legacy/legacy-helper
+            "chained file": (legacy, receiver, alias),
+            # /usr/bin/aa-wireless-receiver -> /opt/legacy, a symlinked parent directory
+            "chained parent": (legacy.parent, None, receiver / "legacy-helper"),
+            # alias -> ../../usr/bin/aa-wireless-receiver -> /opt/legacy/legacy-helper
+            "relative chain": (legacy, Path("../../usr/bin/aa-wireless-receiver"), alias),
+        }
+        for name, (receiver_target, alias_target, execstart) in layouts.items():
+            with self.subTest(layout=name):
+                receiver.symlink_to(receiver_target)
+                if alias_target is not None:
+                    alias.symlink_to(alias_target)
+                unit.write_text(f"[Service]\nExecStart=/{execstart.relative_to(self.target)}\n")
+                before = self.event_log.read_text() if self.event_log.exists() else ""
+                result = self.install()
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn("legacy helper executable overlaps a package-owned file: /usr/bin/aa-wireless-receiver",
+                              result.stderr)
+                self.assertTrue(unit.exists())
+                self.assertTrue(receiver.is_symlink())
+                self.assertNotIn("apt-get install", self.event_log.read_text()[len(before):])
+            receiver.unlink(missing_ok=True)
+            alias.unlink(missing_ok=True)
+        alias.symlink_to(legacy)
+        unit.write_text(f"[Service]\nExecStart=/{alias.relative_to(self.target)}\n")
+        result = self.install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        result = self.rollback()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("rolled_back_to=legacy", result.stdout)
+        self.assertTrue(unit.exists())
+        self.assertTrue(alias.is_symlink())
+        self.assertEqual(alias.resolve(), legacy)
 
     def test_rollback_refuses_legacy_unit_without_its_saved_executable(self) -> None:
         helper, unit = self.legacy_helper()

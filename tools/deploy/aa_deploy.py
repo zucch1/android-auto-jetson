@@ -510,14 +510,53 @@ print(root.rstrip("/") + commands[0])
 """
 
 
+# Walk the legacy ExecStart one component at a time and refuse the layout if
+# any symlink hop, including a symlinked parent directory, or the final file is
+# a path the incoming package installs. APT would replace that hop and break
+# the chain rollback relies on to restore the legacy unit.
 LEGACY_PACKAGE_OVERLAP_CHECK = r"""
+import os
 from pathlib import Path
 import sys
 import tarfile
 
 root, executable = map(Path, sys.argv[1:])
+
+
+def visited_paths(path):
+    visited = []
+    current = Path("/")
+    pending = list(path.parts[1:])
+    hops = 0
+    while pending:
+        part = pending.pop(0)
+        if part in ("", "."):
+            continue
+        if part == "..":
+            current = current.parent
+            continue
+        candidate = current / part
+        if candidate.is_symlink():
+            hops += 1
+            if hops > 40:
+                raise OSError(f"too many symlink levels at {candidate}")
+            visited.append(candidate)
+            target = Path(os.readlink(candidate))
+            if target.is_absolute():
+                current = Path("/")
+                pending = list(target.parts[1:]) + pending
+            else:
+                pending = list(target.parts) + pending
+        else:
+            current = candidate
+    if not current.is_file():
+        raise OSError(f"resolved legacy helper {current} is not a regular file")
+    visited.append(current)
+    return {path.relative_to(root) for path in visited if path.is_relative_to(root)}
+
+
 try:
-    paths = {executable.relative_to(root), executable.resolve(strict=True).relative_to(root)}
+    paths = visited_paths(executable)
     with tarfile.open(fileobj=sys.stdin.buffer, mode="r|") as payload:
         for member in payload:
             path = Path(member.name)
@@ -595,21 +634,35 @@ try:
             if not matches:
                 sys.exit(f"adopt: installed payload differs at {member.name!r}")
 
-    # Check machine-wide drop-ins, including dash-prefix and service-wide
-    # drop-ins. Per-user projection overrides are operator configuration.
+    # Check machine-wide overrides: unit files or mask symlinks that shadow
+    # the packaged units, and drop-ins, including dash-prefix, service-wide
+    # and systemctl set-property (system.control) ones. The bare "service"
+    # entry rejects every host-wide service.d drop-in, even one unrelated to
+    # this package; that fails safe and the operator reviews it. Per-user
+    # projection overrides are operator configuration and are not checked.
     unexpected = []
     units = {
         "system": ("aa-system-helper.service", "aa-system-.service", "aa-.service", "service"),
         "user": ("aa-receiver.service", "aa-.service", "service"),
     }
-    for base in ("etc", "run", "usr/local/lib", "usr/lib"):
-        for scope, names in units.items():
+    directories = {
+        "system": ("etc/systemd/system.control", "run/systemd/system.control",
+                   "etc/systemd/system", "run/systemd/system",
+                   "usr/local/lib/systemd/system", "usr/lib/systemd/system"),
+        "user": ("etc/systemd/user", "run/systemd/user",
+                 "usr/local/lib/systemd/user", "usr/lib/systemd/user"),
+    }
+    for scope, names in units.items():
+        for base in directories[scope]:
+            unit_file = root / base / names[0]
+            if (unit_file.exists() or unit_file.is_symlink()) and unit_file not in packaged_paths:
+                unexpected.append(unit_file.relative_to(root))
             for unit in names:
-                directory = root / base / "systemd" / scope / f"{unit}.d"
+                directory = root / base / f"{unit}.d"
                 unexpected.extend(path.relative_to(root) for path in directory.glob("*.conf")
                                   if path not in packaged_paths)
     if unexpected:
-        sys.exit("adopt: unexpected machine-wide systemd drop-ins: " +
+        sys.exit("adopt: unexpected machine-wide systemd drop-ins or unit overrides: " +
                  ", ".join(f"/{path}" for path in sorted(unexpected)) +
                  "; review and resolve these overrides before adoption")
 except (OSError, EOFError, ValueError, tarfile.TarError) as error:

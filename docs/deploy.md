@@ -82,8 +82,14 @@ tools/deploy/aa-deploy.sh "$target" --adopt-installed "$sha"
 
 Adoption checks dpkg's installed version, the matching version-keyed archive in
 `packages/`, and the installed payload, including file modes. It lists and
-rejects unexpected machine-wide systemd drop-ins for the helper and receiver.
-Review and resolve those overrides before retrying. Per-user receiver projection drop-ins are operator-owned.
+rejects unexpected machine-wide systemd overrides for the helper and receiver:
+drop-ins in `/etc`, `/run`, `/usr/local/lib`, `/usr/lib` and the
+`system.control` directories used by `systemctl set-property`, plus unit files
+or mask symlinks that shadow the packaged units, such as a legacy
+`/etc/systemd/system/aa-system-helper.service` left by an interrupted migration.
+Any host-wide `service.d` drop-in is rejected too, even an unrelated one,
+because it applies to every service. Review and resolve those overrides before
+retrying. Per-user receiver projection drop-ins are operator-owned.
 Successful verification records a dpkg inventory under `runs/<id>-adopt/`
 even when `current.env` already matches. Adoption requires a root-owned
 mode-0700 state directory and cache.
