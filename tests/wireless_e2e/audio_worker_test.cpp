@@ -1636,7 +1636,9 @@ TEST(WirelessAudioWorker, LosslessQueueKeepsTheWholeStallBudgetUnderTheCreditWin
 // only with room for the rest of the window reserved; a stop that kept room for
 // just 2 refused the new stream's first legal chunk (ipc_queue_full, which ends
 // the session) with 4.4 to 4.8 s of guidance queued. At every depth up to a
-// full queue, all 4 must be admitted, whether the old stream plays out or not.
+// full queue, all 4 must be admitted, and the old stream must be preserved
+// whenever at least credit_window_ envelopes remain free (exact-fit boundary)
+// and discarded when one fewer envelope remains (exact-fit minus one).
 TEST(WirelessAudioWorker, LosslessStopLeavesTheNextStreamItsWholeCreditWindow) {
     struct Case final {
         proto::ChannelRole role;
@@ -1646,11 +1648,14 @@ TEST(WirelessAudioWorker, LosslessStopLeavesTheNextStreamItsWholeCreditWindow) {
     };
     for (const auto& c : {Case{proto::ChannelRole::guidance_audio, 6400, 26, "guidance"},
                           Case{proto::ChannelRole::media_audio, 19200, 52, "100 ms media"}}) {
+        const auto exact_fit = c.full - audio::kWirelessCreditWindow;
         for (std::uint64_t depth = c.full - 10; depth <= c.full; ++depth) {
             SCOPED_TRACE(std::string{c.label} + ", " + std::to_string(depth) + " packets queued");
             auto gate = std::make_shared<SinkGate>();
             gate->block_write_index = 1;
-            audio::AudioRenderWorker audio{quiet_wireless_config(), {}, fake_router(gate),
+            CollectedTelemetry telemetry;
+            audio::AudioRenderWorker audio{quiet_wireless_config(), telemetry.callbacks(),
+                                           fake_router(gate),
                                            audio::AudioRenderWorker::monotonic_now,
                                            audio::AudioRenderWorker::kDefaultAckReleaseDrainTimeout,
                                            audio::AudioCreditPolicy{audio::kWirelessCreditWindow}};
@@ -1667,8 +1672,21 @@ TEST(WirelessAudioWorker, LosslessStopLeavesTheNextStreamItsWholeCreditWindow) {
                 if (k == 0) { ASSERT_TRUE(gate->wait_entered(1)); }
                 while (audio.take_completion()) { ++permits; }
             }
+            ASSERT_EQ(sequence, depth);
             // AV_STOP, then the next stream at once: the phone holds the whole window again.
             audio.invalidate(c.role, 1);
+            const auto discarded = telemetry.of("audio_stop_discarded");
+            if (depth <= exact_fit) {
+                EXPECT_TRUE(discarded.empty())
+                    << "stop discarded old stream with " << (c.full - depth)
+                    << " envelopes free: " << discarded.front();
+            } else {
+                ASSERT_EQ(discarded.size(), 1U)
+                    << "stop kept old stream with only " << (c.full - depth) << " envelopes free";
+                EXPECT_NE(discarded.front().find("\"chunks\":" + std::to_string(depth) + "}"),
+                          std::string::npos)
+                    << discarded.front();
+            }
             std::uint64_t admitted = 0;
             for (std::uint64_t k = 0; k < audio::kWirelessCreditWindow; ++k) {
                 const proto::MessageHeader header{c.role, ++sequence, aa::core::Nanoseconds{base}};

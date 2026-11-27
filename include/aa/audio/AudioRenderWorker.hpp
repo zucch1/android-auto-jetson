@@ -275,9 +275,9 @@ private:
     // packets holds hundreds. The rest waits here, as before its decode.
     static constexpr std::size_t kRouterParents = 64;
     // A stopped stream plays out unless that leaves a new one less than this
-    // many envelopes (its largest message), or less than its credit window plus
-    // one when that is more (the phone gets the whole window back at the stop);
-    // then it is cancelled and reported (audio_stop_discarded).
+    // many envelopes (its largest message), or less than its credit window when
+    // that is more (the phone gets the whole window back at the stop); then it
+    // is cancelled and reported (audio_stop_discarded).
     static constexpr std::size_t kStopReserveScale = 2;
     // Longest a lossless stop takes: writes and the sink's end of stream together.
     static constexpr std::chrono::milliseconds kStopDrain{2000};
