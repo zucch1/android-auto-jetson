@@ -11555,7 +11555,7 @@ TEST(WiredReceiver, ManagedWiredEntryPointDeliversFragmentedIdrAndSurvivesInPlac
             ::close(handoff_parent);
             if (receiver.joinable()) { receiver.join(); }
             admission_link_state.reset();
-            broker.release_connection(&video_server.value());
+            (void)broker.release_connection(&video_server.value());
             video_server.value().close();
             input_server.value().close();
             std::filesystem::remove_all(root);
@@ -11563,11 +11563,13 @@ TEST(WiredReceiver, ManagedWiredEntryPointDeliversFragmentedIdrAndSurvivesInPlac
         };
 
         {
-            std::unique_lock lock(state->mutex);
-            if (!state->cv.wait_for(lock, std::chrono::seconds{3},
-                                    [&] { return state->created; })) {
-                fail_child(20);
+            bool created = false;
+            {
+                std::unique_lock lock(state->mutex);
+                created = state->cv.wait_for(lock, std::chrono::seconds{3},
+                                             [&] { return state->created; });
             }
+            if (!created) { fail_child(20); }
         }
 
         // Connect Consumer 1 with unequal limits (4 KiB datagram, 128 KiB AU)
@@ -11635,36 +11637,69 @@ TEST(WiredReceiver, ManagedWiredEntryPointDeliversFragmentedIdrAndSurvivesInPlac
             }
         }
 
+        const auto count_ch99_data_acks = [&] {
+            std::size_t count = 0;
+            for (const auto &raw : state->sent) {
+                const auto f = aa::transport::decode_frame(raw);
+                if (!f.has_value() || f.value().header.channel != 99 ||
+                    f.value().header.kind != aa::transport::MessageKind::specific) {
+                    continue;
+                }
+                std::vector<std::byte> plain;
+                if (f.value().header.encryption == aa::transport::Encryption::encrypted) {
+                    auto opened = cipher->open(f.value().payload);
+                    if (!opened.has_value()) { continue; }
+                    plain = std::move(opened.value());
+                } else {
+                    plain.assign(f.value().payload.begin(), f.value().payload.end());
+                }
+                if (plain.size() >= 2 && plain[0] == std::byte{0x80} &&
+                    plain[1] == std::byte{0x04}) {
+                    ++count;
+                }
+            }
+            return count;
+        };
+
+        // Wait for idr1's specific AvMediaAck (0x8004) on channel 99 BEFORE
+        // queuing the gap frame, because recv_complete(consumer1) can finish
+        // before AvSink sends idr1's ACK.
+        {
+            bool acked_idr1 = false;
+            {
+                std::unique_lock lock(state->mutex);
+                acked_idr1 = state->cv.wait_for(lock, std::chrono::seconds{3},
+                                                [&] { return count_ch99_data_acks() >= 1U; });
+            }
+            if (!acked_idr1) { fail_child(26); }
+        }
+
         // Connect Consumer 2 while Consumer 1 is STILL OPEN. Broker retires
         // Consumer 1 immediately, BEFORE we forward Consumer 2 over fd 3.
         auto consumer2 = connect_consumer(custom);
         if (!consumer2.has_value()) { fail_child(27); }
 
         // Push a frame over fake USB in the gap before fd 3 handoff is sent
-        // and wait until AvSink emits its channel-99 media ACK in state->sent,
-        // proving video_outlet.on_message() actually ran against the retired
-        // borrowed producer, returned success, and kept the phone session live.
-        const auto count_ch99_sends = [&] {
-            std::size_t count = 0;
-            for (const auto &raw : state->sent) {
-                const auto f = aa::transport::decode_frame(raw);
-                if (f.has_value() && f.value().header.channel == 99) { ++count; }
-            }
-            return count;
-        };
-        std::size_t ch99_before = 0;
+        // and wait until AvSink emits the NEXT channel-99 AvMediaAck (0x8004)
+        // in state->sent, proving video_outlet.on_message() actually ran against
+        // the retired borrowed producer, returned success, and kept the phone
+        // session live.
+        std::size_t acks_before_gap = 0;
         {
             std::lock_guard lock(state->mutex);
-            ch99_before = count_ch99_sends();
+            acks_before_gap = count_ch99_data_acks();
         }
         const auto gap_idr = make_idr(8192U, 0x44U);
         push_channel(99, av_data_message(0x2000, gap_idr));
         {
-            std::unique_lock lock(state->mutex);
-            if (!state->cv.wait_for(lock, std::chrono::seconds{3},
-                                    [&] { return count_ch99_sends() > ch99_before; })) {
-                fail_child(28);
+            bool acked_gap = false;
+            {
+                std::unique_lock lock(state->mutex);
+                acked_gap = state->cv.wait_for(
+                    lock, std::chrono::seconds{3},
+                    [&] { return count_ch99_data_acks() > acks_before_gap; });
             }
+            if (!acked_gap) { fail_child(28); }
         }
         const auto eof1 = consumer1.value().receive(Milliseconds{500});
         if (eof1.has_value() || eof1.error().code() != aa::ErrorCode::transport_closed) {
@@ -11712,7 +11747,7 @@ TEST(WiredReceiver, ManagedWiredEntryPointDeliversFragmentedIdrAndSurvivesInPlac
         ::close(handoff_parent);
         receiver.join();
         admission_link_state.reset();
-        broker.release_connection(&video_server.value());
+        (void)broker.release_connection(&video_server.value());
         video_server.value().close();
         input_server.value().close();
         std::filesystem::remove_all(root);

@@ -6,13 +6,17 @@
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
+#include <climits>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
+#include <dirent.h>
 #include <fcntl.h>
 #include <poll.h>
 #include <pthread.h>
 #include <string>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
@@ -1091,10 +1095,14 @@ TEST(VideoChannel, DrainQueuedConnectionsClearsBacklogWithoutAal1AndKeepsListene
     std::memcpy(addr.sun_path, path.value.c_str(), path.value.size() + 1);
     ASSERT_EQ(::connect(stale_fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)), 0);
 
-    EXPECT_EQ(server.value().drain_queued_connections(), 1U);
+    const auto drained = server.value().drain_queued_connections();
+    ASSERT_TRUE(drained);
+    EXPECT_EQ(drained.value(), 1U);
     EXPECT_FALSE(server.value().has_pending_handshake());
+    pollfd pfd{stale_fd, POLLIN, 0};
+    ASSERT_EQ(::poll(&pfd, 1, 500), 1);
     std::array<std::uint8_t, kLimitsRecordBytes> buf{};
-    EXPECT_EQ(::recv(stale_fd, buf.data(), buf.size(), 0), 0);
+    EXPECT_EQ(::recv(stale_fd, buf.data(), buf.size(), MSG_DONTWAIT), 0);
     ::close(stale_fd);
 
     // Subsequent healthy consumer connects cleanly on the same listener.
@@ -1107,6 +1115,341 @@ TEST(VideoChannel, DrainQueuedConnectionsClearsBacklogWithoutAal1AndKeepsListene
     connector.join();
     ASSERT_TRUE(producer);
     ASSERT_TRUE(consumer);
+
+    producer.value().close();
+    consumer.value().close();
+    server.value().close();
+    ::unlink(path.value.c_str());
+    videotest::remove_startup_lock(path.value);
+    ::rmdir((runtime + "/android-auto-receiver").c_str());
+    ::rmdir(runtime.c_str());
+}
+
+namespace {
+
+struct FdBudgetGuard final {
+    rlimit saved{};
+    bool active{false};
+    std::vector<int> fillers{};
+
+    bool engage(std::size_t free_slots) {
+        if (::getrlimit(RLIMIT_NOFILE, &saved) != 0) {
+            return false;
+        }
+        int max_fd = 2;
+        if (DIR* dir = ::opendir("/proc/self/fd")) {
+            while (const dirent* ent = ::readdir(dir)) {
+                char* end = nullptr;
+                const long val = std::strtol(ent->d_name, &end, 10);
+                if (end != ent->d_name && *end == '\0' && val > max_fd && val <= INT_MAX) {
+                    max_fd = static_cast<int>(val);
+                }
+            }
+            ::closedir(dir);
+        }
+        const int devnull = ::open("/dev/null", O_RDONLY | O_CLOEXEC);
+        if (devnull < 0) {
+            return false;
+        }
+        fillers.push_back(devnull);
+        if (devnull > max_fd) {
+            max_fd = devnull;
+        }
+        const rlim_t target =
+            static_cast<rlim_t>(max_fd + 2) + static_cast<rlim_t>(free_slots);
+        if (target >= saved.rlim_cur) {
+            release();
+            return false;
+        }
+        rlimit lowered = saved;
+        lowered.rlim_cur = target;
+        if (::setrlimit(RLIMIT_NOFILE, &lowered) != 0) {
+            release();
+            return false;
+        }
+        active = true;
+        for (;;) {
+            const int dup_fd = ::fcntl(devnull, F_DUPFD_CLOEXEC, 0);
+            if (dup_fd < 0) {
+                break;
+            }
+            fillers.push_back(dup_fd);
+        }
+        for (std::size_t i = 0; i < free_slots && !fillers.empty(); ++i) {
+            ::close(fillers.back());
+            fillers.pop_back();
+        }
+        return true;
+    }
+
+    void release() noexcept {
+        for (const int fd : fillers) {
+            ::close(fd);
+        }
+        fillers.clear();
+        if (active) {
+            (void)::setrlimit(RLIMIT_NOFILE, &saved);
+            active = false;
+        }
+    }
+
+    ~FdBudgetGuard() { release(); }
+};
+
+} // namespace
+
+TEST(VideoChannel, DrainQueuedConnectionsFailsOnAcceptEmfileAndDoesNotReportEmptyQueue) {
+    NegotiatedLimits limits{};
+    const auto runtime = videotest::private_runtime_dir();
+    ASSERT_FALSE(runtime.empty());
+    const auto path = video_socket_path_in(runtime);
+    auto server = VideoServer::listen(path, VideoServerOptions{limits, current_uid()});
+    ASSERT_TRUE(server);
+
+    const int stale_fd = ::socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
+    ASSERT_GE(stale_fd, 0);
+    sockaddr_un addr{};
+    addr.sun_family = AF_UNIX;
+    std::memcpy(addr.sun_path, path.value.c_str(), path.value.size() + 1);
+    ASSERT_EQ(::connect(stale_fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)), 0);
+
+    // Exhaust the descriptor budget so accept4 fails with EMFILE; drain must
+    // report transport_io rather than treating accept failure as an empty queue.
+    aa::core::Result<std::size_t> failed_drain{0U};
+    {
+        FdBudgetGuard fd_guard;
+        ASSERT_TRUE(fd_guard.engage(/*free_slots=*/0));
+        failed_drain = server.value().drain_queued_connections();
+    }
+    ASSERT_FALSE(failed_drain);
+    EXPECT_EQ(failed_drain.error().code(), aa::ErrorCode::transport_io);
+
+    // Once descriptors are available again, the stale peer is still in the
+    // backlog and a retry drains it cleanly.
+    const auto recovered_drain = server.value().drain_queued_connections();
+    ASSERT_TRUE(recovered_drain);
+    EXPECT_EQ(recovered_drain.value(), 1U);
+    pollfd pfd{stale_fd, POLLIN, 0};
+    ASSERT_EQ(::poll(&pfd, 1, 500), 1);
+    std::array<std::uint8_t, kLimitsRecordBytes> buf{};
+    EXPECT_EQ(::recv(stale_fd, buf.data(), buf.size(), MSG_DONTWAIT), 0);
+    ::close(stale_fd);
+
+    server.value().close();
+    ::unlink(path.value.c_str());
+    videotest::remove_startup_lock(path.value);
+    ::rmdir((runtime + "/android-auto-receiver").c_str());
+    ::rmdir(runtime.c_str());
+}
+
+TEST(VideoChannel, ConcurrentRetirementOnlyMapsShutdownErrnoAndPreservesTransportIo) {
+    const std::vector<std::uint8_t> idr{0x00, 0x00, 0x01, 0x65, 0x77};
+
+    // Case 1: owner retires concurrently during send and syscall returns EPIPE ->
+    // transport_closed (both try_send_access_unit and send_access_unit).
+    for (const int shutdown_errno : {EPIPE, ECONNRESET}) {
+        for (const bool use_try : {true, false}) {
+            auto pair = videotest::make_pair({});
+            ASSERT_TRUE(pair);
+            auto& owner = pair.value().producer;
+            auto borrowed = owner.borrow();
+            ASSERT_TRUE(borrowed);
+            borrowed.value().set_datagram_send_for_test(
+                [&](int, const void*, std::size_t, int, int& out_errno) -> std::ptrdiff_t {
+                    owner.close();
+                    out_errno = shutdown_errno;
+                    return -1;
+                });
+            if (use_try) {
+                const auto res = borrowed.value().try_send_access_unit({1, 100, true, idr});
+                ASSERT_FALSE(res);
+                EXPECT_EQ(res.error().code(), aa::ErrorCode::transport_closed);
+            } else {
+                const auto res = borrowed.value().send_access_unit({1, 100, true, idr});
+                ASSERT_FALSE(res);
+                EXPECT_EQ(res.error().code(), aa::ErrorCode::transport_closed);
+            }
+            EXPECT_TRUE(borrowed.value().retired());
+        }
+    }
+
+    // Case 2: owner retires concurrently during send, but syscall fails with an
+    // unrelated error (EIO) -> MUST preserve transport_io (never mask as
+    // consumer replacement).
+    for (const bool use_try : {true, false}) {
+        auto pair = videotest::make_pair({});
+        ASSERT_TRUE(pair);
+        auto& owner = pair.value().producer;
+        auto borrowed = owner.borrow();
+        ASSERT_TRUE(borrowed);
+        borrowed.value().set_datagram_send_for_test(
+            [&](int, const void*, std::size_t, int, int& out_errno) -> std::ptrdiff_t {
+                owner.close();
+                out_errno = EIO;
+                return -1;
+            });
+        if (use_try) {
+            const auto res = borrowed.value().try_send_access_unit({1, 100, true, idr});
+            ASSERT_FALSE(res);
+            EXPECT_EQ(res.error().code(), aa::ErrorCode::transport_io);
+        } else {
+            const auto res = borrowed.value().send_access_unit({1, 100, true, idr});
+            ASSERT_FALSE(res);
+            EXPECT_EQ(res.error().code(), aa::ErrorCode::transport_io);
+        }
+        EXPECT_TRUE(borrowed.value().retired());
+    }
+}
+
+TEST(VideoChannel, BlockingHandshakeRejectsRecordAfterPostWaitDeadlineExpiry) {
+    NegotiatedLimits limits{};
+    const auto runtime = videotest::private_runtime_dir();
+    ASSERT_FALSE(runtime.empty());
+    const auto path = video_socket_path_in(runtime);
+    auto server = VideoServer::listen(path, VideoServerOptions{limits, current_uid()});
+    ASSERT_TRUE(server);
+
+    const auto t0 = std::chrono::steady_clock::time_point{std::chrono::seconds{100}};
+    auto fake_now = t0;
+    unsigned post_wait_step = 0;
+    server.value().set_clock_for_test([&] {
+        if (post_wait_step > 0) {
+            // First clock read (pre-wait check) stays before the deadline so a
+            // blocking wait (poll_wait > 0) runs; the second read (post-wait
+            // deadline check after await_readable returns) is past the deadline.
+            const unsigned call = post_wait_step++;
+            return call == 1 ? (t0 + std::chrono::milliseconds{100})
+                             : (t0 + std::chrono::milliseconds{250});
+        }
+        return fake_now;
+    });
+
+    const int client_fd = ::socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
+    ASSERT_GE(client_fd, 0);
+    sockaddr_un addr{};
+    addr.sun_family = AF_UNIX;
+    std::memcpy(addr.sun_path, path.value.c_str(), path.value.size() + 1);
+    ASSERT_EQ(::connect(client_fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)), 0);
+
+    // Accept at t0 with a 200 ms handshake deadline (deadline = t0 + 200 ms).
+    const auto first =
+        server.value().accept_consumer(aa::core::Milliseconds{0}, aa::core::Milliseconds{200});
+    ASSERT_FALSE(first);
+    EXPECT_EQ(first.error().code(), aa::ErrorCode::timeout);
+    EXPECT_TRUE(server.value().has_pending_handshake());
+
+    // Read server AAL1 and queue client AAL1 so await_readable() returns
+    // immediately on the next blocking accept_consumer() call.
+    std::array<std::uint8_t, kLimitsRecordBytes> server_record{};
+    pollfd srv_pfd{client_fd, POLLIN, 0};
+    ASSERT_EQ(::poll(&srv_pfd, 1, 500), 1);
+    ASSERT_EQ(::recv(client_fd, server_record.data(), server_record.size(), MSG_DONTWAIT),
+              static_cast<ssize_t>(kLimitsRecordBytes));
+    std::array<std::uint8_t, kLimitsRecordBytes> client_record{};
+    encode_limits_record(client_record, limits);
+    ASSERT_EQ(::send(client_fd, client_record.data(), client_record.size(), MSG_NOSIGNAL),
+              static_cast<ssize_t>(kLimitsRecordBytes));
+
+    // Arm the clock so pre-wait is at t0+100ms (blocking poll_wait=100ms) and
+    // post-wait is at t0+250ms (past t0+200ms deadline). Must reject as timeout.
+    post_wait_step = 1;
+    const auto expired =
+        server.value().accept_consumer(aa::core::Milliseconds{500}, aa::core::Milliseconds{200});
+    ASSERT_FALSE(expired);
+    EXPECT_EQ(expired.error().code(), aa::ErrorCode::timeout);
+    EXPECT_FALSE(server.value().has_pending_handshake());
+    ::close(client_fd);
+
+    // Control check: when post-wait stays before the deadline, the blocking
+    // handshake completes normally.
+    post_wait_step = 0;
+    fake_now = t0;
+    const int ok_fd = ::socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
+    ASSERT_GE(ok_fd, 0);
+    ASSERT_EQ(::connect(ok_fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)), 0);
+    ASSERT_FALSE(
+        server.value().accept_consumer(aa::core::Milliseconds{0}, aa::core::Milliseconds{200}));
+    pollfd ok_pfd{ok_fd, POLLIN, 0};
+    ASSERT_EQ(::poll(&ok_pfd, 1, 500), 1);
+    ASSERT_EQ(::recv(ok_fd, server_record.data(), server_record.size(), MSG_DONTWAIT),
+              static_cast<ssize_t>(kLimitsRecordBytes));
+    ASSERT_EQ(::send(ok_fd, client_record.data(), client_record.size(), MSG_NOSIGNAL),
+              static_cast<ssize_t>(kLimitsRecordBytes));
+    fake_now = t0 + std::chrono::milliseconds{150};
+    auto ok_prod =
+        server.value().accept_consumer(aa::core::Milliseconds{500}, aa::core::Milliseconds{200});
+    ASSERT_TRUE(ok_prod);
+    ok_prod.value().close();
+    ::close(ok_fd);
+
+    server.value().close();
+    ::unlink(path.value.c_str());
+    videotest::remove_startup_lock(path.value);
+    ::rmdir((runtime + "/android-auto-receiver").c_str());
+    ::rmdir(runtime.c_str());
+}
+
+TEST(VideoChannel, PrepareSharedStateBeforeAal1ClosesSocketOnSetupFailureWithoutSendingAal1) {
+    NegotiatedLimits limits{};
+    const auto runtime = videotest::private_runtime_dir();
+    ASSERT_FALSE(runtime.empty());
+    const auto path = video_socket_path_in(runtime);
+    auto server = VideoServer::listen(
+        path, VideoServerOptions{limits, current_uid(), /*prepare_shared_state=*/true});
+    ASSERT_TRUE(server);
+
+    const int client_fd = ::socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
+    ASSERT_GE(client_fd, 0);
+    sockaddr_un addr{};
+    addr.sun_family = AF_UNIX;
+    std::memcpy(addr.sun_path, path.value.c_str(), path.value.size() + 1);
+    ASSERT_EQ(::connect(client_fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)), 0);
+
+    // Pre-queue the client AAL1 record so that if the server sent its AAL1
+    // before preparing shared state, accept_consumer would complete AAL1 first.
+    std::array<std::uint8_t, kLimitsRecordBytes> client_record{};
+    encode_limits_record(client_record, limits);
+    ASSERT_EQ(::send(client_fd, client_record.data(), client_record.size(), MSG_NOSIGNAL),
+              static_cast<ssize_t>(kLimitsRecordBytes));
+
+    // Leave exactly 1 free fd: accept4 succeeds, memfd_create fails with EMFILE.
+    aa::core::Result<VideoProducer> failed{aa::Error{aa::ErrorCode::timeout}};
+    {
+        FdBudgetGuard fd_guard;
+        ASSERT_TRUE(fd_guard.engage(/*free_slots=*/1));
+        failed = server.value().accept_consumer(aa::core::Milliseconds{0});
+    }
+    ASSERT_FALSE(failed);
+    EXPECT_EQ(failed.error().code(), aa::ErrorCode::transport_io);
+    EXPECT_FALSE(server.value().has_pending_handshake());
+
+    // Client must NOT have received any AAL1 record — only EOF or ECONNRESET.
+    pollfd pfd{client_fd, POLLIN, 0};
+    ASSERT_EQ(::poll(&pfd, 1, 500), 1);
+    std::array<std::uint8_t, kLimitsRecordBytes> rx{};
+    errno = 0;
+    const ssize_t got = ::recv(client_fd, rx.data(), rx.size(), MSG_DONTWAIT);
+    EXPECT_TRUE(got == 0 || (got == -1 && errno == ECONNRESET))
+        << "got=" << got << " errno=" << errno;
+    ::close(client_fd);
+
+    // With descriptors restored, a subsequent client completes AAL1 and gets a
+    // pre-prepared 0600 size-sealed shared counter file.
+    aa::core::Result<VideoConsumer> consumer{aa::Error{aa::ErrorCode::timeout}};
+    std::thread connector([&] {
+        consumer = connect_video_consumer(
+            path, VideoClientOptions{limits, current_uid(), aa::core::Milliseconds{2000}});
+    });
+    auto producer = server.value().accept_consumer(aa::core::Milliseconds{2000});
+    connector.join();
+    ASSERT_TRUE(producer);
+    ASSERT_TRUE(consumer);
+    auto state_fd = producer.value().prepare_shared_state();
+    ASSERT_TRUE(state_fd);
+    const int seals = ::fcntl(state_fd.value(), F_GET_SEALS);
+    ASSERT_GE(seals, 0);
+    EXPECT_EQ(seals & (F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_SEAL),
+              (F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_SEAL));
 
     producer.value().close();
     consumer.value().close();

@@ -14,12 +14,16 @@
 #include <gtest/gtest.h>
 
 #include <atomic>
+#include <climits>
 #include <condition_variable>
 #include <cstdlib>
 #include <cstring>
+#include <dirent.h>
+#include <fcntl.h>
 #include <filesystem>
 #include <mutex>
 #include <poll.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <thread>
@@ -697,6 +701,8 @@ struct RealVideoHarness final {
     std::optional<aa::wired_receiver::VideoOutlet> wired_outlet{};
     std::uint64_t wired_video_gen{0};
     std::function<int(const wr::WirelessKeep&)> wireless_fn{};
+    wr::WirelessAudioLifecycle wireless_audio{};
+    std::vector<std::pair<std::string, ErrorCode>> broker_errors{};
     wr::Supervisor supervisor;
 
     RealVideoHarness()
@@ -726,7 +732,7 @@ struct RealVideoHarness final {
               },
               [this] { return wireless_idle; },
               [this] {
-                  broker.release_connection(server ? &*server : nullptr);
+                  (void)broker.release_connection(server ? &*server : nullptr);
                   server.reset();
               },
               [] { return true; },
@@ -738,23 +744,32 @@ struct RealVideoHarness final {
                   sync_wired();
               },
               [this] {
-                  broker.release_connection(server ? &*server : nullptr);
+                  (void)broker.release_connection(server ? &*server : nullptr);
                   wired_video_gen = broker.generation();
               },
+              [this] { wireless_audio.reap(); },
           }, wr::ArbitrationPolicy{}) {
         credentials.add_connection(owner, kUid);
         credentials.set_owner(name, owner);
+        broker.set_error_reporter([this](const char* what, ErrorCode code) {
+            broker_errors.emplace_back(what, code);
+            service.emit_diagnostic(ipc::DiagnosticSeverity::error,
+                                    "video_consumer_setup_failed",
+                                    service.registered_consumer().value);
+        });
         policy.check_ready = [this]() -> aa::core::Result<void> {
             if (!server) {
-                auto opened = ipc::VideoServer::listen(video_path, {{}, ipc::current_uid()});
+                auto opened = ipc::VideoServer::listen(
+                    video_path, {{}, ipc::current_uid(), /*prepare_shared_state=*/true});
                 if (!opened) return opened.error();
                 server.emplace(std::move(opened.value()));
             }
             return {};
         };
-        policy.before_start_projection = [this] {
-            broker.release_connection(server ? &*server : nullptr);
+        policy.before_start_projection = [this]() -> aa::core::Result<void> {
+            auto released = broker.release_connection(server ? &*server : nullptr);
             wired_video_gen = broker.generation();
+            return released;
         };
     }
 
@@ -1091,9 +1106,15 @@ TEST(ManagedSupervisor, QueuedConnectionBeforeStopProjectionCannotCrossIntoNextR
     ASSERT_TRUE(h.service.start_projection(owner2));
 
     // Neither stale socket received AAL1 or survived into the new request.
-    std::array<std::uint8_t, ipc::kLimitsRecordBytes> rx{};
-    EXPECT_EQ(::recv(stale_fd, rx.data(), rx.size(), 0), 0);
-    EXPECT_EQ(::recv(stale_fd2, rx.data(), rx.size(), 0), 0);
+    // Use bounded poll deadlines so a drain regression fails cleanly instead of hanging.
+    const auto expect_eof_within = [](int fd) {
+        pollfd pfd{fd, POLLIN, 0};
+        ASSERT_EQ(::poll(&pfd, 1, 500), 1);
+        std::array<std::uint8_t, ipc::kLimitsRecordBytes> rx{};
+        EXPECT_EQ(::recv(fd, rx.data(), rx.size(), MSG_DONTWAIT), 0);
+    };
+    expect_eof_within(stale_fd);
+    expect_eof_within(stale_fd2);
     ::close(stale_fd);
     ::close(stale_fd2);
 
@@ -1139,15 +1160,33 @@ TEST(ManagedSupervisor, WirelessStartupServicesBrokerAndControlBusWhileAudioOpen
                 config, std::make_unique<NullAudioSink>());
         }};
 
+    std::atomic<unsigned> bus_cycles{0};
+    std::atomic<bool> running_flag{true};
+    wr::WirelessAudioStartupResult startup{};
+    std::thread startup_thread;
+    struct ThreadGuard {
+        std::mutex& mu;
+        std::condition_variable& cv;
+        bool& release;
+        std::atomic<bool>& running;
+        std::thread& thread;
+        ~ThreadGuard() {
+            running.store(false);
+            {
+                std::lock_guard lock(mu);
+                release = true;
+            }
+            cv.notify_all();
+            if (thread.joinable()) thread.join();
+        }
+    } guard{gate_mu, gate_cv, release_open, running_flag, startup_thread};
+
     {
         std::unique_lock lock(gate_mu);
         ASSERT_TRUE(gate_cv.wait_for(lock, 3s, [&] { return open_entered; }));
     }
 
-    std::atomic<unsigned> bus_cycles{0};
-    std::atomic<bool> running_flag{true};
-    wr::WirelessAudioStartupResult startup{};
-    std::thread startup_thread([&] {
+    startup_thread = std::thread([&] {
         startup = wr::wait_for_wireless_audio_ready(
             audio_sink,
             [&](aa::core::Milliseconds) -> aa::core::Result<void> {
@@ -1164,14 +1203,10 @@ TEST(ManagedSupervisor, WirelessStartupServicesBrokerAndControlBusWhileAudioOpen
     });
 
     // Drive a real AAL1 handshake while audio initialization is STILL blocked.
+    // Release the opener gate and join startup_thread BEFORE reading broker
+    // state or making fatal assertions.
     auto consumer = ipc::connect_video_consumer(
         h.video_path, {{}, ipc::current_uid(), aa::core::Milliseconds{1500}});
-    ASSERT_TRUE(consumer) << "AAL1 handshake blocked by pending audio initialization";
-    EXPECT_TRUE(h.broker.has_connection());
-    EXPECT_GT(bus_cycles.load(std::memory_order_relaxed), 0U);
-
-    // Release audio open and verify startup completes cleanly and can borrow
-    // the already-negotiated connection to deliver an IDR.
     {
         std::lock_guard lock(gate_mu);
         release_open = true;
@@ -1179,6 +1214,9 @@ TEST(ManagedSupervisor, WirelessStartupServicesBrokerAndControlBusWhileAudioOpen
     gate_cv.notify_all();
     startup_thread.join();
 
+    ASSERT_TRUE(consumer) << "AAL1 handshake blocked by pending audio initialization";
+    EXPECT_TRUE(h.broker.has_connection());
+    EXPECT_GT(bus_cycles.load(std::memory_order_relaxed), 0U);
     ASSERT_FALSE(startup.stopped);
     ASSERT_FALSE(startup.bus_error.has_value());
     ASSERT_TRUE(startup.opened.has_value());
@@ -1195,6 +1233,462 @@ TEST(ManagedSupervisor, WirelessStartupServicesBrokerAndControlBusWhileAudioOpen
     EXPECT_EQ(consumer.value().access_unit().payload.back(), 0xA5U);
     EXPECT_EQ(consumer.value().rejected(), 0U);
     wireless_outlet.close();
+}
+
+namespace {
+
+struct SupervisorFdBudgetGuard final {
+    rlimit saved{};
+    bool active{false};
+    std::vector<int> fillers{};
+
+    bool engage(std::size_t free_slots) {
+        if (::getrlimit(RLIMIT_NOFILE, &saved) != 0) return false;
+        int max_fd = 2;
+        if (DIR* dir = ::opendir("/proc/self/fd")) {
+            while (const dirent* ent = ::readdir(dir)) {
+                char* end = nullptr;
+                const long val = std::strtol(ent->d_name, &end, 10);
+                if (end != ent->d_name && *end == '\0' && val > max_fd && val <= INT_MAX) {
+                    max_fd = static_cast<int>(val);
+                }
+            }
+            ::closedir(dir);
+        }
+        const int devnull = ::open("/dev/null", O_RDONLY | O_CLOEXEC);
+        if (devnull < 0) return false;
+        fillers.push_back(devnull);
+        if (devnull > max_fd) max_fd = devnull;
+        const rlim_t target =
+            static_cast<rlim_t>(max_fd + 2) + static_cast<rlim_t>(free_slots);
+        if (target >= saved.rlim_cur) {
+            release();
+            return false;
+        }
+        rlimit lowered = saved;
+        lowered.rlim_cur = target;
+        if (::setrlimit(RLIMIT_NOFILE, &lowered) != 0) {
+            release();
+            return false;
+        }
+        active = true;
+        for (;;) {
+            const int dup_fd = ::fcntl(devnull, F_DUPFD_CLOEXEC, 0);
+            if (dup_fd < 0) break;
+            fillers.push_back(dup_fd);
+        }
+        for (std::size_t i = 0; i < free_slots && !fillers.empty(); ++i) {
+            ::close(fillers.back());
+            fillers.pop_back();
+        }
+        return true;
+    }
+
+    void release() noexcept {
+        for (const int fd : fillers) {
+            ::close(fd);
+        }
+        fillers.clear();
+        if (active) {
+            (void)::setrlimit(RLIMIT_NOFILE, &saved);
+            active = false;
+        }
+    }
+
+    ~SupervisorFdBudgetGuard() { release(); }
+};
+
+} // namespace
+
+TEST(ManagedSupervisor, WiredPreemptionDuringBlockedWirelessAudioOpenDoesNotStallDisplayHandshake) {
+    RealVideoHarness h;
+    h.approved.push_back({{7}, kWiredIdentity, aa::trust::IdentityStrength::serial_backed});
+    h.approved.push_back({{9}, kWirelessA, aa::trust::IdentityStrength::serial_backed});
+    h.start();
+
+    std::mutex gate_mu;
+    std::condition_variable gate_cv;
+    bool open_entered = false;
+    bool release_open = false;
+    bool attach_wired = false;
+    std::atomic<bool> running_flag{true};
+
+    struct OpenReleaseGuard {
+        std::mutex& mu;
+        std::condition_variable& cv;
+        bool& release;
+        wr::WirelessAudioLifecycle& lifecycle;
+        ~OpenReleaseGuard() {
+            {
+                std::lock_guard lock(mu);
+                release = true;
+            }
+            cv.notify_all();
+            lifecycle.drain_all();
+        }
+    } guard{gate_mu, gate_cv, release_open, h.wireless_audio};
+
+    h.wireless_fn = [&](const wr::WirelessKeep& keep) -> int {
+        auto startup = wr::start_wireless_audio_ready(
+            h.wireless_audio,
+            [&] {
+                return std::make_unique<aa::audio::AudioRenderWorker>(
+                    aa::audio::pcm_router_config(), aa::audio::AudioTelemetryCallbacks{},
+                    [&](const aa::audio::RouterConfig& config)
+                        -> aa::core::Result<aa::audio::AudioRouter> {
+                        {
+                            std::unique_lock lock(gate_mu);
+                            open_entered = true;
+                            gate_cv.notify_all();
+                            gate_cv.wait_for(lock, 5s, [&] { return release_open; });
+                        }
+                        return aa::audio::detail::open_router_with_sink_for_test(
+                            config, std::make_unique<NullAudioSink>());
+                    });
+            },
+            [&](aa::core::Milliseconds) -> aa::core::Result<void> {
+                std::unique_lock lock(gate_mu);
+                if (open_entered && !attach_wired) {
+                    // Simulate an approved wired phone appearing while audio
+                    // router open is still blocked on its background thread.
+                    attach_wired = true;
+                    h.attached = {{{7}, "1-2"}};
+                    h.fake_now += 1s;
+                }
+                return {};
+            },
+            [&] { return h.service.state(); },
+            *h.server, &h.broker, keep,
+            std::chrono::steady_clock::now() + 5s, running_flag);
+        return startup.bus_error ? 1 : 0;
+    };
+
+    // Supervisor starts wireless, observes wired phone mid-open, and MUST yield
+    // immediately without joining the blocked audio open thread.
+    const auto yield_start = std::chrono::steady_clock::now();
+    h.step();
+    const auto yield_elapsed = std::chrono::steady_clock::now() - yield_start;
+    EXPECT_EQ(h.wireless_runs, 1U);
+    EXPECT_LT(yield_elapsed, 1000ms) << "wireless preemption stalled in audio worker destructor";
+    EXPECT_TRUE(h.wireless_audio.has_retiring());
+
+    // While the retired wireless audio open is STILL blocked, supervisor starts
+    // wired and completes a real display AAL1 handshake well within the 2 s budget.
+    h.step();
+    EXPECT_EQ(h.worker_starts, 1U);
+    EXPECT_EQ(h.policy.active_transport, ipc::ProjectionTransport::wired);
+    auto consumer = connect_via_supervisor(
+        h.video_path, *h.server, h.broker, [&] { h.step(); }, aa::core::Milliseconds{1500});
+    ASSERT_TRUE(consumer) << "display AAL1 handshake stalled during wired preemption";
+    aa::protocol::MessageHeader hdr{};
+    hdr.timestamp = aa::core::Nanoseconds{1'000'000};
+    ASSERT_TRUE(h.wired_outlet->on_message({hdr, idr_au(0xC3)}));
+    ASSERT_TRUE(recv_complete(consumer.value()));
+    EXPECT_EQ(consumer.value().access_unit().payload.back(), 0xC3U);
+    EXPECT_EQ(consumer.value().rejected(), 0U);
+    EXPECT_TRUE(h.wireless_audio.has_retiring());
+
+    // Release the blocked audio open and verify supervisor steps reap it cleanly.
+    {
+        std::lock_guard lock(gate_mu);
+        release_open = true;
+    }
+    gate_cv.notify_all();
+    ASSERT_TRUE(h.wireless_audio.wait_one_for(3s));
+    h.step();
+    EXPECT_FALSE(h.wireless_audio.has_retiring());
+}
+
+TEST(ManagedSupervisor, StopAndRestartDuringBlockedWirelessAudioOpenDoesNotStallNextStart) {
+    RealVideoHarness h;
+    h.approved.push_back({{9}, kWirelessA, aa::trust::IdentityStrength::serial_backed});
+    h.start();
+    ASSERT_TRUE(h.service.set_transport_enabled(h.owner, "wired", false));
+
+    std::mutex gate_mu;
+    std::condition_variable gate_cv;
+    unsigned open_calls = 0;
+    bool first_open_entered = false;
+    bool release_first_open = false;
+    bool stopped_during_first_open = false;
+    std::atomic<bool> running_flag{true};
+
+    struct OpenReleaseGuard {
+        std::mutex& mu;
+        std::condition_variable& cv;
+        bool& release;
+        wr::WirelessAudioLifecycle& lifecycle;
+        ~OpenReleaseGuard() {
+            {
+                std::lock_guard lock(mu);
+                release = true;
+            }
+            cv.notify_all();
+            lifecycle.drain_all();
+        }
+    } guard{gate_mu, gate_cv, release_first_open, h.wireless_audio};
+
+    h.wireless_fn = [&](const wr::WirelessKeep& keep) -> int {
+        auto startup = wr::start_wireless_audio_ready(
+            h.wireless_audio,
+            [&] {
+                return std::make_unique<aa::audio::AudioRenderWorker>(
+                    aa::audio::pcm_router_config(), aa::audio::AudioTelemetryCallbacks{},
+                    [&](const aa::audio::RouterConfig& config)
+                        -> aa::core::Result<aa::audio::AudioRouter> {
+                        unsigned call = 0;
+                        {
+                            std::unique_lock lock(gate_mu);
+                            call = ++open_calls;
+                            if (call == 1) {
+                                first_open_entered = true;
+                                gate_cv.notify_all();
+                                gate_cv.wait_for(lock, 5s, [&] { return release_first_open; });
+                            }
+                        }
+                        return aa::audio::detail::open_router_with_sink_for_test(
+                            config, std::make_unique<NullAudioSink>());
+                    });
+            },
+            [&](aa::core::Milliseconds) -> aa::core::Result<void> {
+                std::unique_lock lock(gate_mu);
+                if (first_open_entered && !stopped_during_first_open) {
+                    stopped_during_first_open = true;
+                    lock.unlock();
+                    EXPECT_TRUE(h.service.stop_projection(h.owner));
+                }
+                return {};
+            },
+            [&] { return h.service.state(); },
+            *h.server, &h.broker, keep,
+            std::chrono::steady_clock::now() + 5s, running_flag);
+        return startup.bus_error ? 1 : 0;
+    };
+
+    // First wireless attempt enters blocked audio open, receives StopProjection
+    // on the control bus, and MUST return immediately without joining.
+    const auto stop_start = std::chrono::steady_clock::now();
+    h.step();
+    const auto stop_elapsed = std::chrono::steady_clock::now() - stop_start;
+    EXPECT_EQ(h.wireless_runs, 1U);
+    EXPECT_LT(stop_elapsed, 1000ms) << "StopProjection stalled in audio worker destructor";
+    EXPECT_TRUE(h.wireless_audio.has_retiring());
+    EXPECT_EQ(h.service.state().projection, ipc::ProjectionState::stopped);
+
+    // Immediately issue a new StartProjection while the first worker is STILL
+    // blocked inside open(), then run a second wireless startup on a thread and
+    // verify the display completes AAL1 while the first open is STILL blocked.
+    ASSERT_TRUE(h.service.start_projection(h.owner));
+    wr::WirelessAudioStartupResult restart{};
+    std::thread restart_thread;
+    struct RestartGuard {
+        std::mutex& mu;
+        std::condition_variable& cv;
+        bool& release;
+        std::atomic<bool>& running;
+        std::thread& thread;
+        ~RestartGuard() {
+            running.store(false);
+            {
+                std::lock_guard lock(mu);
+                release = true;
+            }
+            cv.notify_all();
+            if (thread.joinable()) thread.join();
+        }
+    } restart_guard{gate_mu, gate_cv, release_first_open, running_flag, restart_thread};
+
+    restart_thread = std::thread([&] {
+        restart = wr::start_wireless_audio_ready(
+            h.wireless_audio,
+            [&] {
+                return std::make_unique<aa::audio::AudioRenderWorker>(
+                    aa::audio::pcm_router_config(), aa::audio::AudioTelemetryCallbacks{},
+                    [&](const aa::audio::RouterConfig& config)
+                        -> aa::core::Result<aa::audio::AudioRouter> {
+                        {
+                            std::lock_guard lock(gate_mu);
+                            ++open_calls;
+                        }
+                        return aa::audio::detail::open_router_with_sink_for_test(
+                            config, std::make_unique<NullAudioSink>());
+                    });
+            },
+            [](aa::core::Milliseconds) -> aa::core::Result<void> { return {}; },
+            [&] { return h.service.state(); },
+            *h.server, &h.broker,
+            [&](ipc::StateSnapshot current, const std::optional<aa::trust::TransportIdentity>&) {
+                return current.projection == ipc::ProjectionState::projecting;
+            },
+            std::chrono::steady_clock::now() + 5s, running_flag);
+    });
+
+    // Display connects and completes AAL1 while the first open is STILL blocked.
+    auto consumer = ipc::connect_video_consumer(
+        h.video_path, {{}, ipc::current_uid(), aa::core::Milliseconds{1500}});
+
+    // Now release the first open so the second worker finishes opening and
+    // join restart_thread before inspecting shared state.
+    {
+        std::lock_guard lock(gate_mu);
+        release_first_open = true;
+    }
+    gate_cv.notify_all();
+    restart_thread.join();
+
+    ASSERT_TRUE(consumer) << "next StartProjection AAL1 handshake stalled behind retiring audio open";
+    EXPECT_FALSE(h.wireless_audio.has_retiring());
+    ASSERT_FALSE(restart.stopped);
+    ASSERT_TRUE(restart.opened.has_value());
+    ASSERT_TRUE(restart.opened->has_value());
+    ASSERT_TRUE(restart.worker != nullptr);
+    EXPECT_TRUE(h.broker.has_connection());
+}
+
+TEST(ManagedSupervisor, StartProjectionFailsWhenListenerDrainCannotClearStaleBacklog) {
+    RealVideoHarness h;
+    h.approved.push_back({{7}, kWiredIdentity, aa::trust::IdentityStrength::serial_backed});
+    h.attached = {{{7}, "1-2"}};
+    ASSERT_TRUE(h.service.register_consumer(h.owner, h.name));
+    ASSERT_TRUE(h.service.set_projection_mode(h.owner, "projection_ready"));
+    ASSERT_TRUE(h.service.set_transport_enabled(h.owner, "wireless", false));
+
+    // Queue a stale client in the listener backlog before StartProjection.
+    const int stale_fd = ::socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
+    ASSERT_GE(stale_fd, 0);
+    sockaddr_un addr{};
+    addr.sun_family = AF_UNIX;
+    ASSERT_LT(h.video_path.value.size(), sizeof(addr.sun_path));
+    std::memcpy(addr.sun_path, h.video_path.value.c_str(), h.video_path.value.size() + 1);
+    ASSERT_EQ(::connect(stale_fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)), 0);
+
+    // Exhaust descriptors so the pre-StartProjection drain hits EMFILE.
+    // StartProjection MUST fail rather than acknowledging with a stale peer queued.
+    aa::core::Result<void> start_result{};
+    {
+        SupervisorFdBudgetGuard fd_guard;
+        ASSERT_TRUE(fd_guard.engage(/*free_slots=*/0));
+        start_result = h.service.start_projection(h.owner);
+    }
+    ASSERT_FALSE(start_result);
+    EXPECT_EQ(start_result.error().code(), ErrorCode::transport_io);
+    EXPECT_EQ(h.service.state().projection, ipc::ProjectionState::stopped);
+
+    const bool saw_start_failed = std::any_of(
+        h.events.events.begin(), h.events.events.end(), [](const ipc::ControlEvent& ev) {
+            const auto* diag = std::get_if<ipc::DiagnosticEmitted>(&ev);
+            return diag != nullptr && diag->severity == ipc::DiagnosticSeverity::error &&
+                   diag->event == "projection_start_failed";
+        });
+    EXPECT_TRUE(saw_start_failed);
+
+    // Once descriptors recover, retrying StartProjection drains the stale peer
+    // cleanly before acknowledging and admits only the new display client.
+    ASSERT_TRUE(h.service.start_projection(h.owner));
+    pollfd pfd{stale_fd, POLLIN, 0};
+    ASSERT_EQ(::poll(&pfd, 1, 500), 1);
+    std::array<std::uint8_t, ipc::kLimitsRecordBytes> rx{};
+    EXPECT_EQ(::recv(stale_fd, rx.data(), rx.size(), MSG_DONTWAIT), 0);
+    ::close(stale_fd);
+
+    h.step();
+    EXPECT_FALSE(h.broker.has_connection());
+    auto fresh_consumer =
+        connect_via_supervisor(h.video_path, *h.server, h.broker, [&] { h.step(); });
+    ASSERT_TRUE(fresh_consumer);
+}
+
+TEST(ManagedSupervisor, CounterStatePreparationFailureReportsDiagnosticWithoutCompletingAal1) {
+    RealVideoHarness h;
+    h.approved.push_back({{7}, kWiredIdentity, aa::trust::IdentityStrength::serial_backed});
+    h.attached = {{{7}, "1-2"}};
+    h.start();
+    ASSERT_TRUE(h.service.set_transport_enabled(h.owner, "wireless", false));
+    h.step();
+
+    // Queue a raw client with its AAL1 record ready, then engage a 1-fd budget
+    // so accept4 succeeds while memfd_create fails with EMFILE.
+    const int client_fd = ::socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
+    ASSERT_GE(client_fd, 0);
+    sockaddr_un addr{};
+    addr.sun_family = AF_UNIX;
+    ASSERT_LT(h.video_path.value.size(), sizeof(addr.sun_path));
+    std::memcpy(addr.sun_path, h.video_path.value.c_str(), h.video_path.value.size() + 1);
+    ASSERT_EQ(::connect(client_fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)), 0);
+
+    std::array<std::uint8_t, ipc::kLimitsRecordBytes> client_record{};
+    ipc::encode_limits_record(client_record, ipc::NegotiatedLimits{});
+    ASSERT_EQ(::send(client_fd, client_record.data(), client_record.size(), MSG_NOSIGNAL),
+              static_cast<ssize_t>(ipc::kLimitsRecordBytes));
+
+    bool changed = false;
+    {
+        SupervisorFdBudgetGuard fd_guard;
+        ASSERT_TRUE(fd_guard.engage(/*free_slots=*/1));
+        changed = h.broker.poll(*h.server);
+    }
+    EXPECT_FALSE(changed);
+    EXPECT_FALSE(h.broker.has_connection());
+    ASSERT_FALSE(h.broker_errors.empty());
+    EXPECT_EQ(h.broker_errors.back().second, ErrorCode::transport_io);
+
+    const bool saw_setup_diag = std::any_of(
+        h.events.events.begin(), h.events.events.end(), [](const ipc::ControlEvent& ev) {
+            const auto* diag = std::get_if<ipc::DiagnosticEmitted>(&ev);
+            return diag != nullptr && diag->severity == ipc::DiagnosticSeverity::error &&
+                   diag->event == "video_consumer_setup_failed";
+        });
+    EXPECT_TRUE(saw_setup_diag);
+
+    // The client must NOT have received a server AAL1 record before EOF/reset.
+    pollfd pfd{client_fd, POLLIN, 0};
+    ASSERT_EQ(::poll(&pfd, 1, 500), 1);
+    std::array<std::uint8_t, ipc::kLimitsRecordBytes> rx{};
+    errno = 0;
+    const ssize_t got = ::recv(client_fd, rx.data(), rx.size(), MSG_DONTWAIT);
+    EXPECT_TRUE(got == 0 || (got == -1 && errno == ECONNRESET))
+        << "got=" << got << " errno=" << errno;
+    ::close(client_fd);
+
+    // Once descriptors recover, a legitimate consumer connects cleanly.
+    auto active_consumer =
+        connect_via_supervisor(h.video_path, *h.server, h.broker, [&] { h.step(); });
+    ASSERT_TRUE(active_consumer);
+    const auto active_gen = h.broker.generation();
+
+    // A replacement whose counter-state preparation fails must close before
+    // AAL1, emit another diagnostic, and leave the existing producer intact.
+    const int repl_fd = ::socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
+    ASSERT_GE(repl_fd, 0);
+    ASSERT_EQ(::connect(repl_fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)), 0);
+    ASSERT_EQ(::send(repl_fd, client_record.data(), client_record.size(), MSG_NOSIGNAL),
+              static_cast<ssize_t>(ipc::kLimitsRecordBytes));
+
+    const auto errors_before = h.broker_errors.size();
+    {
+        SupervisorFdBudgetGuard fd_guard;
+        ASSERT_TRUE(fd_guard.engage(/*free_slots=*/1));
+        changed = h.broker.poll(*h.server);
+    }
+    EXPECT_FALSE(changed);
+    EXPECT_EQ(h.broker.generation(), active_gen);
+    EXPECT_TRUE(h.broker.has_connection());
+    EXPECT_GT(h.broker_errors.size(), errors_before);
+
+    pollfd repl_pfd{repl_fd, POLLIN, 0};
+    ASSERT_EQ(::poll(&repl_pfd, 1, 500), 1);
+    errno = 0;
+    const ssize_t repl_got = ::recv(repl_fd, rx.data(), rx.size(), MSG_DONTWAIT);
+    EXPECT_TRUE(repl_got == 0 || (repl_got == -1 && errno == ECONNRESET))
+        << "repl_got=" << repl_got << " errno=" << errno;
+    ::close(repl_fd);
+
+    aa::protocol::MessageHeader hdr{};
+    hdr.timestamp = aa::core::Nanoseconds{2'000'000};
+    ASSERT_TRUE(h.wired_outlet->on_message({hdr, idr_au(0xD4)}));
+    ASSERT_TRUE(recv_complete(active_consumer.value()));
+    EXPECT_EQ(active_consumer.value().access_unit().payload.back(), 0xD4U);
+    EXPECT_EQ(active_consumer.value().rejected(), 0U);
 }
 
 TEST(ManagedSupervisor, ConnectHelperFailsBoundedWhenServerNeverAccepts) {

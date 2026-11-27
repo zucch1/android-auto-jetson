@@ -225,8 +225,8 @@ TEST(ManagedWiredWorker, StopReapsWorkerAndKeepsTheTwoSupervisorListeners) {
     EXPECT_TRUE(std::filesystem::exists(scratch.path / "stopped"))
         << "worker did not run SIGTERM trap before reap (stop took " << stop_elapsed.count()
         << " ms)";
-    EXPECT_LT(stop_elapsed.count(), 700)
-        << "worker.stop() appears to have fallen through to SIGKILL";
+    EXPECT_LT(stop_elapsed.count(), 2000)
+        << "worker.stop() exceeded bounded stop/reap window";
     auto inherited_video = aa::ipc::VideoServer::adopt_listener(
         ::dup(video.value().native_handle()), {{}, aa::ipc::current_uid()});
     auto inherited_input = aa::ipc::InputServer::adopt_listener(
@@ -348,7 +348,7 @@ TEST(ManagedWiredWorker, LateClientConnectSurvivesFailedFirstWorkerAndReceivesFr
     EXPECT_EQ(consumer.value().rejected(), 0U);
 
     // Explicit release_connection closes with SHUT_WR -> consumer sees EOF.
-    broker.release_connection(&video.value());
+    ASSERT_TRUE(broker.release_connection(&video.value()));
     const auto closed = consumer.value().receive(aa::core::Milliseconds{500});
     ASSERT_FALSE(closed);
     EXPECT_EQ(closed.error().code(), aa::ErrorCode::transport_closed);

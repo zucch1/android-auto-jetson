@@ -80,6 +80,10 @@ public:
     // is still pending after `timeout`; otherwise returns the startup result.
     [[nodiscard]] std::optional<core::Result<void>>
     wait_ready_for(std::chrono::milliseconds timeout);
+    // Non-blocking check and bounded wait for worker thread exit, used by the
+    // supervisor to reap cancelled startup workers off the dispatch path.
+    [[nodiscard]] bool thread_exited() const noexcept;
+    [[nodiscard]] bool wait_exited_for(std::chrono::milliseconds timeout);
     // The max_unacked every audio channel advertises (AudioCreditPolicy).
     [[nodiscard]] std::uint32_t credit_window() const noexcept { return credit_window_; }
     // Most chunks one channel has had accepted but not yet released for ACK

@@ -7,11 +7,13 @@
 // ownership while sharing monotonic frame/sequence counters across restarts
 // and wired<->wireless handoffs.
 
+#include <aa/core/Error.hpp>
 #include <aa/core/Result.hpp>
 #include <aa/core/Time.hpp>
 #include <aa/ipc/VideoChannel.hpp>
 
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <utility>
 
@@ -19,13 +21,21 @@ namespace aa::wireless_receiver {
 
 class ManagedVideoBroker final {
 public:
+    using ErrorReporter = std::function<void(const char*, ErrorCode)>;
+
     ManagedVideoBroker() = default;
+
+    void set_error_reporter(ErrorReporter reporter) {
+        on_error_ = std::move(reporter);
+    }
 
     // Non-blocking poll of the owned endpoint and listener:
     // 1. Detect peer loss on the held connection and close it cleanly.
     // 2. Poll the listener (0 ms accept wait, 2 s internal pending-handshake
-    //    deadline). A newly negotiated consumer replaces any prior connection
-    //    and allocates a fresh shared stream-counter memfd.
+    //    deadline). Ensures the server prepares its size-sealed shared
+    //    stream-counter memfd BEFORE sending its AAL1 record so counter setup
+    //    failures close the socket prior to handshake completion and surface a
+    //    receiver diagnostic instead of post-AAL1 EOF.
     // Returns true when the held connection changed (cleared or replaced).
     bool poll(ipc::VideoServer& server) {
         bool changed = false;
@@ -37,6 +47,7 @@ public:
             changed = true;
         }
         if (!server.closed()) {
+            server.set_prepare_shared_state(true);
             auto accepted = server.accept_consumer(core::Milliseconds{0});
             if (accepted.has_value()) {
                 auto prepared = accepted.value().prepare_shared_state();
@@ -49,8 +60,11 @@ public:
                     ++generation_;
                     changed = true;
                 } else {
+                    report_error("video shared state", prepared.error().code());
                     accepted.value().close();
                 }
+            } else if (accepted.error().code() != ErrorCode::timeout) {
+                report_error("video consumer accept", accepted.error().code());
             }
         }
         return changed;
@@ -59,16 +73,20 @@ public:
     // End the current consumer connection (marks retired + sends SHUT_WR -> clean
     // EOF), abort any pending half-completed handshake, and drain any connections
     // already queued in the listener's kernel accept queue from the stopped request.
-    void release_connection(ipc::VideoServer* server = nullptr) noexcept {
-        if (server != nullptr) {
-            (void)server->drain_queued_connections();
-        }
+    // Returns an error if the listener queue could not be confirmed empty.
+    [[nodiscard]] core::Result<void> release_connection(ipc::VideoServer* server = nullptr) noexcept {
         if (connection_.has_value()) {
             connection_->close();
             connection_.reset();
             state_fd_ = -1;
             ++generation_;
         }
+        if (server != nullptr) {
+            if (auto drained = server->drain_queued_connections(); !drained) {
+                return drained.error();
+            }
+        }
+        return {};
     }
 
     [[nodiscard]] bool has_connection() const noexcept {
@@ -101,9 +119,16 @@ public:
     }
 
 private:
+    void report_error(const char* what, ErrorCode code) const {
+        if (on_error_) {
+            on_error_(what, code);
+        }
+    }
+
     std::optional<ipc::VideoProducer> connection_{};
     int state_fd_{-1};
     std::uint64_t generation_{0};
+    ErrorReporter on_error_{};
 };
 
 } // namespace aa::wireless_receiver

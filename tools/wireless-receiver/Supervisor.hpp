@@ -181,6 +181,7 @@ struct SupervisorPorts final {
     std::function<TransportArbiter::Clock::time_point()> now = TransportArbiter::Clock::now;
     std::function<void()> service_video{};
     std::function<void()> release_video{};
+    std::function<void()> reap_wireless_audio{};
 };
 
 class Supervisor final {
@@ -192,6 +193,7 @@ public:
 
     // One dispatch turn. Returns an exit status when the supervisor must end.
     std::optional<int> step(core::Milliseconds wait) {
+        if (ports_.reap_wireless_audio) ports_.reap_wireless_audio();
         if (auto cycled = ports_.cycle(wait); !cycled) {
             ports_.report("session bus dispatch", cycled.error().code());
             return 1;

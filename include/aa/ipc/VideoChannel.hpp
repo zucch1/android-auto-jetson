@@ -6,6 +6,7 @@
 #include <aa/ipc/VideoSocket.hpp>
 #include <aa/ipc/VideoTelemetry.hpp>
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -249,6 +250,11 @@ private:
 struct VideoServerOptions final {
     NegotiatedLimits local_limits{};
     std::uint32_t expected_peer_uid{};
+    // When true (managed supervisor), create, 0600-restrict, size-seal, and map
+    // the shared stream-counter memfd BEFORE sending the server AAL1 record so
+    // any counter-state setup failure closes the socket before the consumer
+    // observes a completed handshake.
+    bool prepare_shared_state{false};
 };
 
 // `timeout` bounds each phase independently: the connect attempt (backlog
@@ -304,11 +310,16 @@ public:
 
     [[nodiscard]] bool has_pending_handshake() const noexcept;
     void cancel_pending_handshake() noexcept;
+    void set_prepare_shared_state(bool enabled) noexcept;
+    void set_clock_for_test(std::function<std::chrono::steady_clock::time_point()> clock);
     // Cancel any pending handshake and perform a bounded nonblocking drain of
     // connections already queued in the listener's kernel accept backlog,
-    // closing them without sending AAL1. Used at projection request boundaries
-    // so stale queued peers cannot cross StopProjection into a new request.
-    std::size_t drain_queued_connections() noexcept;
+    // closing them without sending AAL1. Returns the number of drained peers
+    // only once the kernel accept queue is confirmed empty (EAGAIN/EWOULDBLOCK);
+    // returns transport_closed if the listener is closed, timeout if bounded
+    // EINTR/drain time expires before emptying, or transport_io if accept4/fcntl
+    // fails (e.g. EMFILE) or exceeds the per-call drain cap.
+    [[nodiscard]] core::Result<std::size_t> drain_queued_connections() noexcept;
 
     // Closes the listener and unlinks the endpoint node only while it is
     // still the node bound at listen() time and only while holding the
