@@ -609,6 +609,7 @@ int receiver_session(int argc, char **argv, ResumableControl &resumable) {
     bool no_bus = false;
     pid_t supervisor_pid = 0;
     aa::core::PhoneId managed_phone{};
+    std::optional<aa::ipc::NegotiatedLimits> video_client_limits{};
     bool require_video_consumer = false;
     bool wired_enrolment = false;
     std::string required_usb_serial;
@@ -671,6 +672,25 @@ int receiver_session(int argc, char **argv, ResumableControl &resumable) {
             if (error != std::errc{} || end != value.data() + value.size() || supervisor_pid <= 1) {
                 return 2;
             }
+        } else if (std::strcmp(argv[index], "--video-client-limits") == 0 && index + 1 < argc) {
+            const std::string_view value{argv[++index]};
+            const auto first = value.find(',');
+            const auto second = first == std::string_view::npos ? first : value.find(',', first + 1);
+            if (first == std::string_view::npos || second == std::string_view::npos) {
+                return 2;
+            }
+            aa::ipc::NegotiatedLimits limits{};
+            const auto parse_u32 = [](std::string_view field, std::uint32_t& out) {
+                if (field.empty()) return false;
+                const auto [end, ec] = std::from_chars(field.data(), field.data() + field.size(), out);
+                return ec == std::errc{} && end == field.data() + field.size() && out > 0;
+            };
+            if (!parse_u32(value.substr(0, first), limits.max_access_unit_bytes) ||
+                !parse_u32(value.substr(first + 1, second - first - 1), limits.max_datagram_payload) ||
+                !parse_u32(value.substr(second + 1), limits.socket_budget_bytes)) {
+                return 2;
+            }
+            video_client_limits = limits;
         } else if (std::strcmp(argv[index], "--no-bus") == 0) {
             no_bus = true;
         } else if (std::strcmp(argv[index], "--require-video-consumer") == 0) {
@@ -719,7 +739,7 @@ int receiver_session(int argc, char **argv, ResumableControl &resumable) {
     }
     if (port.empty() || duration_ms < 0 || (wired_enrolment && no_bus) ||
         (supervisor_pid ? (!no_bus || !managed_phone.value || !required_usb_serial.empty())
-                        : managed_phone.value != 0) ||
+                        : (managed_phone.value != 0 || video_client_limits.has_value())) ||
         !aa::tools::validate_playout_options(playout)) {
         std::fputs(kUsage, stderr);
         return 2;
@@ -971,16 +991,48 @@ int receiver_session(int argc, char **argv, ResumableControl &resumable) {
     constexpr std::string_view kSerialMismatch =
         "{\"event\":\"err\",\"detail\":\"link\",\"code\":\"phone_serial_mismatch\"}";
 
+    std::optional<aa::ipc::VideoProducer> pre_accepted_video{};
+    if (video_client_limits.has_value()) {
+        auto adopted = aa::ipc::VideoProducer::adopt_accepted(5, *video_client_limits);
+        if (!adopted.has_value()) {
+            log_line("{\"event\":\"err\",\"detail\":\"socket\"}");
+            return 3;
+        }
+        pre_accepted_video.emplace(std::move(adopted.value()));
+    }
+
     aa::trust::WiredIdentity attempted_identity{};
     auto first_link = [&] {
         aa::core::CancellationSource startup_stop;
         auto watch_shutdown = cancel_open_on_shutdown(startup_stop);
+        // Under the supervisor, accept the display's video socket while USB
+        // reset / AOA re-enumeration runs so DisplayController::start_projection
+        // does not hit the 2 s limits-handshake timeout and roll back (#248).
+        std::atomic<bool> open_done{false};
+        std::thread pre_accept;
+        if (supervisor_pid && !pre_accepted_video.has_value()) {
+            pre_accept = std::thread([&] {
+                while (!open_done.load() && g_running.load() &&
+                       std::chrono::steady_clock::now() < deadline) {
+                    auto producer = video.value().accept_consumer(Milliseconds{50});
+                    if (producer.has_value()) {
+                        pre_accepted_video.emplace(std::move(producer.value()));
+                        return;
+                    }
+                }
+            });
+        }
         aa::core::Deadline startup_budget;
         startup_budget.cancellation = startup_stop.get_token();
         aa::transport::AoaRecovery startup_recovery;
         startup_recovery.reset_status = log_reset;
-        return aa::app::open_wired_link(selector, accessory, store, startup_budget,
-                                        &attempted_identity, &startup_recovery);
+        auto result = aa::app::open_wired_link(selector, accessory, store, startup_budget,
+                                               &attempted_identity, &startup_recovery);
+        open_done.store(true);
+        if (pre_accept.joinable()) {
+            pre_accept.join();
+        }
+        return result;
     }();
     if (!g_running.load()) {
         return 0;
@@ -1051,6 +1103,12 @@ int receiver_session(int argc, char **argv, ResumableControl &resumable) {
     std::atomic<std::int64_t> active_ms{-1};
     std::atomic<bool> session_failed{false};
     std::atomic<bool> admitted{false};
+    if (pre_accepted_video.has_value()) {
+        log_line_nonblocking("{\"event\":\"video_accepted\"}");
+        video_outlet.install(std::move(*pre_accepted_video));
+        pre_accepted_video.reset();
+        admitted.store(true);
+    }
     std::mutex gate_mutex;
     std::condition_variable gate_cv;
     aa::core::CancellationSource reconnect_stop;

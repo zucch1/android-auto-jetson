@@ -124,4 +124,72 @@ TEST(ManagedWiredWorker, StopReapsWorkerAndKeepsTheTwoSupervisorListeners) {
     EXPECT_TRUE(std::filesystem::is_socket(input_path));
 }
 
+TEST(ManagedWiredWorker, PassesPreAcceptedVideoClientWithoutClosingSupervisorConnection) {
+    Scratch scratch;
+    ASSERT_FALSE(scratch.path.empty());
+    const auto video_path = scratch.path / "video.sock";
+    const auto input_path = scratch.path / "input.sock";
+    auto video = aa::ipc::VideoServer::listen({video_path.string()}, {{}, aa::ipc::current_uid()});
+    auto input = aa::ipc::InputServer::listen({input_path.string()}, {aa::ipc::current_uid()});
+    ASSERT_TRUE(video);
+    ASSERT_TRUE(input);
+
+    aa::core::Result<aa::ipc::VideoConsumer> consumer{aa::Error{aa::ErrorCode::timeout}};
+    std::thread connector([&] {
+        consumer = aa::ipc::connect_video_consumer(
+            {video_path.string()}, {{}, aa::ipc::current_uid(), aa::core::Milliseconds{2000}});
+    });
+    auto producer = video.value().accept_consumer(aa::core::Milliseconds{2000});
+    connector.join();
+    ASSERT_TRUE(producer);
+    ASSERT_TRUE(consumer);
+
+    // Adopting a duplicated client fd and closing it must not shut down the
+    // supervisor's open connection (the consumer does not see EOF).
+    auto adopted = aa::ipc::VideoProducer::adopt_accepted(
+        ::dup(producer.value().native_handle()), producer.value().limits());
+    ASSERT_TRUE(adopted);
+    adopted.value().close();
+    const auto still_open = consumer.value().receive(aa::core::Milliseconds{20});
+    ASSERT_FALSE(still_open);
+    EXPECT_EQ(still_open.error().code(), aa::ErrorCode::timeout);
+
+    // Spawning a wired worker with the pre-accepted client fd passes fd 5 and
+    // --video-client-limits; when the worker exits quickly, the connection stays open.
+    const auto worker_script = scratch.path / "fake-receiver";
+    {
+        std::ofstream fixture{worker_script};
+        fixture << "#!/bin/bash\n"
+                   "set -eu\n"
+                   "[[ -S /proc/self/fd/3 && -S /proc/self/fd/4 && -S /proc/self/fd/5 ]]\n"
+                   "dir=${0%/*}\n"
+                   "printf '%s\\n' \"$@\" > \"$dir/args\"\n";
+        ASSERT_TRUE(fixture);
+    }
+    ASSERT_EQ(::chmod(worker_script.c_str(), 0700), 0);
+
+    wr::WiredWorker worker;
+    ASSERT_TRUE(worker.start(worker_script, {{17}, "1-2.3"}, scratch.path / "store",
+                             video.value().native_handle(), input.value().native_handle(),
+                             producer.value().native_handle(), producer.value().limits()));
+    const auto until = std::chrono::steady_clock::now() + 2s;
+    while (worker.running() && std::chrono::steady_clock::now() < until) {
+        std::this_thread::sleep_for(10ms);
+    }
+    EXPECT_FALSE(worker.running());
+    std::ifstream args_file{scratch.path / "args"};
+    std::string args_text{std::istreambuf_iterator<char>{args_file}, {}};
+    EXPECT_NE(args_text.find("--video-client-limits\n"), std::string::npos) << args_text;
+
+    const auto after_worker_exit = consumer.value().receive(aa::core::Milliseconds{20});
+    ASSERT_FALSE(after_worker_exit);
+    EXPECT_EQ(after_worker_exit.error().code(), aa::ErrorCode::timeout);
+
+    // Closing the supervisor's own producer cleanly signals EOF to the consumer.
+    producer.value().close();
+    const auto closed = consumer.value().receive(aa::core::Milliseconds{500});
+    ASSERT_FALSE(closed);
+    EXPECT_EQ(closed.error().code(), aa::ErrorCode::transport_closed);
+}
+
 } // namespace

@@ -56,6 +56,8 @@ struct Harness final {
     bool spawn_fails{};
     unsigned wireless_runs{};
     unsigned releases{};
+    unsigned video_accepts{};
+    unsigned video_releases{};
     bool process_running{true};
     bool wireless_idle{true};
     std::vector<std::string> reports{};
@@ -95,6 +97,8 @@ struct Harness final {
               [this] { return process_running; },
               [this](const char* what, ErrorCode) { reports.emplace_back(what); },
               [this] { return use_fake_clock ? fake_now : wr::Supervisor::Clock::now(); },
+              [this] { ++video_accepts; },
+              [this] { ++video_releases; },
           }, arbitration) {
         credentials.add_connection(owner, kUid);
         credentials.set_owner(name, owner);
@@ -497,6 +501,78 @@ TEST(ManagedSupervisor, LiveWirelessSessionNeverPreemptedByParkedWiredProbe) {
     h.step();
     EXPECT_EQ(h.worker_starts, 4U);
     EXPECT_EQ(h.policy.active_transport, ipc::ProjectionTransport::wired);
+}
+
+TEST(ManagedSupervisor, QuickWiredExitWithWirelessDisabledRetriesAfterBackoffAndKeepsVideo) {
+    Harness h{wr::ArbitrationPolicy{}, /*fake_clock=*/true};
+    h.approve_wired();
+    h.attach();
+    h.start();
+    ASSERT_TRUE(h.service.set_transport_enabled(h.owner, "wireless", false));
+
+    // First StartProjection starts the wired worker and accepts video promptly.
+    h.step();
+    EXPECT_EQ(h.worker_starts, 1U);
+    EXPECT_EQ(h.video_accepts, 1U);
+    EXPECT_EQ(h.video_releases, 0U);
+    EXPECT_EQ(h.policy.active_transport, ipc::ProjectionTransport::wired);
+
+    // Worker exits quickly (~1.4 s, e.g. USB reset/re-enumeration failure).
+    // Projection stays requested and the accepted video socket is NOT closed.
+    h.fake_now += 1400ms;
+    h.worker_running = false;
+    h.step();
+    EXPECT_EQ(h.service.state().projection, ipc::ProjectionState::projecting);
+    EXPECT_FALSE(h.policy.active_transport);
+    EXPECT_EQ(h.video_releases, 0U);
+    EXPECT_EQ(h.supervisor.arbiter().wired_failures({7}), 1U);
+
+    // During the 1 s backoff, the supervisor keeps accepting video and does not
+    // spawn early.
+    h.fake_now += 500ms;
+    h.step();
+    EXPECT_EQ(h.worker_starts, 1U);
+    EXPECT_GE(h.video_accepts, 2U);
+
+    // At 1 s backoff, the second wired attempt launches automatically.
+    h.fake_now += 500ms;
+    h.step();
+    EXPECT_EQ(h.worker_starts, 2U);
+    EXPECT_EQ(h.policy.active_transport, ipc::ProjectionTransport::wired);
+
+    // With wireless disabled, wired keeps retrying with exponential backoff
+    // (2 s, then 4 s) and is never parked after 3 failures.
+    h.fake_now += 1s;
+    h.worker_running = false;
+    h.step();
+    h.fake_now += 2s;
+    h.step();
+    EXPECT_EQ(h.worker_starts, 3U);
+
+    h.fake_now += 1s;
+    h.worker_running = false;
+    h.step();
+    ASSERT_EQ(h.supervisor.arbiter().wired_failures({7}), 3U);
+    h.fake_now += 3s;
+    h.step();
+    EXPECT_EQ(h.worker_starts, 3U);
+    h.fake_now += 1s;
+    h.step();
+    EXPECT_EQ(h.worker_starts, 4U);
+    EXPECT_EQ(h.video_releases, 0U);
+
+    // A healthy run (>= 30 s) clears failures and releases the video handle on exit.
+    h.fake_now += 35s;
+    h.worker_running = false;
+    h.step();
+    EXPECT_EQ(h.supervisor.arbiter().wired_failures({7}), 0U);
+    EXPECT_EQ(h.video_releases, 1U);
+
+    // StopProjection releases video and stops retrying.
+    ASSERT_TRUE(h.service.stop_projection(h.owner));
+    h.step();
+    EXPECT_EQ(h.video_releases, 2U);
+    EXPECT_EQ(h.worker_starts, 4U);
 }
 
 } // namespace

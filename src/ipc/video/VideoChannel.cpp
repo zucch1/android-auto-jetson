@@ -591,6 +591,7 @@ struct VideoProducer::Impl final {
     std::uint64_t backpressure{};
     bool waiting_idr{true};
     bool closed{false};
+    bool inherited{false};
     PartialSend partial{};
     VideoEndpoint endpoint{};
     VideoEndpointObserver observer{};
@@ -610,7 +611,9 @@ struct VideoProducer::Impl final {
         closed = true;
         partial.active = false;
         if (fd >= 0) {
-            ::shutdown(fd, SHUT_WR);
+            if (!inherited) {
+                ::shutdown(fd, SHUT_WR);
+            }
             ::close(fd);
             fd = -1;
         }
@@ -627,6 +630,31 @@ VideoProducer& VideoProducer::operator=(VideoProducer&& other) noexcept {
     return *this;
 }
 VideoProducer::~VideoProducer() { close(); }
+
+core::Result<VideoProducer> VideoProducer::adopt_accepted(int fd, const NegotiatedLimits& limits) {
+    int accepting{}, type{};
+    sockaddr_un address{};
+    socklen_t address_size = sizeof(address);
+    socklen_t size = sizeof(type);
+    if (::getsockname(fd, reinterpret_cast<sockaddr*>(&address), &address_size) != 0 ||
+        address.sun_family != AF_UNIX ||
+        ::getsockopt(fd, SOL_SOCKET, SO_TYPE, &type, &size) != 0 || type != SOCK_SEQPACKET ||
+        ::getsockopt(fd, SOL_SOCKET, SO_ACCEPTCONN, &accepting, &size) != 0 || accepting ||
+        ::fcntl(fd, F_SETFD, FD_CLOEXEC) != 0) {
+        return io_error();
+    }
+    auto peer = read_peer(fd);
+    if (!peer) {
+        return peer.error();
+    }
+    auto impl = std::make_unique<Impl>();
+    impl->fd = fd;
+    impl->limits = limits;
+    impl->inherited = true;
+    impl->endpoint = VideoEndpoint{VideoEndpointKind::send_started,
+        static_cast<std::uint32_t>(::getpid()), peer.value().pid, video_monotonic_ns()};
+    return VideoProducer{std::move(impl)};
+}
 
 core::Result<SendStatus> VideoProducer::send_access_unit(const VideoSendRequest& request) {
     if (!impl_ || impl_->closed) {

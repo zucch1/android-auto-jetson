@@ -31,6 +31,9 @@ inline constexpr unsigned kBulkTransferTimeoutMs = 200;
 // (tools/target/usb_aoa_libusb.py REENUMERATE_TIMEOUT_S is 15 s).
 inline constexpr core::Milliseconds kAccessoryWaitMs{15'000};
 
+// Bounded wait for a reset accessory-mode device to re-enumerate in phone mode.
+inline constexpr core::Milliseconds kResetReenumWaitMs{5'000};
+
 // One claimed accessory bulk pipe (IN 0x81 / OUT 0x01). A zero read/write count
 // means the bounded transfer timed out with no data - NOT end-of-stream. A
 // typed error means the pipe failed (hotplug returns transport_closed) and the

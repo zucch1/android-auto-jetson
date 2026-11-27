@@ -24,7 +24,8 @@ int run_wireless_projection(const Options& options, app::WirelessReceiver& recei
                             helper::BusClient& helper, ipc::ControlBusService& bus,
                             const std::optional<trust::TransportIdentity>& identity,
                             Runtime::Clock::time_point deadline, ipc::VideoServer& video,
-                            ipc::InputServer& input, WirelessKeep keep_running = {}) {
+                            ipc::InputServer& input, WirelessKeep keep_running = {},
+                            std::optional<ipc::VideoProducer> pre_accepted_video = {}) {
     aa::audio::AudioRenderWorker audio_sink{
         audio_config(options.audio_backend,
                      aa::core::Nanoseconds{options.audio_catch_up_watermark_ms * 1'000'000LL},
@@ -100,6 +101,10 @@ int run_wireless_projection(const Options& options, app::WirelessReceiver& recei
         },
         options.idr_recovery,
     });
+    if (pre_accepted_video) {
+        media.video.install(std::move(*pre_accepted_video));
+        pre_accepted_video.reset();
+    }
     Runtime runtime{receiver, helper, bus, video, input,
                     media, identity, deadline, std::nullopt, {}, std::nullopt};
     runtime.keep_running = std::move(keep_running);
@@ -121,6 +126,7 @@ core::Result<void> check_projection_credentials() {
 struct ProjectionSockets final {
     ipc::VideoServer video;
     ipc::InputServer input;
+    std::optional<ipc::VideoProducer> pending_video{};
 
     static core::Result<ProjectionSockets> listen(const Options& options) {
         auto video = ipc::VideoServer::listen({options.video_socket}, {{}, ipc::current_uid()});
@@ -181,22 +187,41 @@ int run_managed(const Options& options, trust::ApprovedPhoneStore& store, helper
                                    : std::vector<WiredCandidate>{};
         },
         [&](const WiredCandidate& candidate) {
-            return sockets && wired.start(wired_executable, candidate, store_path,
-                                          sockets->video.native_handle(),
-                                          sockets->input.native_handle());
+            if (!sockets) return false;
+            const int client_fd =
+                sockets->pending_video ? sockets->pending_video->native_handle() : -1;
+            const auto client_limits =
+                sockets->pending_video ? std::optional{sockets->pending_video->limits()}
+                                       : std::nullopt;
+            return wired.start(wired_executable, candidate, store_path,
+                               sockets->video.native_handle(),
+                               sockets->input.native_handle(), client_fd, client_limits);
         },
         [&] { return wired.running(); },
         [&] { wired.stop(); },
         [&] { wired.request_idr(); },
         [&](const WirelessKeep& keep) {
             if (!sockets) return 3;
+            auto pre_accepted = std::move(sockets->pending_video);
+            sockets->pending_video.reset();
             return run_wireless_projection(options, receiver, helper, bus.value(), std::nullopt,
-                                           deadline, sockets->video, sockets->input, keep);
+                                           deadline, sockets->video, sockets->input, keep,
+                                           std::move(pre_accepted));
         },
         [live_receiver] { return !live_receiver->session() && !live_receiver->bootstrapping(); },
         [&] { sockets.reset(); },
         [] { return running.load(); },
         [](const char* what, ErrorCode code) { report(what, code); },
+        Supervisor::Clock::now,
+        [&] {
+            if (!sockets || sockets->pending_video) return;
+            if (auto accepted = sockets->video.accept_consumer(core::Milliseconds{0})) {
+                sockets->pending_video.emplace(std::move(accepted.value()));
+            }
+        },
+        [&] {
+            if (sockets) sockets->pending_video.reset();
+        },
     }};
     log_line("{\"event\":\"ready\",\"state\":\"pairing_only\"}");
     while (running.load() && Runtime::Clock::now() < deadline) {

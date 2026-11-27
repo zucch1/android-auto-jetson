@@ -146,6 +146,12 @@ public:
     // before its first send syscall. Failed/partial sends acquire no sample.
     void set_observer(VideoEndpointObserver observer);
 
+    // Take an already-accepted consumer socket from the receiver supervisor.
+    // Closing an inherited producer closes only this descriptor without
+    // shutting down the underlying connection for the supervisor.
+    [[nodiscard]] static core::Result<VideoProducer> adopt_accepted(
+        int fd, const NegotiatedLimits& limits);
+
     // shutdown(SHUT_WR) + close; idempotent; the consumer then sees a clean
     // end of stream.
     void close() noexcept;

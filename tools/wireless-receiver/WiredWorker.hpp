@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
+#include <aa/ipc/VideoSocket.hpp>
 #include <aa/trust/Store.hpp>
 
 #include <algorithm>
@@ -109,12 +110,21 @@ public:
     [[nodiscard]] bool start(const std::filesystem::path& executable,
                              const WiredCandidate& candidate,
                              const std::filesystem::path& store,
-                             int video, int input) {
+                             int video, int input,
+                             int video_client = -1,
+                             const std::optional<ipc::NegotiatedLimits>& video_limits = {}) {
         if (pid_ > 0) return false;
+        const bool pass_client = video_client >= 0 && video_limits.has_value();
         std::vector<std::string> arguments{
             executable.string(), "--no-bus", "--managed-by", std::to_string(::getpid()),
             "--port", candidate.port, "--managed-phone-id", std::to_string(candidate.phone.value),
             "--store", store.string(), "--require-video-consumer"};
+        if (pass_client) {
+            arguments.emplace_back("--video-client-limits");
+            arguments.emplace_back(std::to_string(video_limits->max_access_unit_bytes) + "," +
+                                   std::to_string(video_limits->max_datagram_payload) + "," +
+                                   std::to_string(video_limits->socket_budget_bytes));
+        }
         std::vector<char*> argv;
         for (auto& argument : arguments) argv.push_back(argument.data());
         argv.push_back(nullptr);
@@ -123,8 +133,9 @@ public:
         // request sent during startup cannot terminate it via the default action.
         posix_spawnattr_t attributes;
         if (::posix_spawnattr_init(&attributes) != 0) return false;
-        const int video_source = ::fcntl(video, F_DUPFD_CLOEXEC, 5);
-        const int input_source = ::fcntl(input, F_DUPFD_CLOEXEC, 5);
+        const int video_source = ::fcntl(video, F_DUPFD_CLOEXEC, 6);
+        const int input_source = ::fcntl(input, F_DUPFD_CLOEXEC, 6);
+        const int client_source = pass_client ? ::fcntl(video_client, F_DUPFD_CLOEXEC, 6) : -1;
         posix_spawn_file_actions_t actions;
         const bool actions_ready = ::posix_spawn_file_actions_init(&actions) == 0;
         sigset_t mask;
@@ -132,8 +143,11 @@ public:
         ::sigaddset(&mask, SIGUSR1);
         pid_t child{};
         const bool started = actions_ready && video_source >= 0 && input_source >= 0 &&
+                             (!pass_client || client_source >= 0) &&
                              ::posix_spawn_file_actions_adddup2(&actions, video_source, 3) == 0 &&
                              ::posix_spawn_file_actions_adddup2(&actions, input_source, 4) == 0 &&
+                             (!pass_client ||
+                              ::posix_spawn_file_actions_adddup2(&actions, client_source, 5) == 0) &&
                              ::posix_spawnattr_setsigmask(&attributes, &mask) == 0 &&
                              ::posix_spawnattr_setflags(&attributes, POSIX_SPAWN_SETSIGMASK) == 0 &&
                              ::posix_spawn(&child, executable.c_str(), &actions, &attributes,
@@ -141,6 +155,7 @@ public:
         if (actions_ready) ::posix_spawn_file_actions_destroy(&actions);
         if (video_source >= 0) ::close(video_source);
         if (input_source >= 0) ::close(input_source);
+        if (client_source >= 0) ::close(client_source);
         ::posix_spawnattr_destroy(&attributes);
         if (started) pid_ = child;
         return started;

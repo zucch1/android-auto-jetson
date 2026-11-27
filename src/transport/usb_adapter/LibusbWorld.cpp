@@ -383,8 +383,22 @@ class LibusbLinkFactory final : public AoaLinkFactory {
         }
         AoaRecovery local_recovery;
         auto &recovery = recovery_ ? *recovery_ : local_recovery;
+        // Once a reset has been issued for a device already in accessory mode,
+        // bound the wait for phone-mode re-enumeration even when the caller
+        // passed an unbounded startup deadline so a phone that stays in
+        // accessory mode times out cleanly instead of hanging forever.
+        auto reenum_until = core::Deadline::Clock::time_point::max();
+        if (recovery.reset_attempted) {
+            reenum_until = std::min(deadline_.until,
+                                    core::Deadline::Clock::now() +
+                                        std::chrono::milliseconds{kResetReenumWaitMs.count});
+        }
+        auto active_budget = [&] {
+            return core::Deadline{std::min(deadline_.until, reenum_until), deadline_.cancellation};
+        };
         for (;;) {
-            if (auto checked = deadline_.check(); !checked) {
+            const auto budget = active_budget();
+            if (auto checked = budget.check(); !checked) {
                 return checked.error();
             }
             Enumeration enumeration;
@@ -399,12 +413,42 @@ class LibusbLinkFactory final : public AoaLinkFactory {
             if (found != candidates.end() && !is_aoa_device(found->snapshot)) {
                 pre_switch = found->snapshot;
                 auto handle =
-                    open_with_strings(session_.api(), found->device, pre_switch, deadline_);
+                    open_with_strings(session_.api(), found->device, pre_switch, budget);
                 if (!handle) {
+                    const auto code = handle.error().code();
+                    if (recovery.reset_attempted &&
+                        (code == ErrorCode::transport_closed ||
+                         code == ErrorCode::transport_unavailable ||
+                         code == ErrorCode::transport_io ||
+                         code == ErrorCode::timeout)) {
+                        // Right after a USB reset the re-enumerating device can
+                        // briefly be unavailable or waiting on udev permissions.
+                        wait_for_reenumeration(budget);
+                        continue;
+                    }
                     return handle.error();
                 }
-                LibusbControlChannel channel(session_.api(), std::move(handle.value()), deadline_);
-                return run_aoa_switch(channel, info, switch_report);
+                if (recovery.reset_attempted && pre_switch.serial.empty()) {
+                    wait_for_reenumeration(budget);
+                    continue;
+                }
+                LibusbControlChannel channel(session_.api(), std::move(handle.value()), budget);
+                auto switched = run_aoa_switch(channel, info, switch_report);
+                if (!switched) {
+                    const auto code = switched.error().code();
+                    const bool permanent =
+                        switch_report.failed_at == "get-protocol-version" ||
+                        switch_report.failed_at == "get-protocol-length" ||
+                        code == ErrorCode::invalid_argument ||
+                        code == ErrorCode::transport_malformed_frame ||
+                        code == ErrorCode::cancelled;
+                    if (recovery.reset_attempted && !permanent) {
+                        wait_for_reenumeration(budget);
+                        continue;
+                    }
+                    return switched.error();
+                }
+                return {};
             }
             if (found != candidates.end() && !is_supported_accessory(found->snapshot)) {
                 return Error{ErrorCode::transport_unavailable};
@@ -416,7 +460,7 @@ class LibusbLinkFactory final : public AoaLinkFactory {
                 // The existing AOA configuration lacks the original phone-mode
                 // VID/PID. Reset the exact enumerated device once, then require
                 // fresh phone-mode descriptors before any switch or admission.
-                if (auto checked = deadline_.check(); !checked) {
+                if (auto checked = budget.check(); !checked) {
                     return checked.error();
                 }
                 recovery.reset_attempted = true;
@@ -425,11 +469,16 @@ class LibusbLinkFactory final : public AoaLinkFactory {
                     reset.error().code() != ErrorCode::transport_unavailable) {
                     return reset.error();
                 }
+                // Start the bounded re-enumeration window after the synchronous
+                // kernel reset returns so reset latency does not consume it.
+                reenum_until = std::min(deadline_.until,
+                                        core::Deadline::Clock::now() +
+                                            std::chrono::milliseconds{kResetReenumWaitMs.count});
                 // A disconnect during the reset can invalidate the handle.
                 // Re-enumerate to determine whether the device changed modes.
                 continue;
             }
-            wait_for_reenumeration(deadline_);
+            wait_for_reenumeration(budget);
         }
     }
 
@@ -468,10 +517,22 @@ class LibusbLinkFactory final : public AoaLinkFactory {
                 LibusbDevice *device = found->device;
                 auto handle = open_with_strings(session_.api(), device, post_switch, budget);
                 if (!handle) {
+                    const auto code = handle.error().code();
+                    if (code == ErrorCode::transport_closed ||
+                        code == ErrorCode::transport_unavailable) {
+                        wait_for_reenumeration(budget);
+                        continue;
+                    }
                     return handle.error();
                 }
                 auto claimed = claim_accessory_interface(session_.api(), handle.value());
                 if (!claimed) {
+                    const auto code = claimed.error().code();
+                    if (code == ErrorCode::transport_closed ||
+                        code == ErrorCode::transport_unavailable) {
+                        wait_for_reenumeration(budget);
+                        continue;
+                    }
                     return claimed.error();
                 }
                 return std::unique_ptr<UsbBulkPipe>(

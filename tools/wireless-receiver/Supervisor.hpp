@@ -179,6 +179,8 @@ struct SupervisorPorts final {
     std::function<bool()> process_running;
     std::function<void(const char*, ErrorCode)> report;
     std::function<TransportArbiter::Clock::time_point()> now = TransportArbiter::Clock::now;
+    std::function<void()> accept_video{};
+    std::function<void()> release_video{};
 };
 
 class Supervisor final {
@@ -200,6 +202,7 @@ public:
                            state.projection == ipc::ProjectionState::projecting;
         if (!wants) {
             ports_.stop_wired();
+            if (ports_.release_video) ports_.release_video();
             wired_.reset();
             request_.reset();
             policy.active_transport.reset();
@@ -220,12 +223,17 @@ public:
             }
             // The worker ended on its own (or for revocation). Projection stays
             // requested and arbitration picks the next transport.
+            const auto exited_phone = wired_->phone;
             arbiter_.wired_exited(now());
+            if (arbiter_.wired_failures(exited_phone) == 0 && ports_.release_video) {
+                ports_.release_video();
+            }
             wired_.reset();
             policy.active_transport.reset();
             return std::nullopt;
         }
 
+        if (ports_.accept_video) ports_.accept_video();
         if (start_wired_if_allowed(approved)) return std::nullopt;
 
         if (policy.wireless && arbiter_.wireless_allowed(now()) && has_wireless(approved)) {
