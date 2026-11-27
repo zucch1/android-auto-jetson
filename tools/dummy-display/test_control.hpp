@@ -15,6 +15,7 @@
 
 #include "ProjectionWidget.hpp"
 
+#include <QShortcut>
 #include <QApplication>
 #include <QKeyEvent>
 #include <QMouseEvent>
@@ -214,6 +215,21 @@ private:
             post_key(Qt::Key_F6, true);
             post_key(Qt::Key_F6, false);
             write_line("{\"event\":\"ok\",\"cmd\":\"stop\"}");
+            return;
+        }
+        if (tok[0] == "shortcut" && tok.size() == 2 &&
+            (tok[1] == "f7" || tok[1] == "f8" || tok[1] == "f9")) {
+            // Test-only: fire the display's F7 (mode), F8 (wired) or F9 (wireless) shortcut.
+            const QKeySequence want{tok[1] == "f7" ? Qt::Key_F7 : tok[1] == "f8" ? Qt::Key_F8 : Qt::Key_F9};
+            bool fired = false;
+            for (QShortcut* shortcut : widget_.findChildren<QShortcut*>()) {
+                if (shortcut->key() == want) {
+                    QMetaObject::invokeMethod(shortcut, "activated");
+                    fired = true;
+                }
+            }
+            write_line(fired ? "{\"event\":\"ok\",\"cmd\":\"shortcut\"}"
+                             : "{\"event\":\"err\",\"cmd\":\"shortcut\"}");
             return;
         }
         if (tok[0] == "quit" && tok.size() == 1) {
