@@ -70,6 +70,10 @@ struct PairingOpened final {
 struct PairingClosed final {
     core::PairingRequestId request{};
 };
+struct PairingCompleted final {
+    core::PairingRequestId request{};
+    std::string outcome{};
+};
 struct DiagnosticEmitted final {
     DiagnosticSeverity severity{};
     std::string_view event{};  // stable literal name, never dynamic data
@@ -77,7 +81,8 @@ struct DiagnosticEmitted final {
 };
 
 using ControlEvent =
-    std::variant<StateChanged, PairingRequested, PairingOpened, PairingClosed, DiagnosticEmitted>;
+    std::variant<StateChanged, PairingRequested, PairingOpened, PairingClosed, PairingCompleted,
+                 DiagnosticEmitted>;
 
 class ControlEventSink {
 public:
@@ -126,6 +131,9 @@ public:
     PhoneDirectory& operator=(PhoneDirectory&&) = delete;
 
     [[nodiscard]] virtual core::Result<void> forget(core::PhoneId phone) = 0;
+    [[nodiscard]] virtual core::Result<std::vector<std::map<std::string, std::string>>> list_phones() const {
+        return std::vector<std::map<std::string, std::string>>{};
+    }
     virtual std::optional<helper::RevocationV1> take_revocation_v1() { return std::nullopt; }
     [[nodiscard]] virtual core::Result<void> pairing_requested(
         core::PairingRequestId request) = 0;
@@ -176,6 +184,22 @@ struct ControlServiceConfig final {
     std::uint32_t session_unix_uid{};
 };
 
+enum class ProjectionTransport { wired, wireless };
+
+struct ProjectionPolicy final {
+    bool ready{};
+    bool wired{true};
+    bool wireless{true};
+    // Validate operator provisioning before entering projection-ready.
+    std::function<core::Result<void>()> check_ready{};
+    // Invoked on StartProjection before acknowledging the request, so the
+    // supervisor can invalidate stale queued connections at the request
+    // boundary while keeping the projection-ready listener open. A non-OK
+    // result aborts StartProjection before entering projecting.
+    std::function<core::Result<void>()> before_start_projection{};
+    std::optional<ProjectionTransport> active_transport{};
+};
+
 struct ControlServiceDeps final {
     PeerCredentialLookup& credentials;
     ControlEventSink& events;
@@ -184,10 +208,14 @@ struct ControlServiceDeps final {
     helper::Confirmation* confirmation{nullptr};
     std::function<std::chrono::steady_clock::time_point()> clock{};
     std::function<bool()> session_active{};
+    ProjectionPolicy* projection_policy{};
+    // Standalone wired can project before a consumer registers. Called on
+    // StopProjection, and when unregister or owner loss ends a started projection.
+    std::function<bool()> stop_legacy_projection{};
 };
 
 // Session D-Bus control dispatcher (task 21) for
-// org.custom.AndroidAutoReceiver1: the fifteen contract methods with their
+// org.custom.AndroidAutoReceiver1: contract methods with their
 // authorization semantics, the one-time pairing request-id gate, and the
 // typed event stream behind the contract's signals.
 //
@@ -208,7 +236,9 @@ public:
     ControlService(ControlServiceConfig config, ControlServiceDeps deps)
         : config_(config), credentials_(deps.credentials), events_(deps.events),
           phones_(deps.phones), gate_(deps.pairing_ids), confirmation_(deps.confirmation),
-          clock_(std::move(deps.clock)), session_active_(std::move(deps.session_active)) {}
+          clock_(std::move(deps.clock)), session_active_(std::move(deps.session_active)),
+          projection_policy_(deps.projection_policy),
+          stop_legacy_projection_(std::move(deps.stop_legacy_projection)) {}
 
     // RegisterConsumer / UnregisterConsumer.
     [[nodiscard]] core::Result<core::ConsumerId> register_consumer(const BusName& caller,
@@ -229,11 +259,22 @@ public:
     void shutdown() {
         if (registered_) teardown("consumer_unregistered", DiagnosticSeverity::info);
     }
+    // Emit a structured receiver diagnostic event onto the control bus.
+    void emit_diagnostic(DiagnosticSeverity severity, std::string_view event,
+                         std::uint64_t subject = 0) {
+        events_.emit(DiagnosticEmitted{severity, event, subject});
+    }
+    [[nodiscard]] core::ConsumerId registered_consumer() const noexcept {
+        return registered_.has_value() ? registered_->consumer : core::ConsumerId{};
+    }
 
     // StartProjection / StopProjection / RequestIdrRecovery.
     [[nodiscard]] core::Result<void> start_projection(const BusName& caller);
     [[nodiscard]] core::Result<void> stop_projection(const BusName& caller);
     [[nodiscard]] core::Result<void> request_idr_recovery(const BusName& caller);
+    [[nodiscard]] core::Result<void> set_projection_mode(const BusName& caller, std::string_view mode);
+    [[nodiscard]] core::Result<void> set_transport_enabled(const BusName& caller,
+                                                           std::string_view transport, bool enabled);
     [[nodiscard]] bool consume_idr_recovery_request() noexcept {
         return idr_recovery_requested_.exchange(false);
     }
@@ -245,6 +286,10 @@ public:
     [[nodiscard]] core::Result<void> cancel_phone_pairing(const BusName& caller,
                                                           core::PairingRequestId request);
     [[nodiscard]] core::Result<void> forget_phone(const BusName& caller, core::PhoneId phone);
+    [[nodiscard]] core::Result<std::vector<std::map<std::string, std::string>>> list_phones(
+        const BusName& caller);
+    [[nodiscard]] core::Result<std::string> pairing_outcome(const BusName& caller,
+                                                            core::PairingRequestId request);
     core::Result<std::map<std::string, std::string>> pairing_comparison(const BusName&, core::PairingRequestId);
     // GetPairingCandidate: consumer-only, for a request this consumer holds
     // pending (not yet confirmed). Never broadcast; the reply is redacted.
@@ -292,8 +337,14 @@ private:
     // durable (optional out): false when the approval landed only as a committed-but-not-durable
     // store result (703).
     core::Result<void> persist_pairing(const Registered&, core::PairingRequestId, bool* durable = nullptr);
+    enum class StoreRetraction { failed, not_durable, durable };
+
     // Revokes an approved phone: store forget plus tracked external revocation (ForgetPhone's core).
-    core::Result<void> revoke_phone(const Registered&, core::PhoneId);
+    core::Result<void> revoke_phone(const Registered&, core::PhoneId,
+                                    StoreRetraction* store_retraction = nullptr,
+                                    core::PairingRequestId retracting_request = {});
+    void record_pairing_pending(core::PairingRequestId request, core::ConsumerId consumer);
+    void finalize_pairing_outcome(core::PairingRequestId request, std::string_view outcome);
     void close_enrolment(std::string_view reason, bool bond_recorded = false);
     // Bond reconciliation (docs/enrolment-ordering.md). Paced from refresh_consumer_owner(): due at
     // start, after any helper failure and whenever an enrolment ends without a commit; otherwise a
@@ -330,6 +381,9 @@ private:
     helper::Confirmation* confirmation_{};
     std::function<std::chrono::steady_clock::time_point()> clock_{};
     std::function<bool()> session_active_{};
+    ProjectionPolicy* projection_policy_{};
+    std::function<bool()> stop_legacy_projection_{};
+    void publish_projection_stop(core::ConsumerId consumer);
     std::vector<PendingRevocation> revocations_;
     std::size_t source_retry_cursor_{0};
     bool reconcile_due_{true};
@@ -351,6 +405,13 @@ private:
         bool accepted{};
     };
     std::optional<OpenPairing> open_pairing_;
+    struct PairingOutcomeRecord final {
+        core::PairingRequestId request{};
+        core::ConsumerId consumer{};
+        std::string outcome{};
+        bool terminal{false};
+    };
+    std::vector<PairingOutcomeRecord> pairing_outcomes_{};
 };
 
 } // namespace aa::ipc

@@ -31,6 +31,9 @@ inline constexpr unsigned kBulkTransferTimeoutMs = 200;
 // (tools/target/usb_aoa_libusb.py REENUMERATE_TIMEOUT_S is 15 s).
 inline constexpr core::Milliseconds kAccessoryWaitMs{15'000};
 
+// Bounded wait for a reset accessory-mode device to re-enumerate in phone mode.
+inline constexpr core::Milliseconds kResetReenumWaitMs{5'000};
+
 // One claimed accessory bulk pipe (IN 0x81 / OUT 0x01). A zero read/write count
 // means the bounded transfer timed out with no data - NOT end-of-stream. A
 // typed error means the pipe failed (hotplug returns transport_closed) and the
@@ -62,6 +65,8 @@ class AoaLinkFactory {
     AoaLinkFactory(const AoaLinkFactory &) = delete;
     AoaLinkFactory &operator=(const AoaLinkFactory &) = delete;
 
+    void set_recovery(AoaRecovery *recovery) noexcept { recovery_ = recovery; }
+
     virtual void set_connect_deadline(const core::Deadline &deadline) { deadline_ = deadline; }
 
     [[nodiscard]] virtual core::Result<void>
@@ -73,6 +78,7 @@ class AoaLinkFactory {
 
   protected:
     core::Deadline deadline_{};
+    AoaRecovery *recovery_{nullptr};
 };
 
 // Port-path syntax gate for every hardware-facing entry point: the kernel's

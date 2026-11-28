@@ -171,7 +171,7 @@ TEST(BusFlow, RealBusHappyStartStopStateFlowWithDummyConsumer) {
     EXPECT_EQ(projecting.projection, ProjectionState::projecting);
     EXPECT_EQ(done.projection, ProjectionState::stopped);
     EXPECT_EQ(fixture.service->state().consumer, aa::core::ConsumerId{});
-    EXPECT_EQ(fixture.service->capabilities().at("contract.semver"), "1.1.0");
+    EXPECT_EQ(fixture.service->capabilities().at("contract.semver"), "1.3.0");
     EXPECT_GT(fixture.service->ping(), 0U);
 }
 

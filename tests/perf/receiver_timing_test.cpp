@@ -108,7 +108,8 @@ TEST_F(ReceiverTiming, EmitsActualAudioWriteCompletionWithScheduledInterval) {
     std::smatch match;
     ASSERT_TRUE(std::regex_search(output, match, std::regex{
         "\"event\":\"audio_write_completed\",\"scheduled_ns\":([0-9]+),"
-        "\"scheduled_end_ns\":([0-9]+),\"completed_ns\":([0-9]+)"})) << output;
+        "\"scheduled_end_ns\":([0-9]+),\"playout_offset_ns\":60000000,"
+        "\"completed_ns\":([0-9]+)"})) << output;
     EXPECT_EQ(std::stoll(match[1].str()), start);
     EXPECT_GT(std::stoll(match[2].str()), start);
     EXPECT_GE(std::stoll(match[3].str()), start);
@@ -129,7 +130,7 @@ TEST_F(ReceiverTiming, SlowSettlementPublishesOnlyMatchingSuccessfulWriteProgres
         const std::vector<std::byte> pcm(960, std::byte{1});
         aa::audio::SinkWriteProgress progress{};
         progress.sequence = 37;
-        progress.effective_scheduled = {scheduled};
+        progress.effective_scheduled = {scheduled + aa::audio::kWiredPlayoutDepth.count};
         progress.entered_at = {scheduled + 10};
         progress.deadline = {scheduled + 2'000'000'000};
         progress.levels_valid = true;
@@ -307,7 +308,8 @@ TEST_F(ReceiverTiming, CurrentPcmProfilesEmitCompletionAndFlushOnlyOnce) {
         std::smatch completion;
         ASSERT_TRUE(std::regex_search(output, completion, std::regex{
             "\"event\":\"audio_write_completed\",\"scheduled_ns\":([0-9]+),"
-            "\"scheduled_end_ns\":([0-9]+),\"completed_ns\":([0-9]+)"})) << output;
+            "\"scheduled_end_ns\":([0-9]+),\"playout_offset_ns\":60000000,"
+            "\"completed_ns\":([0-9]+)"})) << output;
         EXPECT_EQ(std::stoll(completion[1].str()), start);
         EXPECT_GT(std::stoll(completion[2].str()), start);
         EXPECT_LE(std::stoll(completion[2].str()), start + 20'000'000);

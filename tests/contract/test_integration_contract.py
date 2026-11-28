@@ -82,6 +82,8 @@ COPIED_FILES = (
     "tools/wireless-receiver/ServiceDescription.hpp",
     "tools/wireless-receiver/AdmissionEvents.hpp",
     "tools/wireless-receiver/Options.hpp",
+    "tools/wireless-receiver/WiredWorker.hpp",
+    "tools/wireless-receiver/ManagedVideo.hpp",
 )
 
 
@@ -130,6 +132,21 @@ class IntegrationContractTests(unittest.TestCase):
             res = run_checker(root)
             self.assertEqual(res.returncode, 1, msg=res.stdout + res.stderr)
             self.assertIn("INTEGRATION_CONTRACT_RECEIVER_METHOD_DRIFT", res.stdout)
+
+    def test_runtime_capability_drift_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            stage_tree(root)
+            doc = root / "docs/INTEGRATION-CONTRACT.md"
+            doc.write_text(
+                doc.read_text(encoding="utf-8").replace(
+                    "| `transport.control` |", "| `transport.controls` |"
+                ),
+                encoding="utf-8",
+            )
+            res = run_checker(root)
+            self.assertEqual(res.returncode, 1, msg=res.stdout + res.stderr)
+            self.assertIn("INTEGRATION_CONTRACT_RUNTIME_CAPABILITIES", res.stdout)
 
     def test_runtime_receiver_object_path_drift_fails(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -370,6 +387,8 @@ class IntegrationContractTests(unittest.TestCase):
             (unit, "PartOf", "[Unit]", "[Unit]\nPartOf=graphical-session.target"),
             ("docs/INTEGRATION-CONTRACT.md", "WantedBy",
              "WantedBy=default.target", "WantedBy=graphical-session.target"),
+            ("docs/INTEGRATION-CONTRACT.md", "PartOf",
+             "`WantedBy=default.target`", "`WantedBy=default.target`, `PartOf=graphical-session.target`"),
         ):
             with self.subTest(relative=relative, directive=directive), tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp)

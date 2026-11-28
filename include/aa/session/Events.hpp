@@ -5,7 +5,7 @@
 
 namespace aa::session {
 
-// Link medium selects the contract reconnect budget (wired 5 s / wireless 15 s).
+// Link medium selects the reconnect budget (configurable for wired, 15 s for wireless).
 enum class LinkKind { wired, wireless };
 
 // Typed, payload-free lifecycle occurrences. Payload-carrying inputs (a phone

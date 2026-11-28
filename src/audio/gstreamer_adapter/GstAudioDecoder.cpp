@@ -394,6 +394,24 @@ AudioDecoder::AudioDecoder(AudioDecoder&& other) noexcept = default;
 
 AudioDecoder& AudioDecoder::operator=(AudioDecoder&& other) noexcept = default;
 
+namespace {
+
+bool push_payload(GstElement* appsrc, std::span<const std::byte> payload, GstClockTime pts) {
+    GstBuffer* buffer = gst_buffer_new_allocate(nullptr, payload.size(), nullptr);
+    if (buffer == nullptr) { return false; }
+    GstMapInfo map;
+    if (!gst_buffer_map(buffer, &map, GST_MAP_WRITE)) {
+        gst_buffer_unref(buffer);
+        return false;
+    }
+    std::memcpy(map.data, payload.data(), payload.size());
+    gst_buffer_unmap(buffer, &map);
+    GST_BUFFER_PTS(buffer) = pts;
+    return gst_app_src_push_buffer(GST_APP_SRC(appsrc), buffer) == GST_FLOW_OK;
+}
+
+} // namespace
+
 core::Result<PcmChunk> AudioDecoder::decode(const EncodedChunk& chunk) {
     if (!impl_ || impl_->pipeline == nullptr) {
         return Error{ErrorCode::invalid_argument};
@@ -424,23 +442,10 @@ core::Result<PcmChunk> AudioDecoder::decode(const EncodedChunk& chunk) {
         gst_caps_unref(caps);
     }
 
-    GstBuffer* buffer = gst_buffer_new_allocate(nullptr, chunk.payload.size(), nullptr);
-    if (buffer == nullptr) {
-        return Error{ErrorCode::audio_decode_failed};
-    }
-    GstMapInfo map;
-    if (!gst_buffer_map(buffer, &map, GST_MAP_WRITE)) {
-        gst_buffer_unref(buffer);
-        return Error{ErrorCode::audio_decode_failed};
-    }
-    std::memcpy(map.data, chunk.payload.data(), chunk.payload.size());
-    gst_buffer_unmap(buffer, &map);
-    GST_BUFFER_PTS(buffer) = static_cast<GstClockTime>(chunk.timestamp.count);
-
     // One submitted payload is one coded unit; exactly one normalized chunk
     // comes back (documented 1:1 decode contract).
-    const GstFlowReturn pushed = gst_app_src_push_buffer(GST_APP_SRC(impl_->appsrc), buffer);
-    if (pushed != GST_FLOW_OK) {
+    if (!push_payload(impl_->appsrc, chunk.payload,
+                      static_cast<GstClockTime>(chunk.timestamp.count))) {
         return Error{ErrorCode::audio_decode_failed};
     }
 
@@ -489,6 +494,53 @@ void AudioDecoder::flush() noexcept {
     }
     gst_element_send_event(impl_->pipeline, gst_event_new_flush_start());
     gst_element_send_event(impl_->pipeline, gst_event_new_flush_stop(TRUE));
+}
+
+std::vector<std::byte> AudioDecoder::drain(std::span<const std::byte> last) {
+    std::vector<std::byte> tail;
+    if (!impl_ || impl_->pipeline == nullptr) {
+        return tail;
+    }
+    // The resampler drains nothing at the end of a stream without a time.
+    if (!last.empty()) { (void)push_payload(impl_->appsrc, last, 0); }
+    // End of stream makes the resampler push its remaining output; the bounded
+    // pulls below end at the sink's EOS.
+    if (gst_app_src_end_of_stream(GST_APP_SRC(impl_->appsrc)) == GST_FLOW_OK) {
+        for (;;) {
+            GstSample* sample =
+                gst_app_sink_try_pull_sample(GST_APP_SINK(impl_->appsink), kDecodeTimeoutNs);
+            if (sample == nullptr) {
+                break;
+            }
+            GstBuffer* out = gst_sample_get_buffer(sample);
+            GstMapInfo map;
+            if (out != nullptr && gst_buffer_map(out, &map, GST_MAP_READ)) {
+                const std::size_t offset = tail.size();
+                tail.resize(offset + map.size);
+                std::memcpy(tail.data() + offset, map.data, map.size);
+                gst_buffer_unmap(out, &map);
+            }
+            gst_sample_unref(sample);
+        }
+    }
+    (void)restart(); // a pipeline that cannot restart fails its next decode()
+    return tail;
+}
+
+core::Result<void> AudioDecoder::restart() {
+    if (!impl_ || impl_->pipeline == nullptr) {
+        return Error{ErrorCode::invalid_argument};
+    }
+    // NULL stops every element: the converter and resampler drop their history
+    // and the sink its queue and end of stream (READY keeps the last two).
+    if (gst_element_set_state(impl_->pipeline, GST_STATE_NULL) == GST_STATE_CHANGE_FAILURE
+        || gst_element_set_state(impl_->pipeline, GST_STATE_PLAYING) == GST_STATE_CHANGE_FAILURE) {
+        return Error{ErrorCode::audio_decode_failed};
+    }
+    while (GstMessage* message = gst_bus_pop(impl_->bus)) {
+        gst_message_unref(message);
+    }
+    return {};
 }
 
 void AudioDecoder::close() noexcept {

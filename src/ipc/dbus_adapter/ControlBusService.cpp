@@ -59,6 +59,16 @@ public:
         } else if (const auto* closed = std::get_if<PairingClosed>(&event)) {
             member = "PairingClosed";
             request = closed->request.value;
+        } else if (const auto* completed = std::get_if<PairingCompleted>(&event)) {
+            MessageWriter writer;
+            writer.path(kContractObjectPath)
+                .interface_name(kContractInterface)
+                .member("PairingCompleted")
+                .body_signature("ts");
+            writer.put_u64(completed->request.value);
+            writer.put_string(completed->outcome);
+            static_cast<void>(connection_->send_message(MessageType::signal, writer));
+            return;
         } else if (const auto* diagnostic = std::get_if<DiagnosticEmitted>(&event)) {
             MessageWriter writer;
             writer.path(kContractObjectPath)
@@ -101,11 +111,11 @@ struct ControlBusService::Impl final {
     bool closed{false};
     std::chrono::steady_clock::time_point next_refresh{std::chrono::steady_clock::now()};
 
-    Impl(ControlServiceConfig config, PairingIdSource& ids, PhoneDirectory& directory,
-         helper::Confirmation* confirmation, std::function<bool()> session_active)
-        : pairing_ids(ids), phones(directory),
-          service(config, ControlServiceDeps{credentials, emitter, pairing_ids, phones, confirmation,
-                                             {}, std::move(session_active)}),
+    Impl(ControlServiceConfig config, Deps deps)
+        : pairing_ids(deps.pairing_ids), phones(deps.phones),
+          service(config, ControlServiceDeps{credentials, emitter, pairing_ids, phones, deps.confirmation,
+                                             {}, std::move(deps.session_active), deps.projection_policy,
+                                             std::move(deps.stop_legacy_projection)}),
           dispatcher(service) {}
 };
 
@@ -114,9 +124,7 @@ core::Result<ControlBusService> ControlBusService::start(Config config, Deps dep
     if (!connection.has_value()) {
         return connection.error();
     }
-    auto impl = std::make_unique<Impl>(ControlServiceConfig{config.session_unix_uid},
-                                       deps.pairing_ids, deps.phones, deps.confirmation,
-                                       std::move(deps.session_active));
+    auto impl = std::make_unique<Impl>(ControlServiceConfig{config.session_unix_uid}, std::move(deps));
     impl->connection = std::move(connection.value());
     impl->emitter.bind(&*impl->connection);
     const auto owned =

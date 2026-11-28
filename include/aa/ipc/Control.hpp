@@ -38,6 +38,10 @@ enum class ControlMethod {
     respond_pairing_comparison,
     get_pairing_candidate,
     request_idr_recovery,
+    list_phones,
+    get_pairing_outcome,
+    set_projection_mode,
+    set_transport_enabled,
 };
 
 // Stable wire names (the D-Bus introspection contract).
@@ -59,6 +63,10 @@ enum class ControlMethod {
     case ControlMethod::respond_pairing_comparison: return "RespondPairingComparison";
     case ControlMethod::get_pairing_candidate: return "GetPairingCandidate";
     case ControlMethod::request_idr_recovery: return "RequestIdrRecovery";
+    case ControlMethod::list_phones: return "ListPhones";
+    case ControlMethod::get_pairing_outcome: return "GetPairingOutcome";
+    case ControlMethod::set_projection_mode: return "SetProjectionMode";
+    case ControlMethod::set_transport_enabled: return "SetTransportEnabled";
     }
     return {};
 }

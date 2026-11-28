@@ -443,7 +443,7 @@ TEST(CallBoundary, PropertiesGetReturnsStringVariant) {
     ASSERT_TRUE(reply.has_value());
     ASSERT_FALSE(reply->is_error);
     ASSERT_TRUE(std::holds_alternative<aa::ipc::StringPropertyValue>(reply->body));
-    EXPECT_EQ(std::get<aa::ipc::StringPropertyValue>(reply->body).value, "1.1.0");
+    EXPECT_EQ(std::get<aa::ipc::StringPropertyValue>(reply->body).value, "1.3.0");
     EXPECT_EQ(fixture.service.state().consumer, aa::core::ConsumerId{});
 }
 
@@ -470,7 +470,7 @@ TEST(CallBoundary, PropertiesGetAllReturnsContractMetadata) {
         ASSERT_TRUE(std::holds_alternative<aa::ipc::PropertyDictionary>((*reply)->body));
         const auto& dictionary = std::get<aa::ipc::PropertyDictionary>((*reply)->body);
         ASSERT_EQ(dictionary.entries.size(), 1U);
-        EXPECT_EQ(dictionary.entries.at("ContractSemVer"), "1.1.0");
+        EXPECT_EQ(dictionary.entries.at("ContractSemVer"), "1.3.0");
     }
 }
 
@@ -492,7 +492,7 @@ TEST(CallBoundary, PropertiesSetRejectsReadOnlyProperty) {
     ASSERT_TRUE(reply.has_value());
     EXPECT_TRUE(reply->is_error);
     EXPECT_EQ(reply->error_name, "org.freedesktop.DBus.Error.PropertyReadOnly");
-    EXPECT_EQ(aa::ipc::contract_semver(), "1.1.0");
+    EXPECT_EQ(aa::ipc::contract_semver(), "1.3.0");
 }
 
 TEST(CallBoundary, PropertiesRejectInvalidArguments) {
@@ -630,6 +630,112 @@ TEST(CallBoundary, DispatchesRequestIdrRecoveryAndPingDistinctly) {
     ASSERT_TRUE(while_projecting.has_value());
     EXPECT_FALSE(while_projecting->is_error);
     EXPECT_TRUE(fixture.service.consume_idr_recovery_request());
+}
+
+TEST(CallBoundary, RejectsMalformedRuntimeProjectionArguments) {
+    BoundaryFixture fixture;
+    auto invalid_bool = marshal_string("wired");
+    pad_to(invalid_bool, 4);
+    append_u32(invalid_bool, 2);
+    const auto transport = fixture.dispatcher.handle(
+        call_from(":1.70", "SetTransportEnabled", "sb", invalid_bool));
+    ASSERT_TRUE(transport);
+    EXPECT_EQ(transport->error_name, "org.freedesktop.DBus.Error.InvalidArgs");
+    const auto mode = fixture.dispatcher.handle(
+        call_from(":1.70", "SetProjectionMode", "s", {}));
+    ASSERT_TRUE(mode);
+    EXPECT_EQ(mode->error_name, "org.freedesktop.DBus.Error.InvalidArgs");
+}
+
+TEST(CallBoundary, DispatchesListPhonesAndGetPairingOutcomeWithAuthorization) {
+    BoundaryFixture fixture;
+    const BusName name{"org.custom.ConsumerA"};
+    fixture.credentials.add_connection(BusName{":1.70"}, kSessionUid);
+    fixture.credentials.add_connection(BusName{":1.71"}, kSessionUid);
+    fixture.credentials.add_connection(BusName{":1.72"}, kSessionUid + 1);
+    fixture.credentials.set_owner(name, BusName{":1.70"});
+
+    // Unregistered calls fail closed.
+    const auto unreg_list = fixture.dispatcher.handle(call_from(":1.70", "ListPhones"));
+    ASSERT_TRUE(unreg_list.has_value());
+    EXPECT_TRUE(unreg_list->is_error);
+    EXPECT_EQ(unreg_list->error_name, "org.custom.AndroidAutoReceiver1.Error.ConsumerRejected");
+
+    ASSERT_FALSE(fixture.dispatcher
+                     .handle(call_from(":1.70", "RegisterConsumer", "s", marshal_string(name.value)))
+                     ->is_error);
+
+    // Wrong UID and non-active same-UID callers are rejected.
+    for (const char* rogue : {":1.71", ":1.72"}) {
+        const auto denied_list = fixture.dispatcher.handle(call_from(rogue, "ListPhones"));
+        ASSERT_TRUE(denied_list.has_value());
+        EXPECT_TRUE(denied_list->is_error);
+        EXPECT_EQ(denied_list->error_name, "org.custom.AndroidAutoReceiver1.Error.PeerUnauthorized");
+
+        const auto denied_outcome = fixture.dispatcher.handle(
+            call_from(rogue, "GetPairingOutcome", "t", marshal_u64(1)));
+        ASSERT_TRUE(denied_outcome.has_value());
+        EXPECT_TRUE(denied_outcome->is_error);
+        EXPECT_EQ(denied_outcome->error_name,
+                  "org.custom.AndroidAutoReceiver1.Error.PeerUnauthorized");
+    }
+
+    // Wrong signatures are rejected as InvalidArgs.
+    const auto bad_list_sig = fixture.dispatcher.handle(
+        call_from(":1.70", "ListPhones", "t", marshal_u64(1)));
+    ASSERT_TRUE(bad_list_sig.has_value());
+    EXPECT_EQ(bad_list_sig->error_name, "org.freedesktop.DBus.Error.InvalidArgs");
+    const auto bad_outcome_sig = fixture.dispatcher.handle(
+        call_from(":1.70", "GetPairingOutcome", "s", marshal_string("1")));
+    ASSERT_TRUE(bad_outcome_sig.has_value());
+    EXPECT_EQ(bad_outcome_sig->error_name, "org.freedesktop.DBus.Error.InvalidArgs");
+
+    // Zero or unknown request_id fails with MalformedRequest.
+    for (const std::uint64_t bad_id : {std::uint64_t{0}, std::uint64_t{7777}}) {
+        const auto bad = fixture.dispatcher.handle(
+            call_from(":1.70", "GetPairingOutcome", "t", marshal_u64(bad_id)));
+        ASSERT_TRUE(bad.has_value());
+        EXPECT_TRUE(bad->is_error);
+        EXPECT_EQ(bad->error_name, "org.custom.AndroidAutoReceiver1.Error.MalformedRequest");
+    }
+
+    // ListPhones returns aa{ss} with populated redacted entries.
+    fixture.phones.listed_phones = std::vector<std::map<std::string, std::string>>{
+        {{"phone_id", "3"},
+         {"label", "id-0011223344556677"},
+         {"transport", "wired"},
+         {"strength", "serial-backed"}},
+    };
+    const auto listed = fixture.dispatcher.handle(call_from(":1.70", "ListPhones"));
+    ASSERT_TRUE(listed.has_value());
+    ASSERT_FALSE(listed->is_error);
+    using PhoneList = std::vector<std::map<std::string, std::string>>;
+    ASSERT_TRUE(std::holds_alternative<PhoneList>(listed->body));
+    const auto& entries = std::get<PhoneList>(listed->body);
+    ASSERT_EQ(entries.size(), 1U);
+    EXPECT_EQ(entries[0].at("phone_id"), "3");
+    EXPECT_EQ(entries[0].at("label"), "id-0011223344556677");
+
+    // GetPairingOutcome tracks pending -> approved across ConfirmPhonePairing.
+    const auto req = fixture.dispatcher.handle(call_from(":1.70", "RequestAddPhone"));
+    ASSERT_TRUE(req.has_value());
+    ASSERT_FALSE(req->is_error);
+    const auto req_id = std::get<std::uint64_t>(req->body);
+
+    const auto pending = fixture.dispatcher.handle(
+        call_from(":1.70", "GetPairingOutcome", "t", marshal_u64(req_id)));
+    ASSERT_TRUE(pending.has_value());
+    ASSERT_FALSE(pending->is_error);
+    EXPECT_EQ(std::get<std::string>(pending->body), "pending");
+
+    ASSERT_FALSE(fixture.dispatcher
+                     .handle(call_from(":1.70", "ConfirmPhonePairing", "t", marshal_u64(req_id)))
+                     ->is_error);
+    const auto approved = fixture.dispatcher.handle(
+        call_from(":1.70", "GetPairingOutcome", "t", marshal_u64(req_id)));
+    ASSERT_TRUE(approved.has_value());
+    ASSERT_FALSE(approved->is_error);
+    EXPECT_EQ(std::get<std::string>(approved->body), "approved");
 }
 
 } // namespace

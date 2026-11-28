@@ -101,11 +101,13 @@ if(NOT CMAKE_CROSSCOMPILING)
     if(TARGET PkgConfig::AA_AUDIO_GST)
         target_link_libraries(aa_wired_e2e_test PRIVATE PkgConfig::AA_AUDIO_GST)
     endif()
-    target_compile_definitions(aa_wired_e2e_test PRIVATE AA_WIRED_HAS_AUDIO_ROUTER=1)
+    add_dependencies(aa_wired_e2e_test aa_fake_libusb)
+    target_compile_definitions(aa_wired_e2e_test PRIVATE
+        AA_WIRED_HAS_AUDIO_ROUTER=1 AA_FAKE_LIBUSB_PATH="$<TARGET_FILE:aa_fake_libusb>")
     target_link_options(aa_wired_e2e_test PRIVATE
         "-Wl,--wrap=_ZN2aa9transport11usb_adapter24make_libusb_link_factoryEv"
-        "-Wl,--wrap=fsync" "-Wl,--wrap=renameat"
-        "-Wl,--wrap=_ZN2aa3app15open_wired_linkERKNS_9transport17UsbDeviceSelectorERKNS1_16AoaAccessoryInfoERKNS_5trust10TrustStoreERKNS_4core8DeadlineEPNS8_13WiredIdentityE"
+        "-Wl,--wrap=fsync" "-Wl,--wrap=renameat" "-Wl,--wrap=dlopen"
+        "-Wl,--wrap=_ZN2aa3app15open_wired_linkERKNS_9transport17UsbDeviceSelectorERKNS1_16AoaAccessoryInfoERKNS_5trust10TrustStoreERKNS_4core8DeadlineEPNS8_13WiredIdentityEPNS1_11AoaRecoveryE"
         "-Wl,--wrap=_ZN2aa9transport28make_client_handshake_cipherERKSt8functionIFbvEE"
         "-Wl,--wrap=_ZN2aa5audio6detail17open_default_sinkERKNS1_15SinkOpenRequestE")
     list(APPEND AA_WIRED_WARN_TARGETS aa_wired_e2e_test)
@@ -145,10 +147,14 @@ if(NOT CMAKE_CROSSCOMPILING)
     add_test(NAME wired_recovery COMMAND aa_wired_e2e_test --gtest_filter=WiredRecovery.*)
     add_test(NAME wired_receiver COMMAND dbus-run-session --
         $<TARGET_FILE:aa_wired_e2e_test> --gtest_filter=WiredReceiver.*:ReceiverAudioDispatch.*)
+    # Exercise the receiver retry loop with the production libusb adapter and a fake USB runtime.
+    add_test(NAME wired_receiver_usb_recovery COMMAND aa_wired_e2e_test
+        --gtest_filter=WiredReceiverUsbRecovery.*)
+    set_tests_properties(wired_receiver_usb_recovery PROPERTIES TIMEOUT 20)
     add_test(NAME wired_enrolment COMMAND aa_wired_e2e_test --gtest_filter=WiredEnrolment.*:WiredEnrolFlow.*:WiredEnrolAnswerReader.*)
     set_tests_properties(wired_enrolment PROPERTIES TIMEOUT 60)
     # #133 receiver enrolment end to end over a real session bus (own budget:
-    # wired_receiver already runs close to its 120 s timeout).
+    # wired_receiver already runs for over two minutes).
     add_test(NAME wired_receiver_enrolment COMMAND dbus-run-session --
         $<TARGET_FILE:aa_wired_e2e_test> --gtest_filter=WiredReceiverEnrolment.*)
     set_tests_properties(wired_receiver_enrolment PROPERTIES TIMEOUT 90)
@@ -159,7 +165,7 @@ if(NOT CMAKE_CROSSCOMPILING)
     set_tests_properties(wired_e2e_idr_io PROPERTIES TIMEOUT 30)
     add_test(NAME wired_deadline COMMAND aa_wired_e2e_test --gtest_filter=WiredDeadline.*)
     set_tests_properties(wired_deadline PROPERTIES TIMEOUT 30)
-    set_tests_properties(wired_receiver PROPERTIES TIMEOUT 180)
+    set_tests_properties(wired_receiver PROPERTIES TIMEOUT 240)
     set_tests_properties(wired_e2e_happy wired_e2e_revoke wired_e2e_failures wired_e2e_trust_link
         wired_e2e_input_wire wired_e2e_auth wired_e2e_microphone wired_recovery PROPERTIES TIMEOUT 120)
     add_test(NAME wired_e2e_live_qa_gates COMMAND "${Python3_EXECUTABLE}" -B

@@ -8,6 +8,7 @@
 #include "fakes.hpp"
 
 #include <cstdint>
+#include <utility>
 
 #include <gtest/gtest.h>
 
@@ -78,8 +79,89 @@ TEST(ControlService, StateCapabilitiesAndPingStayOpenToAnyCaller) {
     EXPECT_EQ(snapshot.projection, ProjectionState::stopped);
     EXPECT_EQ(snapshot.consumer, aa::core::ConsumerId{});
     EXPECT_EQ(caps.at("contract.interface"), aa::ipc::kContractInterface);
-    EXPECT_EQ(caps.at("contract.semver"), "1.1.0");
+    EXPECT_EQ(caps.at("contract.semver"), "1.3.0");
+    EXPECT_EQ(caps.at("phones.list"), "true");
+    EXPECT_EQ(caps.at("pairing.outcomes"), "true");
     EXPECT_GT(stamp, 0U);
+}
+
+TEST(ControlService, RuntimeProjectionPolicyPreservesRegistrationAndChecksAuthority) {
+    Fixture fixture;
+    bool provisioned = false;
+    aa::ipc::ProjectionPolicy policy{};
+    policy.check_ready = [&]() -> aa::core::Result<void> {
+        if (provisioned) return {};
+        return aa::Error{ErrorCode::session_illegal_transition};
+    };
+    ControlService service{{kSessionUid}, {fixture.credentials, fixture.events, fixture.ids,
+                                          fixture.phones, nullptr, {}, {}, &policy}};
+    const BusName owner{":1.51"};
+    const BusName same_uid{":1.52"};
+    const BusName wrong_uid{":1.53"};
+    const BusName name{"org.custom.ConsumerA"};
+    fixture.credentials.add_connection(owner, kSessionUid);
+    fixture.credentials.add_connection(same_uid, kSessionUid);
+    fixture.credentials.add_connection(wrong_uid, kSessionUid + 1);
+    fixture.credentials.set_owner(name, owner);
+
+    EXPECT_FALSE(fixture.service.capabilities().contains("projection.mode"));
+    EXPECT_EQ(service.capabilities().at("projection.mode.current"), "pairing_only");
+    EXPECT_EQ(service.set_projection_mode(owner, "projection_ready").error().code(),
+              ErrorCode::ipc_consumer_rejected);
+    const auto registered = service.register_consumer(owner, name);
+    ASSERT_TRUE(registered);
+    for (const auto& outsider : {same_uid, wrong_uid}) {
+        EXPECT_EQ(service.set_projection_mode(outsider, "projection_ready").error().code(),
+                  ErrorCode::ipc_peer_unauthorized);
+        EXPECT_EQ(service.set_transport_enabled(outsider, "wired", false).error().code(),
+                  ErrorCode::ipc_peer_unauthorized);
+    }
+    EXPECT_FALSE(service.start_projection(owner));
+    EXPECT_FALSE(service.set_projection_mode(owner, "projection_ready"));
+    EXPECT_FALSE(policy.ready);
+    provisioned = true;
+    ASSERT_TRUE(service.set_projection_mode(owner, "projection_ready"));
+    ASSERT_TRUE(service.set_projection_mode(owner, "projection_ready"));
+    ASSERT_TRUE(service.set_transport_enabled(owner, "wired", false));
+    EXPECT_EQ(service.capabilities().at("transport.wired.enabled"), "false");
+    EXPECT_EQ(service.capabilities().at("transport.wireless.enabled"), "true");
+    ASSERT_TRUE(service.start_projection(owner));
+    policy.active_transport = aa::ipc::ProjectionTransport::wireless;
+
+    ASSERT_TRUE(service.set_transport_enabled(owner, "wired", true));
+    EXPECT_EQ(service.state().projection, ProjectionState::projecting);
+    ASSERT_TRUE(service.set_transport_enabled(owner, "wireless", false));
+    EXPECT_EQ(service.state().projection, ProjectionState::stopped);
+    EXPECT_EQ(service.state().consumer, registered.value());
+
+    ASSERT_TRUE(service.start_projection(owner));
+    ASSERT_TRUE(service.set_projection_mode(owner, "pairing_only"));
+    EXPECT_EQ(service.state().projection, ProjectionState::stopped);
+    EXPECT_EQ(service.state().consumer, registered.value());
+
+    ASSERT_TRUE(service.set_projection_mode(owner, "projection_ready"));
+    ASSERT_TRUE(service.set_transport_enabled(owner, "wired", false));
+    EXPECT_FALSE(service.start_projection(owner));
+}
+
+TEST(ControlService, StopProjectionRetiresStandaloneWiredLinkWithoutPriorStart) {
+    Fixture fixture;
+    bool link_live = true;
+    ControlService service{{kSessionUid}, {fixture.credentials, fixture.events, fixture.ids,
+                                          fixture.phones, nullptr, {}, {}, nullptr,
+                                          [&] { return std::exchange(link_live, false); }}};
+    const BusName owner{":1.61"};
+    const BusName name{"org.custom.ConsumerA"};
+    fixture.credentials.add_connection(owner, kSessionUid);
+    fixture.credentials.set_owner(name, owner);
+
+    EXPECT_FALSE(service.stop_projection(owner));
+    EXPECT_TRUE(link_live);
+    ASSERT_TRUE(service.register_consumer(owner, name));
+    ASSERT_TRUE(service.stop_projection(owner));
+    EXPECT_FALSE(link_live);
+    EXPECT_EQ(service.state().projection, ProjectionState::stopped);
+    EXPECT_FALSE(service.stop_projection(owner));
 }
 
 TEST(ControlService, ProjectionTransitionsEmitStateChangedEvents) {
@@ -617,6 +699,141 @@ TEST(ControlService, RequestIdrRecoveryRequiresProjectingActiveConsumer) {
     ASSERT_TRUE(fixture.service.request_idr_recovery(connection).has_value());
     ASSERT_TRUE(fixture.service.stop_projection(connection).has_value());
     EXPECT_FALSE(fixture.service.consume_idr_recovery_request());
+}
+
+TEST(ControlService, ListPhonesRequiresActiveConsumerAndForwardsDirectory) {
+    Fixture fixture;
+    const BusName owner{":1.130"};
+    const BusName owner_name{"org.custom.ConsumerA"};
+    const BusName other{":1.131"};
+    const BusName stranger{":1.132"};
+    fixture.credentials.add_connection(owner, kSessionUid);
+    fixture.credentials.add_connection(other, kSessionUid);
+    fixture.credentials.add_connection(stranger, kSessionUid + 1);
+    fixture.credentials.set_owner(owner_name, owner);
+
+    const auto unregistered = fixture.service.list_phones(owner);
+    ASSERT_FALSE(unregistered.has_value());
+    EXPECT_EQ(unregistered.error().code(), ErrorCode::ipc_consumer_rejected);
+
+    ASSERT_TRUE(fixture.service.register_consumer(owner, owner_name).has_value());
+    const auto wrong_uid = fixture.service.list_phones(stranger);
+    ASSERT_FALSE(wrong_uid.has_value());
+    EXPECT_EQ(wrong_uid.error().code(), ErrorCode::ipc_peer_unauthorized);
+    const auto same_uid_other = fixture.service.list_phones(other);
+    ASSERT_FALSE(same_uid_other.has_value());
+    EXPECT_EQ(same_uid_other.error().code(), ErrorCode::ipc_peer_unauthorized);
+
+    fixture.phones.listed_phones = std::vector<std::map<std::string, std::string>>{
+        {{"phone_id", "1"},
+         {"label", "id-0123456789abcdef"},
+         {"transport", "wired"},
+         {"strength", "serial-backed"}},
+        {{"phone_id", "2"},
+         {"label", "id-fedcba9876543210"},
+         {"transport", "wireless"},
+         {"strength", "bond-backed"}},
+    };
+    const auto listed = fixture.service.list_phones(owner);
+    ASSERT_TRUE(listed.has_value());
+    ASSERT_EQ(listed.value().size(), 2U);
+    EXPECT_EQ(listed.value()[0].at("phone_id"), "1");
+    EXPECT_EQ(listed.value()[1].at("transport"), "wireless");
+
+    fixture.phones.listed_phones = aa::Error{ErrorCode::trust_store_io};
+    const auto unreadable = fixture.service.list_phones(owner);
+    ASSERT_FALSE(unreadable.has_value());
+    EXPECT_EQ(unreadable.error().code(), ErrorCode::trust_store_io);
+}
+
+TEST(ControlService, GetPairingOutcomeTracksLifecycleAuthorizationAndTerminalSticky) {
+    Fixture fixture;
+    const BusName owner{":1.140"};
+    const BusName owner_name{"org.custom.ConsumerA"};
+    const BusName other{":1.141"};
+    const BusName stranger{":1.142"};
+    fixture.credentials.add_connection(owner, kSessionUid);
+    fixture.credentials.add_connection(other, kSessionUid);
+    fixture.credentials.add_connection(stranger, kSessionUid + 1);
+    fixture.credentials.set_owner(owner_name, owner);
+
+    EXPECT_EQ(fixture.service.pairing_outcome(owner, aa::core::PairingRequestId{1}).error().code(),
+              ErrorCode::ipc_consumer_rejected);
+
+    ASSERT_TRUE(fixture.service.register_consumer(owner, owner_name).has_value());
+    EXPECT_EQ(fixture.service.pairing_outcome(owner, aa::core::PairingRequestId{}).error().code(),
+              ErrorCode::ipc_malformed_request);
+    EXPECT_EQ(fixture.service.pairing_outcome(owner, aa::core::PairingRequestId{999}).error().code(),
+              ErrorCode::ipc_malformed_request);
+
+    const auto approved_req = fixture.service.request_add_phone(owner);
+    ASSERT_TRUE(approved_req.has_value());
+    EXPECT_EQ(fixture.service.pairing_outcome(stranger, approved_req.value()).error().code(),
+              ErrorCode::ipc_peer_unauthorized);
+    EXPECT_EQ(fixture.service.pairing_outcome(other, approved_req.value()).error().code(),
+              ErrorCode::ipc_peer_unauthorized);
+
+    const auto pending = fixture.service.pairing_outcome(owner, approved_req.value());
+    ASSERT_TRUE(pending.has_value());
+    EXPECT_EQ(pending.value(), "pending");
+
+    ASSERT_TRUE(fixture.service.confirm_phone_pairing(owner, approved_req.value()).has_value());
+    const auto approved = fixture.service.pairing_outcome(owner, approved_req.value());
+    ASSERT_TRUE(approved.has_value());
+    EXPECT_EQ(approved.value(), "approved");
+
+    // Post-approval window closure must not overwrite the terminal "approved" outcome.
+    ASSERT_TRUE(fixture.service.cancel_phone_pairing(owner, approved_req.value()).has_value());
+    EXPECT_EQ(fixture.service.pairing_outcome(owner, approved_req.value()).value(), "approved");
+
+    const auto cancelled_req = fixture.service.request_add_phone(owner);
+    ASSERT_TRUE(cancelled_req.has_value());
+    ASSERT_TRUE(fixture.service.cancel_phone_pairing(owner, cancelled_req.value()).has_value());
+    EXPECT_EQ(fixture.service.pairing_outcome(owner, cancelled_req.value()).value(), "cancelled");
+
+    const auto expired_req = fixture.service.request_add_phone(owner);
+    ASSERT_TRUE(expired_req.has_value());
+    fixture.phones.reapable.push_back(expired_req.value());
+    EXPECT_EQ(fixture.service.pairing_outcome(owner, expired_req.value()).value(), "expired");
+
+    const auto teardown_req = fixture.service.request_add_phone(owner);
+    ASSERT_TRUE(teardown_req.has_value());
+    ASSERT_TRUE(fixture.service.unregister_consumer(owner).has_value());
+
+    // A new consumer cannot query the previous consumer's request id.
+    const BusName next_name{"org.custom.ConsumerB"};
+    fixture.credentials.set_owner(next_name, other);
+    ASSERT_TRUE(fixture.service.register_consumer(other, next_name).has_value());
+    EXPECT_EQ(fixture.service.pairing_outcome(other, approved_req.value()).error().code(),
+              ErrorCode::ipc_peer_unauthorized);
+    EXPECT_EQ(fixture.service.pairing_outcome(other, teardown_req.value()).error().code(),
+              ErrorCode::ipc_peer_unauthorized);
+
+    // Confirming with a failing directory yields "failed" and emits PairingCompleted.
+    const auto failed_req = fixture.service.request_add_phone(other);
+    ASSERT_TRUE(failed_req.has_value());
+    fixture.phones.confirm_result = aa::Error{ErrorCode::trust_store_io};
+    EXPECT_FALSE(fixture.service.confirm_phone_pairing(other, failed_req.value()).has_value());
+    EXPECT_EQ(fixture.service.pairing_outcome(other, failed_req.value()).value(), "failed");
+
+    std::size_t completed_count = 0;
+    for (const auto& event : fixture.events.events) {
+        if (const auto* completed = std::get_if<aa::ipc::PairingCompleted>(&event)) {
+            if (completed->request == approved_req.value()) {
+                EXPECT_EQ(completed->outcome, "approved");
+                ++completed_count;
+            }
+            if (completed->request == teardown_req.value()) {
+                EXPECT_EQ(completed->outcome, "cancelled");
+                ++completed_count;
+            }
+            if (completed->request == failed_req.value()) {
+                EXPECT_EQ(completed->outcome, "failed");
+                ++completed_count;
+            }
+        }
+    }
+    EXPECT_EQ(completed_count, 3U);
 }
 
 } // namespace

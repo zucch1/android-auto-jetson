@@ -6,6 +6,7 @@
 #include <aa/ipc/VideoSocket.hpp>
 #include <aa/ipc/VideoTelemetry.hpp>
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -146,16 +147,52 @@ public:
     // before its first send syscall. Failed/partial sends acquire no sample.
     void set_observer(VideoEndpointObserver observer);
 
+    // Take an already-accepted consumer socket from the receiver supervisor.
+    // When `state_fd >= 0`, attaches the supervisor's size-sealed shared
+    // stream-counter memfd so frame IDs and fragment sequence numbers remain
+    // monotonic across serial producer changes on the same consumer connection.
+    // Exclusivity: active producers sharing a counter file MUST be serialized
+    // (at most one active sender at a time); sequence numbers are cached locally
+    // and the shared memfd holds restart high-water marks plus owner-retirement
+    // state, so concurrent borrowers could emit duplicate sequence numbers.
+    // On error, the caller retains ownership of `fd` and `state_fd`.
+    // Closing an inherited producer closes only its descriptors without
+    // shutting down the underlying connection for the supervisor.
+    [[nodiscard]] static core::Result<VideoProducer> adopt_accepted(
+        int fd, const NegotiatedLimits& limits, int state_fd = -1);
+
+    // Ensure a size-sealed (0600, F_SEAL_SHRINK|F_SEAL_GROW|F_SEAL_SEAL) shared
+    // stream-counter memfd backs this producer and return its descriptor (still
+    // owned by this VideoProducer) for cross-process handoff. Active producers
+    // using this counter file must be mutually exclusive (serial handoff only).
+    [[nodiscard]] core::Result<int> prepare_shared_state();
+
+    // Create a borrowed (inherited) VideoProducer referencing the same
+    // underlying socket and shared stream-counter state. Closing the borrowed
+    // producer closes only its duplicated descriptors without SHUT_WR. Callers
+    // must ensure only one producer actively sends on a connection at a time.
+    [[nodiscard]] core::Result<VideoProducer> borrow();
+
     // shutdown(SHUT_WR) + close; idempotent; the consumer then sees a clean
-    // end of stream.
+    // end of stream. When backed by shared stream-counter state, the owning
+    // producer marks the connection retired before SHUT_WR so any still-live
+    // borrowed producer observes an expected transport_closed disconnect instead
+    // of an unexpected EPIPE I/O fault. For an inherited (borrowed) producer
+    // created via adopt_accepted() or borrow(), closes only this producer's
+    // descriptors without calling shutdown(SHUT_WR) or marking retired, keeping
+    // the supervisor's connection open.
     void close() noexcept;
 
     [[nodiscard]] core::Result<SocketBufferResult> configure_send_buffer(
         const protocol::VideoProfile& profile) noexcept;
 
     [[nodiscard]] bool closed() const noexcept;
+    [[nodiscard]] bool peer_closed() const noexcept;
+    [[nodiscard]] bool retired() const noexcept;
     [[nodiscard]] bool waiting_idr() const noexcept;
     [[nodiscard]] const NegotiatedLimits& limits() const noexcept;
+    [[nodiscard]] std::uint64_t last_frame_id() const noexcept;
+    [[nodiscard]] std::uint64_t next_sequence() const noexcept;
     [[nodiscard]] std::uint64_t dropped() const noexcept;
     [[nodiscard]] std::uint64_t backpressure_events() const noexcept;
     [[nodiscard]] int native_handle() const noexcept;
@@ -213,6 +250,11 @@ private:
 struct VideoServerOptions final {
     NegotiatedLimits local_limits{};
     std::uint32_t expected_peer_uid{};
+    // When true (managed supervisor), create, 0600-restrict, size-seal, and map
+    // the shared stream-counter memfd BEFORE sending the server AAL1 record so
+    // any counter-state setup failure closes the socket before the consumer
+    // observes a completed handshake.
+    bool prepare_shared_state{false};
 };
 
 // `timeout` bounds each phase independently: the connect attempt (backlog
@@ -245,13 +287,39 @@ public:
     [[nodiscard]] static core::Result<VideoServer> listen(const VideoSocketPath& path,
                                                           const VideoServerOptions& options);
 
+    // Take an inherited listener from the receiver supervisor. The
+    // supervisor remains responsible for the socket's filesystem entry.
+    [[nodiscard]] static core::Result<VideoServer> adopt_listener(
+        int fd, const VideoServerOptions& options);
+
     // Peer-credential gate then limits exchange. Rejected peers are counted
     // and never returned; the listener stays up. timeout.count < 0 blocks.
+    // Listener polling (`timeout` / `accept_timeout`) and the limits-exchange
+    // deadline (`handshake_timeout`, bounded to 2 s) are tracked separately:
+    // if a peer connects and has not yet sent its limits record when the call's
+    // poll budget expires (including `timeout == 0`), the accepted socket is
+    // kept in a single pending-handshake slot until `handshake_timeout` elapses
+    // so subsequent calls can finish the exchange without blocking dispatch.
     // Multiplicity is caller-owned: each call may return a live producer
     // while an earlier one is still open; callers serialize consumers.
     // listen(fd,1) bounds pending (backlog) connections only, not
     // established ones.
     [[nodiscard]] core::Result<VideoProducer> accept_consumer(core::Milliseconds timeout);
+    [[nodiscard]] core::Result<VideoProducer> accept_consumer(
+        core::Milliseconds accept_timeout, core::Milliseconds handshake_timeout);
+
+    [[nodiscard]] bool has_pending_handshake() const noexcept;
+    void cancel_pending_handshake() noexcept;
+    void set_prepare_shared_state(bool enabled) noexcept;
+    void set_clock_for_test(std::function<std::chrono::steady_clock::time_point()> clock);
+    // Cancel any pending handshake and perform a bounded nonblocking drain of
+    // connections already queued in the listener's kernel accept backlog,
+    // closing them without sending AAL1. Returns the number of drained peers
+    // only once the kernel accept queue is confirmed empty (EAGAIN/EWOULDBLOCK);
+    // returns transport_closed if the listener is closed, timeout if bounded
+    // EINTR/drain time expires before emptying, or transport_io if accept4/fcntl
+    // fails (e.g. EMFILE) or exceeds the per-call drain cap.
+    [[nodiscard]] core::Result<std::size_t> drain_queued_connections() noexcept;
 
     // Closes the listener and unlinks the endpoint node only while it is
     // still the node bound at listen() time and only while holding the

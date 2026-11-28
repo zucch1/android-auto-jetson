@@ -122,6 +122,12 @@ RouterStats accumulate_router_stats(const RouterStats& lifetime, const RouterSta
     out.frames_padded += lifetime.frames_padded;
     out.playout_resumes += lifetime.playout_resumes;
     out.frames_shed += lifetime.frames_shed;
+    out.frames_compressed += lifetime.frames_compressed;
+    out.frames_stretched += lifetime.frames_stretched;
+    out.playout_overflows += lifetime.playout_overflows;
+    out.frames_overflowed += lifetime.frames_overflowed;
+    out.playout_retimes += lifetime.playout_retimes;
+    out.playout_retimed.count += lifetime.playout_retimed.count;
     out.playout_shed_residual_chunks += lifetime.playout_shed_residual_chunks;
     out.playout_shed_residual_peak =
         std::max(out.playout_shed_residual_peak, lifetime.playout_shed_residual_peak);
@@ -157,7 +163,7 @@ std::string media_timing_json(const RouterStats& stats, const MediaTimingContext
         ",\"frames_idle_skipped\":" + std::to_string(stats.frames_idle_skipped) +
         ",\"sink_reopens\":" + std::to_string(context.sink_reopens);
     if (context.playout_target) {
-        // Wireless playout buffer: depth is slot minus arrival of the latest
+        // Playout buffer: depth is slot minus arrival of the latest
         // chunk, min/max its range (anchors excluded), offset the depth of the
         // least-delayed arrivals that audio_write_completed reports.
         json += ",\"playout_target_ms\":" + format_ms(*context.playout_target) +
@@ -186,6 +192,16 @@ std::string media_timing_json(const RouterStats& stats, const MediaTimingContext
     if (context.playout_target) {
         json += ",\"playout_shed_residual_chunks\":" + std::to_string(stats.playout_shed_residual_chunks) +
             ",\"playout_shed_residual_peak_ms\":" + format_ms(stats.playout_shed_residual_peak);
+    }
+    if (context.lossless) {
+        // Rate correction (no sample lost) and the emergency bound (lost).
+        json += ",\"frames_compressed\":" + std::to_string(stats.frames_compressed) +
+            ",\"frames_stretched\":" + std::to_string(stats.frames_stretched) +
+            ",\"playout_overflows\":" + std::to_string(stats.playout_overflows) +
+            ",\"frames_overflowed\":" + std::to_string(stats.frames_overflowed) +
+            // Slots moved later behind a stalled sink (latency, nothing lost).
+            ",\"playout_retimes\":" + std::to_string(stats.playout_retimes) +
+            ",\"playout_retimed_ms\":" + format_ms(stats.playout_retimed);
     }
     return json + "}";
 }
@@ -414,7 +430,9 @@ std::string audio_rejection_json(const AudioRejectionSnapshot& value) {
         ",\"pending_completions_by_role\":" + role_counts_json(value.pending_completions_by_role) + "}";
 }
 
-RouterConfig pcm_router_config(AudioTelemetryCallbacks telemetry, SinkBackend backend) {
+RouterConfig pcm_router_config(AudioTelemetryCallbacks telemetry, SinkBackend backend,
+                               core::Nanoseconds playout_depth,
+                               core::Nanoseconds catch_up_watermark) {
     RouterConfig config;
     config.backend = backend;
     config.output_format = AudioFormat{48000, 2, 16};
@@ -425,23 +443,20 @@ RouterConfig pcm_router_config(AudioTelemetryCallbacks telemetry, SinkBackend ba
     config.roles[role_index(Role::media)].input_format = AudioFormat{48000, 2, 16};
     // Live-PCM drift policy: the only production enable point. The phone's
     // media clock disagrees with the output clock (~100-200 ppm); without
-    // bounded head trims the preserved backlog grows without bound.
+    // bounded head trims (or lossless playout's rate correction) the preserved
+    // backlog grows without bound.
     config.live_pcm_drift.enabled = true;
-    // #154: after a sink stall the phone bursts its withheld backlog, which is
-    // placed after the cursor far behind its arrival. A run placed more than
-    // 90 ms (the A/V excursion bound) behind its arrival is trimmed from its
-    // head down to the 15 ms drift target at once instead of 5 ms per chunk
-    // (resampler carryover at a run's head counts at its older source time),
-    // and the router's 200 ms late cap judges such a caught-up run by the end
-    // of its parent's own PTS range against the committed source-time frontier.
-    // A stall's burst - including 200 ms guidance parents stamped milliseconds
-    // apart, however the resampler splits them - is therefore trimmed rather
-    // than ending the session as audio_sink_failure; a parent whose PCM ends
-    // over 200 ms behind recent source audio still fails late. The dropped
-    // audio is logged as audio_catch_up. Wired uses this 90 ms default;
-    // wireless overrides it via audio_config() (configurable, default off = 0)
-    // until a wireless-safe policy for TCP coalescing is decided.
-    config.live_pcm_drift.catch_up_watermark = core::Nanoseconds{90'000'000};
+    // #228 / #230: both receivers use the lossless playout clock by default
+    // (wired 60 ms, wireless 120 ms), with
+    // catch-up off (0). Passing playout_depth = 0 restores the legacy arrival
+    // model, where an explicit catch_up_watermark (e.g. 90 ms) remains
+    // available behind its flag.
+    config.live_pcm_drift.catch_up_watermark = catch_up_watermark;
+    config.playout.enabled = playout_depth.count > 0;
+    if (config.playout.enabled) {
+        config.playout.depth = playout_depth;
+        config.playout.lossless = true;
+    }
     config.on_write_completed = [log_media = std::move(telemetry.log_media)](const WriteCompletion& completion) {
         if (log_media) {
             log_media("audio_write_completed", audio_write_completed_json(completion));
@@ -450,8 +465,10 @@ RouterConfig pcm_router_config(AudioTelemetryCallbacks telemetry, SinkBackend ba
     return config;
 }
 
-RouterConfig pcm_router_config(SinkBackend backend, AudioTelemetryCallbacks telemetry) {
-    return pcm_router_config(std::move(telemetry), backend);
+RouterConfig pcm_router_config(SinkBackend backend, AudioTelemetryCallbacks telemetry,
+                               core::Nanoseconds playout_depth,
+                               core::Nanoseconds catch_up_watermark) {
+    return pcm_router_config(std::move(telemetry), backend, playout_depth, catch_up_watermark);
 }
 
 } // namespace aa::audio

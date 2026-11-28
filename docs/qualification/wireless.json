@@ -1,0 +1,83 @@
+{
+  "schema": "aa-wireless-qualification/1",
+  "status": "PENDING",
+  "target": {
+    "model": null,
+    "jetpack_version": null,
+    "l4t_version": null,
+    "kernel_version": null
+  },
+  "ap": {
+    "interface": null,
+    "channel": null,
+    "regulatory_domain": null,
+    "confirmed_jurisdiction": null,
+    "startup_ms": null,
+    "receipt": null
+  },
+  "bluez": {
+    "version": null,
+    "numeric_comparison_accepted": null,
+    "helper_bond_acknowledged": null,
+    "approval_persisted": null,
+    "approved_bond_reused": null,
+    "receipt": null
+  },
+  "phone": {
+    "model": null,
+    "android_version": null,
+    "android_auto_version": null
+  },
+  "session": {
+    "rfcomm_channel": null,
+    "bootstrap_completed": null,
+    "aap_tls_authenticated": null,
+    "confirmed_active": null,
+    "video_frames": null,
+    "audio_writes": null,
+    "inputs_forwarded": null,
+    "receipt": null
+  },
+  "performance": {
+    "perf_30m": {
+      "result": null,
+      "receipt": null,
+      "ap_uptime_seconds": null,
+      "helper_rss_peak_mb": null,
+      "helper_crashes": null
+    },
+    "soak_2h": {
+      "result": null,
+      "receipt": null,
+      "ap_uptime_seconds": null,
+      "helper_rss_peak_mb": null,
+      "helper_crashes": null
+    }
+  },
+  "recovery": {
+    "receiver_restart": {
+      "elapsed_ms": null,
+      "confirmed_active": null,
+      "video_resumed": null,
+      "audio_resumed": null,
+      "input_resumed": null,
+      "fresh_pairing": null
+    },
+    "session_reconnect": {
+      "elapsed_ms": null,
+      "confirmed_active": null,
+      "video_resumed": null,
+      "audio_resumed": null,
+      "input_resumed": null,
+      "fresh_pairing": null
+    },
+    "receipt": null
+  },
+  "limitations": [
+    {
+      "claim": "PENDING",
+      "detail": "PENDING"
+    }
+  ],
+  "provenance": null
+}

@@ -398,6 +398,7 @@ TEST_F(AcknowledgementOrder, CommitFollowsTheDurableStoreWrite) {
     EXPECT_TRUE(bridge.approved_at_commit) << "committed before the trust write";
     EXPECT_EQ(store.phones().size(), 1U); EXPECT_EQ(bridge.forgets, 0);
     EXPECT_FALSE(has_diagnostic("pairing_commit_failed"));
+    EXPECT_EQ(control.pairing_outcome(caller, request).value(), "approved");
 }
 TEST_F(AcknowledgementOrder, FailedCommitRetractsTheApproval) {
     bridge.commitment = Error{ErrorCode::timeout};
@@ -411,6 +412,7 @@ TEST_F(AcknowledgementOrder, FailedCommitRetractsTheApproval) {
     EXPECT_TRUE(bridge.snapshots[0].phone) << "the retraction must revoke the approved phone";
     EXPECT_EQ(helper::revocation_peer(bridge.snapshots[0]), bridge.prepared);
     EXPECT_EQ(control.pending_revocations(), 0U);
+    EXPECT_EQ(control.pairing_outcome(caller, request).value(), "retracted");
 }
 TEST_F(AcknowledgementOrder, NotDurableApprovalIsNeverCommittedAndIsRetracted) {
     {
@@ -422,6 +424,102 @@ TEST_F(AcknowledgementOrder, NotDurableApprovalIsNeverCommittedAndIsRetracted) {
     EXPECT_TRUE(has_diagnostic("pairing_commit_failed"));
     EXPECT_TRUE(store.phones().empty());
     EXPECT_EQ(bridge.snapshots.size(), 1U);
+    EXPECT_EQ(control.pairing_outcome(caller, request).value(), "not_durable");
+}
+TEST_F(AcknowledgementOrder, NotDurableApprovalDurablyRetractedReportsRetracted) {
+    {
+        trust::test::faults::ScopedFault first_only{trust::test::faults::Fault::dir_fsync_eio_once};
+        accept();
+    }
+    EXPECT_TRUE(has_diagnostic("pairing_approval_not_durable"));
+    EXPECT_EQ(bridge.commits, 0);
+    EXPECT_TRUE(store.phones().empty());
+    EXPECT_EQ(bridge.snapshots.size(), 1U);
+    EXPECT_EQ(control.pending_revocations(), 0U);
+    EXPECT_EQ(control.pairing_outcome(caller, request).value(), "retracted");
+}
+TEST_F(AcknowledgementOrder, DurableRetractionWithPendingHelperLegReportsRetracted) {
+    bridge.commitment = Error{ErrorCode::timeout};
+    bridge.bond = Error{ErrorCode::helper_unavailable};
+    accept();
+    EXPECT_EQ(bridge.commits, 1);
+    EXPECT_TRUE(store.phones().empty());
+    EXPECT_EQ(control.pending_revocations(), 1U);
+    EXPECT_EQ(control.pairing_outcome(caller, request).value(), "retracted");
+}
+TEST_F(AcknowledgementOrder, FailedCommitWithNotDurableRetractionReportsNotDurable) {
+    bridge.commitment = Error{ErrorCode::timeout};
+    std::optional<trust::test::faults::ScopedFault> retract_sync_fault;
+    bridge.on_commit = [&] {
+        retract_sync_fault.emplace(trust::test::faults::Fault::dir_fsync);
+    };
+    accept();
+    retract_sync_fault.reset();
+    EXPECT_TRUE(store.phones().empty());
+    EXPECT_EQ(bridge.snapshots.size(), 1U);
+    EXPECT_EQ(control.pairing_outcome(caller, request).value(), "not_durable");
+}
+TEST_F(AcknowledgementOrder, FailedRetractionAfterCommitFailureReportsRetractionFailed) {
+    bridge.commitment = Error{ErrorCode::timeout};
+    std::optional<trust::test::faults::ScopedFault> retract_fault;
+    bridge.on_commit = [&] {
+        retract_fault.emplace(trust::test::faults::Fault::renameat);
+    };
+    accept();
+    retract_fault.reset();
+    EXPECT_EQ(store.phones().size(), 1U);
+    EXPECT_EQ(bridge.cancellations, 1);
+    EXPECT_EQ(count_closed(), 1U);
+    EXPECT_EQ(control.pairing_outcome(caller, request).value(), "retraction_failed");
+}
+TEST_F(AcknowledgementOrder, FailedRetractionWithReconcilingBackendRetiresHelperSourceAndRetries) {
+    bridge.reconciling = true;
+    bridge.expect_empty_store = false;
+    bridge.cancel_result = Error{ErrorCode::helper_unavailable};
+    bridge.retirement_limit = 0;
+    {
+        trust::test::faults::ScopedFault first_sync{trust::test::faults::Fault::dir_fsync_eio_once};
+        trust::test::faults::set_observer([&] {
+            if (has_diagnostic("pairing_approval_not_durable")) {
+                trust::test::faults::arm(trust::test::faults::Fault::renameat);
+            }
+        });
+        accept();
+        trust::test::faults::set_observer({});
+    }
+    // The approval remains in the store, the receiver window closes with outcome
+    // "retraction_failed", and the failed source cancel stays tracked for retry.
+    EXPECT_EQ(store.phones().size(), 1U);
+    EXPECT_EQ(bridge.cancellations, 1);
+    EXPECT_EQ(count_closed(), 1U);
+    EXPECT_EQ(bridge.forgets, 0);
+    EXPECT_EQ(control.pending_revocations(), 1U);
+    EXPECT_TRUE(has_diagnostic("phone_revocation_retirement_pending"));
+
+    // Querying the outcome runs owner refresh, which reconciles with the retained approval
+    // and makes the first tracked source-retirement retry.
+    EXPECT_EQ(control.pairing_outcome(caller, request).value(), "retraction_failed");
+    ASSERT_FALSE(bridge.reconciled_sets.empty());
+    EXPECT_EQ(bridge.reconciled_sets.back(), std::vector<helper::PeerIdentity>{*bridge.prepared});
+    EXPECT_EQ(bridge.forgets, 1);
+    ASSERT_EQ(bridge.retirement_batches.size(), 1U);
+    ASSERT_EQ(bridge.retirement_batches.back().size(), 1U);
+    EXPECT_EQ(bridge.retirement_batches.back()[0].request, request);
+    EXPECT_EQ(control.pending_revocations(), 1U);
+
+    // Once the helper accepts the source retirement, the tracked record clears.
+    bridge.retirement_limit.reset();
+    clock.now += std::chrono::seconds{2};
+    (void)control.state();
+    EXPECT_EQ(bridge.forgets, 2);
+    EXPECT_EQ(control.pending_revocations(), 0U);
+    EXPECT_EQ(bridge.reconciled_sets.back(), std::vector<helper::PeerIdentity>{*bridge.prepared});
+}
+
+TEST_F(AcknowledgementOrder, RejectedComparisonReportsRejectedOutcome) {
+    ASSERT_TRUE(control.respond_pairing_comparison(caller, request, {79, false}));
+    EXPECT_TRUE(store.phones().empty());
+    EXPECT_EQ(control.pairing_outcome(caller, request).value(), "rejected");
 }
 
 // With a reconciling helper (the production BusClient) the trust store is the single authority.
@@ -440,6 +538,7 @@ TEST_F(AcknowledgementOrder, FailedCommitKeepsTheDurableApprovalForReconciliatio
     EXPECT_EQ(control.pending_revocations(), 0U);
     EXPECT_GE(bridge.cancellations, 1) << "the enrolment's source was not retired";
     EXPECT_EQ(count_closed(), 1U);
+    EXPECT_EQ(control.pairing_outcome(caller, request).value(), "approved_commit_failed");
     (void)control.state();
     ASSERT_FALSE(bridge.reconciled_sets.empty()) << "no reconciliation after the failed commit";
     EXPECT_EQ(bridge.reconciled_sets.back(), std::vector<helper::PeerIdentity>{*bridge.prepared});

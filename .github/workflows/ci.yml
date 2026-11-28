@@ -95,7 +95,8 @@ jobs:
             libgstreamer-plugins-base1.0-dev gstreamer1.0-tools gstreamer1.0-plugins-bad \
             gstreamer1.0-plugins-good gstreamer1.0-pipewire pipewire-bin wireplumber \
             pipewire-pulse pulseaudio-utils dbus-daemon qt6-base-dev valgrind \
-            g++-aarch64-linux-gnu binutils ccache
+            g++-aarch64-linux-gnu binutils ccache lintian
+          lintian --version
           protoc --version
           valgrind --version
           dpkg-query -W libprotobuf-dev protobuf-compiler libboost-system-dev \

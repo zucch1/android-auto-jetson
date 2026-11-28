@@ -12,10 +12,13 @@
 #include <functional>
 
 #include <future>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <string>
 #include <thread>
+#include <vector>
 
 namespace aa::app {
 class WiredSession;
@@ -45,6 +48,7 @@ class WiredPhoneControl final {
     void bind_owner();
     void bind_phone(const trust::PhoneIdentity&);
     [[nodiscard]] core::Result<void> forget(core::PhoneId);
+    [[nodiscard]] core::Result<std::vector<std::map<std::string, std::string>>> list_phones();
     std::optional<helper::RevocationV1> take_revocation_v1();
     void checkpoint();
     [[nodiscard]] bool revoked() const noexcept;
@@ -69,6 +73,7 @@ class WiredPhoneControl final {
     void settle();
     void start_job();
     void abandon_job();
+    void refresh_listed();
 
     trust::ApprovedPhoneStore& store_;
     WiredSession& session_;
@@ -80,6 +85,8 @@ class WiredPhoneControl final {
     std::unique_ptr<Request> pending_;
     core::Result<void> pending_result_{};
     std::optional<trust::PhoneIdentity> phone_;
+    core::Result<std::vector<std::map<std::string, std::string>>> listed_{
+        Error{ErrorCode::trust_store_io}};
     bool revoked_{false};
     std::optional<helper::RevocationV1> revocation_;
     Persist persist_;

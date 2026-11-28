@@ -23,7 +23,7 @@
       "minimum": 0
     },
     "playout_offset_ns": {
-      "description": "Wireless playout only: how long after scheduled_ns (the content's arrival-clock time) the piece was scheduled on the output clock. Absent on the arrival model.",
+      "description": "Playout clock only (default on wired and wireless): how long after scheduled_ns (the content's arrival-clock time) the piece was scheduled on the output clock. Absent on the legacy arrival model (--audio-playout-ms 0).",
       "type": "integer",
       "minimum": 1
     },

@@ -7,6 +7,7 @@
 // supplies its own identity.
 #include <aa/ipc/BusPeerLookup.hpp>
 #include <aa/ipc/Contract.hpp>
+#include <aa/ipc/ControlBusClient.hpp>
 #include <aa/ipc/ControlBusService.hpp>
 #include <aa/ipc/ControlDispatcher.hpp>
 #include <aa/ipc/ControlService.hpp>
@@ -18,7 +19,10 @@
 
 #include <array>
 #include <chrono>
+#include <csignal>
+#include <span>
 #include <thread>
+#include <pthread.h>
 #include <sys/socket.h>
 
 #include <unistd.h>
@@ -467,7 +471,7 @@ TEST(BusBoundary, PropertiesGetUsesVariantWireEncoding) {
     ASSERT_EQ(reply.value().type, bus::MessageType::method_return);
     ASSERT_EQ(reply.value().signature, "v");
     const std::vector<std::uint8_t> expected{0x01, 0x73, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00,
-                                             0x31, 0x2e, 0x31, 0x2e, 0x30, 0x00};
+                                             0x31, 0x2e, 0x33, 0x2e, 0x30, 0x00};
     EXPECT_EQ(reply.value().body, expected);
     bus::Cursor cursor(reply.value().body);
     const auto contained = cursor.read_signature();
@@ -475,7 +479,7 @@ TEST(BusBoundary, PropertiesGetUsesVariantWireEncoding) {
     ASSERT_TRUE(contained.has_value());
     EXPECT_EQ(contained.value(), "s");
     ASSERT_TRUE(value.has_value());
-    EXPECT_EQ(value.value(), "1.1.0");
+    EXPECT_EQ(value.value(), "1.3.0");
     EXPECT_TRUE(cursor.done());
 }
 
@@ -499,7 +503,7 @@ TEST(BusBoundary, PropertiesGetAllUsesVariantDictionaryEncoding) {
     const std::vector<std::uint8_t> expected{
         0x22, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0e, 0x00, 0x00, 0x00, 0x43,
         0x6f, 0x6e, 0x74, 0x72, 0x61, 0x63, 0x74, 0x53, 0x65, 0x6d, 0x56, 0x65, 0x72,
-        0x00, 0x01, 0x73, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00, 0x31, 0x2e, 0x31,
+        0x00, 0x01, 0x73, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00, 0x31, 0x2e, 0x33,
         0x2e, 0x30, 0x00};
     EXPECT_EQ(reply.value().body, expected);
     bus::Cursor cursor(reply.value().body);
@@ -517,7 +521,7 @@ TEST(BusBoundary, PropertiesGetAllUsesVariantDictionaryEncoding) {
     EXPECT_EQ(contained.value(), "s");
     const auto value = cursor.read_string();
     ASSERT_TRUE(value.has_value());
-    EXPECT_EQ(value.value(), "1.1.0");
+    EXPECT_EQ(value.value(), "1.3.0");
     EXPECT_TRUE(cursor.done());
 }
 
@@ -540,7 +544,7 @@ TEST(BusBoundary, PropertiesSetReturnsPropertyReadOnly) {
     ASSERT_TRUE(reply.has_value());
     EXPECT_EQ(reply.value().type, bus::MessageType::error_reply);
     EXPECT_EQ(reply.value().error_name, "org.freedesktop.DBus.Error.PropertyReadOnly");
-    EXPECT_EQ(bus_state.service->capabilities().at("contract.semver"), "1.1.0");
+    EXPECT_EQ(bus_state.service->capabilities().at("contract.semver"), "1.3.0");
 }
 
 TEST(BusBoundary, OversizeCallIsDrainedAndTheNextCallSurvives) {
@@ -646,6 +650,306 @@ TEST(BusBoundary, DropDiagnosticsAggregateAtMostOncePerInterval) {
     EXPECT_FALSE(throttle.record(start + std::chrono::seconds(10)));
     EXPECT_EQ(throttle.record(start + std::chrono::seconds(20)), 2U);
     EXPECT_EQ(throttle.record(start + std::chrono::seconds(100)), 1U);
+}
+
+TEST(BusBoundary, RuntimeProjectionControlsRoundTripOverRealSessionBus) {
+    aa::ipc::test::SequencePairingIds ids;
+    aa::ipc::test::RecordingPhoneDirectory phones;
+    aa::ipc::ProjectionPolicy policy{};
+    auto service = aa::ipc::ControlBusService::start(
+        {static_cast<std::uint32_t>(::getuid())}, {ids, phones, nullptr, {}, &policy});
+    ASSERT_TRUE(service);
+    std::jthread server_thread([&](std::stop_token stop) {
+        while (!stop.stop_requested() && service.value().cycle(aa::core::Milliseconds{10})) {}
+    });
+    auto client = aa::ipc::ControlBusClient::connect();
+    ASSERT_TRUE(client);
+    auto caps = client.value().get_capabilities();
+    ASSERT_TRUE(caps);
+    EXPECT_EQ(caps.value().at("transport.control"), "true");
+    EXPECT_FALSE(client.value().set_projection_mode("projection_ready"));
+
+    const auto registered = client.value().register_consumer(BusName{kConsumerName});
+    ASSERT_TRUE(registered);
+    ASSERT_TRUE(client.value().set_transport_enabled("wired", false));
+    ASSERT_TRUE(client.value().set_projection_mode("projection_ready"));
+    ASSERT_TRUE(client.value().start_projection());
+
+    auto standby = aa::ipc::ControlBusClient::connect();
+    ASSERT_TRUE(standby);
+    const auto denied = standby.value().set_transport_enabled("wireless", false);
+    ASSERT_FALSE(denied);
+    EXPECT_EQ(denied.error().code(), ErrorCode::ipc_peer_unauthorized);
+
+    ASSERT_TRUE(client.value().set_transport_enabled("wireless", false));
+    const auto state = client.value().get_state();
+    ASSERT_TRUE(state);
+    EXPECT_EQ(state.value().consumer, registered.value());
+    EXPECT_EQ(state.value().projection, aa::ipc::ProjectionState::stopped);
+    caps = client.value().get_capabilities();
+    ASSERT_TRUE(caps);
+    EXPECT_EQ(caps.value().at("projection.mode.current"), "projection_ready");
+    EXPECT_EQ(caps.value().at("transport.wired.enabled"), "false");
+    EXPECT_EQ(caps.value().at("transport.wireless.enabled"), "false");
+}
+
+TEST(BusBoundary, ListPhonesAndPairingOutcomeRoundTripOverRealSessionBus) {
+    aa::ipc::test::SequencePairingIds ids;
+    aa::ipc::test::RecordingPhoneDirectory phones;
+    phones.listed_phones = std::vector<std::map<std::string, std::string>>{
+        {{"phone_id", "1"},
+         {"label", "id-0123456789abcdef"},
+         {"transport", "wired"},
+         {"strength", "serial-backed"}},
+        {{"phone_id", "4"},
+         {"label", "id-fedcba9876543210"},
+         {"transport", "wireless"},
+         {"strength", "bond-backed"}},
+    };
+    auto service = aa::ipc::ControlBusService::start(
+        {static_cast<std::uint32_t>(::getuid())}, {ids, phones});
+    ASSERT_TRUE(service.has_value());
+
+    std::jthread server_thread([&](std::stop_token stop) {
+        while (!stop.stop_requested()) {
+            const auto step = service.value().cycle(aa::core::Milliseconds{10});
+            if (!step.has_value()) {
+                break;
+            }
+        }
+    });
+
+    auto client = aa::ipc::ControlBusClient::connect();
+    ASSERT_TRUE(client.has_value());
+
+    const auto caps = client.value().get_capabilities();
+    ASSERT_TRUE(caps.has_value());
+    EXPECT_EQ(caps.value().at("contract.semver"), "1.3.0");
+    EXPECT_EQ(caps.value().at("phones.list"), "true");
+    EXPECT_EQ(caps.value().at("pairing.outcomes"), "true");
+
+    // Unregistered consumer is rejected over real D-Bus.
+    const auto denied = client.value().list_phones();
+    ASSERT_FALSE(denied.has_value());
+    EXPECT_EQ(denied.error().code(), ErrorCode::ipc_consumer_rejected);
+
+    ASSERT_TRUE(client.value().register_consumer(BusName{kConsumerName}).has_value());
+    const auto listed = client.value().list_phones();
+    ASSERT_TRUE(listed.has_value());
+    ASSERT_EQ(listed.value().size(), 2U);
+    EXPECT_EQ(listed.value()[0].at("phone_id"), "1");
+    EXPECT_EQ(listed.value()[0].at("transport"), "wired");
+    EXPECT_EQ(listed.value()[1].at("phone_id"), "4");
+    EXPECT_EQ(listed.value()[1].at("transport"), "wireless");
+
+    const auto req = client.value().request_add_phone();
+    ASSERT_TRUE(req.has_value());
+    const auto pending = client.value().pairing_outcome(req.value());
+    ASSERT_TRUE(pending.has_value());
+    EXPECT_EQ(pending.value(), "pending");
+
+    ASSERT_TRUE(client.value().confirm_phone_pairing(req.value()).has_value());
+    const auto approved = client.value().pairing_outcome(req.value());
+    ASSERT_TRUE(approved.has_value());
+    EXPECT_EQ(approved.value(), "approved");
+
+    // Drain with a zero timeout only, as the reference display's pump does:
+    // a non-blocking wait must still read signals waiting on the socket.
+    bool saw_completed = false;
+    const auto drain_deadline = std::chrono::steady_clock::now() + std::chrono::seconds{2};
+    while (!saw_completed && std::chrono::steady_clock::now() < drain_deadline) {
+        const auto sig = client.value().wait_signal(aa::core::Milliseconds{0});
+        if (!sig.has_value()) {
+            ASSERT_EQ(sig.error().code(), ErrorCode::timeout);
+            std::this_thread::sleep_for(std::chrono::milliseconds{5});
+            continue;
+        }
+        if (sig.value().member == "PairingCompleted" && sig.value().request == req.value()) {
+            EXPECT_EQ(sig.value().outcome, "approved");
+            saw_completed = true;
+        }
+    }
+    EXPECT_TRUE(saw_completed);
+
+    ASSERT_TRUE(client.value().unregister_consumer().has_value());
+    server_thread.request_stop();
+    server_thread.join();
+    service.value().close();
+}
+
+// A low-level owner of the contract name and a separate subscribed client. The
+// owner only broadcasts; wait_signal() is the only call that reads them.
+class SignalWait : public ::testing::Test {
+protected:
+    using Client = aa::ipc::ControlBusClient;
+    std::optional<bus::BusConnection> owner;
+    std::optional<Client> client;
+
+    void start(Client::Signals signals = Client::Signals::subscribe, bool pin = true) {
+        auto connected = bus::BusConnection::connect_session();
+        ASSERT_TRUE(connected.has_value());
+        owner.emplace(std::move(connected.value()));
+        ASSERT_TRUE(owner->request_name(BusName{kReceiverName}).has_value());
+        auto subscribed = Client::connect(signals);
+        ASSERT_TRUE(subscribed.has_value());
+        client.emplace(std::move(subscribed.value()));
+        if (pin) {
+            const auto resolved = client->receiver_owner();
+            ASSERT_TRUE(resolved.has_value());
+            ASSERT_TRUE(resolved.value().has_value());
+            ASSERT_EQ(*resolved.value(), owner->unique_name());
+        }
+    }
+    static bus::MessageWriter signal(std::string_view member) {
+        bus::MessageWriter writer;
+        writer.path(kReceiverPath).interface_name("org.custom.AndroidAutoReceiver1").member(member);
+        return writer;
+    }
+    [[nodiscard]] static bool broadcast(bus::BusConnection& from, const bus::MessageWriter& message) {
+        return from.send_message(bus::MessageType::signal, message).has_value();
+    }
+    [[nodiscard]] static bool broadcast_completed(bus::BusConnection& from, std::uint64_t request) {
+        auto writer = signal("PairingCompleted");
+        writer.body_signature("ts").put_u64(request).put_string("approved");
+        return broadcast(from, writer);
+    }
+    // A daemon round trip: everything `from` sent before has been routed.
+    [[nodiscard]] static bool routed(bus::BusConnection& from) {
+        return from.name_has_owner(BusName{kReceiverName}).has_value();
+    }
+    // Zero-timeout waits only, as the reference display's pump makes.
+    [[nodiscard]] std::optional<Client::ContractSignal> drain(int* calls = nullptr) {
+        const auto until = std::chrono::steady_clock::now() + std::chrono::seconds{2};
+        while (std::chrono::steady_clock::now() < until) {
+            if (calls != nullptr) ++*calls;
+            auto received = client->wait_signal(aa::core::Milliseconds{0});
+            if (received.has_value()) return received.value();
+            if (received.error().code() != ErrorCode::timeout) return std::nullopt;
+            std::this_thread::sleep_for(std::chrono::milliseconds{5});
+        }
+        return std::nullopt;
+    }
+};
+
+TEST_F(SignalWait, ZeroTimeoutReadsASignalWaitingOnTheSocket) {
+    start();
+    const auto idle = client->wait_signal(aa::core::Milliseconds{0});
+    ASSERT_FALSE(idle.has_value());
+    ASSERT_EQ(idle.error().code(), ErrorCode::timeout);
+
+    // No method call follows, so nothing can park the signal on the side.
+    ASSERT_TRUE(broadcast_completed(*owner, 42));
+    const auto received = drain();
+    ASSERT_TRUE(received.has_value());
+    EXPECT_EQ(received->member, "PairingCompleted");
+    EXPECT_EQ(received->request, aa::core::PairingRequestId{42});
+    EXPECT_EQ(received->outcome, "approved");
+}
+
+TEST_F(SignalWait, ZeroTimeoutExaminesABoundedNumberOfForeignFrames) {
+    start();
+    auto foreign = bus::BusConnection::connect_session();
+    ASSERT_TRUE(foreign.has_value());
+    // All of it is queued ahead of the owner's signal before the first wait.
+    constexpr int kForeign = 200;
+    for (int i = 0; i < kForeign; ++i) {
+        ASSERT_TRUE(broadcast_completed(foreign.value(), 7));
+    }
+    ASSERT_TRUE(routed(foreign.value()));
+    ASSERT_TRUE(broadcast_completed(*owner, 42));
+    ASSERT_TRUE(routed(*owner));
+    std::this_thread::sleep_for(std::chrono::milliseconds{100});
+
+    int calls = 0;
+    const auto received = drain(&calls);
+    ASSERT_TRUE(received.has_value());
+    EXPECT_EQ(received->request, aa::core::PairingRequestId{42});
+    // 16 frames per call: the owner's signal cannot come earlier than this.
+    EXPECT_GT(calls, kForeign / 16);
+}
+
+TEST_F(SignalWait, PairingResultsSubscriptionAdmitsOnlyTheOwnersPairingResults) {
+    // Unpinned, so only the match rule can reject the foreign sender.
+    start(Client::Signals::pairing_results, false);
+    auto foreign = bus::BusConnection::connect_session();
+    ASSERT_TRUE(foreign.has_value());
+    ASSERT_TRUE(broadcast_completed(foreign.value(), 7));
+    ASSERT_TRUE(routed(foreign.value()));
+    auto opened = signal("PairingOpened");
+    opened.body_signature("t").put_u64(41);
+    ASSERT_TRUE(broadcast(*owner, opened));
+    auto closed = signal("PairingClosed");
+    closed.body_signature("t").put_u64(42);
+    ASSERT_TRUE(broadcast(*owner, closed));
+    ASSERT_TRUE(broadcast_completed(*owner, 42));
+
+    const auto first = drain();
+    ASSERT_TRUE(first.has_value());
+    EXPECT_EQ(first->member, "PairingClosed");
+    EXPECT_EQ(first->request, aa::core::PairingRequestId{42});
+    const auto second = drain();
+    ASSERT_TRUE(second.has_value());
+    EXPECT_EQ(second->member, "PairingCompleted");
+    EXPECT_EQ(second->request, aa::core::PairingRequestId{42});
+}
+
+TEST_F(SignalWait, LongFiniteWaitOutlivesThePollCap) {
+    start();
+    // Past the 2 s poll cap, within the requested wait. Nothing else may wake
+    // the wait: an interruption would restart the capped poll.
+    bool sent = false;
+    std::jthread sender{[&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds{2200});
+        sent = broadcast_completed(*owner, 42);
+    }};
+    const auto received = client->wait_signal(aa::core::Milliseconds{3000});
+    sender.join();
+    ASSERT_TRUE(sent);
+    ASSERT_TRUE(received.has_value()) << aa::to_string(received.error().code());
+    EXPECT_EQ(received.value().request, aa::core::PairingRequestId{42});
+}
+
+TEST_F(SignalWait, FiniteWaitSurvivesAnInterruption) {
+    start();
+    struct sigaction action{};
+    struct sigaction previous{};
+    action.sa_handler = [](int) {}; // no SA_RESTART: poll() returns EINTR
+    ASSERT_EQ(::sigaction(SIGUSR1, &action, &previous), 0);
+    const auto waiting = ::pthread_self();
+    bool sent = false;
+    std::jthread sender{[&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds{100});
+        (void)::pthread_kill(waiting, SIGUSR1);
+        std::this_thread::sleep_for(std::chrono::milliseconds{100});
+        sent = broadcast_completed(*owner, 42);
+    }};
+    const auto received = client->wait_signal(aa::core::Milliseconds{1500});
+    sender.join();
+    ASSERT_EQ(::sigaction(SIGUSR1, &previous, nullptr), 0);
+    ASSERT_TRUE(sent);
+    ASSERT_TRUE(received.has_value()) << aa::to_string(received.error().code());
+    EXPECT_EQ(received.value().request, aa::core::PairingRequestId{42});
+}
+
+TEST_F(SignalWait, FiniteWaitEndsAtItsDeadlineUnderForeignTraffic) {
+    start();
+    std::jthread flood{[](const std::stop_token& stop) {
+        auto foreign = bus::BusConnection::connect_session();
+        if (!foreign.has_value()) return;
+        const auto until = std::chrono::steady_clock::now() + std::chrono::seconds{4};
+        while (!stop.stop_requested() && std::chrono::steady_clock::now() < until) {
+            if (!broadcast_completed(foreign.value(), 7)) return;
+        }
+    }};
+    const auto start_time = std::chrono::steady_clock::now();
+    const auto expired = client->wait_signal(aa::core::Milliseconds{300});
+    const auto elapsed = std::chrono::steady_clock::now() - start_time;
+    flood.request_stop();
+    flood.join();
+    ASSERT_FALSE(expired.has_value());
+    EXPECT_EQ(expired.error().code(), ErrorCode::timeout);
+    EXPECT_GE(elapsed, std::chrono::milliseconds{300});
+    EXPECT_LT(elapsed, std::chrono::milliseconds{2000});
 }
 
 // Substitute only the authenticated connection's transport, leaving production
@@ -800,6 +1104,106 @@ TEST_F(SocketBoundary, TricklingPeerCannotExtendDrainDeadline) {
     EXPECT_EQ(receiver->dropped_messages(), 0U);
     EXPECT_GE(elapsed, std::chrono::milliseconds(50));
     EXPECT_LT(elapsed, std::chrono::milliseconds(400));
+}
+
+TEST_F(SocketBoundary, NonBlockingReadKeepsAPartialFrameAcrossCalls) {
+    bus::MessageWriter large;
+    large.path(kReceiverPath).member("Ping").body_signature("s").put_string(std::string(3000, 'x'));
+    const auto bytes = large.build(bus::MessageType::method_call, 42);
+    const auto all = std::span{bytes};
+    const auto start = std::chrono::steady_clock::now();
+    const auto idle = receiver->try_read_message();
+    ASSERT_TRUE(idle.has_value());
+    EXPECT_FALSE(idle.value().has_value());
+    EXPECT_FALSE(receiver->frame_pending());
+    // Stop inside the fixed header, then inside the body: neither may wait.
+    ASSERT_TRUE(bus::bus_io::write_full(peer, all.first(7)));
+    auto part = receiver->try_read_message();
+    ASSERT_TRUE(part.has_value());
+    EXPECT_FALSE(part.value().has_value());
+    EXPECT_TRUE(receiver->frame_pending());
+    ASSERT_TRUE(bus::bus_io::write_full(peer, all.subspan(7, 1000)));
+    part = receiver->try_read_message();
+    ASSERT_TRUE(part.has_value());
+    EXPECT_FALSE(part.value().has_value());
+    EXPECT_LT(std::chrono::steady_clock::now() - start, std::chrono::milliseconds(500));
+    EXPECT_GE(receiver->native_handle(), 0);
+
+    // The rest arrives with a second frame behind it.
+    bus::MessageWriter ping;
+    ping.path(kReceiverPath).member("Ping");
+    const auto valid = ping.build(bus::MessageType::method_call, 43);
+    ASSERT_TRUE(bus::bus_io::write_full(peer, all.subspan(1007)));
+    ASSERT_TRUE(bus::bus_io::write_full(peer, valid));
+    const auto whole = receiver->try_read_message();
+    ASSERT_TRUE(whole.has_value());
+    ASSERT_TRUE(whole.value().has_value());
+    EXPECT_EQ(whole.value()->serial, 42U);
+    EXPECT_EQ(whole.value()->body.size(), 4U + 3000U + 1U);
+    EXPECT_FALSE(receiver->frame_pending());
+    const auto next = receiver->try_read_message();
+    ASSERT_TRUE(next.has_value());
+    ASSERT_TRUE(next.value().has_value());
+    EXPECT_EQ(next.value()->serial, 43U);
+}
+
+TEST_F(SocketBoundary, BlockingReadResumesAFrameTheNonBlockingReadLeft) {
+    bus::MessageWriter ping;
+    ping.path(kReceiverPath).member("Ping");
+    const auto valid = ping.build(bus::MessageType::method_call, 43);
+    for (const std::size_t split : {std::size_t{5}, std::size_t{16}, valid.size() - 1}) {
+        SCOPED_TRACE(split);
+        ASSERT_TRUE(bus::bus_io::write_full(peer, std::span{valid}.first(split)));
+        const auto part = receiver->try_read_message();
+        ASSERT_TRUE(part.has_value());
+        ASSERT_FALSE(part.value().has_value());
+        ASSERT_TRUE(bus::bus_io::write_full(peer, std::span{valid}.subspan(split)));
+        const auto whole = receiver->read_message();
+        ASSERT_TRUE(whole.has_value());
+        EXPECT_EQ(whole.value().serial, 43U);
+    }
+}
+
+TEST_F(SocketBoundary, NonBlockingReadDrainsAnOversizeFrameAcrossCalls) {
+    const auto oversized = frame(1024 * 1024);
+    bus::MessageWriter ping;
+    ping.path(kReceiverPath).member("Ping");
+    const auto valid = ping.build(bus::MessageType::method_call, 43);
+    std::jthread writer{[&] {
+        (void)bus::bus_io::write_full(peer, oversized);
+        (void)bus::bus_io::write_full(peer, valid);
+    }};
+    int calls = 0;
+    bool dropped = false;
+    const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!dropped && std::chrono::steady_clock::now() < until) {
+        ++calls;
+        const auto step = receiver->try_read_message();
+        if (!step.has_value()) {
+            ASSERT_EQ(step.error().code(), ErrorCode::transport_message_dropped);
+            dropped = true;
+        } else {
+            ASSERT_FALSE(step.value().has_value());
+        }
+    }
+    ASSERT_TRUE(dropped);
+    EXPECT_GE(calls, 16); // at most kMaxMessageBytes per call
+    EXPECT_EQ(receiver->dropped_messages(), 1U);
+    const auto next = receiver->read_message();
+    writer.join();
+    ASSERT_TRUE(next.has_value());
+    EXPECT_EQ(next.value().serial, 43U);
+}
+
+TEST_F(SocketBoundary, StalledPartialFrameClosesANonBlockingConnection) {
+    const auto bytes = frame(4096);
+    ASSERT_TRUE(bus::bus_io::write_full(peer, std::span{bytes}.first(100)));
+    ASSERT_TRUE(receiver->try_read_message().has_value());
+    std::this_thread::sleep_for(std::chrono::milliseconds(bus::bus_io::kIoTimeoutMs + 50));
+    const auto stalled = receiver->try_read_message();
+    ASSERT_FALSE(stalled.has_value());
+    EXPECT_EQ(stalled.error().code(), ErrorCode::transport_io);
+    EXPECT_EQ(receiver->native_handle(), -1);
 }
 
 } // namespace

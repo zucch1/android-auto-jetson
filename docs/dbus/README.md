@@ -76,21 +76,24 @@ Typed errors added with the method:
 
 ## Contract versioning
 
-`ContractSemVer` is `1.1.0`. The major version is carried in the interface
-name (`org.custom.AndroidAutoReceiver1`); the minor version grows when methods
-or typed errors are added compatibly. 1.1.0 adds `GetPairingCandidate` and the
-two errors above. Consumers feature-detect by minor version: read
-`ContractSemVer` (or `contract.semver` in `GetCapabilities`) and call
-`GetPairingCandidate` only when the minor version is at least 1. An older
-receiver (1.0.x) answers the call with `org.freedesktop.DBus.Error.UnknownMethod`.
+`ContractSemVer` is `1.2.0`. The major version is carried in the interface
+name (`org.custom.AndroidAutoReceiver1`); the minor version grows when methods,
+signals, capability keys, or typed errors are added compatibly. `1.1.0` added
+`GetPairingCandidate` and the two errors above; `1.2.0` adds `ListPhones`,
+`GetPairingOutcome`, `PairingCompleted`, and capability keys `phones.list` and
+`pairing.outcomes`. Consumers feature-detect by reading `ContractSemVer` (or
+`contract.semver` and feature keys in `GetCapabilities`) and calling `1.1.0+` /
+`1.2.0+` methods only when advertised. An older receiver answers unknown methods
+with `org.freedesktop.DBus.Error.UnknownMethod`.
 
 ## Validation
 
 - `tools/ipc/dbus_contract.py` runs in `check` (validate the checked XML) and
   `generate` (validate, then emit the introspection header) modes.
-- Validation is a structural allowlist: exactly fifteen methods, five signals and
-  one read-only property, with argument types restricted to scalars and the string
-  map so bulk or high-rate payload shapes are rejected.
+- Validation is a structural allowlist: exactly 18 methods, 6 signals and
+  one read-only property, with argument types restricted to scalars, the string
+  map (`a{ss}`), and the bounded string-map array (`aa{ss}`) so bulk or
+  high-rate payload shapes are rejected.
 - Violations print named `DBUS_CONTRACT_*` diagnostics, exit nonzero, and produce
   no generated output, so the build fails closed.
 - The embedding is byte-preserving: XML bytes are encoded as fixed-width octal

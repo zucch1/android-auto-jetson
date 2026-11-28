@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 #include "AdmissionEvents.hpp"
+#include "ManagedVideo.hpp"
 #include "Media.hpp"
 #include <aa/app/WirelessReceiver.hpp>
 #include <aa/ipc/ControlBusService.hpp>
@@ -24,7 +25,8 @@ struct Runtime final {
     ipc::VideoServer& video_server;
     ipc::InputServer& input_server;
     Media& media;
-    trust::TransportIdentity identity;
+    // nullopt: admit whichever approved wireless phone the helper observes.
+    std::optional<trust::TransportIdentity> identity;
     Clock::time_point deadline;
     std::optional<ipc::InputEndpoint> input;
     std::deque<ipc::InputEvent> queued_input;
@@ -46,9 +48,45 @@ struct Runtime final {
     std::function<void(app::WiredSession&, bool in_poll, const core::Result<void>& serviced)>
         on_after_audio_completions_for_test{};
 
-    void stop_runtime() {
+    // A managed projection stops its media and leaves the shared bus alive.
+    std::function<bool(ipc::StateSnapshot, const std::optional<trust::TransportIdentity>&)>
+        keep_running{};
+    // Non-null when running under the supervisor: borrows the supervisor-owned
+    // consumer video connection instead of owning/closing it on wireless exit.
+    ManagedVideoBroker* managed_video{};
+    std::uint64_t managed_video_generation_{0};
+    // The phone the current attempt admitted (the fixed identity, or the one observed).
+    std::optional<trust::TransportIdentity> admitted{};
+
+    void service_video_consumer(bool may_install) {
+        if (managed_video != nullptr) {
+            (void)managed_video->poll(video_server);
+            if (!may_install) return;
+            const auto gen = managed_video->generation();
+            if (gen != managed_video_generation_) {
+                if (managed_video->has_connection()) {
+                    if (auto borrowed = managed_video->borrow()) {
+                        media.video.install(std::move(borrowed.value()));
+                        managed_video_generation_ = gen;
+                    }
+                } else {
+                    media.video.clear_producer();
+                    managed_video_generation_ = gen;
+                }
+            }
+            return;
+        }
+        if (!may_install) return;
+        auto producer = video_server.accept_consumer(core::Milliseconds{0});
+        if (producer) media.video.install(std::move(producer.value()));
+    }
+
+    // Ends this projection. A managed projection's failure stays contained to
+    // this transport: only a process-level cause (signal, deadline, stdout log
+    // or bus failure) clears the process-wide flag the supervisor runs on.
+    void stop_runtime(bool process = false) {
         stopping = true;
-        running.store(false);
+        if (process || !keep_running) running.store(false);
     }
 
     bool service_audio_failure() {
@@ -128,9 +166,14 @@ struct Runtime final {
                 ? std::chrono::milliseconds{5}
                 : std::chrono::milliseconds{25});
         if (auto step = bus.cycle(core::Milliseconds{0}); !step) {
-            report("session bus dispatch", step.error().code()); failed = true; stop_runtime();
+            report("session bus dispatch", step.error().code()); failed = true; stop_runtime(true);
         }
         const auto state = bus.service().state();
+        if (stopping || (keep_running && !keep_running(state, admitted))) {
+            stopping = true;
+            if (auto* session = receiver.session()) session->request_stop();
+            return;
+        }
         auto* recovery_session = receiver.session();
         if (recovery_session && !recovery_session->outbound_in_progress()) {
             if (auto pending = recovery_session->service_pending_video_idr(); !pending) {
@@ -179,10 +222,7 @@ struct Runtime final {
         if (stopping || (state.consumer.value && state.projection == ipc::ProjectionState::stopped)) {
             if (auto* session = receiver.session()) session->request_stop();
         }
-        if (!recovery_session || !recovery_session->outbound_in_progress()) {
-            auto producer = video_server.accept_consumer(core::Milliseconds{0});
-            if (producer) media.video.install(std::move(producer.value()));
-        }
+        service_video_consumer(!recovery_session || !recovery_session->outbound_in_progress());
         if (!input) {
             auto accepted = input_server.accept_sender(core::Milliseconds{0});
             if (accepted) input.emplace(std::move(accepted.value()));
@@ -203,14 +243,23 @@ struct Runtime final {
     void defer() {
         pending_ack_error_.reset();
         receiver.stop(); media.video.reset(); configured = nullptr; attempting = false; acquisition.reset(); queued_input.clear();
+        if (!identity) admitted.reset();
         retry = Clock::now() + backoff;
         backoff = std::min(backoff * 2, std::chrono::milliseconds{5000});
     }
     core::Result<void> admit(ipc::StateSnapshot state) {
         // reconnect() stops the previous epoch and settles its denial before contacting the helper.
-        const auto result = receiver.reconnect(bus.service(), identity);
-        media.video.reset(); configured = nullptr;
-        if (!result) return result.error();
+        if (identity) {
+            const auto result = receiver.reconnect(bus.service(), *identity);
+            media.video.reset(); configured = nullptr;
+            if (!result) return result.error();
+            admitted = identity;
+        } else {
+            auto result = receiver.reconnect_observed(bus.service());
+            media.video.reset(); configured = nullptr;
+            if (!result) return result.error();
+            admitted = std::move(result.value());
+        }
         auto status = helper.status(helper::Action::ap_status);
         if (!status) return status.error();
         if (status.value() != helper::State::active) {
@@ -317,9 +366,11 @@ struct Runtime final {
                 std::this_thread::sleep_until(std::min(deadline, turn + poll_step));
             }
         }
-        running.store(false);
+        if (!keep_running) {
+            running.store(false);
+            bus.service().shutdown();
+        }
         media.audio.stop();
-        bus.service().shutdown();
         receiver.stop();
         if (on_turn_for_test) { on_turn_for_test(false); }
         media.video.close();

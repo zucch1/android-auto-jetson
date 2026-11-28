@@ -19,6 +19,11 @@ public:
               eligibility_.consumer(std::nullopt);
           }) {}
     ~WirelessReceiver() { stop(); }
+    void configure(WirelessLink::Config config) {
+        stop();
+        ap_channel_ = config.ap_channel;
+        link_.configure(std::move(config));
+    }
     helper::Confirmation& confirmation() { return confirmation_; }
     WiredSession* session() const { return link_.session(); }
     // A phone's bootstrap is in progress (bounded): don't defer or retry the attempt (#161).
@@ -56,6 +61,16 @@ public:
         const auto result = helper_.reconnect(identity);
         if (!result) return result.error();
         return begin(control, {state.consumer.value, 0});
+    }
+    // Any approved wireless phone: the one the helper currently observes.
+    core::Result<trust::TransportIdentity> reconnect_observed(ipc::ControlService& control) {
+        const auto state = control.state();
+        if (!state.consumer.value) return Error{ErrorCode::ipc_consumer_rejected};
+        stop(HandoffEligibilityCoordinator::Retirement::before_reconnect);
+        auto admitted = helper_.reconnect_observed();
+        if (!admitted) return admitted.error();
+        if (auto begun = begin(control, {state.consumer.value, 0}); !begun) return begun.error();
+        return admitted;
     }
     core::Result<bool> poll(ipc::ControlService& control, std::function<void()> work = {}) {
         auto result = link_.poll(eligibility_, [this, &control, work = std::move(work)] {

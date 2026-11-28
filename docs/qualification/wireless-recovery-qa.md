@@ -41,8 +41,8 @@ attached", window 3, 2026-11-18).
 ## Wireless audio: credit window + playout (owner decision 2026-11-20)
 
 `aa-wireless-receiver` shares `AudioRenderWorker` and `pcm_router_config()` with
-the wired receiver (`live_pcm_drift.enabled = true`, bounded 5 ms head trim
-above 20 ms), but schedules wireless audio differently.
+the wired receiver, lossless playout included since #230, but schedules wireless
+audio with a deeper buffer and a credit window.
 
 Why: the A26 sent media audio stop-and-wait (`maxUnackedFramesAllowed: 1` in
 its log), one 2048-frame (42.67 ms) chunk per credit round trip, and the
@@ -52,8 +52,9 @@ late). Window 9 (#180, TCP_NODELAY) still trimmed 5.8% and filled 8.4% with
 silence over 26 s of audio, then ended `late` (~218 ms) right after a Wi-Fi
 spike second of 12 acks at 83 ms.
 
-Policy (wired is unchanged: stop-and-wait and the arrival model with the
-#155 90 ms catch-up):
+Policy (wired uses the same lossless playout clock and `--video-delay-ms match`
+with a smaller `60` ms USB buffer and stop-and-wait `max_unacked 1`, #228;
+`--audio-playout-ms 0` restores the legacy arrival model on either receiver):
 
 - **Credit window** (`--audio-max-unacked`, default 4): every audio channel
   advertises `max_unacked` 4, so the phone may keep four chunks
@@ -67,7 +68,13 @@ Policy (wired is unchanged: stop-and-wait and the arrival model with the
   pending deliveries and acks each one as it completes. The A26 honored the
   window in live testing. A delivery beyond the advertised window is refused
   because the worker reserves capacity for exactly N. Stop-and-wait (N = 1,
-  wired) keeps its historical accounting.
+  wired) keeps its historical accounting. Under lossless playout the queue is
+  bounded by time (2 s emergency bound + 2 s write deadline + 400 ms, see
+  `AudioRenderWorker`), and the window's N permits come on top of it (#230):
+  5.2 s a role at N = 4, so the four reserved envelopes no longer eat into the
+  4 s a stall the sink recovers from can queue (before, credits went out on
+  receipt for only 4.0 s of 100 ms media packets and 3.6 s of guidance,
+  against wired's 4.3 and 4.2 s).
 - **Playout clock** (`--audio-playout-ms`, default 120, max 180): each role's
   stream is anchored 120 ms after the arrival of its first chunk, and every
   later chunk plays back to back after the previous one. Bursts and droughts
@@ -93,7 +100,34 @@ Policy (wired is unchanged: stop-and-wait and the arrival model with the
   buffer (at most the depth), not gap silence, and does not count against the
   200 ms aggregate silence cap, so two re-anchors in one render step (media
   and guidance) cannot end the session.
-- **Drift**: the buffer depth of a chunk is its slot minus its arrival. The
+- **Lossless (#230, owner rule 2026-11-23: audio must not drop sound on either
+  transport)**: wireless plays with `PlayoutPolicy::lossless`, the mechanism
+  #229 made wired's default. No decoded sample is trimmed, shed, padded or
+  caught up. A Wi-Fi burst deepens the buffer instead, the writes report the
+  deeper offset, and the excess drains by resampling at most 0.5% fast (1%
+  while more than 100 ms over, moving by at most 0.1% per chunk); a floor
+  under half the depth plays at most 0.5% slow. Silence is written only on an
+  anchor, a resume or an underrun. Overdue audio (its slot passed when it is
+  about to be written: a blocked write, a held render thread) moves the whole
+  timeline to 20 ms from now on the current clock, one `audio_playout_retime`
+  each; the part of the lateness the previous write spent blocked past its own
+  end is held by a `pulsesink` that stood still (`held_ms`), and a slot less
+  than 5 ms past is not retimed. No frame plays more than 2 s after its
+  content time (its chunk's arrival plus its place in it): the part beyond is
+  cut and counted as overflow (`playout_overflows`, `frames_overflowed`,
+  `audio_playout_overflow`), however it got there. A stopped stream plays out
+  what was accepted. How deep a burst gets: the most one burst can bring after
+  a drought is what the phone held back, its credit window (4 chunks) plus its
+  341 ms capture buffer (8 chunks), 12 chunks at once: 120 ms + 11 x 42.67 ms
+  = **589 ms**, back near 120 ms in about a minute. The depth stays **120 ms**
+  (re-checked for #230): it is now the floor the correction drains back to,
+  not a bound on the offset, and it is still the underrun margin on Wi-Fi
+  (wired's 60 ms would underrun on every one-way excursion over 60 ms;
+  windows 11-12 had 4-5 underruns in 8 min at 120 ms). 120 + 42.67 ms still
+  fits the 200 ms PulseAudio ring; a deeper buffer after a burst blocks writes
+  until the ring has room, before their slots. The drift rules below are what
+  wireless ran from #182 to #230; no receiver flag selects them any more.
+- **Drift (#182, superseded by lossless in #230)**: the buffer depth of a chunk is its slot minus its arrival. The
   A26 delivers in groups (windows 10-12: `max_arrival_burst` 5). It captures
   in real time (`Start capturing system audio with sampling rate: 48000,
   buffer size: 65536, expected frame duration: 42.666667 ms`, an
@@ -161,8 +195,11 @@ Policy (wired is unchanged: stop-and-wait and the arrival model with the
   playout audio write, and after a second without audio (a pause without a
   stop message, including one already recorded: video latency then drops to
   the depth and climbs back on resume, with no audio to pair), it holds for
-  the 120 ms depth. Above 400 ms it is capped, and every capped frame is counted
-  and logged (`video_hold_capped`). Held frames are released at their due
+  the 120 ms depth. Above **700 ms** (`kLosslessVideoHoldCap`, 400 ms under the
+  drift rules) it is capped, and every capped frame is counted and logged
+  (`video_hold_capped`). The deepest phone burst (589 ms) stays 111 ms under
+  it, and a sink stall of up to about 580 ms does too; beyond, video leads
+  audio by the rest until the buffer drains back under the cap (#232). Held frames are released at their due
   by a timer thread of the outlet's own (it sleeps until the front frame's
   due, re-checking every 5 ms since a new audio write can move a due
   earlier), and also from the runtime's checkpoint, even while the session
@@ -260,8 +297,9 @@ Latency this adds over the wired arrival model: the playout offset, for audio
 and for video alike (the hold follows it), which includes touch-to-photon on
 the projected UI and every IDR recovery. It is the 120 ms buffer plus however
 late this phone's groups and opening backlog make the anchor chunk: windows
-11-12 settled at about 150-220 ms (window 12 ended at 217 ms), more for a
-moment after a drought until the backlog is shed. **The owner accepted the
+11-12 settled at about 150-220 ms (window 12 ended at 217 ms). Since #230 a
+drought's backlog is kept rather than shed: up to 589 ms right after the
+deepest burst, draining back by the rate correction in about a minute. **The owner accepted the
 cost** when choosing "Credit window + playout, ~100-150 ms buffer, video
 matched" on 2026-11-20. The buffer is still 120 ms; the rest is the A26's
 grouped delivery, which a fixed 120 ms delay cannot ride out without frequent
@@ -270,12 +308,30 @@ underruns. Lip sync stays where it was.
 IDR and recovery budgets with the hold: a recovery IDR reaches the display
 one hold later, so each waiting_idr episode is that much longer. Against the
 drive smoke's `waiting_idr_max` (1.0 s per episode) that leaves 880 ms at the
-120 ms depth, ~780-830 ms at windows 11-12's 170-220 ms, and 600 ms at the
-400 ms cap. The producer's IDR re-request interval (250 ms) may send one or
+120 ms depth, ~780-830 ms at windows 11-12's 170-220 ms, ~410 ms right after
+the deepest phone burst (589 ms) and 300 ms at the 700 ms cap. The producer's IDR re-request interval (250 ms) may send one or
 two extra requests while a recovery IDR is held, and the focus-transition
 escalation (after three nudges or 1.0 s) has one hold less margin. Windows 10-12 had no
 mid-session recovery episode to measure this (only startup episodes). The
-next drive smoke must show recovery episodes under 1.0 s with the hold.
+next drive smoke must show recovery episodes under 1.0 s with the hold. Since
+#230 the deepest hold follows a drought, so the live run must force one: a
+Wi-Fi drought long enough to underrun, followed by an IDR recovery (the
+consumer requesting one, or the producer's own after loss) while the backlog
+it brought is still queued. Report that episode's waiting_idr time against the
+1.0 s budget, the peak `playout_reported_offset_ms`, and how long latency
+stays raised: the time from the drought until the reported offset is back
+within 15 ms of where it was before it.
+
+Live result (#230 sink-stall run, owner-accepted): forced pulsesink stalls on
+the lossless wireless receiver each produced exactly one
+`audio_playout_retime`, and every stall up to 1 s played with zero
+`frames_trimmed`, `frames_shed` and `frames_padded` (no
+`audio_playout_overflow`). Two stalls back to back, 1 s then 1.6 s, took the
+offset to a peak of 2112 ms, past the 2 s emergency bound, and cost one
+counted cut of 110 ms (`frames_overflowed` 5301, one
+`audio_playout_overflow`). **The owner accepted it**: the cut only happens
+beyond the bound and is counted, and the bound stays at 2 s. Outside the
+stalls the offset held steady at 185-236 ms.
 On wireless, video setup sends the initial focus notification. The receiver
 requests an IDR at the first accepted video start for the stream, after any
 staged codec-config ACK. This can precede the transition to active. With a
@@ -302,10 +358,13 @@ over 90 ms per 30 min and none over 150 ms) measures the same thing as on
 wired and is not relaxed. `--video-delay-ms 0` keeps video at arrival; the
 contract then sees the audio lag and fails, so the offset is never hidden.
 
-The #60 stall bypass still starts 250 ms after a credit is first withheld.
-With the window of 4 the worker withholds credit only once its scaled
-reservation is full, about 500-680 ms of queued media, so on wireless the
-bypass engages later than on wired (~128 ms of queued audio).
+The #60 stall bypass: under lossless playout (both receivers since #230) the
+credit goes out on receipt through any stall the sink recovers from, and the
+bypass needs one write blocked for the whole 2 s emergency bound plus a credit
+withheld for 250 ms; a sink that fails its write (2 s deadline) drops what is
+queued, reports it (`audio_stall_bypass`) and reopens. Before #230 wireless
+withheld credit once its scaled reservation was full (about 500-680 ms of
+queued media) and bypassed 250 ms later.
 
 Telemetry for the next live window: `{"event":"wireless_media_policy",...}` at
 startup (`video_hold` "match" or "fixed", and `video_delay_ms`, always a
@@ -327,14 +386,21 @@ What a live window should check:
    `MediaSourceFlowController out of permits` lines.
 2. `CAR.AUDIO.STATS` ack latency stays well under 170 ms; acks/s stays near
    23.4 (real time) even through a spike second.
-3. `frames_trimmed` and `frames_silence` stay near 0 (window 10: 0.81% and
-   0.66% before the sustained-error rule; window 11: 0.14% and 0.10%;
-   window 12: 0.25% and 0.22%), `playout_underruns` is 0 or rare
+3. `frames_trimmed`, `frames_shed`, `frames_padded`, `frames_caught_up` and
+   `playout_overflows` are 0 (lossless, #230), and `frames_silence` grows only
+   with `audio_playout_underrun` / `audio_playout_anchor` (under the drift
+   rules: window 10: 0.81% and 0.66% trimmed and silent before the
+   sustained-error rule; window 11: 0.14% and 0.10%; window 12: 0.25% and
+   0.22%). `frames_compressed` / `frames_stretched` stay at a few hundred ppm
+   of `frames_decoded` in steady state, more while a burst drains;
+   `playout_reported_offset_ms` rises after a burst (at most ~590 ms) and
+   comes back toward 120-220 ms within about a minute. `playout_underruns` is 0 or rare
    (windows 11-12: 4-5 in 8 min), every `audio_playout_underrun` has
    `late_ms` matching a Wi-Fi spike, and `playout_depth_min_ms` stays well
    above 0. `playout_offset_ms` sits above 120 ms by about the phone's group
    span; that is the real delay, and the video hold follows
-   `playout_reported_offset_ms`. No `video_hold_capped` outside a drought.
+   `playout_reported_offset_ms`. No `video_hold_capped` (the cap is 700 ms)
+   and no `audio_stall_bypass`.
 4. No `late` failure and no `audio_sink_failure`; the session outlasts the
    ~33.5 s of window 9.
 5. The drive smoke's signed A/V criterion, judged on the run's own records
@@ -344,7 +410,8 @@ What a live window should check:
    `checkpoint_gap_ms` say whether the timer itself was late. Record its
    result as measured, including the first seconds after audio starts and
    any pair over 90 ms with its cause. Every waiting_idr episode should
-   stay under 1.0 s with the hold.
+   stay under 1.0 s with the hold, including one forced right after a Wi-Fi
+   drought (see the IDR budgets above), with how long latency stayed raised.
 
 ## Run
 

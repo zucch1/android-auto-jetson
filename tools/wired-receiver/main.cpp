@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "../json_stdout.hpp"
+#include "../media_playout_options.hpp"
 #include "../video_capabilities.hpp"
+#include "../video_handoff.hpp"
 //
 // Wired end-to-end receiver entry point (task 30 phase-B harness driver): the
 // composed receiver for the real approved phone over USB/AOA. It wires the
@@ -55,6 +57,7 @@
 
 #include <array>
 #include <atomic>
+#include <charconv>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -67,6 +70,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <stop_token>
 #include <string>
 #include <system_error>
 #include <thread>
@@ -74,6 +78,7 @@
 #include <vector>
 
 #include <signal.h>
+#include <sys/prctl.h>
 #include "VideoOutlet.hpp"
 #include "StdoutLog.hpp"
 #include "AvCreditJson.hpp"
@@ -84,6 +89,9 @@ using aa::core::Milliseconds;
 using aa::wired_receiver::VideoOutlet;
 
 std::atomic<bool> g_running{true};
+// A process-level stop (signal): never resume a session after it.
+std::atomic<bool> g_shutdown{false};
+std::atomic<bool> g_managed_idr{false};
 
 void log_line(const std::string &json) {
     auto *writer = aa::wired_receiver::active_stdout_log.load();
@@ -137,7 +145,27 @@ void log_sink_selected(const aa::audio::SinkReport &selected, std::string_view o
     aa::audio::log_sink_selected(selected, origin, wired_telemetry());
 }
 
-void on_signal(int) { g_running.store(false); }
+void on_signal(int) {
+    g_shutdown.store(true);
+    g_running.store(false);
+}
+void on_managed_idr(int) { g_managed_idr.store(true); }
+
+// The handler only publishes the shutdown flag. A normal thread wakes USB waits,
+// even if the D-Bus dispatcher is inside a synchronous ForgetPhone call.
+std::jthread cancel_open_on_shutdown(aa::core::CancellationSource &source) {
+    return std::jthread([&source](const std::stop_token &stop) {
+        std::mutex mutex;
+        std::condition_variable_any cv;
+        std::unique_lock lock(mutex);
+        while (g_running.load() && !stop.stop_requested()) {
+            cv.wait_for(lock, stop, std::chrono::milliseconds{25}, [] { return false; });
+        }
+        if (!g_running.load()) {
+            source.request_stop();
+        }
+    });
+}
 
 using aa::audio::AudioDispatchObservation;
 using aa::audio::AudioFailureOrigin;
@@ -176,6 +204,10 @@ class StorePhones final : public aa::ipc::PhoneDirectory {
     [[nodiscard]] aa::core::Result<void> forget(aa::core::PhoneId phone) override {
         return control_.forget(phone);
     }
+    [[nodiscard]] aa::core::Result<std::vector<std::map<std::string, std::string>>> list_phones()
+        const override {
+        return control_.list_phones();
+    }
     std::optional<aa::helper::RevocationV1> take_revocation_v1() override {
         return control_.take_revocation_v1();
     }
@@ -206,6 +238,148 @@ class ConcreteAudioRenderWorker final : public aa::audio::AudioRenderWorker {
                                        std::move(open), std::move(idle_clock)) {}
 };
 
+
+// ForgetPhone and ListPhones between two standalone sessions, when no session
+// owns the store: synchronous on the dispatch thread, from the file on disk.
+class IdlePhones final : public aa::ipc::PhoneDirectory {
+  public:
+    void bind(std::filesystem::path path) { path_ = std::move(path); }
+
+    [[nodiscard]] aa::core::Result<void> forget(aa::core::PhoneId phone) override {
+        aa::trust::ApprovedPhoneStore store{path_};
+        if (auto loaded = store.load(); !loaded) return loaded.error();
+        std::optional<aa::helper::RevocationV1> snapshot;
+        for (const auto &entry : store.phones()) {
+            if (entry.phone_id == phone) snapshot = aa::helper::RevocationV1{entry.phone_id, entry.identity};
+        }
+        auto result = store.forget_phone(phone);
+        if (result.has_value() || result.error().code() == aa::ErrorCode::trust_store_not_durable) {
+            revocation_ = std::move(snapshot);
+        }
+        return result;
+    }
+    [[nodiscard]] aa::core::Result<std::vector<std::map<std::string, std::string>>> list_phones()
+        const override {
+        aa::trust::ApprovedPhoneStore store{path_};
+        if (auto loaded = store.load(); !loaded) return loaded.error();
+        return aa::trust::list_approved_phones(store);
+    }
+    std::optional<aa::helper::RevocationV1> take_revocation_v1() override {
+        return std::exchange(revocation_, std::nullopt);
+    }
+    [[nodiscard]] aa::core::Result<void> pairing_requested(aa::core::PairingRequestId) override {
+        return aa::Error{aa::ErrorCode::invalid_argument};
+    }
+    [[nodiscard]] aa::core::Result<aa::core::PhoneId>
+    pairing_confirmed(aa::core::PairingRequestId) override {
+        return aa::Error{aa::ErrorCode::invalid_argument};
+    }
+    void pairing_cancelled(aa::core::PairingRequestId) override {}
+    [[nodiscard]] std::vector<aa::core::PairingRequestId> reap_expired() override { return {}; }
+    [[nodiscard]] std::vector<aa::core::PairingRequestId> take_invalidated_pairings() override {
+        return {};
+    }
+
+  private:
+    std::filesystem::path path_{};
+    std::optional<aa::helper::RevocationV1> revocation_{};
+};
+
+// The bus outlives each session, so its directory follows the current one:
+// the session's (or the enrolment's) while a session runs, IdlePhones between.
+class SwitchablePhones final : public aa::ipc::PhoneDirectory {
+  public:
+    void attach(aa::ipc::PhoneDirectory &directory) { current_ = &directory; }
+    void detach() { current_ = nullptr; }
+    IdlePhones &idle() { return idle_; }
+
+    [[nodiscard]] aa::core::Result<void> forget(aa::core::PhoneId phone) override {
+        return now().forget(phone);
+    }
+    [[nodiscard]] aa::core::Result<std::vector<std::map<std::string, std::string>>> list_phones()
+        const override {
+        return now().list_phones();
+    }
+    std::optional<aa::helper::RevocationV1> take_revocation_v1() override {
+        return now().take_revocation_v1();
+    }
+    [[nodiscard]] aa::core::Result<void> pairing_requested(aa::core::PairingRequestId request) override {
+        return now().pairing_requested(request);
+    }
+    [[nodiscard]] aa::core::Result<aa::core::PhoneId>
+    pairing_confirmed(aa::core::PairingRequestId request) override {
+        return now().pairing_confirmed(request);
+    }
+    aa::core::Result<void> validate_pairing(aa::core::PairingRequestId request) override {
+        return now().validate_pairing(request);
+    }
+    std::optional<aa::core::PhoneId> committed_pairing() const override {
+        return now().committed_pairing();
+    }
+    void pairing_cancelled(aa::core::PairingRequestId request) override {
+        now().pairing_cancelled(request);
+    }
+    [[nodiscard]] std::vector<aa::core::PairingRequestId> reap_expired() override {
+        return now().reap_expired();
+    }
+    [[nodiscard]] std::vector<aa::core::PairingRequestId> take_invalidated_pairings() override {
+        return now().take_invalidated_pairings();
+    }
+    aa::core::Result<void> note_wireless_candidate(const aa::helper::PeerIdentity &peer) override {
+        return now().note_wireless_candidate(peer);
+    }
+    bool same_wireless_identity(const aa::helper::PeerIdentity &a,
+                                const aa::helper::PeerIdentity &b) const override {
+        return now().same_wireless_identity(a, b);
+    }
+    std::optional<aa::helper::PeerIdentity> wireless_identity(aa::core::PhoneId phone) const override {
+        return now().wireless_identity(phone);
+    }
+    std::optional<std::vector<aa::helper::PeerIdentity>> approved_wireless() const override {
+        return now().approved_wireless();
+    }
+    std::optional<aa::helper::PeerIdentity>
+    pairing_wireless_identity(aa::core::PairingRequestId request) const override {
+        return now().pairing_wireless_identity(request);
+    }
+    std::optional<aa::helper::PeerIdentity>
+    take_expired_wireless_identity(aa::core::PairingRequestId request) override {
+        return now().take_expired_wireless_identity(request);
+    }
+    std::optional<std::map<std::string, std::string>>
+    pairing_candidate(aa::core::PairingRequestId request) override {
+        return now().pairing_candidate(request);
+    }
+    bool presents_candidates() const override { return now().presents_candidates(); }
+
+  private:
+    aa::ipc::PhoneDirectory &now() const { return current_ ? *current_ : idle_; }
+    aa::ipc::PhoneDirectory *current_{};
+    mutable IdlePhones idle_{};
+};
+
+// Standalone wired with the control bus (#240 review P2-1): the bus and the
+// consumer registration outlive each wired session. A consumer stop ends the
+// session (StopProjection, or UnregisterConsumer / owner loss after a
+// StartProjection); the receiver then waits for the next StartProjection and
+// opens a fresh session. A signal, the --duration-ms deadline or a failure
+// still ends the process as before.
+struct ResumableControl final {
+    aa::ipc::RandomPairingIdSource ids{};
+    SwitchablePhones phones{};
+    std::optional<aa::ipc::ControlBusService> bus{};
+    std::atomic<bool> link_live{false};
+    bool consumer_stopped{false};
+    std::optional<std::chrono::steady_clock::time_point> deadline{};
+
+    // The session's link is live and a consumer stop ends it.
+    bool stop_session() {
+        if (!link_live.exchange(false)) return false;
+        consumer_stopped = true;
+        g_running.store(false);
+        return true;
+    }
+};
 
 class InputQueue final {
   public:
@@ -238,8 +412,10 @@ class InputQueue final {
 // the default and only supported real-time route (automatic also selects
 // pulsesink; explicit pipewire is refused at startup).
 aa::audio::RouterConfig pcm_router_config(
-    aa::audio::SinkBackend backend = aa::audio::SinkBackend::pulse) {
-    return aa::audio::pcm_router_config(backend, wired_telemetry());
+    aa::audio::SinkBackend backend = aa::audio::SinkBackend::pulse,
+    aa::core::Nanoseconds playout_depth = aa::audio::kWiredPlayoutDepth,
+    aa::core::Nanoseconds catch_up_watermark = aa::core::Nanoseconds{0}) {
+    return aa::audio::pcm_router_config(backend, wired_telemetry(), playout_depth, catch_up_watermark);
 }
 
 // Backend-supported video profiles, preferred first. The first is the primary
@@ -367,18 +543,22 @@ int run_wired_enrolment(aa::ipc::ControlBusService &bus, aa::app::WiredEnrolment
 const char *const kUsage =
     "usage: aa-wired-receiver --port <usb-port-context> [--store PATH]\n"
     "                         [--video-socket PATH] [--input-socket PATH]\n"
-    "                         [--duration-ms N] [--no-bus]\n"
+    "                         [--duration-ms N] [--reconnect-ms N] [--no-bus]\n"
     "                         [--require-video-consumer] [--wired-enrolment]\n"
     "                         [--screen-<field> N]... [--screen-experimental-geometry]\n"
     "                         [--audio-sink pulse|pipewire|automatic]\n"
+    "                         [--audio-playout-ms N] [--video-delay-ms N|match]\n"
+    "                         [--audio-catch-up-watermark-ms N]\n"
     "                         [--require-usb-serial SERIAL]\n"
     "  runs the wired session over USB/AOA with TrustStore admission;\n"
     "  the approved-phones store must already contain the phone (fail closed).\n"
+    "  --reconnect-ms bounds recovery from link loss to active\n"
+    "  (1..120000 ms, default 30000).\n"
     "  --wired-enrolment: when admission refuses the phone, keep the D-Bus\n"
     "  contract up for 120 s so the registered consumer can approve that exact\n"
     "  refused phone (RequestAddPhone, GetPairingCandidate, then\n"
     "  ConfirmPhonePairing = yes or CancelPhonePairing = no; aa-wired-enrol is\n"
-    "  the terminal reference). An approval exits 0 (replug to connect); no\n"
+    "  the terminal reference). An approval exits 0 (restart to connect); no\n"
     "  approval exits 3. Needs the bus (not with --no-bus).\n"
     "  --require-usb-serial pins the run to one physical phone: the first link\n"
     "  and every reconnect must carry this pre-switch USB serial (the adb\n"
@@ -389,6 +569,15 @@ const char *const kUsage =
     "  pipewire-pulse; automatic: pulsesink; pipewire: refused because\n"
     "  pipewiresink has no rate control on PipeWire 1.0.5 / Ubuntu noble and\n"
     "  degrades after 1.5-2.3 h; use pulse).\n"
+    "  --audio-playout-ms N: wired audio playout buffer in ms: chunks play back\n"
+    "  to back N ms after the arrival that anchored the stream (default 60, max\n"
+    "  180; 0 = legacy arrival-time model).\n"
+    "  --video-delay-ms N|match: hold video before forwarding it so it stays\n"
+    "  aligned with audio (default match: follow the audio playout offset,\n"
+    "  starting at --audio-playout-ms; N: fixed 0..180, needs --audio-playout-ms\n"
+    "  > 0 when N > 0).\n"
+    "  --audio-catch-up-watermark-ms N: post-stall catch-up watermark in ms\n"
+    "  (0 disables catch-up, default 0; else 20..200; needs --audio-playout-ms 0).\n"
     "  --screen-<field> N describes the panel in service discovery. Fields:\n"
     "  density (120|160|240|320|480|640), real-density, pixel-aspect-ratio-e4,\n"
     "  decoder-additional-depth, theme (0|1|2), width-margin, height-margin,\n"
@@ -405,7 +594,7 @@ const char *const kUsage =
     "  exit codes: 0 clean stop, 1 runtime failure, 2 usage error, 3 blocked,\n"
     "  4 stdout isolation failed (fd 1 unusable at start).\n";
 
-int receiver_main(int argc, char **argv) {
+int receiver_session(int argc, char **argv, ResumableControl &resumable) {
     auto video_profiles = aa::config::default_video_profiles();
     bool exact_video_profiles = false;
     auto video_decoder = aa::consumer::DecodeBackend::software;
@@ -417,11 +606,16 @@ int receiver_main(int argc, char **argv) {
     std::string video_socket = aa::ipc::production_video_socket_path().value;
     std::string input_socket = aa::ipc::production_input_socket_path().value;
     std::int64_t duration_ms = 0;
+    std::int64_t reconnect_ms = 30'000;
     bool no_bus = false;
+    pid_t supervisor_pid = 0;
+    aa::core::PhoneId managed_phone{};
     bool require_video_consumer = false;
     bool wired_enrolment = false;
     std::string required_usb_serial;
     aa::audio::SinkBackend audio_backend = aa::audio::SinkBackend::pulse;
+    aa::tools::PlayoutOptions playout{
+        aa::audio::kWiredPlayoutDepth.count / 1'000'000, 0, std::nullopt};
     for (int index = 1; index < argc; ++index) {
         if (std::strcmp(argv[index], "--port") == 0 && index + 1 < argc) {
             port = argv[++index];
@@ -457,6 +651,27 @@ int receiver_main(int argc, char **argv) {
             input_socket = argv[++index];
         } else if (std::strcmp(argv[index], "--duration-ms") == 0 && index + 1 < argc) {
             duration_ms = std::strtoll(argv[++index], nullptr, 10);
+        } else if (std::strcmp(argv[index], "--reconnect-ms") == 0 && index + 1 < argc) {
+            const std::string_view value{argv[++index]};
+            const auto end = value.data() + value.size();
+            const auto [ptr, ec] = std::from_chars(value.data(), end, reconnect_ms);
+            if (ec != std::errc{} || ptr != end || reconnect_ms < 1 || reconnect_ms > 120'000) {
+                std::fputs("invalid --reconnect-ms\n", stderr);
+                return 2;
+            }
+        } else if (std::strcmp(argv[index], "--managed-phone-id") == 0 && index + 1 < argc) {
+            const std::string_view value{argv[++index]};
+            if (!aa::tools::parse_uint64_strict(value, managed_phone.value) ||
+                managed_phone.value == 0 || managed_phone.value > aa::trust::kMaxPhoneId) {
+                return 2;
+            }
+        } else if (std::strcmp(argv[index], "--managed-by") == 0 && index + 1 < argc) {
+            const std::string_view value{argv[++index]};
+            const auto [end, error] = std::from_chars(value.data(), value.data() + value.size(),
+                                                       supervisor_pid);
+            if (error != std::errc{} || end != value.data() + value.size() || supervisor_pid <= 1) {
+                return 2;
+            }
         } else if (std::strcmp(argv[index], "--no-bus") == 0) {
             no_bus = true;
         } else if (std::strcmp(argv[index], "--require-video-consumer") == 0) {
@@ -481,12 +696,32 @@ int receiver_main(int argc, char **argv) {
                 std::fputs(kUsage, stderr);
                 return 2;
             }
+        } else if (std::strcmp(argv[index], "--audio-playout-ms") == 0 && index + 1 < argc) {
+            if (!aa::tools::parse_audio_playout_ms(argv[++index], playout.audio_playout_ms)) {
+                std::fputs(kUsage, stderr);
+                return 2;
+            }
+        } else if (std::strcmp(argv[index], "--audio-catch-up-watermark-ms") == 0 &&
+                   index + 1 < argc) {
+            if (!aa::tools::parse_audio_catch_up_watermark_ms(
+                    argv[++index], playout.audio_catch_up_watermark_ms)) {
+                std::fputs(kUsage, stderr);
+                return 2;
+            }
+        } else if (std::strcmp(argv[index], "--video-delay-ms") == 0 && index + 1 < argc) {
+            if (!aa::tools::parse_video_delay_ms(argv[++index], playout.video_delay_ms)) {
+                std::fputs(kUsage, stderr);
+                return 2;
+            }
         } else {
             std::fputs(kUsage, stderr);
             return 2;
         }
     }
-    if (port.empty() || duration_ms < 0 || (wired_enrolment && no_bus)) {
+    if (port.empty() || duration_ms < 0 || (wired_enrolment && no_bus) ||
+        (supervisor_pid ? (!no_bus || !managed_phone.value || !required_usb_serial.empty())
+                        : (managed_phone.value != 0)) ||
+        !aa::tools::validate_playout_options(playout)) {
         std::fputs(kUsage, stderr);
         return 2;
     }
@@ -514,8 +749,12 @@ int receiver_main(int argc, char **argv) {
         return 2;
     }
     const auto started = std::chrono::steady_clock::now();
-    const auto deadline = duration_ms > 0 ? started + std::chrono::milliseconds{duration_ms}
-                                          : std::chrono::steady_clock::time_point::max();
+    if (!resumable.deadline) {
+        resumable.deadline = duration_ms > 0 ? started + std::chrono::milliseconds{duration_ms}
+                                             : std::chrono::steady_clock::time_point::max();
+    }
+    // --duration-ms bounds the whole process, across resumed sessions.
+    const auto deadline = *resumable.deadline;
 #ifdef AA_WIRED_RECEIVER_SHUTDOWN_TEST
     if (deadline_observation) {
         deadline_observation->cutoff = started + std::chrono::milliseconds{duration_ms};
@@ -523,6 +762,18 @@ int receiver_main(int argc, char **argv) {
 #endif
     ::signal(SIGINT, on_signal);
     ::signal(SIGTERM, on_signal);
+    if (supervisor_pid) {
+        // A child without its supervisor must never keep projecting. Check
+        // after arming the signal to cover a parent death during exec.
+        if (::prctl(PR_SET_PDEATHSIG, SIGKILL) != 0 || ::getppid() != supervisor_pid ||
+            ::signal(SIGUSR1, on_managed_idr) == SIG_ERR) {
+            return 3;
+        }
+        sigset_t idr_signal;
+        ::sigemptyset(&idr_signal);
+        ::sigaddset(&idr_signal, SIGUSR1);
+        if (::pthread_sigmask(SIG_UNBLOCK, &idr_signal, nullptr) != 0) return 3;
+    }
 
     std::filesystem::path store_file{};
     if (store_path.empty()) {
@@ -541,6 +792,16 @@ int receiver_main(int argc, char **argv) {
         return 3;
     }
 
+    if (supervisor_pid) {
+        for (const auto& phone : store.phones()) {
+            if (phone.phone_id != managed_phone) continue;
+            if (const auto* wired = std::get_if<aa::trust::WiredIdentity>(&phone.identity)) {
+                required_usb_serial = wired->usb_serial;
+            }
+        }
+        if (required_usb_serial.empty()) return 3;
+    }
+
     if (store.dropped_port_only_count() != 0) {
         log_line(std::string{"{\"event\":\"trust_store_migrated_dropped_port_only\",\"count\":"} +
                  std::to_string(store.dropped_port_only_count()) + "}");
@@ -551,7 +812,10 @@ int receiver_main(int argc, char **argv) {
     aa::session::SteadyClock clock{};
     aa::input::CapabilityDescriptor input = aa::input::CapabilityDescriptor::bench_defaults();
 
-    aa::audio::RouterConfig audio_config = pcm_router_config(audio_backend);
+    aa::audio::RouterConfig audio_config = pcm_router_config(
+        audio_backend,
+        aa::core::Nanoseconds{playout.audio_playout_ms * 1'000'000LL},
+        aa::core::Nanoseconds{playout.audio_catch_up_watermark_ms * 1'000'000LL});
     ConcreteAudioRenderWorker audio_sink{audio_config};
     const auto opened = audio_sink.ready();
     // Run provenance (#60, #80): log the sink selection (including any refusal
@@ -566,24 +830,45 @@ int receiver_main(int argc, char **argv) {
         return 3;
     }
 
-    auto video =
-        aa::ipc::VideoServer::listen(aa::ipc::VideoSocketPath{video_socket},
-                                     aa::ipc::VideoServerOptions{{}, aa::ipc::current_uid()});
-    auto input_server =
-        aa::ipc::InputServer::listen(aa::ipc::InputSocketPath{input_socket},
-                                     aa::ipc::InputServerOptions{aa::ipc::current_uid()});
-    if (!video.has_value() || !input_server.has_value()) {
+    const aa::ipc::VideoServerOptions video_options{{}, aa::ipc::current_uid()};
+    const aa::ipc::InputServerOptions input_options{aa::ipc::current_uid()};
+    std::optional<aa::ipc::VideoServer> video{};
+    int video_handoff_fd = -1;
+    struct HandoffFdGuard final {
+        int fd{-1};
+        ~HandoffFdGuard() {
+            if (fd >= 0) ::close(fd);
+        }
+    } video_handoff_guard{};
+    if (supervisor_pid) {
+        if (!aa::tools::validate_video_handoff_fd(3)) {
+            log_line("{\"event\":\"err\",\"detail\":\"socket\"}");
+            return 3;
+        }
+        video_handoff_fd = 3;
+        video_handoff_guard.fd = 3;
+    } else {
+        auto opened_video = aa::ipc::VideoServer::listen({video_socket}, video_options);
+        if (!opened_video.has_value()) {
+            log_line("{\"event\":\"err\",\"detail\":\"socket\"}");
+            return 3;
+        }
+        video.emplace(std::move(opened_video.value()));
+    }
+    auto input_server = supervisor_pid ? aa::ipc::InputServer::adopt_listener(4, input_options)
+                                       : aa::ipc::InputServer::listen({input_socket}, input_options);
+    if (!input_server.has_value()) {
         log_line("{\"event\":\"err\",\"detail\":\"socket\"}");
         return 3;
     }
 
     aa::app::WiredSessionConfig session_config{};
     session_config.lifecycle.phases.negotiate = Milliseconds{15'000};
+    session_config.lifecycle.wired_reconnect = Milliseconds{reconnect_ms};
     session_config.input_enabled = true;
     session_config.input = input;
     aa::app::WiredSession session{{store, clock, diagnostics}, session_config};
     aa::app::WiredPhoneControl control{store, session};
-    aa::ipc::RandomPairingIdSource ids;
     StorePhones phones{control};
     // #133 wired enrolment: before a session owns the store (this thread runs
     // the bus until then), the bus directory is the enrolment state machine;
@@ -593,18 +878,38 @@ int receiver_main(int argc, char **argv) {
     if (!wired_enrolment) {
         enrolment.close();
     }
-    std::optional<aa::ipc::ControlBusService> bus{};
-    if (!no_bus) {
-        auto started_bus = aa::ipc::ControlBusService::start(
-            aa::ipc::ControlBusService::Config{aa::ipc::current_uid()},
-            aa::ipc::ControlBusService::Deps{ids, wired_enrolment
-                                                      ? static_cast<aa::ipc::PhoneDirectory &>(enrolment)
-                                                      : static_cast<aa::ipc::PhoneDirectory &>(phones)});
-        if (!started_bus.has_value()) {
-            log_line("{\"event\":\"err\",\"detail\":\"dbus\"}");
-            return 3;
+    // The bus directory follows this session until it returns.
+    struct SessionDirectory final {
+        ResumableControl &resumable;
+        ~SessionDirectory() {
+            resumable.link_live.store(false);
+            // The idle directory keeps this session's store path: ListPhones
+            // and ForgetPhone keep working until the next session starts.
+            resumable.phones.detach();
         }
-        bus.emplace(std::move(started_bus.value()));
+    } session_directory{resumable};
+    resumable.phones.idle().bind(store_file);
+    if (wired_enrolment) {
+        resumable.phones.attach(enrolment);
+    } else {
+        resumable.phones.attach(phones);
+    }
+    aa::ipc::ControlBusService *bus = nullptr;
+    if (!no_bus) {
+        if (!resumable.bus) {
+            auto started_bus = aa::ipc::ControlBusService::start(
+                aa::ipc::ControlBusService::Config{aa::ipc::current_uid()},
+                aa::ipc::ControlBusService::Deps{resumable.ids, resumable.phones, nullptr, {},
+                                                nullptr, [&resumable] {
+                                                    return resumable.stop_session();
+                                                }});
+            if (!started_bus.has_value()) {
+                log_line("{\"event\":\"err\",\"detail\":\"dbus\"}");
+                return 3;
+            }
+            resumable.bus.emplace(std::move(started_bus.value()));
+        }
+        bus = &resumable.bus.value();
     }
     log_line(screen_description_event(screen));
     if (!experimental.empty()) {
@@ -617,6 +922,21 @@ int receiver_main(int argc, char **argv) {
         return 1;
     }
     VideoOutlet video_outlet{log_line_nonblocking, log_media};
+    std::chrono::milliseconds video_hold{};
+    bool follow_audio_playout = false;
+    aa::tools::configure_video_hold(video_outlet, audio_sink, playout, follow_audio_playout,
+                                    video_hold);
+    if (follow_audio_playout || video_hold.count() > 0) {
+        try {
+            video_outlet.start_release_timer();
+        } catch (const std::system_error &) {
+            log_line("{\"event\":\"video_release_timer_error\",\"reason\":\"start_failed\"}");
+            return 3;
+        }
+    }
+    log_line(aa::tools::media_policy_json("wired_media_policy", playout,
+                                          audio_sink.credit_window(), follow_audio_playout,
+                                          video_hold));
     video_outlet.set_idr_recovery({
         [&session] { return session.video_projecting(); },
         [&session] { return session.request_video_idr(); },
@@ -642,8 +962,12 @@ int receiver_main(int argc, char **argv) {
     aa::transport::UsbDeviceSelector selector{};
     selector.port_context = port;
     aa::transport::AoaAccessoryInfo accessory{};
-    log_line("{\"event\":\"connecting\",\"port\":\"" +
-             aa::diagnostics::redact_identifier(port) + "\"}");
+    const auto redacted_port = aa::diagnostics::redact_identifier(port);
+    log_line("{\"event\":\"connecting\",\"port\":\"" + redacted_port + "\"}");
+    const auto log_reset = [&](std::string_view status) {
+        log_line_nonblocking("{\"event\":\"diag\",\"detail\":\"aoa_reset\",\"port\":\"" +
+                             redacted_port + "\",\"status\":\"" + std::string{status} + "\"}");
+    };
 
     // Per-link cipher (P1-B/P1-C): the initial attach AND every reconnect build
     // a FRESH cipher bound to the identity the TrustStore admitted for THIS
@@ -670,7 +994,19 @@ int receiver_main(int argc, char **argv) {
         "{\"event\":\"err\",\"detail\":\"link\",\"code\":\"phone_serial_mismatch\"}";
 
     aa::trust::WiredIdentity attempted_identity{};
-    auto first_link = aa::app::open_wired_link(selector, accessory, store, {}, &attempted_identity);
+    auto first_link = [&] {
+        aa::core::CancellationSource startup_stop;
+        auto watch_shutdown = cancel_open_on_shutdown(startup_stop);
+        aa::core::Deadline startup_budget;
+        startup_budget.cancellation = startup_stop.get_token();
+        aa::transport::AoaRecovery startup_recovery;
+        startup_recovery.reset_status = log_reset;
+        return aa::app::open_wired_link(selector, accessory, store, startup_budget,
+                                        &attempted_identity, &startup_recovery);
+    }();
+    if (!g_running.load()) {
+        return 0;
+    }
     if (!first_link.has_value()) {
         // ADDITIVE attribution at admission rejection (item 2): the link-error
         // record names the rejected attempt's identity+port. The identity is
@@ -687,11 +1023,11 @@ int receiver_main(int argc, char **argv) {
         }
         line += "}";
         log_line(line);
-        if (wired_enrolment && bus.has_value() &&
+        if (wired_enrolment && bus &&
             first_link.error().code() == aa::ErrorCode::transport_unauthorized_peer &&
             !attempted_identity.port_context.empty() &&
             enrolment.note_refused(attempted_identity).has_value()) {
-            return run_wired_enrolment(bus.value(), enrolment, attempted_identity, deadline);
+            return run_wired_enrolment(*bus, enrolment, attempted_identity, deadline);
         }
         return 3;
     }
@@ -700,6 +1036,7 @@ int receiver_main(int argc, char **argv) {
         return 3;
     }
     enrolment.close();  // a session now owns the store; pairing is refused again
+    resumable.link_live.store(true);
     std::optional<aa::app::WiredLink> link{std::move(first_link.value())};
     session.attach_transport(link->transport.get());
     if (!bind_link_cipher(link->phone)) {
@@ -738,6 +1075,46 @@ int receiver_main(int argc, char **argv) {
     std::atomic<bool> admitted{false};
     std::mutex gate_mutex;
     std::condition_variable gate_cv;
+    const auto drain_video_handoff = [&](Milliseconds first_timeout) {
+        if (video_handoff_fd < 0) return;
+        std::optional<aa::tools::VideoHandoffEvent> latest;
+        Milliseconds wait = first_timeout;
+        for (;;) {
+            auto event = aa::tools::receive_video_handoff(video_handoff_fd, wait);
+            wait = Milliseconds{0};
+            if (!event.has_value()) {
+                if (event.error().code() == aa::ErrorCode::transport_closed) {
+                    g_running.store(false);
+                }
+                break;
+            }
+            latest.emplace(std::move(event.value()));
+        }
+        if (!latest.has_value() || !g_running.load() ||
+            std::chrono::steady_clock::now() >= deadline) {
+            return;
+        }
+        if (latest->kind == aa::tools::VideoHandoffKind::install && latest->producer.has_value()) {
+            log_line_nonblocking("{\"event\":\"video_accepted\"}");
+            video_outlet.install(std::move(*latest->producer));
+            {
+                std::lock_guard gate_lock(gate_mutex);
+                if (!g_running.load() || std::chrono::steady_clock::now() >= deadline) {
+                    return;
+                }
+                admitted.store(true);
+            }
+            gate_cv.notify_all();
+        } else if (latest->kind == aa::tools::VideoHandoffKind::clear) {
+            video_outlet.clear_producer();
+        }
+    };
+    if (video_handoff_fd >= 0) {
+        drain_video_handoff(Milliseconds{0});
+    }
+    aa::core::CancellationSource reconnect_stop;
+    aa::transport::AoaRecovery recovery;
+    recovery.reset_status = log_reset;
     bool runtime_failed = false;
 
     auto service_control = [&] {
@@ -766,7 +1143,7 @@ int receiver_main(int argc, char **argv) {
     bool in_video_recovery = false;
     bool in_receive_poll = false;
     auto service_video_recovery = [&]() -> bool {
-        if (in_video_recovery || session.outbound_in_progress()) {
+        if (in_video_recovery) {
             return true;
         }
         in_video_recovery = true;
@@ -774,6 +1151,20 @@ int receiver_main(int argc, char **argv) {
             bool &active;
             ~Guard() { active = false; }
         } guard{in_video_recovery};
+        // Held video leaves on time even while the session is mid-send:
+        // release_held() needs no session I/O (IDR requests wait for service_pending).
+        if (auto held = video_outlet.release_held(); !held) {
+            session_failed.store(true);
+            g_running.store(false);
+            log_line_nonblocking(poll_error_json(held.error().code(), session, audio_sink));
+            if (!session.failure()) {
+                (void)session.fail(held.error());
+            }
+            return false;
+        }
+        if (session.outbound_in_progress()) {
+            return true;
+        }
         if (!video_outlet.idr_dispatching()) {
             if (auto flushed = video_outlet.service_pending(); !flushed) {
                 session_failed.store(true);
@@ -795,8 +1186,9 @@ int receiver_main(int argc, char **argv) {
                 return false;
             }
         }
-        if (bus && !video_outlet.idr_dispatching() &&
-            bus->service().consume_idr_recovery_request()) {
+        if (!video_outlet.idr_dispatching() &&
+            ((bus && bus->service().consume_idr_recovery_request()) ||
+             g_managed_idr.exchange(false))) {
             const auto idr = video_outlet.request_idr_external("consumer_ipc");
             if (!idr) {
                 const bool fatal = idr.error().code() == aa::ErrorCode::channel_focus_restore_failed;
@@ -825,6 +1217,7 @@ int receiver_main(int argc, char **argv) {
     };
 
     auto io_checkpoint = [&] {
+        if (!g_running.load()) session.request_stop();
         control.checkpoint();
         if (in_receive_poll && !session.failure() && g_running.load()) {
             (void)service_video_recovery();
@@ -839,7 +1232,14 @@ int receiver_main(int argc, char **argv) {
             return lost.error();
         }
         video_outlet.reset();
-        const auto budget = session.io_deadline();
+        const auto session_budget = session.io_deadline();
+        aa::core::CancellationSource open_stop;
+        const std::stop_callback cancel_on_session_stop{session_budget.cancellation,
+                                                        [&] { open_stop.request_stop(); }};
+        const std::stop_callback cancel_on_dispatcher_stop{reconnect_stop.get_token(),
+                                                           [&] { open_stop.request_stop(); }};
+        auto watch_shutdown = cancel_open_on_shutdown(open_stop);
+        const aa::core::Deadline budget{session_budget.until, open_stop.get_token()};
         while (g_running.load()) {
             if (service_control()) {
                 return aa::Error{aa::ErrorCode::cancelled};
@@ -848,8 +1248,12 @@ int receiver_main(int argc, char **argv) {
                 session.tick();
                 return checked.error();
             }
-            auto relink = aa::app::open_wired_link(selector, accessory, store, budget);
-            if (service_control()) {
+            const aa::core::Deadline slice{
+                std::min(budget.until, aa::core::Deadline::Clock::now() + std::chrono::seconds{1}),
+                budget.cancellation};
+            auto relink = aa::app::open_wired_link(selector, accessory, store, slice,
+                                                  nullptr, &recovery);
+            if (!g_running.load() || service_control()) {
                 return aa::Error{aa::ErrorCode::cancelled};
             }
             if (relink) {
@@ -1039,7 +1443,9 @@ int receiver_main(int argc, char **argv) {
                 }
                 if (session.state() == aa::session::State::negotiating &&
                     session.channel_opens() > 0) {
-                    (void)session.apply(aa::session::Event::negotiation_succeeded);
+                    if (session.apply(aa::session::Event::negotiation_succeeded)) {
+                        recovery.reset_attempted = false;
+                    }
                 }
                 if (session.state() == aa::session::State::active && active_ms.load() < 0) {
                     const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -1101,11 +1507,24 @@ int receiver_main(int argc, char **argv) {
             std::chrono::ceil<std::chrono::milliseconds>(
                 deadline - std::chrono::steady_clock::now()).count()))};
     };
+    // A started projection that stops for any reason (StopProjection,
+    // UnregisterConsumer, owner loss) ends this session (#240 review P3-4).
+    bool projection_started = false;
     while (g_running.load() && std::chrono::steady_clock::now() < deadline) {
-        if (bus.has_value()) {
-            auto step = bus.value().cycle(runtime_slice());
+        if (video_handoff_fd >= 0) {
+            drain_video_handoff(runtime_slice());
+            continue;
+        }
+        if (bus) {
+            auto step = bus->cycle(runtime_slice());
             if (!step.has_value()) {
                 runtime_failed = true;
+                break;
+            }
+            const auto control_state = bus->service().state();
+            if (control_state.projection == aa::ipc::ProjectionState::projecting) {
+                projection_started = true;
+            } else if (projection_started && resumable.stop_session()) {
                 break;
             }
         } else {
@@ -1151,6 +1570,9 @@ int receiver_main(int argc, char **argv) {
     }
 
     g_running.store(false);
+    // A link open can wait for re-enumeration while the owner holds the mutex.
+    // Wake it before taking the mutex for the ordered session stop.
+    reconnect_stop.request_stop();
 #ifdef AA_WIRED_RECEIVER_SHUTDOWN_TEST
     if (shutdown_observation) {
         shutdown_observation->published_false();
@@ -1180,9 +1602,8 @@ int receiver_main(int argc, char **argv) {
 
     video_outlet.close();
     input_server.value().close();
-    video.value().close();
-    if (bus.has_value()) {
-        bus.value().close();
+    if (video.has_value()) {
+        video.value().close();
     }
 
     const auto total = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -1200,6 +1621,56 @@ int receiver_main(int argc, char **argv) {
         runtime_failed = true;
     }
     return runtime_failed || session_failed.load() ? 1 : 0;
+}
+int receiver_main(int argc, char **argv) {
+    ResumableControl resumable;
+    const auto close_bus = [&] {
+        if (resumable.bus) resumable.bus->close();
+    };
+    for (;;) {
+        resumable.consumer_stopped = false;
+        const int code = receiver_session(argc, argv, resumable);
+        const auto *writer = aa::wired_receiver::active_stdout_log.load();
+        const bool resume = code == 0 && resumable.bus && resumable.consumer_stopped &&
+                            !g_shutdown.load() && !(writer && writer->latched_error()) &&
+                            resumable.deadline &&
+                            std::chrono::steady_clock::now() < *resumable.deadline;
+        if (!resume) {
+            close_bus();
+            return code;
+        }
+        // The consumer stopped projection: keep the bus and its registration,
+        // and open a fresh session on the next StartProjection.
+        log_line("{\"event\":\"ready\",\"state\":\"waiting_for_start\"}");
+        bool start = false;
+        while (!g_shutdown.load() && std::chrono::steady_clock::now() < *resumable.deadline) {
+            const auto slice = std::max<std::int64_t>(0, std::min<std::int64_t>(200,
+                std::chrono::ceil<std::chrono::milliseconds>(
+                    *resumable.deadline - std::chrono::steady_clock::now()).count()));
+            if (auto step = resumable.bus->cycle(Milliseconds{slice}); !step.has_value()) {
+                log_line("{\"event\":\"err\",\"detail\":\"dbus\"}");
+                close_bus();
+                return 1;
+            }
+            if (writer && writer->latched_error()) break;
+            const auto control_state = resumable.bus->service().state();
+            if (control_state.consumer.value &&
+                control_state.projection == aa::ipc::ProjectionState::projecting) {
+                start = true;
+                break;
+            }
+        }
+        if (!start) {
+            close_bus();
+            return writer && writer->latched_error() ? 1 : 0;
+        }
+        g_running.store(true);
+        // A signal between the wait above and this store must still win.
+        if (g_shutdown.load()) {
+            close_bus();
+            return 0;
+        }
+    }
 }
 } // namespace
 

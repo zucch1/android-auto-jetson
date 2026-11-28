@@ -123,11 +123,12 @@ public:
         return idr_dispatching_.load(std::memory_order_acquire);
     }
 
-    // Wireless playout (credit window + playout, 2026-11-20): video is held this long after it arrives
-    // before it is forwarded, matching the audio playout buffer so audio and
-    // video still leave the receiver together. The frame keeps its arrival
-    // timestamp, so the display's video_presented latency includes the delay
-    // exactly as audio_write_completed's does. Zero (wired) forwards at once.
+    // Playout clock (wireless since 2026-11-20, wired since #228): video is held
+    // this long after it arrives before it is forwarded, matching the audio
+    // playout buffer so audio and video still leave the receiver together. The
+    // frame keeps its arrival timestamp, so the display's video_presented
+    // latency includes the delay exactly as audio_write_completed's does. Zero
+    // (the arrival model, --audio-playout-ms 0) forwards at once.
     void set_presentation_delay(std::chrono::nanoseconds delay) {
         std::lock_guard lock(mutex_);
         delay_ = std::max(std::chrono::nanoseconds{0}, delay);
@@ -136,17 +137,23 @@ public:
     }
 
     // N1: the hold is read per frame from `source`, given the frame's own
-    // timestamp (the wireless receiver passes the audio playout offset
+    // timestamp (both receivers pass the audio playout offset
     // reported for that content time: the delay the audio it pairs with
     // really plays with), so the two stay the same quantity. The applied hold
     // never falls faster than half the time that passes, so t + hold only
     // ever rises and a frame is never pinned behind an earlier one's due
-    // (no freeze, then burst; Neon P1-1). Bounded to kMaxPresentationDelay,
-    // and every capped frame is counted and logged (video_hold_capped).
+    // (no freeze, then burst; Neon P1-1). Bounded to the hold cap
+    // (set_max_presentation_delay), and every capped frame is counted and logged (video_hold_capped).
     void set_presentation_delay_source(std::function<std::chrono::nanoseconds(core::Nanoseconds)> source) {
         std::lock_guard lock(mutex_);
         delay_source_ = std::move(source);
         last_released_.reset();
+    }
+
+    // The longest hold (default kMaxPresentationDelay).
+    void set_max_presentation_delay(std::chrono::milliseconds cap) {
+        std::lock_guard lock(mutex_);
+        max_delay_ = std::max(std::chrono::milliseconds{0}, cap);
     }
 
     [[nodiscard]] std::uint64_t late_releases() const {
@@ -232,13 +239,13 @@ public:
 
     // Window 14: the owner thread's checkpoint is not a clock. It went
     // 35-90 ms without running, every ~2 s, so held frames due in that time
-    // left late (video_release_late, ~270 in 480 s). The wireless receiver
-    // therefore also releases held frames on a thread of its own that sleeps
-    // until the front frame's due (re-checking at least every
+    // left late (video_release_late, ~270 in 480 s). Receivers with video hold
+    // enabled therefore also release held frames on a thread of their own that
+    // sleeps until the front frame's due (re-checking at least every
     // kReleaseTimerSlice, since the hold source can move a due earlier). Like
     // release_held() it needs no session I/O: an IDR request it triggers
     // waits for service_pending(), and a delivery error is returned from the
-    // next release_held(). Wired never starts it.
+    // next release_held().
     void start_release_timer() {
         std::lock_guard lock(mutex_);
         if (release_thread_.joinable()) { return; }
@@ -472,10 +479,33 @@ public:
         had_producer_ = true;
         had_backpressure_ = false;
         producer_installed_at_ = now_locked();
+        sequence_ = std::max(sequence_, producer.last_frame_id());
         producer_.emplace(std::move(producer));
         if (profile_) {
             configure_buffer_locked(*profile_);
         }
+    }
+
+    // Clear the currently installed consumer producer without shutting down
+    // the outlet itself (used when the supervisor detects peer disconnect).
+    void clear_producer() noexcept {
+        std::unique_lock lock(mutex_);
+        const DeferredMedia logs{*this, lock};
+        if (!producer_.has_value()) {
+            return;
+        }
+        clear_delayed_locked("consumer_disconnected");
+        clear_pending_locked(/*abandon_partial=*/false, "consumer_disconnected");
+        release_error_.reset();
+        deferred_idr_reason_.reset();
+        last_released_.reset();
+        producer_->close();
+        producer_.reset();
+        idr_coordinator_.reset();
+        startup_idr_wait_ = false;
+        had_backpressure_ = false;
+        armed_late_consumer_ = false;
+        producer_installed_at_.reset();
     }
 
     void close() noexcept {
@@ -507,9 +537,12 @@ private:
         std::vector<std::byte> payload{};
         std::chrono::steady_clock::time_point arrived{};
     };
-    // Above this the hold is capped (and logged): it bounds touch latency and
-    // keeps 600 ms of the drive smoke's 1.0 s waiting_idr budget. The router
-    // sheds a backlog above 350 ms so the audio offset stays under it.
+    // Above the cap the hold is clipped (and logged). The default bounds touch
+    // latency and keeps 600 ms of the drive smoke's 1.0 s waiting_idr budget;
+    // the drift rules shed a backlog above 350 ms so the audio offset stays
+    // under it. Lossless playout (both receivers' default) keeps every sample
+    // and raises the cap instead (tools/media_playout_options.hpp,
+    // kLosslessVideoHoldCap).
     static constexpr std::chrono::milliseconds kMaxPresentationDelay{400};
 
     [[nodiscard]] std::chrono::nanoseconds requested_delay_locked(core::Nanoseconds content) const {
@@ -529,7 +562,7 @@ private:
     };
     [[nodiscard]] FrontHold front_hold_locked(const DelayedMessage& front) const {
         const auto requested = requested_delay_locked(front.header.timestamp);
-        auto hold = std::min(requested, std::chrono::nanoseconds{kMaxPresentationDelay});
+        auto hold = std::min(requested, std::chrono::nanoseconds{max_delay_});
         if (last_released_) {
             const auto spacing = std::chrono::duration_cast<std::chrono::nanoseconds>(
                 front.arrived - last_released_->arrived);
@@ -545,17 +578,18 @@ private:
     // Counts and logs a frame whose requested hold the cap clips (once per
     // frame, when it is released with the capped hold).
     void note_capped_locked(std::chrono::nanoseconds requested) {
-        if (requested <= kMaxPresentationDelay) { return; }
+        if (requested <= max_delay_) { return; }
         ++capped_holds_;
         if (capped_holds_ == 1 || capped_holds_ % 30 == 0) {
             defer_media("video_hold_capped", "{\"event\":\"video_hold_capped\",\"requested_ms\":" +
                   std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(requested).count()) +
-                  ",\"cap_ms\":" + std::to_string(kMaxPresentationDelay.count()) +
+                  ",\"cap_ms\":" + std::to_string(max_delay_.count()) +
                   ",\"capped_frames\":" + std::to_string(capped_holds_) + "}");
         }
     }
 
-    // 400 ms at 60 fps is 24 units; the byte bound covers IDR-heavy bursts.
+    // 700 ms (the longest cap) at 60 fps is 42 units; the byte bound covers
+    // IDR-heavy bursts.
     static constexpr std::size_t kMaxDelayedUnits = 64;
     static constexpr std::size_t kMaxDelayedBytes = std::size_t{32} * 1024 * 1024;
 
@@ -797,23 +831,32 @@ private:
     }
 
     [[nodiscard]] bool handle_transport_error_locked(const Error& err, std::size_t extra_drops) {
-        // Error erases errno; confirm peer hangup rather than hiding every I/O failure.
-        if (err.code() != ErrorCode::transport_io || !producer_.has_value()) {
+        // Error erases errno; confirm either explicit supervisor retirement of
+        // a borrowed connection (in-place consumer replacement / stop) or peer
+        // hangup rather than hiding every I/O failure.
+        if (!producer_.has_value()) {
             return false;
         }
-        pollfd peer{producer_->native_handle(), 0, 0};
-        int ready;
-        do {
-            ready = ::poll(&peer, 1, 0);
-        } while (ready < 0 && errno == EINTR);
-        if (ready <= 0 || (peer.revents & POLLHUP) == 0) {
-            return false;
+        const bool retired = err.code() == ErrorCode::transport_closed && producer_->retired();
+        if (!retired) {
+            if (err.code() != ErrorCode::transport_io) {
+                return false;
+            }
+            pollfd peer{producer_->native_handle(), 0, 0};
+            int ready;
+            do {
+                ready = ::poll(&peer, 1, 0);
+            } while (ready < 0 && errno == EINTR);
+            if (ready <= 0 || (peer.revents & POLLHUP) == 0) {
+                return false;
+            }
         }
+        const char* drop_reason = retired ? "consumer_replaced" : "consumer_disconnected";
         const std::size_t lost_units = pending_queue_.size() + extra_drops;
         reset_pending_state_locked();
         // Frames held for the playout delay go with the consumer, and so does
         // any IDR request deferred for it.
-        clear_delayed_locked("consumer_disconnected");
+        clear_delayed_locked(drop_reason);
         deferred_idr_reason_.reset();
         last_released_.reset();
         producer_->close();
@@ -825,7 +868,7 @@ private:
         producer_installed_at_.reset();
         const auto cadence = frame_cadence(profile_);
         for (std::size_t i = 0; i < lost_units; ++i) {
-            record_drop("consumer_disconnected", cadence);
+            record_drop(drop_reason, cadence);
         }
         return true;
     }
@@ -1081,6 +1124,7 @@ private:
     std::optional<std::chrono::steady_clock::time_point> producer_installed_at_{};
     std::deque<PendingAccessUnit> pending_queue_{};
     std::chrono::nanoseconds delay_{0};
+    std::chrono::milliseconds max_delay_{kMaxPresentationDelay};
     std::function<std::chrono::nanoseconds(core::Nanoseconds)> delay_source_{};
     struct ReleasedHold final {
         std::chrono::steady_clock::time_point arrived;

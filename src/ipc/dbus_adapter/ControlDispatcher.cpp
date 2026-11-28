@@ -187,6 +187,42 @@ constexpr std::string_view kPropertiesInterface = "org.freedesktop.DBus.Properti
         }
         return from_void(service.request_idr_recovery(sender));
     }
+    case 16: {
+        if (!body_consumed(cursor)) {
+            return error_reply("org.freedesktop.DBus.Error.InvalidArgs", "malformed arguments");
+        }
+        const auto listed = service.list_phones(sender);
+        if (!listed) {
+            return error_reply(error_name_for(listed.error().code()), listed.error().message());
+        }
+        return ok(listed.value());
+    }
+    case 17: {
+        const auto id = cursor.read_u64();
+        if (!id || !body_consumed(cursor)) {
+            return error_reply("org.freedesktop.DBus.Error.InvalidArgs", "malformed arguments");
+        }
+        const auto outcome = service.pairing_outcome(sender, core::PairingRequestId{id.value()});
+        if (!outcome) {
+            return error_reply(error_name_for(outcome.error().code()), outcome.error().message());
+        }
+        return ok(outcome.value());
+    }
+    case dbus_contract::kSetProjectionModeIndex: {
+        const auto mode = cursor.read_string();
+        if (!mode || !body_consumed(cursor)) {
+            return error_reply("org.freedesktop.DBus.Error.InvalidArgs", "malformed arguments");
+        }
+        return from_void(service.set_projection_mode(sender, mode.value()));
+    }
+    case dbus_contract::kSetTransportEnabledIndex: {
+        const auto transport = cursor.read_string();
+        const auto enabled = cursor.read_u32();
+        if (!transport || !enabled || enabled.value() > 1 || !body_consumed(cursor)) {
+            return error_reply("org.freedesktop.DBus.Error.InvalidArgs", "malformed arguments");
+        }
+        return from_void(service.set_transport_enabled(sender, transport.value(), enabled.value() != 0));
+    }
     default: return error_reply("org.freedesktop.DBus.Error.UnknownMethod", "unknown member");
     }
 }

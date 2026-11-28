@@ -7,13 +7,16 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
+#include <new>
 #include <poll.h>
 #include <sys/file.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
@@ -75,10 +78,11 @@ core::Result<PeerCredentials> read_peer(int fd) noexcept {
                            static_cast<std::uint32_t>(creds.pid)};
 }
 
-core::Result<void> write_record(int fd, std::span<const std::uint8_t> record) noexcept {
+core::Result<void> write_record(int fd, std::span<const std::uint8_t> record,
+                                int extra_flags = 0) noexcept {
     ssize_t sent;
     do {
-        sent = ::send(fd, record.data(), record.size(), MSG_NOSIGNAL);
+        sent = ::send(fd, record.data(), record.size(), MSG_NOSIGNAL | extra_flags);
     } while (sent < 0 && errno == EINTR);
     if (sent != static_cast<ssize_t>(record.size())) {
         return io_error();
@@ -573,6 +577,65 @@ core::Result<void> prepare_video_socket_path(const VideoSocketPath& path) {
 
 std::uint32_t current_uid() noexcept { return static_cast<std::uint32_t>(::getuid()); }
 
+constexpr std::uint32_t kStreamStateMagic = 0x41415354U; // "AAST"
+constexpr std::uint32_t kStreamStateVersion = 1U;
+constexpr int kRequiredStateSeals = F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_SEAL;
+
+struct SharedStreamCounters final {
+    std::uint32_t magic{kStreamStateMagic};
+    std::uint32_t version{kStreamStateVersion};
+    std::atomic<std::uint64_t> last_frame{0};
+    std::atomic<std::uint64_t> next_sequence{0};
+    std::atomic<std::uint32_t> retired{0};
+    std::uint32_t reserved{0};
+};
+static_assert(std::atomic<std::uint64_t>::is_always_lock_free);
+static_assert(std::atomic<std::uint32_t>::is_always_lock_free);
+
+struct SealedSharedState final {
+    int fd{-1};
+    SharedStreamCounters* counters{nullptr};
+};
+
+void release_shared_state(int& state_fd, SharedStreamCounters*& shared) noexcept {
+    if (shared != nullptr) {
+        ::munmap(shared, sizeof(SharedStreamCounters));
+        shared = nullptr;
+    }
+    if (state_fd >= 0) {
+        ::close(state_fd);
+        state_fd = -1;
+    }
+}
+
+core::Result<SealedSharedState> create_sealed_shared_state(
+    std::uint64_t initial_last_frame = 0, std::uint64_t initial_next_sequence = 0) noexcept {
+    const int mfd = ::memfd_create("aa-video-stream", MFD_CLOEXEC | MFD_ALLOW_SEALING);
+    if (mfd < 0) {
+        return io_error();
+    }
+    if (::fchmod(mfd, 0600) != 0 ||
+        ::ftruncate(mfd, static_cast<off_t>(sizeof(SharedStreamCounters))) != 0 ||
+        ::fcntl(mfd, F_ADD_SEALS, kRequiredStateSeals) != 0) {
+        ::close(mfd);
+        return io_error();
+    }
+    void* mapped = ::mmap(nullptr, sizeof(SharedStreamCounters), PROT_READ | PROT_WRITE,
+                          MAP_SHARED, mfd, 0);
+    if (mapped == MAP_FAILED) {
+        ::close(mfd);
+        return io_error();
+    }
+    auto* counters = new (mapped) SharedStreamCounters{};
+    counters->last_frame.store(initial_last_frame, std::memory_order_relaxed);
+    counters->next_sequence.store(initial_next_sequence, std::memory_order_release);
+    return SealedSharedState{mfd, counters};
+}
+
+constexpr bool is_retirement_send_errno(int err) noexcept {
+    return err == EPIPE || err == ECONNRESET;
+}
+
 struct VideoProducer::Impl final {
     struct PartialSend final {
         bool active{false};
@@ -584,13 +647,17 @@ struct VideoProducer::Impl final {
     };
 
     int fd{-1};
+    int state_fd{-1};
+    SharedStreamCounters* shared{nullptr};
     NegotiatedLimits limits{};
     std::array<std::uint8_t, kFrameHeaderBytes + kMaxDatagramPayload> packet{};
     std::uint64_t sequence{};
+    std::uint64_t last_frame{};
     std::uint64_t dropped{};
     std::uint64_t backpressure{};
     bool waiting_idr{true};
     bool closed{false};
+    bool inherited{false};
     PartialSend partial{};
     VideoEndpoint endpoint{};
     VideoEndpointObserver observer{};
@@ -603,16 +670,54 @@ struct VideoProducer::Impl final {
     Impl(Impl&&) = delete;
     Impl& operator=(Impl&&) = delete;
 
+    void record_frame_attempt(std::uint64_t frame) noexcept {
+        if (frame > last_frame) {
+            last_frame = frame;
+        }
+        if (shared != nullptr) {
+            auto prev = shared->last_frame.load(std::memory_order_relaxed);
+            while (frame > prev &&
+                   !shared->last_frame.compare_exchange_weak(
+                       prev, frame, std::memory_order_release, std::memory_order_relaxed)) {}
+        }
+    }
+
+    void record_sequence_attempt(std::uint64_t next_seq) noexcept {
+        if (shared != nullptr) {
+            auto prev = shared->next_sequence.load(std::memory_order_relaxed);
+            while (next_seq > prev &&
+                   !shared->next_sequence.compare_exchange_weak(
+                       prev, next_seq, std::memory_order_release, std::memory_order_relaxed)) {}
+        }
+    }
+
+    [[nodiscard]] bool is_retired() const noexcept {
+        return shared != nullptr && shared->retired.load(std::memory_order_acquire) != 0;
+    }
+
     void release() noexcept {
         if (closed) {
             return;
         }
         closed = true;
         partial.active = false;
+        if (!inherited && shared != nullptr) {
+            shared->retired.store(1, std::memory_order_release);
+        }
         if (fd >= 0) {
-            ::shutdown(fd, SHUT_WR);
+            if (!inherited) {
+                ::shutdown(fd, SHUT_WR);
+            }
             ::close(fd);
             fd = -1;
+        }
+        if (shared != nullptr) {
+            ::munmap(shared, sizeof(SharedStreamCounters));
+            shared = nullptr;
+        }
+        if (state_fd >= 0) {
+            ::close(state_fd);
+            state_fd = -1;
         }
     }
 };
@@ -628,8 +733,108 @@ VideoProducer& VideoProducer::operator=(VideoProducer&& other) noexcept {
 }
 VideoProducer::~VideoProducer() { close(); }
 
+core::Result<VideoProducer> VideoProducer::adopt_accepted(int fd, const NegotiatedLimits& limits,
+                                                          int state_fd) {
+    if (!valid_negotiated_limits(limits)) {
+        return Error{ErrorCode::protocol_negotiation_failed};
+    }
+    int accepting{}, type{};
+    sockaddr_un address{};
+    socklen_t address_size = sizeof(address);
+    socklen_t size = sizeof(type);
+    if (::getsockname(fd, reinterpret_cast<sockaddr*>(&address), &address_size) != 0 ||
+        address.sun_family != AF_UNIX ||
+        ::getsockopt(fd, SOL_SOCKET, SO_TYPE, &type, &size) != 0 || type != SOCK_SEQPACKET ||
+        ::getsockopt(fd, SOL_SOCKET, SO_ACCEPTCONN, &accepting, &size) != 0 || accepting ||
+        ::fcntl(fd, F_SETFD, FD_CLOEXEC) != 0) {
+        return io_error();
+    }
+    auto peer = read_peer(fd);
+    if (!peer) {
+        return peer.error();
+    }
+    SharedStreamCounters* counters = nullptr;
+    if (state_fd >= 0) {
+        struct stat info {};
+        const int seals = ::fcntl(state_fd, F_GET_SEALS);
+        if (::fstat(state_fd, &info) != 0 || !S_ISREG(info.st_mode) ||
+            info.st_size < static_cast<off_t>(sizeof(SharedStreamCounters)) ||
+            seals < 0 || (seals & kRequiredStateSeals) != kRequiredStateSeals ||
+            ::fcntl(state_fd, F_SETFD, FD_CLOEXEC) != 0) {
+            return io_error();
+        }
+        void* mapped = ::mmap(nullptr, sizeof(SharedStreamCounters), PROT_READ | PROT_WRITE,
+                              MAP_SHARED, state_fd, 0);
+        if (mapped == MAP_FAILED) {
+            return io_error();
+        }
+        counters = static_cast<SharedStreamCounters*>(mapped);
+        if (counters->magic != kStreamStateMagic || counters->version != kStreamStateVersion) {
+            ::munmap(mapped, sizeof(SharedStreamCounters));
+            return io_error();
+        }
+    }
+    auto impl = std::make_unique<Impl>();
+    impl->fd = fd;
+    impl->state_fd = state_fd;
+    impl->shared = counters;
+    impl->limits = limits;
+    impl->inherited = true;
+    if (counters != nullptr) {
+        impl->last_frame = counters->last_frame.load(std::memory_order_acquire);
+        impl->sequence = counters->next_sequence.load(std::memory_order_acquire);
+    }
+    impl->endpoint = VideoEndpoint{VideoEndpointKind::send_started,
+        static_cast<std::uint32_t>(::getpid()), peer.value().pid, video_monotonic_ns()};
+    return VideoProducer{std::move(impl)};
+}
+
+core::Result<int> VideoProducer::prepare_shared_state() {
+    if (!impl_ || impl_->closed || impl_->fd < 0) {
+        return closed_error();
+    }
+    if (impl_->state_fd >= 0 && impl_->shared != nullptr) {
+        return impl_->state_fd;
+    }
+    auto created = create_sealed_shared_state(impl_->last_frame, impl_->sequence);
+    if (!created) {
+        return created.error();
+    }
+    impl_->state_fd = created.value().fd;
+    impl_->shared = created.value().counters;
+    return impl_->state_fd;
+}
+
+core::Result<VideoProducer> VideoProducer::borrow() {
+    auto state = prepare_shared_state();
+    if (!state) {
+        return state.error();
+    }
+    const int dup_fd = ::fcntl(impl_->fd, F_DUPFD_CLOEXEC, 0);
+    if (dup_fd < 0) {
+        return io_error();
+    }
+    const int dup_state = ::fcntl(state.value(), F_DUPFD_CLOEXEC, 0);
+    if (dup_state < 0) {
+        ::close(dup_fd);
+        return io_error();
+    }
+    auto adopted = adopt_accepted(dup_fd, impl_->limits, dup_state);
+    if (!adopted) {
+        ::close(dup_fd);
+        ::close(dup_state);
+        return adopted.error();
+    }
+    return adopted;
+}
+
 core::Result<SendStatus> VideoProducer::send_access_unit(const VideoSendRequest& request) {
     if (!impl_ || impl_->closed) {
+        return closed_error();
+    }
+    if (impl_->is_retired()) {
+        impl_->partial.active = false;
+        impl_->waiting_idr = true;
         return closed_error();
     }
     if (request.profile && !protocol::valid_video_profile(*request.profile)) {
@@ -653,9 +858,18 @@ core::Result<SendStatus> VideoProducer::send_access_unit(const VideoSendRequest&
     const auto first_sequence = impl_->sequence;
     std::uint64_t send_started_ns{};
     for (std::uint32_t index = 0; index < count; ++index) {
+        if (impl_->is_retired()) {
+            impl_->waiting_idr = true;
+            return closed_error();
+        }
         const auto length = std::min<std::size_t>(
             datagram, request.payload.size() - static_cast<std::size_t>(index) * datagram);
-        VideoFrameHeader header{request.frame, impl_->sequence++, request.timestamp_ns,
+        const auto seq = impl_->sequence++;
+        if (index == 0) {
+            impl_->record_frame_attempt(request.frame);
+        }
+        impl_->record_sequence_attempt(seq + 1);
+        VideoFrameHeader header{request.frame, seq, request.timestamp_ns,
                                 index,          count,
                                 static_cast<std::uint32_t>(request.payload.size()),
                                 static_cast<std::uint32_t>(length), request.idr, request.profile};
@@ -686,6 +900,9 @@ core::Result<SendStatus> VideoProducer::send_access_unit(const VideoSendRequest&
                 ++impl_->backpressure;
                 return SendStatus::dropped_backpressure;
             }
+            if (sent < 0 && is_retirement_send_errno(send_errno) && impl_->is_retired()) {
+                return closed_error();
+            }
             return io_error();
         }
     }
@@ -704,6 +921,11 @@ core::Result<SendStatus> VideoProducer::send_access_unit(const VideoSendRequest&
 
 core::Result<TrySendStatus> VideoProducer::try_send_access_unit(const VideoSendRequest& request) {
     if (!impl_ || impl_->closed) {
+        return closed_error();
+    }
+    if (impl_->is_retired()) {
+        impl_->partial.active = false;
+        impl_->waiting_idr = true;
         return closed_error();
     }
     if (request.profile && !protocol::valid_video_profile(*request.profile)) {
@@ -744,8 +966,17 @@ core::Result<TrySendStatus> VideoProducer::try_send_access_unit(const VideoSendR
     }
 
     for (std::uint32_t index = start_index; index < count; ++index) {
+        if (impl_->is_retired()) {
+            impl_->partial.active = false;
+            impl_->waiting_idr = true;
+            return closed_error();
+        }
         const auto length = std::min<std::size_t>(
             datagram, request.payload.size() - static_cast<std::size_t>(index) * datagram);
+        if (index == 0) {
+            impl_->record_frame_attempt(request.frame);
+        }
+        impl_->record_sequence_attempt(impl_->sequence + 1);
         VideoFrameHeader header{request.frame, impl_->sequence, request.timestamp_ns,
                                 index,          count,
                                 static_cast<std::uint32_t>(request.payload.size()),
@@ -783,6 +1014,9 @@ core::Result<TrySendStatus> VideoProducer::try_send_access_unit(const VideoSendR
         impl_->partial.active = false;
         impl_->waiting_idr = true;
         ++impl_->dropped;
+        if (sent < 0 && is_retirement_send_errno(send_errno) && impl_->is_retired()) {
+            return closed_error();
+        }
         return io_error();
     }
     impl_->partial.active = false;
@@ -842,8 +1076,41 @@ core::Result<SocketBufferResult> VideoProducer::configure_send_buffer(
 }
 
 bool VideoProducer::closed() const noexcept { return !impl_ || impl_->closed; }
+bool VideoProducer::peer_closed() const noexcept {
+    if (!impl_ || impl_->closed || impl_->fd < 0) {
+        return true;
+    }
+    pollfd ready{impl_->fd, static_cast<short>(POLLRDHUP), 0};
+    int status;
+    do {
+        status = ::poll(&ready, 1, 0);
+    } while (status < 0 && errno == EINTR);
+    if (status < 0) {
+        return true;
+    }
+    return status > 0 && (ready.revents & (POLLHUP | POLLRDHUP | POLLERR | POLLNVAL)) != 0;
+}
+bool VideoProducer::retired() const noexcept { return impl_ && impl_->is_retired(); }
 bool VideoProducer::waiting_idr() const noexcept { return !impl_ || impl_->waiting_idr; }
 const NegotiatedLimits& VideoProducer::limits() const noexcept { return impl_->limits; }
+std::uint64_t VideoProducer::last_frame_id() const noexcept {
+    if (!impl_) {
+        return 0;
+    }
+    if (impl_->shared != nullptr) {
+        return impl_->shared->last_frame.load(std::memory_order_acquire);
+    }
+    return impl_->last_frame;
+}
+std::uint64_t VideoProducer::next_sequence() const noexcept {
+    if (!impl_) {
+        return 0;
+    }
+    if (impl_->shared != nullptr) {
+        return impl_->shared->next_sequence.load(std::memory_order_acquire);
+    }
+    return impl_->sequence;
+}
 std::uint64_t VideoProducer::dropped() const noexcept { return impl_->dropped; }
 std::uint64_t VideoProducer::backpressure_events() const noexcept { return impl_->backpressure; }
 int VideoProducer::native_handle() const noexcept { return impl_->fd; }
@@ -997,13 +1264,34 @@ std::uint64_t VideoConsumer::suppressed() const noexcept { return impl_->assembl
 int VideoConsumer::native_handle() const noexcept { return impl_->fd; }
 
 struct VideoServer::Impl final {
+    struct PendingHandshake final {
+        int fd{-1};
+        int state_fd{-1};
+        SharedStreamCounters* shared{nullptr};
+        PeerCredentials peer{};
+        std::chrono::steady_clock::time_point deadline{};
+
+        void close() noexcept {
+            if (fd >= 0) {
+                ::close(fd);
+                fd = -1;
+            }
+            release_shared_state(state_fd, shared);
+            peer = {};
+            deadline = {};
+        }
+    };
+
     int fd{-1};
     VideoSocketPath path{};
     EndpointIdentity identity{};
     VideoServerOptions options{};
     StartupLock lock{};
+    PendingHandshake pending{};
+    std::function<std::chrono::steady_clock::time_point()> clock_for_test{};
     std::uint64_t unauthorized{};
     bool closed{false};
+    bool inherited{false};
 
     Impl() = default;
     ~Impl() { release(); }
@@ -1017,9 +1305,15 @@ struct VideoServer::Impl final {
             return;
         }
         closed = true;
+        pending.close();
         if (fd < 0) {
             // Uninitialized: listen() failed before adopting the listener,
             // so there is no endpoint to clean up and no lock to reacquire.
+            return;
+        }
+        if (inherited) {
+            ::close(fd);
+            fd = -1;
             return;
         }
         // Reacquire the startup lock while the listener is still live so a
@@ -1100,11 +1394,141 @@ core::Result<VideoServer> VideoServer::listen(const VideoSocketPath& path,
     return VideoServer{std::move(impl)};
 }
 
+core::Result<VideoServer> VideoServer::adopt_listener(int fd, const VideoServerOptions& options) {
+    int accepting{}, type{};
+    sockaddr_un address{};
+    socklen_t address_size = sizeof(address);
+    socklen_t size = sizeof(type);
+    if (::getsockname(fd, reinterpret_cast<sockaddr*>(&address), &address_size) != 0 ||
+        address.sun_family != AF_UNIX ||
+        ::getsockopt(fd, SOL_SOCKET, SO_TYPE, &type, &size) != 0 || type != SOCK_SEQPACKET ||
+        ::getsockopt(fd, SOL_SOCKET, SO_ACCEPTCONN, &accepting, &size) != 0 || !accepting ||
+        ::fcntl(fd, F_SETFD, FD_CLOEXEC) != 0) {
+        return io_error();
+    }
+    auto impl = std::make_unique<Impl>();
+    impl->fd = fd;
+    impl->options = options;
+    impl->inherited = true;
+    return VideoServer{std::move(impl)};
+}
+
 core::Result<VideoProducer> VideoServer::accept_consumer(core::Milliseconds timeout) {
+    return accept_consumer(timeout, kHandshakeTimeout);
+}
+
+core::Result<VideoProducer> VideoServer::accept_consumer(core::Milliseconds accept_timeout,
+                                                         core::Milliseconds handshake_timeout) {
     if (!impl_ || impl_->closed) {
         return closed_error();
     }
-    if (auto ready = poll_one(impl_->fd, static_cast<short>(POLLIN), timeout); !ready) {
+    const auto clock_now = [&]() noexcept -> std::chrono::steady_clock::time_point {
+        return impl_->clock_for_test ? impl_->clock_for_test() : std::chrono::steady_clock::now();
+    };
+
+    const auto complete_pending = [&](core::Milliseconds wait,
+                                      bool newly_accepted) -> core::Result<VideoProducer> {
+        const auto now = clock_now();
+        if (!newly_accepted && now >= impl_->pending.deadline) {
+            impl_->pending.close();
+            return Error{ErrorCode::timeout};
+        }
+        const auto remaining_hs = impl_->pending.deadline - now;
+        core::Milliseconds poll_wait{0};
+        if (remaining_hs > std::chrono::steady_clock::duration::zero()) {
+            const auto hs_nanos =
+                std::chrono::duration_cast<std::chrono::nanoseconds>(remaining_hs).count();
+            const std::int64_t hs_ms = std::max<std::int64_t>(1, (hs_nanos + 999'999) / 1'000'000);
+            if (wait.count < 0) {
+                poll_wait = core::Milliseconds{hs_ms};
+            } else {
+                poll_wait = core::Milliseconds{std::min(wait.count, hs_ms)};
+            }
+        }
+        auto ready = await_readable(impl_->pending.fd, poll_wait);
+        if (!ready) {
+            if (ready.error().code() == ErrorCode::timeout) {
+                if (clock_now() >= impl_->pending.deadline) {
+                    impl_->pending.close();
+                }
+                return Error{ErrorCode::timeout};
+            }
+            impl_->pending.close();
+            return ready.error();
+        }
+        if ((!newly_accepted || poll_wait.count > 0) && clock_now() >= impl_->pending.deadline) {
+            impl_->pending.close();
+            return Error{ErrorCode::timeout};
+        }
+        std::array<std::uint8_t, kLimitsRecordBytes> peer_record{};
+        auto got = read_record(impl_->pending.fd, peer_record, core::Milliseconds{0});
+        if (!got) {
+            impl_->pending.close();
+            return got.error();
+        }
+        if (got.value() != kLimitsRecordBytes) {
+            impl_->pending.close();
+            return Error{ErrorCode::protocol_malformed_message};
+        }
+        auto peer_limits = decode_limits_record(peer_record);
+        if (!peer_limits) {
+            impl_->pending.close();
+            return peer_limits.error();
+        }
+        auto negotiated = negotiate_limits(impl_->options.local_limits, peer_limits.value());
+        if (!negotiated) {
+            impl_->pending.close();
+            return negotiated.error();
+        }
+        if (auto budget = set_budget(impl_->pending.fd, negotiated.value().socket_budget_bytes);
+            !budget) {
+            impl_->pending.close();
+            return budget.error();
+        }
+        auto producer_impl = std::make_unique<VideoProducer::Impl>();
+        producer_impl->fd = impl_->pending.fd;
+        producer_impl->state_fd = impl_->pending.state_fd;
+        producer_impl->shared = impl_->pending.shared;
+        producer_impl->limits = negotiated.value();
+        producer_impl->endpoint = VideoEndpoint{VideoEndpointKind::send_started,
+            static_cast<std::uint32_t>(::getpid()), impl_->pending.peer.pid, video_monotonic_ns()};
+        impl_->pending.fd = -1;
+        impl_->pending.state_fd = -1;
+        impl_->pending.shared = nullptr;
+        impl_->pending.peer = {};
+        impl_->pending.deadline = {};
+        return VideoProducer{std::move(producer_impl)};
+    };
+
+    if (impl_->pending.fd >= 0) {
+        return complete_pending(accept_timeout, /*newly_accepted=*/false);
+    }
+
+    const auto call_start = clock_now();
+    const bool has_call_deadline = accept_timeout.count > 0;
+    const auto call_deadline =
+        has_call_deadline
+            ? call_start + std::chrono::milliseconds{
+                               accept_timeout.count > 60000 ? 60000 : accept_timeout.count}
+            : std::chrono::steady_clock::time_point{};
+
+    const auto remaining_call_wait = [&]() noexcept -> core::Milliseconds {
+        if (accept_timeout.count < 0) {
+            return core::Milliseconds{-1};
+        }
+        if (accept_timeout.count == 0) {
+            return core::Milliseconds{0};
+        }
+        const auto remaining = call_deadline - clock_now();
+        if (remaining <= std::chrono::steady_clock::duration::zero()) {
+            return core::Milliseconds{0};
+        }
+        const auto nanos =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(remaining).count();
+        return core::Milliseconds{std::max<std::int64_t>(1, (nanos + 999'999) / 1'000'000)};
+    };
+
+    if (auto ready = poll_one(impl_->fd, static_cast<short>(POLLIN), accept_timeout); !ready) {
         return ready.error();
     }
     int fd;
@@ -1125,22 +1549,125 @@ core::Result<VideoProducer> VideoServer::accept_consumer(core::Milliseconds time
         ::close(fd);
         return authorized.error();
     }
-    auto negotiated =
-        exchange_limits(fd, impl_->options.local_limits, bounded_handshake_timeout(timeout));
-    if (!negotiated) {
-        ::close(fd);
-        return negotiated.error();
+    int state_fd = -1;
+    SharedStreamCounters* shared = nullptr;
+    if (impl_->options.prepare_shared_state) {
+        auto prepared = create_sealed_shared_state();
+        if (!prepared) {
+            ::close(fd);
+            return prepared.error();
+        }
+        state_fd = prepared.value().fd;
+        shared = prepared.value().counters;
     }
-    if (auto budget = set_budget(fd, negotiated.value().socket_budget_bytes); !budget) {
+    std::array<std::uint8_t, kLimitsRecordBytes> record{};
+    encode_limits_record(record, impl_->options.local_limits);
+    if (auto sent = write_record(fd, record, MSG_DONTWAIT); !sent) {
+        release_shared_state(state_fd, shared);
         ::close(fd);
-        return budget.error();
+        return sent.error();
     }
-    auto producer_impl = std::make_unique<VideoProducer::Impl>();
-    producer_impl->fd = fd;
-    producer_impl->limits = negotiated.value();
-    producer_impl->endpoint = VideoEndpoint{VideoEndpointKind::send_started,
-        static_cast<std::uint32_t>(::getpid()), peer.value().pid, video_monotonic_ns()};
-    return VideoProducer{std::move(producer_impl)};
+    const auto hs_budget = bounded_handshake_timeout(handshake_timeout);
+    impl_->pending.fd = fd;
+    impl_->pending.state_fd = state_fd;
+    impl_->pending.shared = shared;
+    impl_->pending.peer = peer.value();
+    impl_->pending.deadline = clock_now() + std::chrono::milliseconds{hs_budget.count};
+    return complete_pending(remaining_call_wait(), /*newly_accepted=*/true);
+}
+
+bool VideoServer::has_pending_handshake() const noexcept {
+    return impl_ && !impl_->closed && impl_->pending.fd >= 0;
+}
+
+void VideoServer::cancel_pending_handshake() noexcept {
+    if (impl_) {
+        impl_->pending.close();
+    }
+}
+
+void VideoServer::set_prepare_shared_state(bool enabled) noexcept {
+    if (impl_) {
+        impl_->options.prepare_shared_state = enabled;
+    }
+}
+
+void VideoServer::set_clock_for_test(
+    std::function<std::chrono::steady_clock::time_point()> clock) {
+    if (impl_) {
+        impl_->clock_for_test = std::move(clock);
+    }
+}
+
+core::Result<std::size_t> VideoServer::drain_queued_connections() noexcept {
+    if (!impl_ || impl_->closed || impl_->fd < 0) {
+        return closed_error();
+    }
+    impl_->pending.close();
+    const int flags = ::fcntl(impl_->fd, F_GETFL, 0);
+    if (flags < 0) {
+        return io_error();
+    }
+    const bool set_nonblock = (flags & O_NONBLOCK) == 0;
+    if (set_nonblock && ::fcntl(impl_->fd, F_SETFL, flags | O_NONBLOCK) != 0) {
+        return io_error();
+    }
+    const auto restore_flags = [&]() noexcept {
+        if (set_nonblock) {
+            (void)::fcntl(impl_->fd, F_SETFL, flags);
+        }
+    };
+    const auto clock_now = [&]() noexcept -> std::chrono::steady_clock::time_point {
+        return impl_->clock_for_test ? impl_->clock_for_test() : std::chrono::steady_clock::now();
+    };
+    constexpr std::size_t kMaxDrain = 32;
+    constexpr auto kDrainTimeBudget = std::chrono::milliseconds{50};
+    const auto deadline = clock_now() + kDrainTimeBudget;
+    std::size_t drained = 0;
+    std::size_t attempts = 0;
+    for (;;) {
+        const int client_fd = ::accept4(impl_->fd, nullptr, nullptr, SOCK_CLOEXEC);
+        if (client_fd >= 0) {
+            ::close(client_fd);
+            ++drained;
+            ++attempts;
+            if (attempts > kMaxDrain) {
+                restore_flags();
+                return io_error();
+            }
+            if (clock_now() >= deadline) {
+                restore_flags();
+                return Error{ErrorCode::timeout};
+            }
+            continue;
+        }
+        const int err = errno;
+        if (err == EAGAIN || err == EWOULDBLOCK) {
+            restore_flags();
+            return drained;
+        }
+        if (err == EINTR) {
+            if (clock_now() >= deadline) {
+                restore_flags();
+                return Error{ErrorCode::timeout};
+            }
+            continue;
+        }
+        if (err == ECONNABORTED) {
+            ++attempts;
+            if (attempts > kMaxDrain) {
+                restore_flags();
+                return io_error();
+            }
+            if (clock_now() >= deadline) {
+                restore_flags();
+                return Error{ErrorCode::timeout};
+            }
+            continue;
+        }
+        restore_flags();
+        return io_error();
+    }
 }
 
 void VideoServer::close() noexcept {

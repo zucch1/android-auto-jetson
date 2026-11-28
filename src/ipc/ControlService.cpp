@@ -28,12 +28,16 @@ void ControlService::teardown(std::string_view reason, DiagnosticSeverity severi
         confirmation_->teardown(consumer);
     }
     if (projection_ == ProjectionState::projecting) {
+        // Unregister and owner loss end a started projection the same way
+        // StopProjection does, standalone wired included (#240 review P3-4).
+        if (stop_legacy_projection_) (void)stop_legacy_projection_();
         projection_ = ProjectionState::stopped;
         events_.emit(StateChanged{ProjectionState::stopped, consumer});
     }
     for (const auto request : gate_.close_all()) {
         phones_.pairing_cancelled(request);
         events_.emit(PairingClosed{request});
+        finalize_pairing_outcome(request, "cancelled");
     }
     registered_.reset();
     open_pairing_.reset();
@@ -99,6 +103,7 @@ void ControlService::refresh_consumer_owner() {
         retire_failed_pairing(registered_->consumer, request, peer);
         (void)gate_.cancel({registered_->consumer, registered_->name}, request);
         events_.emit(PairingClosed{request});
+        finalize_pairing_outcome(request, "expired");
     }
     const auto owner = credentials_.name_owner(registered_->name);
     if (!owner.has_value() || !(owner.value() == registered_->connection)) {
@@ -113,6 +118,7 @@ void ControlService::refresh_consumer_owner() {
             (void)gate_.cancel({registered_->consumer, registered_->name}, request);
             if (open_pairing_ && open_pairing_->request == request) open_pairing_.reset();
             events_.emit(PairingClosed{request});
+            finalize_pairing_outcome(request, "expired");
             events_.emit(DiagnosticEmitted{DiagnosticSeverity::warning, "pairing_expired", request.value});
         }
     }
@@ -188,8 +194,17 @@ core::Result<void> ControlService::start_projection(const BusName& caller) {
     if (!admitted.has_value()) {
         return admitted.error();
     }
-    if (projection_ == ProjectionState::projecting) {
+    if (projection_ == ProjectionState::projecting ||
+        (projection_policy_ && (!projection_policy_->ready ||
+                                (!projection_policy_->wired && !projection_policy_->wireless)))) {
         return Error{ErrorCode::session_illegal_transition};
+    }
+    if (projection_policy_ && projection_policy_->before_start_projection) {
+        if (auto prepared = projection_policy_->before_start_projection(); !prepared) {
+            events_.emit(DiagnosticEmitted{DiagnosticSeverity::error, "projection_start_failed",
+                                           active.value().consumer.value});
+            return prepared.error();
+        }
     }
     projection_ = ProjectionState::projecting;
     events_.emit(StateChanged{ProjectionState::projecting, active.value().consumer});
@@ -207,14 +222,61 @@ core::Result<void> ControlService::stop_projection(const BusName& caller) {
     if (!admitted.has_value()) {
         return admitted.error();
     }
-    if (projection_ == ProjectionState::stopped) {
+    const bool stopped_legacy = stop_legacy_projection_ && stop_legacy_projection_();
+    if (projection_ == ProjectionState::stopped && !stopped_legacy) {
         return Error{ErrorCode::session_illegal_transition};
     }
+    publish_projection_stop(active.value().consumer);
+    return {};
+}
+
+void ControlService::publish_projection_stop(core::ConsumerId consumer) {
     projection_ = ProjectionState::stopped;
     idr_recovery_requested_.store(false);
-    events_.emit(StateChanged{ProjectionState::stopped, active.value().consumer});
-    events_.emit(DiagnosticEmitted{DiagnosticSeverity::info, "projection_stopped",
-                                   active.value().consumer.value});
+    events_.emit(StateChanged{ProjectionState::stopped, consumer});
+    events_.emit(DiagnosticEmitted{DiagnosticSeverity::info, "projection_stopped", consumer.value});
+}
+
+core::Result<void> ControlService::set_projection_mode(const BusName& caller, std::string_view mode) {
+    const auto active = require_consumer();
+    if (!active) return active.error();
+    if (auto admitted = admit(caller, active.value()); !admitted) return admitted.error();
+    if (!projection_policy_) return Error{ErrorCode::session_illegal_transition};
+    if (mode != "pairing_only" && mode != "projection_ready") {
+        return Error{ErrorCode::invalid_argument};
+    }
+    const bool ready = mode == "projection_ready";
+    if (ready && !projection_policy_->ready && projection_policy_->check_ready) {
+        if (auto checked = projection_policy_->check_ready(); !checked) return checked.error();
+    }
+    projection_policy_->ready = ready;
+    if (!ready && projection_ == ProjectionState::projecting) {
+        publish_projection_stop(active.value().consumer);
+    }
+    return {};
+}
+
+core::Result<void> ControlService::set_transport_enabled(const BusName& caller,
+                                                         std::string_view transport, bool enabled) {
+    const auto active = require_consumer();
+    if (!active) return active.error();
+    if (auto admitted = admit(caller, active.value()); !admitted) return admitted.error();
+    if (!projection_policy_) return Error{ErrorCode::session_illegal_transition};
+    ProjectionTransport changed;
+    if (transport == "wired") {
+        projection_policy_->wired = enabled;
+        changed = ProjectionTransport::wired;
+    } else if (transport == "wireless") {
+        projection_policy_->wireless = enabled;
+        changed = ProjectionTransport::wireless;
+    } else {
+        return Error{ErrorCode::invalid_argument};
+    }
+    if (!enabled && projection_ == ProjectionState::projecting &&
+        (projection_policy_->active_transport == changed ||
+         (!projection_policy_->wired && !projection_policy_->wireless))) {
+        publish_projection_stop(active.value().consumer);
+    }
     return {};
 }
 
@@ -246,14 +308,86 @@ StateSnapshot ControlService::state() {
 }
 
 std::map<std::string, std::string> ControlService::capabilities() const {
-    return {
+    std::map<std::string, std::string> result{
         {"contract.interface", std::string{kContractInterface}},
         {"contract.semver", std::string{contract_semver()}},
         {"consumer.exclusive", "true"},
         {"pairing.one_time_request_ids", "true"},
+        {"pairing.outcomes", "true"},
+        {"phones.list", "true"},
         {"display.viewport", "true"},
         {"diagnostics.events", "true"},
     };
+    if (projection_policy_) {
+        result.emplace("projection.mode", "true");
+        result.emplace("projection.mode.current", projection_policy_->ready ? "projection_ready" : "pairing_only");
+        result.emplace("transport.control", "true");
+        result.emplace("transport.wired.enabled", projection_policy_->wired ? "true" : "false");
+        result.emplace("transport.wireless.enabled", projection_policy_->wireless ? "true" : "false");
+    }
+    return result;
+}
+
+core::Result<std::vector<std::map<std::string, std::string>>> ControlService::list_phones(
+    const BusName& caller) {
+    const auto active = require_consumer();
+    if (!active.has_value()) {
+        return active.error();
+    }
+    const auto admitted = admit(caller, active.value());
+    if (!admitted.has_value()) {
+        return admitted.error();
+    }
+    return phones_.list_phones();
+}
+
+core::Result<std::string> ControlService::pairing_outcome(const BusName& caller,
+                                                          core::PairingRequestId request) {
+    const auto active = require_consumer();
+    if (!active.has_value()) {
+        return active.error();
+    }
+    const auto admitted = admit(caller, active.value());
+    if (!admitted.has_value()) {
+        return admitted.error();
+    }
+    if (!request) {
+        return Error{ErrorCode::ipc_malformed_request};
+    }
+    for (const auto& record : pairing_outcomes_) {
+        if (record.request != request) {
+            continue;
+        }
+        if (record.consumer != active.value().consumer) {
+            return Error{ErrorCode::ipc_peer_unauthorized};
+        }
+        return record.outcome;
+    }
+    return Error{ErrorCode::ipc_malformed_request};
+}
+
+void ControlService::record_pairing_pending(core::PairingRequestId request,
+                                            core::ConsumerId consumer) {
+    if (pairing_outcomes_.size() >= PairingGate::kIssuedBudget) {
+        pairing_outcomes_.erase(pairing_outcomes_.begin());
+    }
+    pairing_outcomes_.push_back(PairingOutcomeRecord{request, consumer, "pending", false});
+}
+
+void ControlService::finalize_pairing_outcome(core::PairingRequestId request,
+                                              std::string_view outcome) {
+    for (auto& record : pairing_outcomes_) {
+        if (record.request != request) {
+            continue;
+        }
+        if (record.terminal) {
+            return;
+        }
+        record.outcome = std::string{outcome};
+        record.terminal = true;
+        events_.emit(PairingCompleted{request, record.outcome});
+        return;
+    }
 }
 
 std::uint64_t ControlService::ping() const noexcept {

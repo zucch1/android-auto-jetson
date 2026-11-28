@@ -234,6 +234,46 @@ them prescribes a p99, a rolling mean or a coverage rule.
   speaker output. The physical offset, and even its sign, are unmeasured until
   #58. Keep the bounds symmetric until then; #58 may justify an asymmetric
   window.
+- **Wired playout latency (#228):** `aa-wired-receiver` runs the lossless
+  playout clock by default (`--audio-playout-ms 60`, `--video-delay-ms match`,
+  stop-and-wait `max_unacked 1`, catch-up off). Both audio
+  (`presented_ns - scheduled_ns`) and held video (`completed_ns - scheduled_ns`)
+  include the playout offset (starting at `60` ms, half of wireless's `120` ms),
+  so the signed A/V contract is unchanged while touch-to-photon and each
+  `waiting_idr` recovery episode gain ~`60` ms (leaving ~`940` ms of the `1.0` s
+  `waiting_idr_max` budget). After a burst both grow by the backlog (at most
+  ~`360` ms for a phone's 8 buffered chunks), after a sink stall by the stall,
+  and shrink again at 5-10 ms/s. While a write is blocked past its slot, video
+  whose audio it holds waits with it; the hold then follows the offset the sink
+  really plays with. It is capped at `700` ms (wireless too since `#230`), above which A/V
+  parts by the rest: A/V holds for sink stalls up to about `600` ms. The write in
+  progress during a stall can also lose up to ~`50` ms inside the sink (both
+  `#232`).
+  `--audio-playout-ms 0` restores the legacy arrival-time model. Live wired
+  verification: `docs/qualification/wired-live-qa.md`.
+- **Wired playout depth basis (#228):** `audio_write_completed` of 47 wired A26
+  runs (2026-11-15..17, arrival scheduling, 5.8 h, 488,000 media chunks; the
+  runs that paused the sink on purpose are excluded). The arrival model starts a
+  chunk at its receipt stamp whenever it is late, so the gap before it is its
+  lateness; gaps within 2 s of each other are added up (an upper bound for what
+  one anchor has to ride out). "Sink stall" means the write before the gap
+  completed after its slot: the receiver itself withheld the credit.
+
+  | Lateness episodes | n | p50 | p95 | p99 | max | over 60 ms |
+  | --- | --- | --- | --- | --- | --- | --- |
+  | sink on time | 397 | 3.1 ms | 21.4 ms | 43.3 ms | 69.5 ms | 3 (60.6, 61.2, 69.5 ms) |
+  | after a sink stall | 7 | 41.8 ms | | | 204.7 ms | 2 (85.6, 204.7 ms) |
+
+  All three over-60 ms episodes with the sink on time are from the 2026-11-15
+  builds; the largest since is 43.3 ms. So 60 ms is expected to underrun at
+  most about once in two hours because of the link, and less on current builds. The
+  204.7 ms gap followed a 283.6 ms blocked write whose 249 ms credit deferral
+  held the phone back: the lossless queue (4.4 s per role) now grants that credit
+  on receipt. `--audio-playout-ms 100` would also cover 69.5 and 85.6 ms, at
+  40 ms more latency. These are receipt times on the receiver; USB-side bursts
+  above 8 chunks (the phone's 341 ms capture buffer) were not seen.
+  `WiredDefaultsReplayTheMeasuredStallWithoutLoss` replays the 204.7 ms stall and
+  the 43.3 ms lateness.
 
 Re-analysis of the 2026-11-16 evidence under this contract:
 
@@ -328,9 +368,9 @@ stage.
 
 ## Soak stages: moving-map workload and signed A/V (v3)
 
-From capture `aa-projection-perf-capture/3` and result `aa-projection-perf/3`
-on (#137), every live soak stage (1800 s, then 7200 s) runs the drive smoke's
-workload and is judged by its A/V contract.
+Starting with v3 captures and result `aa-projection-perf/3` (#137), every
+live soak stage (1800 s, then 7200 s) runs the drive smoke's workload and
+is judged by its A/V contract.
 
 **Workload.** `tools/perf/aa_moving_map.py` is the one implementation, shared
 with the drive smoke. Before the receiver starts, the collector resets the
@@ -1182,9 +1222,8 @@ the withdrawn 33 ms gate is **not** restored.
 
 ## Provenance and equivalence
 
-Both runs require capture `aa-projection-perf-capture/3` and result
-`aa-projection-perf/3` (historical runs: `/2`, judged by the v2 contract), with
-`measurement_coverage` policy
+Both runs require v3 captures and result `aa-projection-perf/3` (historical
+runs use `/2` with the v2 contract), with `measurement_coverage` policy
 `active-window-coverage/1`. V1 results remain explicitly validatable against
 their unchanged schema, not automatically qualified as v2. Independently parse
 coverage after export removes the capture: labels/hashes alone prove neither

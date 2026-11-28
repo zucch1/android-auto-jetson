@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Exercise the actual harness adapters, not copies of their logging logic.
 #include <chrono>
+#include <cmath>
 #include <atomic>
 #include <condition_variable>
 #include <future>
@@ -200,6 +201,7 @@ class ObservedSessionMutex {
 
 #include "harness.hpp"
 #include "../../tools/wired-enrol/EnrolFlow.hpp"
+#include "../../tools/wireless-receiver/ManagedVideo.hpp"
 #include <aa/ipc/ControlBusClient.hpp>
 #include "../session/Fakes.hpp"
 #include "../video_socket/pair.hpp"
@@ -1312,7 +1314,15 @@ std::atomic<int> runtime_connects{0};
 std::atomic<int> runtime_ciphers{0};
 std::atomic<int> runtime_sends{0};
 bool runtime_recovers = false;
+int runtime_wait_on_open_attempt = 0;
+int runtime_fake_usb_from_attempt = 0;
+std::atomic<bool> runtime_open_wait_started{false};
+std::atomic<bool> runtime_open_wait_cancelled{false};
+std::chrono::milliseconds runtime_reenumeration_delay{0};
+std::chrono::steady_clock::time_point runtime_link_lost_at;
 bool runtime_quiet = false;
+// Every open attempt gets a fresh link (resumed sessions, #240 review P2-1).
+bool runtime_links_every_attempt = false;
 std::atomic<bool> runtime_waiting{false};
 std::atomic<bool> runtime_closed{false};
 std::mutex runtime_owner_mutex;
@@ -1623,6 +1633,9 @@ struct AdmissionState final {
     std::size_t served = 0;
     bool created = false;
     bool closed = false;
+    // False: the owner thread stays inside the wait for input (no checkpoint,
+    // no poll return), so held video can leave only through the outlet's timer.
+    bool checkpoints = true;
 };
 
 class AdmissionTransport final : public aa::transport::Transport {
@@ -1655,7 +1668,7 @@ class AdmissionTransport final : public aa::transport::Transport {
                 state_->cv.notify_all();
                 return frame;
             }
-            if (checkpoint_) {
+            if (checkpoint_ && state_->checkpoints) {
                 lock.unlock();
                 checkpoint_();
                 lock.lock();
@@ -1664,6 +1677,26 @@ class AdmissionTransport final : public aa::transport::Transport {
             if (token_.stop_requested()) {
                 return aa::Error{aa::ErrorCode::cancelled};
             }
+        }
+    }
+    // Used while video is held or audio is outstanding, as by the USB transport.
+    aa::core::Result<std::optional<std::vector<std::byte>>>
+    poll_receive(aa::core::Deadline::Clock::time_point until) override {
+        std::unique_lock lock(state_->mutex);
+        for (;;) {
+            if (state_->closed) { return aa::Error{aa::ErrorCode::transport_closed}; }
+            if (token_.stop_requested()) { return aa::Error{aa::ErrorCode::cancelled}; }
+            if (state_->served < state_->inbound.size()) {
+                auto frame = state_->inbound[state_->served];
+                ++state_->served;
+                lock.unlock();
+                state_->cv.notify_all();
+                return std::optional{std::move(frame)};
+            }
+            if (state_->checkpoints && aa::core::Deadline::Clock::now() >= until) {
+                return std::optional<std::vector<std::byte>>{};
+            }
+            state_->cv.wait_for(lock, token_, std::chrono::milliseconds{2}, [] { return false; });
         }
     }
     void close() noexcept override {
@@ -1680,25 +1713,39 @@ class AdmissionTransport final : public aa::transport::Transport {
 std::shared_ptr<AdmissionState> admission_link_state;
 }
 
+// Redirect only the adapter's dlopen in the fake USB recovery case. AASDK
+// still links its usual libusb dependency at process startup.
+extern "C" void *__real_dlopen(const char *filename, int flags);
+extern "C" void *__wrap_dlopen(const char *filename, int flags) {
+    if (runtime_fake_usb_from_attempt > 0 && filename &&
+        (std::strcmp(filename, "libusb-1.0.so.0") == 0 ||
+         std::strcmp(filename, "libusb-1.0.so") == 0)) {
+        return __real_dlopen(AA_FAKE_LIBUSB_PATH, flags);
+    }
+    return __real_dlopen(filename, flags);
+}
+
 // Link-time seams keep the real CLI/thread loop under test without USB or audio hardware.
 aa::core::Result<aa::app::WiredLink>
 real_open_link(const aa::transport::UsbDeviceSelector &, const aa::transport::AoaAccessoryInfo &,
                const aa::trust::TrustStore &, const aa::core::Deadline &,
-               aa::trust::WiredIdentity *)
-    asm("__real__ZN2aa3app15open_wired_linkERKNS_9transport17UsbDeviceSelectorERKNS1_16AoaAccessoryInfoERKNS_5trust10TrustStoreERKNS_4core8DeadlineEPNS8_13WiredIdentityE");
+               aa::trust::WiredIdentity *, aa::transport::AoaRecovery *)
+    asm("__real__ZN2aa3app15open_wired_linkERKNS_9transport17UsbDeviceSelectorERKNS1_16AoaAccessoryInfoERKNS_5trust10TrustStoreERKNS_4core8DeadlineEPNS8_13WiredIdentityEPNS1_11AoaRecoveryE");
 aa::core::Result<aa::app::WiredLink>
 runtime_open_link(const aa::transport::UsbDeviceSelector &, const aa::transport::AoaAccessoryInfo &,
                   const aa::trust::TrustStore &, const aa::core::Deadline &,
-                  aa::trust::WiredIdentity *)
-    asm("__wrap__ZN2aa3app15open_wired_linkERKNS_9transport17UsbDeviceSelectorERKNS1_16AoaAccessoryInfoERKNS_5trust10TrustStoreERKNS_4core8DeadlineEPNS8_13WiredIdentityE");
+                  aa::trust::WiredIdentity *, aa::transport::AoaRecovery *)
+    asm("__wrap__ZN2aa3app15open_wired_linkERKNS_9transport17UsbDeviceSelectorERKNS1_16AoaAccessoryInfoERKNS_5trust10TrustStoreERKNS_4core8DeadlineEPNS8_13WiredIdentityEPNS1_11AoaRecoveryE");
 aa::core::Result<aa::app::WiredLink>
 runtime_open_link(const aa::transport::UsbDeviceSelector &selector,
                   const aa::transport::AoaAccessoryInfo &info,
                   const aa::trust::TrustStore &store, const aa::core::Deadline &deadline,
-                  aa::trust::WiredIdentity *attempted_identity) {
+                  aa::trust::WiredIdentity *attempted_identity,
+                  aa::transport::AoaRecovery *recovery) {
     const int attempt = ++runtime_connects;
-    if (runtime_real_admission) {
-        return real_open_link(selector, info, store, deadline, attempted_identity);
+    if (runtime_real_admission ||
+        (runtime_fake_usb_from_attempt > 0 && attempt >= runtime_fake_usb_from_attempt)) {
+        return real_open_link(selector, info, store, deadline, attempted_identity, recovery);
     }
     if (admission_link_state) {
         if (attempt != 1) {
@@ -1712,7 +1759,25 @@ runtime_open_link(const aa::transport::UsbDeviceSelector &selector,
         admission_link_state->cv.notify_all();
         return aa::app::WiredLink{std::move(transport), runtime_phone};
     }
-    if (attempt == 1 || (runtime_recovers && attempt >= 4)) {
+    if (attempt == 2) {
+        runtime_link_lost_at = std::chrono::steady_clock::now();
+    }
+    if (attempt == runtime_wait_on_open_attempt) {
+        if (attempt > 1) {
+            EXPECT_LE(deadline.until - aa::core::Deadline::Clock::now(), std::chrono::seconds{1});
+        }
+        std::mutex mutex;
+        std::condition_variable_any cv;
+        std::unique_lock lock(mutex);
+        runtime_open_wait_started.store(true);
+        cv.wait_until(lock, deadline.cancellation, deadline.until, [] { return false; });
+        const bool cancelled = deadline.cancellation.stop_requested();
+        runtime_open_wait_cancelled.store(cancelled);
+        return aa::Error{cancelled ? aa::ErrorCode::cancelled : aa::ErrorCode::timeout};
+    }
+    if (attempt == 1 || runtime_links_every_attempt ||
+        (runtime_recovers && attempt >= 4 &&
+         std::chrono::steady_clock::now() - runtime_link_lost_at >= runtime_reenumeration_delay)) {
         const auto &phone = attempt >= 4 && !runtime_reconnect_phone.key.empty()
                                 ? runtime_reconnect_phone : runtime_phone;
         return aa::app::WiredLink{std::make_unique<RuntimeTransport>(attempt == 1), phone};
@@ -2515,6 +2580,78 @@ TEST(WiredReceiver, TransientLinkLossRetriesUntilFreshSessionRecovers) {
         << result.output;
 }
 
+TEST(WiredReceiver, DefaultReconnectWindowSurvivesSlowUsbReenumeration) {
+    runtime_reenumeration_delay = std::chrono::milliseconds{5'200};
+    const auto result = run_runtime(true, 9'000);
+    runtime_reenumeration_delay = std::chrono::milliseconds{0};
+
+    EXPECT_EQ(result.code, 0) << result.output;
+    EXPECT_EQ(runtime_ciphers.load(), 2);
+    const auto active = result.output.find("\"to_state\":\"active\"");
+    ASSERT_NE(active, std::string::npos) << result.output;
+    EXPECT_NE(result.output.find("\"to_state\":\"active\"", active + 1), std::string::npos)
+        << result.output;
+}
+
+void check_signal_interrupts_link_open(int attempt) {
+    runtime_wait_on_open_attempt = attempt;
+    runtime_open_wait_started.store(false);
+    runtime_open_wait_cancelled.store(false);
+    auto run = std::async(std::launch::async, [] { return run_runtime(false, 3'000); });
+    const auto ready_by = std::chrono::steady_clock::now() + std::chrono::seconds{2};
+    while (!runtime_open_wait_started.load() && std::chrono::steady_clock::now() < ready_by) {
+        std::this_thread::sleep_for(std::chrono::milliseconds{1});
+    }
+    const bool waiting = runtime_open_wait_started.load();
+    const auto sent = std::chrono::steady_clock::now();
+    if (waiting) {
+        EXPECT_EQ(::raise(SIGTERM), 0);
+    }
+    const auto result = run.get();
+    const auto elapsed = std::chrono::steady_clock::now() - sent;
+    runtime_wait_on_open_attempt = 0;
+
+    EXPECT_TRUE(waiting) << result.output;
+    EXPECT_TRUE(runtime_open_wait_cancelled.load()) << result.output;
+    EXPECT_EQ(result.code, 0) << result.output;
+    EXPECT_EQ(runtime_connects.load(), attempt);
+    EXPECT_LT(elapsed, std::chrono::seconds{2});
+}
+
+TEST(WiredReceiver, ShutdownInterruptsAReconnectWaitingForReenumeration) {
+    check_signal_interrupts_link_open(2);
+}
+
+TEST(WiredReceiver, ShutdownInterruptsStartupOpen) {
+    check_signal_interrupts_link_open(1);
+}
+
+TEST(WiredReceiverUsbRecovery, FailedResetIsIssuedOnlyOnceAcrossReconnectAttempts) {
+    char directory[] = "/tmp/wired-usb-reset-XXXXXX";
+    const std::filesystem::path root{::mkdtemp(directory)};
+    const auto log_path = root / "usb.calls";
+    ASSERT_EQ(::setenv("AA_FAKE_LIBUSB_SCENARIO", "reset-fails", 1), 0);
+    ASSERT_EQ(::setenv("AA_FAKE_LIBUSB_LOG", log_path.c_str(), 1), 0);
+    runtime_fake_usb_from_attempt = 2;
+    runtime_extra_args = {"--reconnect-ms", "1500"};
+    const auto result = run_runtime(false, 3'000);
+    runtime_extra_args.clear();
+    runtime_fake_usb_from_attempt = 0;
+    ::unsetenv("AA_FAKE_LIBUSB_LOG");
+    ::unsetenv("AA_FAKE_LIBUSB_SCENARIO");
+
+    std::ifstream log{log_path};
+    const std::string calls{std::istreambuf_iterator<char>{log}, {}};
+    std::filesystem::remove_all(root);
+    EXPECT_EQ(result.code, 1) << result.output;
+    EXPECT_GE(runtime_connects.load(), 4);
+    EXPECT_EQ(count_substr(calls, "libusb_reset_device"), 1U) << calls;
+    EXPECT_EQ(count_substr(result.output, "\"detail\":\"aoa_reset\""), 2U) << result.output;
+    EXPECT_NE(result.output.find("\"status\":\"issued\""), std::string::npos) << result.output;
+    EXPECT_NE(result.output.find("\"status\":\"transport_io\""), std::string::npos) << result.output;
+    EXPECT_EQ(result.output.find("\"port\":\"1-2.1\""), std::string::npos) << result.output;
+}
+
 TEST(WiredReceiver, RequiredUsbSerialAdmitsTheSamePhoneAcrossReconnects) {
     // Given the qualification pin naming the attached phone's USB serial.
     runtime_extra_args = {"--require-usb-serial", "SYNTHETIC"};
@@ -2563,11 +2700,26 @@ TEST(WiredReceiver, RequiredUsbSerialMustNotBeEmpty) {
 }
 
 TEST(WiredReceiver, PermanentLinkLossExitsNonzeroWithinWiredRecoveryBudget) {
-    const auto result = run_runtime(false);
+    runtime_extra_args = {"--reconnect-ms", "300"};
+    const auto result = run_runtime(false, 2'000);
+    runtime_extra_args.clear();
+
     EXPECT_EQ(result.code, 1) << "dead session returned clean success: " << result.output;
-    EXPECT_GE(runtime_connects.load(), 3);
+    EXPECT_GE(runtime_connects.load(), 2);
     EXPECT_EQ(runtime_ciphers.load(), 1);
-    EXPECT_LT(result.elapsed, std::chrono::milliseconds{5500});
+    EXPECT_LT(result.elapsed, std::chrono::seconds{2});
+    EXPECT_NE(result.output.find("\"to_state\":\"failed\""), std::string::npos) << result.output;
+}
+
+TEST(WiredReceiver, InvalidReconnectWindowIsAUsageError) {
+    for (const auto *value : {"0", "-1", "120001", "5000ms", ""}) {
+        SCOPED_TRACE(value);
+        runtime_extra_args = {"--reconnect-ms", value};
+        const auto result = run_runtime(false);
+        runtime_extra_args.clear();
+        EXPECT_EQ(result.code, 2);
+        EXPECT_EQ(runtime_connects.load(), 0);
+    }
 }
 
 TEST(WiredReceiver, ActiveFramesShutdownOrdersStopAndReset) {
@@ -2736,7 +2888,7 @@ TEST(WiredReceiver, ActiveFramesShutdownOrdersStopAndReset) {
     }
 }
 
-TEST(WiredReceiver, ForgetPhoneUsesOwnerQueueAndDisconnectsQuietSession) {
+void check_forget_phone_during_session(bool reconnecting) {
     namespace bus = aa::ipc::dbus_adapter;
     namespace faults = aa::trust::test::faults;
     char directory[] = "/tmp/wired-revoke-runtime-XXXXXX";
@@ -2749,7 +2901,9 @@ TEST(WiredReceiver, ForgetPhoneUsesOwnerQueueAndDisconnectsQuietSession) {
     const auto approved = initial.approve(aa::trust::TransportIdentity{identity});
     ASSERT_TRUE(approved.has_value());
     runtime_phone = aa::app::wired_phone_identity(identity).value();
-    runtime_quiet = true;
+    runtime_quiet = !reconnecting;
+    runtime_wait_on_open_attempt = reconnecting ? 2 : 0;
+    runtime_open_wait_started.store(false);
     runtime_recovers = false;
     runtime_connects.store(0);
     runtime_ciphers.store(0);
@@ -2786,15 +2940,19 @@ TEST(WiredReceiver, ForgetPhoneUsesOwnerQueueAndDisconnectsQuietSession) {
         }
     });
     const auto until = std::chrono::steady_clock::now() + std::chrono::seconds{2};
-    while (!runtime_waiting.load() && std::chrono::steady_clock::now() < until) {
+    const auto waiting = [&] {
+        return reconnecting ? runtime_open_wait_started.load() : runtime_waiting.load();
+    };
+    while (!waiting() && std::chrono::steady_clock::now() < until) {
         std::this_thread::sleep_for(std::chrono::milliseconds{1});
     }
-    const bool was_quiet = runtime_waiting.load();
+    const bool was_waiting = waiting();
     auto client = bus::BusConnection::connect_session();
     aa::core::Result<bus::ParsedMessage> reply{aa::Error{aa::ErrorCode::internal}};
     bool registered = false;
     bool closed_at_reply = false;
-    if (client && was_quiet) {
+    std::chrono::steady_clock::duration forget_elapsed{};
+    if (client && was_waiting) {
         const aa::ipc::BusName consumer{"org.custom.AndroidAutoReceiverTest.Consumer"};
         const aa::ipc::BusName service{"org.custom.AndroidAutoReceiver"};
         auto named = client.value().request_name(consumer);
@@ -2814,9 +2972,11 @@ TEST(WiredReceiver, ForgetPhoneUsesOwnerQueueAndDisconnectsQuietSession) {
                 forget.destination(service.value).path("/org/custom/AndroidAutoReceiver")
                     .interface_name("org.custom.AndroidAutoReceiver1").member("ForgetPhone")
                     .body_signature("t").put_u64(approved.value().value);
+                const auto began = std::chrono::steady_clock::now();
                 auto sent = client.value().send_message(bus::MessageType::method_call, forget);
                 if (sent) {
                     reply = client.value().await_reply(sent.value(), owner.value());
+                    forget_elapsed = std::chrono::steady_clock::now() - began;
                     closed_at_reply = runtime_closed.load();
                 }
             }
@@ -2832,7 +2992,9 @@ TEST(WiredReceiver, ForgetPhoneUsesOwnerQueueAndDisconnectsQuietSession) {
     faults::set_observer({});
     faults::disarm();
     EXPECT_FALSE(watchdog_fired.load()) << output;
-    EXPECT_TRUE(was_quiet);
+    runtime_wait_on_open_attempt = 0;
+    runtime_quiet = false;
+    EXPECT_TRUE(was_waiting);
     EXPECT_TRUE(registered);
     ASSERT_TRUE(reply.has_value()) << output;
     EXPECT_EQ(reply.value().type, bus::MessageType::error_reply);
@@ -2840,10 +3002,17 @@ TEST(WiredReceiver, ForgetPhoneUsesOwnerQueueAndDisconnectsQuietSession) {
     EXPECT_EQ(external_error.read_string().value(), aa::Error{aa::ErrorCode::helper_unavailable}.message());
     EXPECT_TRUE(closed_at_reply);
     EXPECT_EQ(code, 1) << output;
-    EXPECT_EQ(runtime_connects.load(), 1);
+    if (reconnecting) {
+        EXPECT_GE(runtime_connects.load(), 2);
+        EXPECT_LT(forget_elapsed, std::chrono::seconds{2});
+    } else {
+        EXPECT_EQ(runtime_connects.load(), 1);
+    }
     EXPECT_EQ(runtime_ciphers.load(), 1);
     EXPECT_NE(output.find("\"to_state\":\"failed\""), std::string::npos) << output;
-    EXPECT_EQ(output.find("\"detail\":\"poll\""), std::string::npos) << output;
+    if (!reconnecting) {
+        EXPECT_EQ(output.find("\"detail\":\"poll\""), std::string::npos) << output;
+    }
     ASSERT_FALSE(mutations.empty());
     {
         const std::lock_guard lock(runtime_owner_mutex);
@@ -2858,7 +3027,14 @@ TEST(WiredReceiver, ForgetPhoneUsesOwnerQueueAndDisconnectsQuietSession) {
     ASSERT_TRUE(persisted.load().has_value());
     EXPECT_EQ(persisted.lookup(runtime_phone), aa::trust::Decision::unknown);
     std::filesystem::remove_all(root);
-    runtime_quiet = false;
+}
+
+TEST(WiredReceiver, ForgetPhoneUsesOwnerQueueAndDisconnectsQuietSession) {
+    check_forget_phone_during_session(false);
+}
+
+TEST(WiredReceiver, ForgetPhoneCompletesDuringReconnectOpen) {
+    check_forget_phone_during_session(true);
 }
 
 struct RequiredRun {
@@ -3309,6 +3485,9 @@ TEST(WiredReceiver, RequiredVideoConsumerAdmissionDeliversSoleInitialConfigIdr) 
     g_running.store(true);
     auto state = std::make_shared<AdmissionState>();
     admission_link_state = state;
+    struct AdmissionStateReset {
+        ~AdmissionStateReset() { admission_link_state.reset(); }
+    } admission_reset;
     std::vector<std::string> args{"receiver", "--port", "1-2.1", "--no-bus", "--store",
         store_path.string(), "--video-socket", (root / "video").string(), "--input-socket",
         (root / "input").string(), "--duration-ms", "6000", "--require-video-consumer"};
@@ -3411,6 +3590,7 @@ TEST(WiredReceiver, RequiredVideoConsumerAdmissionDeliversSoleInitialConfigIdr) 
         EXPECT_FALSE(connected.value().access_unit().idr);
         EXPECT_EQ(connected.value().access_unit().payload, p_frame);
     }
+    g_running.store(false);
     guard.worker.join();
     const auto output = capture.release();
     admission_link_state.reset();
@@ -3424,6 +3604,126 @@ TEST(WiredReceiver, RequiredVideoConsumerAdmissionDeliversSoleInitialConfigIdr) 
                                      << output;
     EXPECT_NE(output.find("\"to_state\":\"active\""), std::string::npos) << output;
     std::filesystem::remove_all(root);
+}
+
+// #228: the receiver as started by default holds every video unit for the
+// playout depth before its consumer sees it, and releases it on the outlet's
+// own timer (no checkpoint runs, no further input arrives). --video-delay-ms 0
+// is the control: the same units arrive well inside the hold.
+TEST(WiredReceiver, DefaultReceiverHoldsVideoForTheWiredPlayoutDepth) {
+    namespace p = aa::protocol;
+    namespace tr = aa::transport;
+    const auto depth = std::chrono::nanoseconds{aa::audio::kWiredPlayoutDepth.count};
+    for (const bool held : {true, false}) {
+        SCOPED_TRACE(held);
+        char directory[] = "/tmp/wired-hold-XXXXXX";
+        const std::filesystem::path root{::mkdtemp(directory)};
+        const auto store_path = root / "approved.json";
+        aa::trust::ApprovedPhoneStore store{store_path};
+        ASSERT_TRUE(store.load().has_value());
+        const aa::trust::WiredIdentity identity{
+            "04e8", "6860", "SYNTHETIC", "TEST", "TEST", "SYNTHETIC", "1-2.1"};
+        ASSERT_TRUE(store.approve(aa::trust::TransportIdentity{identity}).has_value());
+        runtime_phone = aa::app::wired_phone_identity(identity).value();
+        runtime_recovers = false;
+        runtime_quiet = false;
+        runtime_connects.store(0);
+        runtime_ciphers.store(0);
+        runtime_sends.store(0);
+        g_running.store(true);
+        auto state = std::make_shared<AdmissionState>();
+        admission_link_state = state;
+        struct AdmissionStateReset {
+            ~AdmissionStateReset() { admission_link_state.reset(); }
+        } admission_reset;
+        std::vector<std::string> args{"receiver", "--port", "1-2.1", "--no-bus", "--store",
+            store_path.string(), "--video-socket", (root / "video").string(), "--input-socket",
+            (root / "input").string(), "--duration-ms", "8000"};
+        if (!held) { args.insert(args.end(), {"--video-delay-ms", "0"}); }
+        std::vector<char *> argv;
+        argv.reserve(args.size());
+        for (auto &arg : args) { argv.push_back(arg.data()); }
+        StdoutCaptureGuard capture;
+        int code = -1;
+        ReceiverRunGuard guard;
+        guard.worker = std::thread(
+            [&] { code = wired_receiver_main(static_cast<int>(argv.size()), argv.data()); });
+        {
+            std::unique_lock lock(state->mutex);
+            ASSERT_TRUE(state->cv.wait_for(lock, std::chrono::seconds{3}, [&] { return state->created; }));
+        }
+        auto cipher = active_test_cipher();
+        const auto push_plain = [&](const std::vector<std::byte> &frame) {
+            const std::lock_guard lock(state->mutex);
+            state->inbound.push_back(frame);
+            state->cv.notify_all();
+        };
+        const auto push_media = [&](std::vector<std::byte> payload) {
+            auto frames = tr::encode_message(
+                {std::uint8_t{99}, tr::MessageKind::specific, std::move(payload)},
+                tr::Encryption::encrypted, cipher.get());
+            ASSERT_TRUE(frames.has_value());
+            const std::lock_guard lock(state->mutex);
+            for (auto &frame : frames.value()) { state->inbound.push_back(std::move(frame)); }
+            state->cv.notify_all();
+        };
+        const auto unit = [](std::byte type) {
+            return std::vector<std::byte>{std::byte{0}, std::byte{0}, std::byte{0}, std::byte{1},
+                                          type, std::byte{0x88}};
+        };
+        std::vector<std::byte> config_message{std::byte{0x00}, std::byte{0x01}};
+        for (const auto byte : unit(std::byte{0x67})) { config_message.push_back(byte); }
+        auto connected = aa::ipc::connect_video_consumer(
+            aa::ipc::VideoSocketPath{(root / "video").string()},
+            aa::ipc::VideoClientOptions{{}, aa::ipc::current_uid(), aa::core::Milliseconds{3000}});
+        ASSERT_TRUE(connected.has_value());
+        push_plain(wiredtest::control_frame(p::encode(p::VersionResponse{1, 6, 0}).value()));
+        push_plain(wiredtest::control_frame(p::encode(p::EncapsulatedSsl{{std::byte{1}}}).value()));
+        push_plain(wiredtest::discovery_request_frame());
+        push_plain(wiredtest::open_request_frame(99));
+        push_media(p::encode(p::AvSinkSetup{p::AvSinkCodec::h264}).value());
+        push_media(p::encode(p::AvSinkStart{-7, 0}).value());
+        push_media(config_message);
+        push_media(av_data_message(0x1111, unit(std::byte{0x65})));
+        const auto receive = [&]() -> bool {
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{3};
+            while (std::chrono::steady_clock::now() < deadline) {
+                const auto status = connected.value().receive(Milliseconds{500});
+                if (!status.has_value()) { return false; }
+                if (status.value() == aa::ipc::ReceiveStatus::complete) { return true; }
+            }
+            return false;
+        };
+        ASSERT_TRUE(receive());
+        // From here the owner's checkpoint is silent.
+        {
+            const std::lock_guard lock(state->mutex);
+            state->checkpoints = false;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds{50});
+        std::chrono::nanoseconds fastest = std::chrono::seconds{9};
+        for (int frame = 0; frame < 5; ++frame) {
+            const auto pushed = std::chrono::steady_clock::now();
+            push_media(av_data_message(0x2222U + static_cast<std::uint64_t>(frame), unit(std::byte{0x41})));
+            ASSERT_TRUE(receive()) << frame;
+            fastest = std::min<std::chrono::nanoseconds>(fastest, std::chrono::steady_clock::now() - pushed);
+        }
+        if (held) {
+            EXPECT_GE(fastest, depth); // never early, whatever the host does
+            EXPECT_LT(fastest, depth + std::chrono::milliseconds{50});
+        } else {
+            EXPECT_LT(fastest, depth);
+        }
+        g_running.store(false);
+        {
+            const std::lock_guard lock(state->mutex);
+            state->closed = true;
+            state->cv.notify_all();
+        }
+        guard.worker.join();
+        (void)capture.release();
+        std::filesystem::remove_all(root);
+    }
 }
 
 struct RenderGate {
@@ -3445,6 +3745,8 @@ struct RenderGate {
     std::vector<std::int64_t> entered_ns;
     std::vector<std::int64_t> completed_ns;
     std::vector<std::size_t> completed_writes; // 1-based write number of each success
+    std::function<std::int64_t()> clock; // the output clock: what is stamped before it is not heard
+    std::vector<std::int64_t> clock_ns;
     void release() {
         std::lock_guard lock(mutex);
         released = true;
@@ -3469,6 +3771,7 @@ class GatedRenderSink final : public aa::audio::detail::ObservedAudioSink {
         const auto index = ++gate_->writes;
         gate_->pcm.emplace_back(chunk.pcm.begin(), chunk.pcm.end());
         gate_->timestamps.push_back(chunk.timestamp);
+        if (gate_->clock) { gate_->clock_ns.push_back(gate_->clock()); }
         gate_->threads.push_back(std::this_thread::get_id());
         gate_->cv.notify_all();
         gate_->entered_ns.push_back(steady_ns());
@@ -3526,7 +3829,9 @@ TEST(WiredReceiver, WorkerFirstFailureContextFreezesRenderAndSubmitIdentityThrou
     for (const bool negative : {false, true}) {
         SCOPED_TRACE(negative);
         auto gate = std::make_shared<RenderGate>();
-        ConcreteAudioRenderWorker audio{pcm_router_config(), gated_router(gate)};
+        ConcreteAudioRenderWorker audio{
+        pcm_router_config(aa::audio::SinkBackend::pulse, aa::core::Nanoseconds{0}),
+        gated_router(gate)};
         ASSERT_TRUE(audio.ready());
         const auto role = aa::protocol::ChannelRole::media_audio;
         const std::vector<std::byte> pcm(960, std::byte{1});
@@ -3625,7 +3930,9 @@ TEST(WiredReceiver, WorkerSubmitFailureNeverAttachesStaleRouterRenderSnapshot) {
     auto gate = std::make_shared<RenderGate>();
     const auto role = aa::protocol::ChannelRole::media_audio;
     const std::vector<std::byte> pcm(960, std::byte{1});
-    ConcreteAudioRenderWorker audio{pcm_router_config(), [&](const auto& config) {
+    ConcreteAudioRenderWorker audio{
+        pcm_router_config(aa::audio::SinkBackend::pulse, aa::core::Nanoseconds{0}),
+        [&](const auto& config) {
         auto opened = gated_router(gate)(config);
         if (opened) {
             EXPECT_TRUE(opened.value().submit({{role, 1, {1'000'000'000}}, pcm}));
@@ -3664,7 +3971,9 @@ TEST(WiredReceiver, WorkerRenderFailureMatchesFullHeaderAndOmitsAmbiguousDispatc
     for (const bool ambiguous : {false, true}) {
         SCOPED_TRACE(ambiguous);
         auto gate = std::make_shared<RenderGate>();
-        ConcreteAudioRenderWorker audio{pcm_router_config(), gated_router(gate)};
+        ConcreteAudioRenderWorker audio{
+        pcm_router_config(aa::audio::SinkBackend::pulse, aa::core::Nanoseconds{0}),
+        gated_router(gate)};
         ASSERT_TRUE(audio.ready());
         const auto role = aa::protocol::ChannelRole::media_audio;
         const std::vector<std::byte> pcm(960, std::byte{1});
@@ -3799,8 +4108,14 @@ TEST(WiredReceiver, ActualMainPollReportsWorkerOversizeOriginWithoutChangingErro
 }
 
 TEST(WiredReceiver, ActualMainTransientStallIndependentCadenceAndWorstCaseBurst) {
+    // Default (lossless, #228): the phone's credit is never withheld by these
+    // stalls. --audio-playout-ms 0 keeps the arrival model's stop-and-wait
+    // accounting (no burst case: without catch-up it fails late by design).
+    for (const bool lossless : {true, false})
     for (const int stall_ms : {0, 50, 100, 150, 200, 250, 300, -50}) {
+        if (!lossless && stall_ms < 0) { continue; }
         SCOPED_TRACE(stall_ms);
+        SCOPED_TRACE(lossless);
         CadencedPcmSource source;
         source.burst = stall_ms < 0; // Deliberately ACK-paced worst-case, NOT normal PCM cadence.
         // 8 chunks put the last arrival only ~200 ms behind the cursor (step-size
@@ -3812,27 +4127,33 @@ TEST(WiredReceiver, ActualMainTransientStallIndependentCadenceAndWorstCaseBurst)
         runtime_pcm_source = &source;
         runtime_audio_ack_attempts.store(0);
         runtime_sink_override = [gate] { return std::make_unique<GatedRenderSink>(gate); };
+        if (!lossless) { runtime_extra_args = {"--audio-playout-ms", "0"}; }
         const auto result = run_runtime(false, 450, true);
+        runtime_extra_args.clear();
         runtime_sink_override = {};
         runtime_pcm_source = nullptr;
         runtime_send_audio = false;
-        // Third queued chunk of one role arrives before the stalled first
-        // write returns: its credit is withheld instead of over-admitting.
-        const bool deferred = std::abs(stall_ms) >= 100 || source.burst;
+        // Arrival model: the third queued chunk of one role arrives before the
+        // stalled first write returns, so its credit is withheld instead of
+        // over-admitting.
+        const bool deferred = !lossless && std::abs(stall_ms) >= 100;
         EXPECT_FALSE(gate->timed_out);
         EXPECT_EQ(runtime_connects.load(), 1);
         EXPECT_EQ(result.output.find("ipc_queue_full"), std::string::npos) << result.output;
         EXPECT_EQ(result.output.find("\"event\":\"audio_credit_deferred\"") != std::string::npos,
                   deferred) << result.output;
         if (source.burst) {
-            // Credit pacing holds the queue, but an unpaced source places its
-            // chunks ever further behind their arrival. Phones do burst like
-            // this after a sink stall (#154, live), so the catch-up drops the
-            // part more than 90 ms behind arrival instead of letting a later
-            // chunk fail the 200 ms late-arrival cap and end the session.
+            // #228: default wired playout (60 ms, catch-up off) plays the
+            // burst back to back without trimming any audio or ending late.
             EXPECT_EQ(result.code, 0) << result.output;
             EXPECT_EQ(result.output.find("\"event\":\"err\""), std::string::npos) << result.output;
-            EXPECT_NE(result.output.find("{\"event\":\"audio_catch_up\",\"frames\":"),
+            EXPECT_EQ(result.output.find("{\"event\":\"audio_catch_up\","),
+                      std::string::npos) << result.output;
+            EXPECT_NE(result.output.find("\"event\":\"wired_media_policy\",\"audio_playout_ms\":60,"
+                                         "\"audio_max_unacked\":1,\"video_hold\":\"match\","
+                                         "\"video_delay_ms\":60"),
+                      std::string::npos) << result.output;
+            EXPECT_NE(result.output.find("\"frames_trimmed\":0,"),
                       std::string::npos) << result.output;
             EXPECT_EQ(source.acks.size(), source.arrivals.size()) << result.output;
             std::cout << "STALL_RESULT mode=worst_case_burst stall_ms=" << std::abs(stall_ms)
@@ -3866,7 +4187,10 @@ TEST(WiredReceiver, ActualMainTransientStallIndependentCadenceAndWorstCaseBurst)
             EXPECT_GE(source.acks[i], source.arrivals[i]);
             if (i + 1 < source.arrivals.size()) { EXPECT_LE(source.acks[i], source.arrivals[i + 1]); }
         }
-        EXPECT_EQ(!source.held_chunks.empty(), stall_ms >= 150); // Chunk 4 is due at 128 ms.
+        EXPECT_EQ(!source.held_chunks.empty(), deferred && stall_ms >= 150); // Chunk 4 is due at 128 ms.
+        if (lossless) {
+            EXPECT_NE(result.output.find("\"frames_trimmed\":0,"), std::string::npos) << result.output;
+        }
         if (deferred) {
             EXPECT_GE(source.acks[2], gate->completed_ns.front() - epoch_ns);
         } else {
@@ -3882,7 +4206,9 @@ TEST(WiredReceiver, ActualMainTransientStallIndependentCadenceAndWorstCaseBurst)
 }
 
 // #60 / HU09: a sink stall far beyond the credit window must not end the
-// session. Stalled audio is dropped and ACKed in time, then output resumes.
+// session. On the arrival model the stalled audio is dropped and ACKed in time,
+// then output resumes; the lossless default (#228) queues a 1 s stall whole and
+// gives up only a sink that fails.
 TEST(WiredReceiver, SinkStallBeyondCreditWindowDropsAudioAndContinues) {
     struct Case {
         const char *name;
@@ -3890,10 +4216,13 @@ TEST(WiredReceiver, SinkStallBeyondCreditWindowDropsAudioAndContinues) {
         bool fail_write;
         std::optional<int> unacked_ms;
         const char *outcome;
+        bool lossless;
     };
-    for (const Case c : {Case{"conforming_phone", 1000, false, std::nullopt, "write_returned"},
-                         Case{"hu09_phone", 1000, false, 470, "write_returned"},
-                         Case{"sink_write_timeout", 2500, true, 470, "sink_reopened"}}) {
+    for (const Case c : {Case{"conforming_phone", 1000, false, std::nullopt, "write_returned", false},
+                         Case{"hu09_phone", 1000, false, 470, "write_returned", false},
+                         Case{"sink_write_timeout", 2500, true, 470, "sink_reopened", false},
+                         Case{"lossless_hu09_phone", 1000, false, 470, nullptr, true},
+                         Case{"lossless_sink_write_timeout", 2500, true, 470, "sink_reopened", true}}) {
         SCOPED_TRACE(c.name);
         CadencedPcmSource source;
         source.chunks = 80; // ~3.4 s of 8192-byte media chunks at normal cadence
@@ -3905,17 +4234,28 @@ TEST(WiredReceiver, SinkStallBeyondCreditWindowDropsAudioAndContinues) {
         runtime_pcm_source = &source;
         runtime_audio_ack_attempts.store(0);
         runtime_sink_override = [gate] { return std::make_unique<GatedRenderSink>(gate); };
+        if (!c.lossless) { runtime_extra_args = {"--audio-playout-ms", "0"}; }
         const auto result = run_runtime(false, 6000, true);
+        runtime_extra_args.clear();
         runtime_sink_override = {};
         runtime_pcm_source = nullptr;
         runtime_send_audio = false;
         EXPECT_EQ(result.code, 0) << result.output;
         EXPECT_EQ(result.output.find("ipc_queue_full"), std::string::npos) << result.output;
         EXPECT_EQ(result.output.find("\"event\":\"err\""), std::string::npos) << result.output;
-        EXPECT_NE(result.output.find("\"event\":\"audio_stall_bypass\",\"phase\":\"begin\""),
-                  std::string::npos) << result.output;
-        EXPECT_NE(result.output.find(std::string{"\"outcome\":\""} + c.outcome + "\""),
-                  std::string::npos) << result.output;
+        if (c.outcome) {
+            EXPECT_NE(result.output.find("\"event\":\"audio_stall_bypass\",\"phase\":\"begin\""),
+                      std::string::npos) << result.output;
+            EXPECT_NE(result.output.find(std::string{"\"outcome\":\""} + c.outcome + "\""),
+                      std::string::npos) << result.output;
+        } else {
+            EXPECT_EQ(result.output.find("audio_stall_bypass"), std::string::npos) << result.output;
+            EXPECT_EQ(result.output.find("audio_credit_deferred"), std::string::npos) << result.output;
+        }
+        if (c.lossless) {
+            EXPECT_EQ(result.output.find("audio_playout_overflow"), std::string::npos) << result.output;
+            EXPECT_NE(result.output.find("\"frames_trimmed\":0,"), std::string::npos) << result.output;
+        }
         ASSERT_EQ(source.arrivals.size(), source.chunks) << result.output;
         EXPECT_EQ(source.acks.size(), source.arrivals.size());
         // Every withheld ACK was released before the phone stopped waiting.
@@ -3932,7 +4272,9 @@ TEST(WiredReceiver, StallBypassCountsInFlightRenderedParentAsRendered) {
     ReceiverLogScope logging{g_running};
     auto gate = std::make_shared<RenderGate>();
     gate->first_write_delay = std::chrono::milliseconds{3000}; // released explicitly below
-    ConcreteAudioRenderWorker audio{pcm_router_config(), gated_router(gate)};
+    ConcreteAudioRenderWorker audio{
+        pcm_router_config(aa::audio::SinkBackend::pulse, aa::core::Nanoseconds{0}),
+        gated_router(gate)};
     ASSERT_TRUE(audio.ready());
     capture_receiver_stdout();
     const auto role = aa::protocol::ChannelRole::media_audio;
@@ -3969,7 +4311,7 @@ TEST(WiredReceiver, StallBypassReportsPartiallyRenderedVoiceParentAsLost) {
     ReceiverLogScope logging{g_running};
     auto gate = std::make_shared<RenderGate>();
     gate->first_write_delay = std::chrono::milliseconds{3000}; // released explicitly below
-    auto config = pcm_router_config();
+    auto config = pcm_router_config(aa::audio::SinkBackend::pulse, aa::core::Nanoseconds{0});
     config.roles[aa::audio::role_index(aa::audio::Role::guidance)].input_format =
         aa::audio::AudioFormat{16000, 1, 16}; // as the receiver advertises voice audio
     ConcreteAudioRenderWorker audio{config, gated_router(gate)};
@@ -4219,8 +4561,16 @@ class ReceiverAudioDispatch : public testing::Test {
     wiredtest::CaptureSink capture;
     aa::diagnostics::Diagnostics diagnostics{capture};
     std::shared_ptr<RenderGate> gate = std::make_shared<RenderGate>();
+    // Stop-and-wait capacity (four slots, 38,400 B per role): the accounting
+    // these tests pin is the arrival model's and wireless's; lossless playout
+    // only scales it (LosslessWorkerQueuesThroughASinkStall...).
+    static aa::audio::RouterConfig stop_and_wait_config() {
+        auto config = pcm_router_config();
+        config.playout.lossless = false;
+        return config;
+    }
     // Failed writes here model a sink that stays broken (no reopen).
-    ConcreteAudioRenderWorker audio{pcm_router_config(), first_open_only(gated_router(gate))};
+    ConcreteAudioRenderWorker audio{stop_and_wait_config(), first_open_only(gated_router(gate))};
     ReceiverPollTransport transport;
     VideoOutlet video{log_line};
     aa::app::WiredSession session{{trust, clock, diagnostics}};
@@ -4288,14 +4638,32 @@ class ReceiverAudioDispatch : public testing::Test {
         }
         return receive(channel, aa::protocol::encode(aa::protocol::AvSinkStart{7, 0}).value());
     }
+    // Services the owner until the render worker is idle. It polls with a
+    // bound instead of calling receive_with_audio(): that helper re-reads
+    // audio.outstanding() and, once the worker has gone idle in between,
+    // takes its blocking receive, which on this scripted transport with
+    // nothing queued fails as transport_closed (#202). On a live link that
+    // blocking receive is the intended idle path and simply waits for the
+    // phone's next frame.
     aa::core::Result<void> wait_owner() {
         const auto until = std::chrono::steady_clock::now() + std::chrono::seconds{2};
         while (audio.outstanding() && std::chrono::steady_clock::now() < until) {
-            auto result = receive_with_audio(session, audio);
-            if (!result) { return result.error(); }
+            if (auto serviced = service_audio_completions(session, audio); !serviced) {
+                return serviced.error();
+            }
+            const auto slice = std::min(until, std::chrono::steady_clock::now() +
+                                                   std::chrono::milliseconds{5});
+            auto polled = session.poll_transport(slice);
+            if (!polled) { return polled.error(); }
+        }
+        // Service once more before judging the deadline, so a worker error
+        // latched during the last poll is reported as itself, not as a
+        // generic timeout, and a queued credit is still sent.
+        if (auto serviced = service_audio_completions(session, audio); !serviced) {
+            return serviced.error();
         }
         if (audio.outstanding()) { return aa::Error{aa::ErrorCode::timeout}; }
-        return service_audio_completions(session, audio);
+        return {};
     }
 };
 
@@ -4342,7 +4710,7 @@ TEST_F(ReceiverAudioDispatch, BlockedRenderOwnerAcksAdmissionBeforeRenderWhileVi
     std::vector<std::byte> rendered;
     for (const auto &chunk : gate->pcm) { rendered.insert(rendered.end(), chunk.begin(), chunk.end()); }
     EXPECT_EQ(rendered, original);
-    EXPECT_EQ(gate->timestamps.front().count, base);
+    EXPECT_EQ(gate->timestamps.front().count, base + aa::audio::kWiredPlayoutDepth.count);
     EXPECT_EQ(gate->drains, 1U);
     EXPECT_EQ(gate->destroyed, 1U);
     for (const auto thread : gate->threads) {
@@ -4365,7 +4733,7 @@ TEST_F(ReceiverAudioDispatch, AckSendFailureConsumesPendingWithoutRenderOrAckRet
     ASSERT_TRUE(service_audio_completions(session, audio));
     EXPECT_EQ(transport.wire.sent_count(), before);
     EXPECT_LE(gate->writes, 4U);
-    EXPECT_EQ(gate->timestamps.front().count, base);
+    EXPECT_EQ(gate->timestamps.front().count, base + aa::audio::kWiredPlayoutDepth.count);
     EXPECT_FALSE(session.failure());
 }
 
@@ -4458,11 +4826,12 @@ TEST_F(ReceiverAudioDispatch, StopAndRestartKeepsRouterTimelineAndAcksOnlyNewSes
     ASSERT_TRUE(frame);
     EXPECT_EQ(cipher->open(frame.value().payload).value(), aa::protocol::encode_av_sink_ack(-18).value());
     ASSERT_TRUE(audio.finish());
+    const auto expected_new_start = base + 20'000'000 + aa::audio::kWiredPlayoutDepth.count;
     const auto new_start = std::find_if(gate->timestamps.begin(), gate->timestamps.end(), [&](const auto &stamp) {
-        return stamp.count == base + 20'000'000;
+        return stamp.count == expected_new_start;
     });
     EXPECT_NE(new_start, gate->timestamps.end());
-    EXPECT_EQ(gate->timestamps.back().count, base + 20'000'000);
+    EXPECT_EQ(gate->timestamps.back().count, expected_new_start);
     EXPECT_EQ(gate->drains, 1U);
 }
 
@@ -4671,7 +5040,8 @@ TEST_F(ReceiverAudioDispatch, VariableMediaParentsRenderFifoAndCreditExactlyOnce
         if (i == 0) { ASSERT_EQ(transport.wire.sent_count(), before + 1); }
         if (i == 1) { gate->release(); }
         if (i >= 1) {
-            ASSERT_TRUE(wait_owner());
+            const auto owned = wait_owner();
+            ASSERT_TRUE(owned) << aa::to_string(owned.error().code());
             EXPECT_EQ(transport.wire.sent_count(), before + i + 1);
             ASSERT_TRUE(service_audio_completions(session, audio));
             EXPECT_EQ(transport.wire.sent_count(), before + i + 1);
@@ -5044,8 +5414,11 @@ class CadencedRealGstSink final : public aa::audio::detail::ObservedAudioSink {
 };
 
 TEST(WiredReceiver, ActualMainRealGstIndependentCadenceReversibleHoldControls) {
+    for (const bool lossless : {true, false})
     for (const int hold_ms : {0, 50, 300}) {
+        if (!lossless && hold_ms != 300) { continue; } // the accounting differs only there
         SCOPED_TRACE(hold_ms);
+        SCOPED_TRACE(lossless);
         CadencedPcmSource source;
         CadencedGstObservation observed;
         runtime_send_audio = true;
@@ -5060,7 +5433,9 @@ TEST(WiredReceiver, ActualMainRealGstIndependentCadenceReversibleHoldControls) {
             }
             return outcome;
         };
+        if (!lossless) { runtime_extra_args = {"--audio-playout-ms", "0"}; }
         const auto result = run_runtime(false, 1200, true);
+        runtime_extra_args.clear();
         runtime_sink_request_override = {};
         runtime_pcm_source = nullptr;
         runtime_send_audio = false;
@@ -5123,7 +5498,13 @@ TEST(WiredReceiver, ActualMainRealGstIndependentCadenceReversibleHoldControls) {
         EXPECT_EQ(result.output.find("ipc_queue_full"), std::string::npos);
         EXPECT_EQ(result.output.find("\"event\":\"err\""), std::string::npos);
         EXPECT_EQ(result.output.find("\"audio_rejection\":"), std::string::npos);
-        if (hold_ms == 300) {
+        if (hold_ms == 300 && lossless) {
+            // #228: the held write withholds nothing; the phone keeps cadence.
+            EXPECT_EQ(result.output.find("\"event\":\"audio_credit_deferred\""), std::string::npos)
+                << result.output;
+            EXPECT_LT(source.acks[2], observed.released_at - epoch_ns);
+            EXPECT_NE(result.output.find("\"frames_trimmed\":0,"), std::string::npos) << result.output;
+        } else if (hold_ms == 300) {
             // The held first write keeps the third chunk's credit withheld
             // until the real backend returns; nothing is over-admitted.
             EXPECT_NE(result.output.find("\"event\":\"audio_credit_deferred\""), std::string::npos)
@@ -5394,7 +5775,7 @@ TEST(WiredReceiver, WorkerSettledIdleResumesOriginalTimelineAndReportsPrefixExac
     gate->release();
     const auto base = steady_ns() - 10'000'000'000LL;
     std::atomic<std::int64_t> now{base + 5'000'000};
-    ConcreteAudioRenderWorker audio{pcm_router_config(), gated_router(gate),
+    ConcreteAudioRenderWorker audio{pcm_router_config(aa::audio::SinkBackend::pulse, aa::core::Nanoseconds{0}), gated_router(gate),
         [&] { return aa::core::Nanoseconds{now.load()}; }};
     ASSERT_TRUE(audio.ready());
     const auto role = aa::protocol::ChannelRole::media_audio;
@@ -5484,7 +5865,7 @@ void expect_post_completion_idle_order(CompletionIdleOrder order) {
     const auto second_end = base + 10'000'000;
     const auto third_start = second_end + gap_ns;
     std::atomic<std::int64_t> now{base + 5'000'000};
-    auto config = pcm_router_config();
+    auto config = pcm_router_config(aa::audio::SinkBackend::pulse, aa::core::Nanoseconds{0});
     config.on_write_completed = [&, normal = config.on_write_completed](const auto &value) {
         normal(value); // Forward the real completion observation BEFORE blocking.
         barrier.complete(value);
@@ -5741,7 +6122,7 @@ TEST(WiredReceiver, WorkerBlockedCompletionObserverPreservesGenerationStopAndEar
         CompletionBarrier barrier;
         const auto base = steady_ns() - 30'000'000'000LL;
         std::atomic<std::int64_t> now{base + 5'000'000};
-        auto config = pcm_router_config();
+        auto config = pcm_router_config(aa::audio::SinkBackend::pulse, aa::core::Nanoseconds{0});
         config.on_write_completed = [&](const auto &value) { barrier.complete(value); };
         ConcreteAudioRenderWorker audio{config, gated_router(gate),
             [&] { return aa::core::Nanoseconds{now.load()}; }};
@@ -5829,7 +6210,7 @@ TEST(WiredReceiver, WorkerCancelledDuringLeadingSilenceCanRecoverFromSecondIdle)
     // Conservative frame rounding leaves one residual frame before the first
     // authorized range. Its abandoned prefix then fits the 200 ms gap cap.
     std::atomic<std::int64_t> now{base + 5'010'000};
-    ConcreteAudioRenderWorker audio{pcm_router_config(), gated_router(gate),
+    ConcreteAudioRenderWorker audio{pcm_router_config(aa::audio::SinkBackend::pulse, aa::core::Nanoseconds{0}), gated_router(gate),
         [&] { return aa::core::Nanoseconds{now.load()}; }};
     ASSERT_TRUE(audio.ready());
     const auto role = aa::protocol::ChannelRole::media_audio;
@@ -5884,7 +6265,7 @@ TEST(WiredReceiver, WorkerIdleSkipCorrelationTotalsSlicesAroundBackpressure) {
     gate->release();
     const auto base = steady_ns() - 10'000'000'000LL;
     std::atomic<std::int64_t> now{base + 5'000'000};
-    ConcreteAudioRenderWorker audio{pcm_router_config(), [&](const auto &config) {
+    ConcreteAudioRenderWorker audio{pcm_router_config(aa::audio::SinkBackend::pulse, aa::core::Nanoseconds{0}), [&](const auto &config) {
         auto opened = gated_router(gate)(config);
         if (opened) {
             opened.value().note_backpressure({base + 805'000'000}, {base + 1'005'000'000});
@@ -5919,7 +6300,7 @@ TEST(WiredReceiver, WorkerOtherRolePendingWithoutInflightWriteDoesNotArmIdle) {
     auto gate = std::make_shared<RenderGate>();
     const auto base = steady_ns() - 10'000'000'000LL;
     std::atomic<std::int64_t> now{base + 5'000'000};
-    ConcreteAudioRenderWorker audio{pcm_router_config(), gated_router(gate),
+    ConcreteAudioRenderWorker audio{pcm_router_config(aa::audio::SinkBackend::pulse, aa::core::Nanoseconds{0}), gated_router(gate),
         [&] { return aa::core::Nanoseconds{now.load()}; }};
     ASSERT_TRUE(audio.ready());
     bool observed = false;
@@ -5960,7 +6341,7 @@ TEST(WiredReceiver, RealGstSameWorkerIdlePauseResumesWithoutReopeningRoute) {
     std::vector<aa::audio::SinkWriteProgress> progress;
     std::vector<aa::audio::WriteCompletion> completions;
     std::vector<aa::audio::RouterReport> settled;
-    auto config = pcm_router_config();
+    auto config = pcm_router_config(aa::audio::SinkBackend::pulse, aa::core::Nanoseconds{0});
     config.on_sink_write_progress = [&](const auto &value) {
         const std::lock_guard lock(progress_mutex);
         if (!value.readiness_probe && value.completed_at) { progress.push_back(value); }
@@ -6082,7 +6463,7 @@ TEST(WiredReceiver, WorkerShortSettledIdleNeverAuthorizesLongScheduledGap) {
         gate->release();
         const auto base = steady_ns() - 10'000'000'000LL;
         std::atomic<std::int64_t> now{base + 5'000'000};
-        ConcreteAudioRenderWorker audio{pcm_router_config(), gated_router(gate),
+        ConcreteAudioRenderWorker audio{pcm_router_config(aa::audio::SinkBackend::pulse, aa::core::Nanoseconds{0}), gated_router(gate),
             [&] { return aa::core::Nanoseconds{now.load()}; }};
         ASSERT_TRUE(audio.ready());
         const auto role = aa::protocol::ChannelRole::media_audio;
@@ -6111,7 +6492,9 @@ TEST(WiredReceiver, WorkerSinkStallPastScheduledEndSkipsElapsedGapInsteadOfFaili
     StdoutCaptureGuard capture;
     auto gate = std::make_shared<RenderGate>();
     gate->first_write_delay = std::chrono::milliseconds{600};
-    ConcreteAudioRenderWorker audio{pcm_router_config(), gated_router(gate)};
+    ConcreteAudioRenderWorker audio{
+        pcm_router_config(aa::audio::SinkBackend::pulse, aa::core::Nanoseconds{0}),
+        gated_router(gate)};
     ASSERT_TRUE(audio.ready());
     const auto role = aa::protocol::ChannelRole::media_audio;
     const std::vector<std::byte> pcm(960, std::byte{1});
@@ -6160,7 +6543,10 @@ TEST(WiredReceiver, WorkerStallBurstCatchesUpInsteadOfEndingTheSession) {
     StdoutCaptureGuard capture;
     auto gate = std::make_shared<RenderGate>();
     gate->release();
-    ConcreteAudioRenderWorker audio{pcm_router_config(), gated_router(gate)};
+    ConcreteAudioRenderWorker audio{
+        pcm_router_config(aa::audio::SinkBackend::pulse, aa::core::Nanoseconds{0},
+                          aa::core::Nanoseconds{90'000'000}),
+        gated_router(gate)};
     ASSERT_TRUE(audio.ready());
     const auto role = aa::protocol::ChannelRole::media_audio;
     const std::vector<std::byte> pcm(8192, std::byte{1}); // one 42.67 ms phone chunk
@@ -6215,20 +6601,37 @@ TEST(WiredReceiver, WorkerGuidanceStallBurstInProductionFormatCatchesUp) {
     StdoutCaptureGuard capture;
     auto gate = std::make_shared<RenderGate>();
     gate->release();
-    const auto config = pcm_router_config();
+    const auto config = pcm_router_config(aa::audio::SinkBackend::pulse, aa::core::Nanoseconds{0},
+                                          aa::core::Nanoseconds{90'000'000});
     const auto guidance_format =
         config.roles[aa::audio::role_index(aa::audio::Role::guidance)].input_format;
     ASSERT_EQ(guidance_format, (aa::audio::AudioFormat{16000, 1, 16}));
-    ConcreteAudioRenderWorker audio{config, gated_router(gate)};
+    const auto arrival = steady_ns() - 10'000'000'000LL;
+    std::atomic<std::int64_t> clock_ns{arrival};
+    ConcreteAudioRenderWorker audio{config, gated_router(gate),
+                                    [&] { return aa::core::Nanoseconds{clock_ns.load()}; }};
     ASSERT_TRUE(audio.ready());
     const auto role = aa::protocol::ChannelRole::guidance_audio;
     const std::vector<std::byte> pcm(2048, std::byte{1}); // 1024 mono frames: 64 ms at 16 kHz
-    const auto arrival = steady_ns();
     for (std::uint64_t sequence = 1; sequence <= 16; ++sequence) {
         ASSERT_TRUE(audio.submit({{role, sequence, {arrival}}, pcm}, {role, 0, sequence, 7}));
         ASSERT_TRUE(audio.wait_idle(std::chrono::steady_clock::now() + std::chrono::seconds{2}));
         ASSERT_FALSE(audio.failure()) << sequence;
     }
+    const auto written_end_ns = [&]() -> std::int64_t {
+        if (gate->timestamps.empty()) { return arrival; }
+        const auto last_piece_frames = static_cast<std::uint64_t>(gate->pcm.back().size() / 4);
+        return gate->timestamps.back().count +
+            static_cast<std::int64_t>((last_piece_frames * 1'000'000'000ULL) / 48000ULL);
+    };
+    std::size_t writes_before_resume = 0;
+    std::int64_t burst_end_ns = arrival;
+    {
+        std::lock_guard lock(gate->mutex);
+        writes_before_resume = gate->timestamps.size();
+        burst_end_ns = written_end_ns();
+    }
+    clock_ns.store(arrival + 100'000'000);
     ASSERT_TRUE(audio.submit({{role, 17, {arrival + 100'000'000}}, pcm}, {role, 0, 17, 7}));
     ASSERT_TRUE(audio.wait_idle(std::chrono::steady_clock::now() + std::chrono::seconds{2}));
     const bool failed = audio.failure().has_value();
@@ -6240,6 +6643,7 @@ TEST(WiredReceiver, WorkerGuidanceStallBurstInProductionFormatCatchesUp) {
     const auto report = audio.final_report();
     ASSERT_TRUE(report);
     EXPECT_FALSE(report->render_failure);
+    EXPECT_EQ(report->stats.chunks_submitted, 17U);
     // Logged at the 48 kHz output rate, never the 16 kHz input rate.
     const std::regex catch_up{
         R"(\{"event":"audio_catch_up","frames":([0-9]+),"frames_total":([0-9]+),"rate":48000,"events_lifetime":([0-9]+),"frames_lifetime":([0-9]+)(?:,"emit_ns":[0-9]+)?\})"};
@@ -6254,7 +6658,24 @@ TEST(WiredReceiver, WorkerGuidanceStallBurstInProductionFormatCatchesUp) {
     EXPECT_EQ(logged, report->stats.frames_caught_up) << output;
     std::lock_guard lock(gate->mutex);
     ASSERT_FALSE(gate->timestamps.empty());
-    EXPECT_LE(gate->timestamps.back().count, arrival + 100'000'000 + 90'000'000);
+    // #181: assert the catch-up cursor invariant on the worker's scheduled
+    // 48 kHz timeline (matching IncrementalMaxSizeGuidanceBurstSurvivesTheRealResampler):
+    // never more than the 90 ms watermark past the end of the newest parent's
+    // own 64 ms PCM. Under CPU load, GStreamer's audioresample/appsink can
+    // split a 64 ms chunk down to 96 frames (wholly absorbed by the 5 ms
+    // bounded trim) or coalesce a carryover buffer onto chunk 17 while
+    // source_phase stays <= 90 ms (causing render_step() to emit three 50 ms
+    // quanta so timestamps.back() lands ~29 ms past arrival + 190 ms even
+    // though chunk 17 started ~19 ms behind arrival).
+    constexpr std::int64_t kGuidanceChunkNs = 64'000'000;
+    constexpr std::int64_t kCatchUpWatermarkNs = 90'000'000;
+    const auto resumed_arrival = arrival + 100'000'000;
+    EXPECT_LE(burst_end_ns, arrival + kGuidanceChunkNs + kCatchUpWatermarkNs);
+    if (gate->timestamps.size() > writes_before_resume) {
+        EXPECT_LE(gate->timestamps[writes_before_resume].count,
+                  resumed_arrival + kCatchUpWatermarkNs);
+    }
+    EXPECT_LE(written_end_ns(), resumed_arrival + kGuidanceChunkNs + kCatchUpWatermarkNs);
 }
 
 // A stand-in for the guidance resampler with a fixed output schedule (#155
@@ -6323,7 +6744,10 @@ TEST(WiredReceiver, WorkerMaxSizeGuidanceBurstSurvivesTheLateCap) {
                       config, std::make_unique<GatedRenderSink>(gate), scripted_resampler(schedule));
               }}
             : gated_router(gate);
-        ConcreteAudioRenderWorker audio{pcm_router_config(), std::move(open)};
+        ConcreteAudioRenderWorker audio{
+            pcm_router_config(aa::audio::SinkBackend::pulse, aa::core::Nanoseconds{0},
+                              aa::core::Nanoseconds{90'000'000}),
+            std::move(open)};
         ASSERT_TRUE(audio.ready());
         const auto role = aa::protocol::ChannelRole::guidance_audio;
         const std::vector<std::byte> pcm(6400, std::byte{1}); // the admitted maximum: 200 ms
@@ -6348,6 +6772,1992 @@ TEST(WiredReceiver, WorkerMaxSizeGuidanceBurstSurvivesTheLateCap) {
     }
 }
 
+// #228: default wired config uses the playout clock (60 ms, catch-up off,
+// stop-and-wait max_unacked 1) and emits wired_media_policy + playout_offset_ns.
+TEST(WiredReceiver, WiredDefaultPlayoutConfigAndPolicy) {
+    const auto cfg = pcm_router_config();
+    EXPECT_TRUE(cfg.live_pcm_drift.enabled);
+    EXPECT_EQ(cfg.live_pcm_drift.catch_up_watermark, aa::core::Nanoseconds{0});
+    EXPECT_TRUE(cfg.playout.enabled);
+    EXPECT_TRUE(cfg.playout.lossless);
+    EXPECT_EQ(cfg.playout.depth, aa::audio::kWiredPlayoutDepth);
+    EXPECT_EQ(cfg.playout.emergency_backlog, aa::core::Nanoseconds{2'000'000'000});
+    EXPECT_FALSE(pcm_router_config(aa::audio::SinkBackend::pulse, aa::core::Nanoseconds{0}).playout.lossless);
+
+    auto gate = std::make_shared<RenderGate>();
+    gate->release();
+    CadencedPcmSource source;
+    source.chunks = 4;
+    runtime_send_audio = true;
+    runtime_pcm_source = &source;
+    runtime_sink_override = [gate] { return std::make_unique<GatedRenderSink>(gate); };
+    const auto result = run_runtime(false, 400, true);
+    runtime_sink_override = {};
+    runtime_pcm_source = nullptr;
+    runtime_send_audio = false;
+
+    EXPECT_EQ(result.code, 0) << result.output;
+    EXPECT_NE(result.output.find("\"event\":\"wired_media_policy\",\"audio_playout_ms\":60,"
+                                 "\"audio_max_unacked\":1,\"video_hold\":\"match\","
+                                 "\"video_delay_ms\":60"),
+              std::string::npos) << result.output;
+    EXPECT_NE(result.output.find("\"playout_offset_ns\":"), std::string::npos) << result.output;
+    EXPECT_NE(result.output.find("\"playout_target_ms\":60,"), std::string::npos) << result.output;
+    EXPECT_NE(result.output.find("\"frames_trimmed\":0,"), std::string::npos) << result.output;
+    EXPECT_EQ(result.output.find("\"event\":\"audio_catch_up\""), std::string::npos) << result.output;
+}
+
+// #228: wired default playout keeps frames_trimmed == 0 for media AND guidance
+// in steady state, post-stall bursts, an on-time resampler-split guidance
+// parent over media, a 2x200 ms prompt, and a >1 s prompt over media; silence
+// is filled only on a real underrun.
+TEST(WiredReceiver, WiredPlayoutMediaAndGuidanceBurstsAndPromptsAreLossless) {
+    ReceiverLogScope logging{g_running};
+    constexpr std::int64_t kMediaChunkNs = 2048LL * 1'000'000'000LL / 48000LL; // 42.67 ms
+    constexpr std::int64_t kGuidanceChunkNs = 200'000'000LL;
+    const std::vector<std::byte> media_pcm(8192, std::byte{1});
+    const std::vector<std::byte> guidance_pcm(6400, std::byte{2}); // 200 ms @ 16 kHz mono
+
+    // 1. Post-stall burst for media (16 chunks at one arrival + resumed chunk).
+    {
+        StdoutCaptureGuard capture;
+        auto gate = std::make_shared<RenderGate>();
+        gate->release();
+        ConcreteAudioRenderWorker audio{pcm_router_config(), gated_router(gate)};
+        ASSERT_TRUE(audio.ready());
+        const auto role = aa::protocol::ChannelRole::media_audio;
+        const auto arrival = steady_ns();
+        for (std::uint64_t seq = 1; seq <= 16; ++seq) {
+            ASSERT_TRUE(audio.submit({{role, seq, {arrival}}, media_pcm}, {role, 0, seq, 7}));
+            ASSERT_TRUE(audio.wait_idle(std::chrono::steady_clock::now() + std::chrono::seconds{2}));
+            ASSERT_FALSE(audio.failure()) << seq;
+        }
+        ASSERT_TRUE(audio.submit({{role, 17, {arrival + 100'000'000}}, media_pcm}, {role, 0, 17, 7}));
+        ASSERT_TRUE(audio.wait_idle(std::chrono::steady_clock::now() + std::chrono::seconds{2}));
+        ASSERT_TRUE(audio.finish());
+        const auto output = capture.release();
+        const auto report = audio.final_report();
+        ASSERT_TRUE(report);
+        EXPECT_EQ(report->stats.frames_trimmed, 0U) << output;
+        EXPECT_EQ(report->stats.frames_caught_up, 0U) << output;
+        EXPECT_EQ(report->stats.frames_silence, 0U) << output;
+        EXPECT_EQ(report->stats.playout_underruns, 0U) << output;
+    }
+
+    // 2. Post-stall burst for guidance (8 x 200 ms chunks, Sol's 96+19098 split).
+    {
+        StdoutCaptureGuard capture;
+        auto gate = std::make_shared<RenderGate>();
+        gate->release();
+        auto open = ConcreteAudioRenderWorker::OpenRouter{[gate](const auto &config) {
+            return aa::audio::detail::open_router_with_decoder_for_test(
+                config, std::make_unique<GatedRenderSink>(gate),
+                scripted_resampler([](std::size_t call, std::size_t buffered) {
+                    return call == 0 ? std::size_t{96} : call == 1 ? std::size_t{19098} : buffered;
+                }));
+        }};
+        ConcreteAudioRenderWorker audio{pcm_router_config(), std::move(open)};
+        ASSERT_TRUE(audio.ready());
+        const auto role = aa::protocol::ChannelRole::guidance_audio;
+        const auto arrival = steady_ns();
+        std::uint64_t seq = 1;
+        for (const std::int64_t offset_ms : {0, 1, 10, 12, 12, 13, 20, 20}) {
+            ASSERT_TRUE(audio.submit({{role, seq, {arrival + offset_ms * 1'000'000}}, guidance_pcm},
+                                     {role, 0, seq, 7}));
+            ASSERT_TRUE(audio.wait_idle(std::chrono::steady_clock::now() + std::chrono::seconds{2}));
+            ASSERT_FALSE(audio.failure()) << seq;
+            ++seq;
+        }
+        ASSERT_TRUE(audio.finish());
+        const auto output = capture.release();
+        const auto report = audio.final_report();
+        ASSERT_TRUE(report);
+        EXPECT_EQ(report->stats.frames_trimmed, 0U) << output;
+        EXPECT_EQ(report->stats.frames_caught_up, 0U) << output;
+        EXPECT_EQ(report->stats.frames_silence, 0U) << output;
+    }
+
+    // 3. On-time 96+19098 resampler-split guidance over concurrent media:
+    //    2 x 200 ms prompt AND > 1 s (6 x 200 ms = 1.2 s) prompt.
+    for (const std::uint64_t prompt_chunks : {std::uint64_t{2}, std::uint64_t{6}}) {
+        SCOPED_TRACE(prompt_chunks);
+        StdoutCaptureGuard capture;
+        auto gate = std::make_shared<RenderGate>();
+        gate->release();
+        auto open = ConcreteAudioRenderWorker::OpenRouter{[gate](const auto &config) {
+            return aa::audio::detail::open_router_with_decoder_for_test(
+                config, std::make_unique<GatedRenderSink>(gate),
+                scripted_resampler([](std::size_t call, std::size_t buffered) {
+                    return call == 0 ? std::size_t{96} : call == 1 ? std::size_t{19098} : buffered;
+                }));
+        }};
+        ConcreteAudioRenderWorker audio{pcm_router_config(), std::move(open)};
+        ASSERT_TRUE(audio.ready());
+        const auto arrival = steady_ns();
+        std::uint64_t mseq = 1;
+        std::uint64_t gseq = 1;
+        const int media_chunks = prompt_chunks == 2 ? 20 : 45;
+        for (int k = 0; k < media_chunks; ++k) {
+            const std::int64_t t = arrival + k * kMediaChunkNs;
+            // In real time, as the phone sends: the worker holds the prompt for
+            // each media chunk instead of playing it out alone.
+            std::this_thread::sleep_for(std::chrono::nanoseconds{t - steady_ns()});
+            ASSERT_TRUE(audio.submit({{aa::protocol::ChannelRole::media_audio, mseq, {t}}, media_pcm},
+                                     {aa::protocol::ChannelRole::media_audio, 0, mseq, 7}));
+            ++mseq;
+            const std::int64_t next_t = t + kMediaChunkNs;
+            while (gseq <= prompt_chunks &&
+                   arrival + 120'000'000LL + static_cast<std::int64_t>(gseq - 1) * kGuidanceChunkNs < next_t) {
+                const std::int64_t gt = arrival + 120'000'000LL +
+                    static_cast<std::int64_t>(gseq - 1) * kGuidanceChunkNs;
+                ASSERT_TRUE(audio.submit(
+                    {{aa::protocol::ChannelRole::guidance_audio, gseq, {gt}}, guidance_pcm},
+                    {aa::protocol::ChannelRole::guidance_audio, 0, gseq, 7}));
+                ++gseq;
+            }
+            ASSERT_FALSE(audio.failure()) << k;
+        }
+        ASSERT_TRUE(audio.wait_idle(std::chrono::steady_clock::now() + std::chrono::seconds{3}));
+        ASSERT_TRUE(audio.finish());
+        const auto output = capture.release();
+        const auto report = audio.final_report();
+        ASSERT_TRUE(report);
+        EXPECT_EQ(gseq, prompt_chunks + 1U);
+        EXPECT_EQ(report->stats.frames_trimmed, 0U) << output;
+        EXPECT_EQ(report->stats.frames_caught_up, 0U) << output;
+        EXPECT_EQ(report->stats.frames_silence, 0U) << output;
+        EXPECT_EQ(report->stats.playout_underruns, 0U) << output;
+    }
+
+    // 4. Silence fill happens only on a real underrun (drought > 60 ms depth).
+    {
+        StdoutCaptureGuard capture;
+        auto gate = std::make_shared<RenderGate>();
+        gate->release();
+        ConcreteAudioRenderWorker audio{pcm_router_config(), gated_router(gate)};
+        ASSERT_TRUE(audio.ready());
+        const auto role = aa::protocol::ChannelRole::media_audio;
+        const auto arrival = steady_ns();
+        ASSERT_TRUE(audio.submit({{role, 1, {arrival}}, media_pcm}, {role, 0, 1, 7}));
+        ASSERT_TRUE(audio.wait_idle(std::chrono::steady_clock::now() + std::chrono::seconds{2}));
+        // Chunk 2 arrives 30 ms late (inside the 60 ms buffer): no underrun, no silence.
+        ASSERT_TRUE(audio.submit({{role, 2, {arrival + kMediaChunkNs + 30'000'000}}, media_pcm},
+                                 {role, 0, 2, 7}));
+        ASSERT_TRUE(audio.wait_idle(std::chrono::steady_clock::now() + std::chrono::seconds{2}));
+        // Chunk 3 arrives 180 ms past its slot (> 60 ms depth): real underrun fills silence.
+        ASSERT_TRUE(audio.submit({{role, 3, {arrival + 2 * kMediaChunkNs + 240'000'000}}, media_pcm},
+                                 {role, 0, 3, 7}));
+        ASSERT_TRUE(audio.wait_idle(std::chrono::steady_clock::now() + std::chrono::seconds{2}));
+        ASSERT_TRUE(audio.finish());
+        const auto output = capture.release();
+        const auto report = audio.final_report();
+        ASSERT_TRUE(report);
+        EXPECT_EQ(report->stats.playout_underruns, 1U) << output;
+        EXPECT_GT(report->stats.frames_silence, 0U) << output;
+        EXPECT_EQ(report->stats.frames_trimmed, 0U) << output;
+        EXPECT_NE(output.find("\"event\":\"audio_playout_underrun\""), std::string::npos) << output;
+    }
+}
+
+// #228 / #173: CLI validation for --audio-playout-ms, --video-delay-ms, and
+// --audio-catch-up-watermark-ms, plus --audio-playout-ms 0 arrival opt-out.
+TEST(WiredReceiver, WiredPlayoutCliOptionsAndArrivalModelOptOut) {
+    // 1. Arrival-model opt-out (--audio-playout-ms 0) disables playout and video hold.
+    {
+        auto gate = std::make_shared<RenderGate>();
+        gate->release();
+        runtime_extra_args = {"--audio-playout-ms", "0"};
+        runtime_sink_override = [gate] { return std::make_unique<GatedRenderSink>(gate); };
+        const auto result = run_runtime(false, 120, true);
+        runtime_sink_override = {};
+        runtime_extra_args.clear();
+        EXPECT_EQ(result.code, 0) << result.output;
+        EXPECT_NE(result.output.find("\"event\":\"wired_media_policy\",\"audio_playout_ms\":0,"
+                                     "\"audio_max_unacked\":1,\"video_hold\":\"fixed\","
+                                     "\"video_delay_ms\":0"),
+                  std::string::npos) << result.output;
+    }
+
+    // 2. Arrival-model opt-out with --audio-catch-up-watermark-ms 90 restores catch-up.
+    {
+        auto gate = std::make_shared<RenderGate>();
+        gate->release();
+        CadencedPcmSource source;
+        source.burst = true;
+        source.chunks = 16;
+        runtime_send_audio = true;
+        runtime_pcm_source = &source;
+        runtime_extra_args = {"--audio-playout-ms", "0", "--audio-catch-up-watermark-ms", "90"};
+        runtime_sink_override = [gate] { return std::make_unique<GatedRenderSink>(gate); };
+        const auto result = run_runtime(false, 450, true);
+        runtime_sink_override = {};
+        runtime_pcm_source = nullptr;
+        runtime_send_audio = false;
+        runtime_extra_args.clear();
+        EXPECT_EQ(result.code, 0) << result.output;
+        EXPECT_NE(result.output.find("{\"event\":\"audio_catch_up\",\"frames\":"),
+                  std::string::npos) << result.output;
+    }
+
+    // 3. Invalid flag combinations exit 2 (usage error).
+    const std::vector<std::vector<std::string>> bad_cases{
+        {"--audio-catch-up-watermark-ms", "90"},                      // conflicts with default playout 60
+        {"--audio-playout-ms", "0", "--audio-catch-up-watermark-ms", "1"},
+        {"--audio-playout-ms", "0", "--audio-catch-up-watermark-ms", "19"},
+        {"--audio-playout-ms", "0", "--audio-catch-up-watermark-ms", "201"},
+        {"--audio-playout-ms", "0", "--audio-catch-up-watermark-ms", "1000"},
+        {"--audio-playout-ms", "0", "--video-delay-ms", "60"},        // fixed video hold needs playout > 0
+        {"--audio-playout-ms", "181"},                                // exceeds max 180
+        {"--video-delay-ms", "181"},
+    };
+    for (const auto &extra : bad_cases) {
+        runtime_extra_args = extra;
+        const auto result = run_runtime(false, 50, true);
+        runtime_extra_args.clear();
+        EXPECT_EQ(result.code, 2) << extra.front();
+    }
+}
+
+// #228: a blocked sink write neither withholds the phone's credit nor drops
+// queued audio for over half a second (#154 measured a 283.6 ms stall), and a
+// credit is granted on receipt however deep the buffer is. The former wired
+// capacity deferred the third chunk's credit and, 250 ms later, bypassed.
+TEST(WiredReceiver, LosslessWorkerQueuesThroughASinkStallWithoutLossOrWithheldCredit) {
+    ReceiverLogScope logging{g_running};
+    StdoutCaptureGuard capture;
+    auto gate = std::make_shared<RenderGate>(); // every write blocks until released
+    ConcreteAudioRenderWorker audio{pcm_router_config(), gated_router(gate)};
+    ASSERT_TRUE(audio.ready());
+    EXPECT_EQ(audio.credit_window(), 1U);
+    constexpr std::int64_t kChunkNs = 2048LL * 1'000'000'000LL / 48000LL;
+    const auto media = aa::protocol::ChannelRole::media_audio;
+    const auto guidance = aa::protocol::ChannelRole::guidance_audio;
+    const std::vector<std::byte> media_pcm(8192, std::byte{1});
+    const std::vector<std::byte> guidance_pcm(6400, std::byte{2});
+    const auto start = steady_ns();
+    std::size_t credits = 0;
+    const auto submit = [&](aa::protocol::ChannelRole role, std::uint64_t sequence, std::int64_t at,
+                            const std::vector<std::byte> &pcm) {
+        ASSERT_TRUE(audio.submit({{role, sequence, {at}}, pcm}, {role, 0, sequence, 7}));
+        ASSERT_TRUE(audio.take_completion(std::chrono::steady_clock::now() + std::chrono::seconds{1}));
+        ++credits;
+    };
+    for (std::uint64_t k = 0; k < 14; ++k) { // 600 ms of media
+        submit(media, k + 1, start + static_cast<std::int64_t>(k) * kChunkNs, media_pcm);
+        if (k % 5 == 0) {
+            submit(guidance, k / 5 + 1, start + static_cast<std::int64_t>(k) * kChunkNs, guidance_pcm);
+        }
+    }
+    ASSERT_TRUE(gate->wait_writes(1));
+    std::this_thread::sleep_for(std::chrono::milliseconds{400});
+    (void)audio.take_completion(std::chrono::steady_clock::now()); // where a bypass would start
+    gate->release();
+    ASSERT_TRUE(audio.wait_idle(std::chrono::steady_clock::now() + std::chrono::seconds{3}));
+    EXPECT_EQ(credits, 17U);
+    EXPECT_FALSE(audio.failure());
+    ASSERT_TRUE(audio.finish());
+    const auto output = capture.release();
+    const auto report = audio.final_report();
+    ASSERT_TRUE(report);
+    EXPECT_EQ(output.find("audio_stall_bypass"), std::string::npos) << output;
+    EXPECT_EQ(output.find("audio_credit_deferred"), std::string::npos) << output;
+    EXPECT_NE(output.find("\"playout_overflows\":0,\"frames_overflowed\":0"), std::string::npos) << output;
+    EXPECT_EQ(report->stats.frames_trimmed, 0U) << output;
+    EXPECT_EQ(report->stats.frames_padded, 0U) << output;
+    EXPECT_EQ(report->stats.frames_decoded + report->stats.frames_stretched,
+              report->stats.frames_retained + report->stats.frames_compressed) << output;
+    EXPECT_FALSE(gate->timed_out);
+}
+
+// #228: a prompt alone on a live route is not held forever: the worker wakes
+// itself shortly before each piece's slot while media is only late.
+TEST(WiredReceiver, LosslessWorkerPlaysAPromptOutWhenMediaStopsArriving) {
+    ReceiverLogScope logging{g_running};
+    StdoutCaptureGuard capture;
+    auto gate = std::make_shared<RenderGate>();
+    gate->release();
+    ConcreteAudioRenderWorker audio{pcm_router_config(), gated_router(gate)};
+    ASSERT_TRUE(audio.ready());
+    const auto media = aa::protocol::ChannelRole::media_audio;
+    const auto guidance = aa::protocol::ChannelRole::guidance_audio;
+    const auto start = steady_ns();
+    ASSERT_TRUE(audio.submit({{media, 1, {start}}, std::vector<std::byte>(8192, std::byte{1})},
+                             {media, 0, 1, 7}));
+    ASSERT_TRUE(audio.submit({{guidance, 1, {start}}, std::vector<std::byte>(6400, std::byte{2})},
+                             {guidance, 0, 1, 7}));
+    ASSERT_TRUE(audio.wait_idle(std::chrono::steady_clock::now() + std::chrono::seconds{3}));
+    // Played to its end, and no earlier than the hold allows: the last 10 ms
+    // piece ends 260 ms after the anchor and waits until 20 ms before its slot.
+    EXPECT_GE(steady_ns() - start, 200'000'000);
+    ASSERT_TRUE(audio.finish());
+    const auto report = audio.final_report();
+    ASSERT_TRUE(report);
+    EXPECT_EQ(report->stats.frames_decoded, report->stats.frames_retained);
+    EXPECT_EQ(report->stats.frames_trimmed, 0U);
+    (void)capture.release();
+}
+
+// #228: wired video hold (--video-delay-ms match) follows the audio playout offset.
+TEST(WiredReceiver, WiredVideoHoldFollowsAudioPlayoutOffset) {
+    ReceiverLogScope logging{g_running};
+    StdoutCaptureGuard capture;
+    auto gate = std::make_shared<RenderGate>();
+    gate->release();
+    ConcreteAudioRenderWorker audio{pcm_router_config(), gated_router(gate)};
+    ASSERT_TRUE(audio.ready());
+    VideoOutlet outlet{log_line_nonblocking, log_media};
+    const aa::tools::PlayoutOptions opts{aa::audio::kWiredPlayoutDepth.count / 1'000'000, 0, std::nullopt};
+    std::chrono::milliseconds hold{};
+    bool follow = false;
+    aa::tools::configure_video_hold(outlet, audio, opts, follow, hold);
+    EXPECT_TRUE(follow);
+    EXPECT_EQ(hold, std::chrono::milliseconds{60});
+    const auto arrival = steady_ns();
+    // Before first audio write, fallback is the configured 60 ms depth.
+    EXPECT_EQ(outlet.presentation_delay_for({arrival}), std::chrono::milliseconds{60});
+    // Submit a 3-chunk burst so the audio playout offset rises above 60 ms,
+    // and verify the video hold follows the reported audio offset.
+    const std::vector<std::byte> pcm(8192, std::byte{1});
+    const auto role = aa::protocol::ChannelRole::media_audio;
+    for (std::uint64_t seq = 1; seq <= 3; ++seq) {
+        ASSERT_TRUE(audio.submit({{role, seq, {arrival}}, pcm}, {role, 0, seq, 7}));
+        ASSERT_TRUE(audio.wait_idle(std::chrono::steady_clock::now() + std::chrono::seconds{2}));
+    }
+    const auto audio_offset = audio.playout_offset_at({arrival + 50'000'000});
+    EXPECT_GT(audio_offset, std::chrono::milliseconds{60});
+    EXPECT_EQ(outlet.presentation_delay_for({arrival + 50'000'000}), audio_offset);
+    ASSERT_TRUE(audio.finish());
+    (void)capture.release();
+}
+
+// Re-review of #229, P1: the queue is bounded by time, not by packets. A
+// conforming phone (one chunk unacknowledged) sends at its own cadence while the
+// first write is blocked; the sink then recovers. 4a3f49f filled 32 packet slots,
+// withheld the credit and after 250 ms bypassed: of 960-byte packets it lost 32
+// of 33 in a 425 ms stall, of A26's 8,192-byte ones 32 of 33 in 1.6 s.
+TEST(WiredReceiver, LosslessWorkerLosesNothingInAnyStallTheSinkRecoversFrom) {
+    struct Case {
+        std::size_t bytes;
+        int stall_ms;
+    };
+    for (const Case c : {Case{960, 425}, Case{960, 1600}, Case{384, 425}, Case{8192, 1600}, Case{8192, 1850}}) {
+        SCOPED_TRACE(std::to_string(c.bytes) + " bytes, " + std::to_string(c.stall_ms) + " ms");
+        ReceiverLogScope logging{g_running};
+        StdoutCaptureGuard capture;
+        auto gate = std::make_shared<RenderGate>();
+        gate->first_write_delay = std::chrono::milliseconds{c.stall_ms};
+        ConcreteAudioRenderWorker audio{pcm_router_config(), gated_router(gate)};
+        ASSERT_TRUE(audio.ready());
+        const auto role = aa::protocol::ChannelRole::media_audio;
+        const std::vector<std::byte> pcm(c.bytes, std::byte{1});
+        const auto packet_ns = static_cast<std::int64_t>(c.bytes) * 1'000'000'000 / 192'000;
+        const auto start = steady_ns();
+        std::uint64_t sent = 0;
+        bool credit = true;
+        bool last = false;
+        while (!last) {
+            const auto due = start + static_cast<std::int64_t>(sent) * packet_ns;
+            std::this_thread::sleep_for(std::chrono::nanoseconds{due - steady_ns()});
+            while (!credit && steady_ns() - start < 3'000'000'000) {
+                credit = audio.take_completion(std::chrono::steady_clock::now() +
+                                               std::chrono::milliseconds{5}).has_value();
+            }
+            ASSERT_TRUE(credit) << sent;
+            last = steady_ns() - start > c.stall_ms * 1'000'000LL + 20'000'000;
+            ++sent;
+            ASSERT_TRUE(audio.submit({{role, sent, {due}}, pcm}, {role, 0, sent, 7}));
+            credit = audio.take_completion(std::chrono::steady_clock::now()).has_value();
+        }
+        ASSERT_TRUE(audio.wait_idle(std::chrono::steady_clock::now() + std::chrono::seconds{3}));
+        EXPECT_FALSE(audio.failure());
+        ASSERT_TRUE(audio.finish());
+        const auto output = capture.release();
+        const auto report = audio.final_report();
+        ASSERT_TRUE(report);
+        EXPECT_EQ(output.find("audio_stall_bypass"), std::string::npos) << output;
+        EXPECT_EQ(output.find("audio_credit_deferred"), std::string::npos) << output;
+        EXPECT_EQ(report->stats.frames_decoded, sent * c.bytes / 4) << output;
+        EXPECT_EQ(report->stats.frames_decoded + report->stats.frames_stretched,
+                  report->stats.frames_retained + report->stats.frames_compressed) << output;
+        EXPECT_EQ(report->stats.frames_trimmed, 0U) << output;
+        EXPECT_FALSE(gate->timed_out);
+    }
+}
+
+// The other side of that line (#60): a write that never returns must not end the
+// session. Below the emergency bound a withheld credit waits; past it the worker
+// drops, ACKs and reports. A one second bound and queue keep the test short.
+TEST(WiredReceiver, LosslessWorkerBypassesOnlyASinkStuckBeyondTheEmergencyBound) {
+    ReceiverLogScope logging{g_running};
+    StdoutCaptureGuard capture;
+    auto gate = std::make_shared<RenderGate>();
+    gate->write_timeout = std::chrono::milliseconds{10'000};
+    auto config = pcm_router_config();
+    config.playout.emergency_backlog = aa::core::Nanoseconds{1'000'000'000};
+    config.sink_write_timeout = aa::core::Milliseconds{0};
+    ConcreteAudioRenderWorker audio{config, gated_router(gate)};
+    ASSERT_TRUE(audio.ready());
+    const auto role = aa::protocol::ChannelRole::media_audio;
+    const std::vector<std::byte> pcm(19'200, std::byte{1}); // 100 ms
+    const auto start = steady_ns();
+    std::uint64_t sent = 0;
+    // Without pacing the queue (1.4 s) fills in an instant: no credit is left.
+    std::int64_t withheld = 0;
+    while (withheld == 0 && sent < 40) {
+        ++sent;
+        ASSERT_TRUE(audio.submit({{role, sent, {start}}, pcm}, {role, 0, sent, 7}));
+        if (!audio.take_completion(std::chrono::steady_clock::now())) { withheld = steady_ns(); }
+    }
+    EXPECT_EQ(sent, 14U); // 1.4 s: the 14th leaves no room for another envelope
+    // 600 ms of withheld credit is latency, not loss.
+    while (steady_ns() - start < 900'000'000) {
+        EXPECT_FALSE(audio.take_completion(std::chrono::steady_clock::now() + std::chrono::milliseconds{20}));
+    }
+    // Past the bound the session goes on without the sink.
+    const auto deadline = start + 2'000'000'000;
+    bool released = false;
+    while (!released && steady_ns() < deadline) {
+        released = audio.take_completion(std::chrono::steady_clock::now() + std::chrono::milliseconds{20}).has_value();
+    }
+    EXPECT_TRUE(released);
+    EXPECT_GE(steady_ns() - start, 1'000'000'000);
+    ASSERT_TRUE(audio.submit({{role, sent + 1, {steady_ns()}}, pcm}, {role, 0, sent + 1, 7}));
+    ASSERT_TRUE(audio.take_completion(std::chrono::steady_clock::now() + std::chrono::milliseconds{100}));
+    EXPECT_FALSE(audio.failure());
+    gate->release();
+    ASSERT_TRUE(audio.wait_idle(std::chrono::steady_clock::now() + std::chrono::seconds{2}));
+    EXPECT_TRUE(audio.finish());
+    const auto output = capture.release();
+    EXPECT_NE(output.find("\"phase\":\"begin\",\"trigger\":\"credit_wait\""), std::string::npos) << output;
+    EXPECT_NE(output.find("\"outcome\":\"write_returned\""), std::string::npos) << output;
+}
+
+// Re-review of #229, P1: the phone stops a stream right after its last ACK. All
+// it sent plays out: a whole prompt held for the media slot (4a3f49f cancelled
+// 9,502 of its 9,600 frames), and a media backlog.
+TEST(WiredReceiver, LosslessStopPlaysOutEverythingAccepted) {
+    ReceiverLogScope logging{g_running};
+    StdoutCaptureGuard capture;
+    auto gate = std::make_shared<RenderGate>();
+    gate->release();
+    ConcreteAudioRenderWorker audio{pcm_router_config(), gated_router(gate)};
+    ASSERT_TRUE(audio.ready());
+    const auto media = aa::protocol::ChannelRole::media_audio;
+    const auto guidance = aa::protocol::ChannelRole::guidance_audio;
+    const std::vector<std::byte> media_pcm(8192, std::byte{1});
+    const std::vector<std::byte> prompt(6400, std::byte{2});
+    const auto ack = [&] {
+        return audio.take_completion(std::chrono::steady_clock::now() + std::chrono::milliseconds{100});
+    };
+    const auto start = steady_ns();
+    ASSERT_TRUE(audio.submit({{media, 1, {start}}, media_pcm}, {media, 0, 1, 7}));
+    ASSERT_TRUE(ack());
+    ASSERT_TRUE(gate->wait_writes(1)); // the media parent is rendered
+    ASSERT_TRUE(audio.submit({{guidance, 2, {start}}, prompt}, {guidance, 0, 1, 7}));
+    ASSERT_TRUE(ack());
+    audio.invalidate(guidance, 1); // AV_STOP
+    // The next prompt, in a new session of the channel, right away.
+    ASSERT_TRUE(audio.submit({{guidance, 3, {steady_ns()}}, prompt}, {guidance, 1, 1, 8}));
+    ASSERT_TRUE(ack());
+    audio.invalidate(guidance, 2);
+    ASSERT_TRUE(audio.wait_idle(std::chrono::steady_clock::now() + std::chrono::seconds{3}));
+    // A deep media buffer, then stop: the rest plays out as well.
+    const auto burst = steady_ns();
+    for (std::uint64_t k = 0; k < 8; ++k) {
+        ASSERT_TRUE(audio.submit({{media, 4 + k, {burst}}, media_pcm}, {media, 0, 2 + k, 7}));
+        ASSERT_TRUE(ack());
+    }
+    audio.invalidate(media, 1);
+    EXPECT_FALSE(audio.take_completion(std::chrono::steady_clock::now())); // no stale ACK
+    ASSERT_TRUE(audio.wait_idle(std::chrono::steady_clock::now() + std::chrono::seconds{3}));
+    EXPECT_FALSE(audio.failure());
+    ASSERT_TRUE(audio.finish());
+    const auto output = capture.release();
+    const auto report = audio.final_report();
+    ASSERT_TRUE(report);
+    EXPECT_GE(report->stats.frames_retained, 9U * 2048U + 2U * 9598U) << output;
+    EXPECT_EQ(report->stats.frames_decoded, report->stats.frames_retained) << output;
+    EXPECT_EQ(report->stats.frames_trimmed, 0U) << output;
+    EXPECT_EQ(output.find("audio_stop_discarded"), std::string::npos) << output;
+}
+
+// Rapid stop/start cycles each bring a fresh credit; what cannot be kept without
+// refusing the new stream is cancelled and reported, never a failed session.
+TEST(WiredReceiver, LosslessStopAlwaysLeavesRoomForTheNextStream) {
+    ReceiverLogScope logging{g_running};
+    StdoutCaptureGuard capture;
+    auto gate = std::make_shared<RenderGate>(); // the sink is blocked throughout
+    ConcreteAudioRenderWorker audio{pcm_router_config(), gated_router(gate)};
+    ASSERT_TRUE(audio.ready());
+    const auto media = aa::protocol::ChannelRole::media_audio;
+    const std::vector<std::byte> pcm(19'200, std::byte{1});
+    for (std::uint64_t cycle = 0; cycle < 120; ++cycle) {
+        ASSERT_TRUE(audio.submit({{media, cycle + 1, {steady_ns()}}, pcm}, {media, cycle, 1, 7})) << cycle;
+        audio.invalidate(media, cycle + 1);
+    }
+    gate->release();
+    ASSERT_TRUE(audio.wait_idle(std::chrono::steady_clock::now() + std::chrono::seconds{3}));
+    EXPECT_FALSE(audio.failure());
+    ASSERT_TRUE(audio.finish());
+    EXPECT_NE(capture.release().find("{\"event\":\"audio_stop_discarded\",\"role\":"), std::string::npos);
+}
+
+// The receiver's own shutdown: what was accepted plays out (bounded), instead of
+// being cancelled before the final flush.
+TEST(WiredReceiver, LosslessShutdownPlaysOutEverythingAccepted) {
+    ReceiverLogScope logging{g_running};
+    for (const bool stuck : {false, true}) {
+        SCOPED_TRACE(stuck);
+        StdoutCaptureGuard capture;
+        auto gate = std::make_shared<RenderGate>();
+        if (stuck) { gate->write_timeout = std::chrono::milliseconds{300}; }
+        else { gate->release(); }
+        ConcreteAudioRenderWorker audio{pcm_router_config(), gated_router(gate)};
+        ASSERT_TRUE(audio.ready());
+        const auto media = aa::protocol::ChannelRole::media_audio;
+        const auto guidance = aa::protocol::ChannelRole::guidance_audio;
+        const auto start = steady_ns();
+        ASSERT_TRUE(audio.submit({{media, 1, {start}}, std::vector<std::byte>(8192, std::byte{1})},
+                                 {media, 0, 1, 7}));
+        ASSERT_TRUE(audio.submit({{guidance, 2, {start}}, std::vector<std::byte>(6400, std::byte{2})},
+                                 {guidance, 0, 1, 7}));
+        ASSERT_TRUE(gate->wait_writes(1));
+        const auto finished = audio.finish();
+        // Bounded by the sink's write deadline and kStopDrain.
+        EXPECT_LT(steady_ns() - start, 3'000'000'000);
+        EXPECT_EQ(finished.has_value(), !stuck);
+        const auto report = audio.final_report();
+        ASSERT_TRUE(report);
+        if (!stuck) { EXPECT_GE(report->stats.frames_retained, 2048U + 9598U); }
+        EXPECT_EQ(gate->destroyed, 1U);
+        (void)capture.release();
+    }
+}
+
+// Third review of #229, P2: the worker is idle and its queue empty, but the decoder
+// still holds the end of a prompt that is yet to play. 07b82f0 cancelled it without
+// a word (9,502 of 9,598 frames).
+TEST(WiredReceiver, LosslessShutdownPlaysWhatOnlyTheDecoderHolds) {
+    ReceiverLogScope logging{g_running};
+    StdoutCaptureGuard capture;
+    auto gate = std::make_shared<RenderGate>();
+    gate->release();
+    ConcreteAudioRenderWorker audio{pcm_router_config(), gated_router(gate)};
+    ASSERT_TRUE(audio.ready());
+    const auto guidance = aa::protocol::ChannelRole::guidance_audio;
+    ASSERT_TRUE(audio.submit({{guidance, 1, {steady_ns()}}, std::vector<std::byte>(6400, std::byte{2})},
+                             {guidance, 0, 1, 7}));
+    ASSERT_TRUE(audio.take_completion(std::chrono::steady_clock::now() + std::chrono::milliseconds{100}));
+    ASSERT_TRUE(audio.wait_idle(std::chrono::steady_clock::now() + std::chrono::seconds{2}));
+    ASSERT_TRUE(audio.finish());
+    const auto output = capture.release();
+    const auto report = audio.final_report();
+    ASSERT_TRUE(report);
+    EXPECT_GE(report->stats.frames_retained, 9'598U) << output;
+    EXPECT_EQ(report->stats.frames_decoded, report->stats.frames_retained) << output;
+    EXPECT_EQ(output.find("audio_stop_discarded"), std::string::npos) << output;
+    EXPECT_EQ(gate->drains, 1U);
+}
+
+namespace {
+
+// Every write takes `write`, the end of stream `eos` (it fails when the worker
+// leaves it less).
+struct SlowSinkState {
+    std::chrono::milliseconds write{};
+    std::chrono::milliseconds eos{};
+    std::atomic<std::size_t> writes{};
+    std::atomic<std::int64_t> last_write_started{};
+    std::atomic<std::int64_t> drain_timeout_ms{-1};
+};
+
+class SlowRenderSink final : public aa::audio::detail::ObservedAudioSink {
+  public:
+    explicit SlowRenderSink(std::shared_ptr<SlowSinkState> state) : state_(std::move(state)) {}
+    aa::core::Result<void> write(const aa::audio::MixedChunk &) override {
+        state_->last_write_started = steady_ns();
+        ++state_->writes;
+        std::this_thread::sleep_for(state_->write);
+        return {};
+    }
+    aa::core::Result<void> drain(aa::core::Milliseconds timeout) override {
+        state_->drain_timeout_ms = timeout.count;
+        std::this_thread::sleep_for(std::min(state_->eos, std::chrono::milliseconds{timeout.count}));
+        if (state_->eos.count() > timeout.count) { return aa::Error{aa::ErrorCode::timeout}; }
+        return {};
+    }
+    aa::audio::SinkProbeStats probe_stats() const override { return {}; }
+    aa::audio::RenderBarrierStats render_stats() const override { return {}; }
+  private:
+    std::shared_ptr<SlowSinkState> state_;
+};
+
+} // namespace
+
+// Sol's delta review of 25df492: the write that fails during a shutdown is all that was
+// left, a decoder tail without a job, and 25df492 lost its 96 frames without a word.
+// So is one with jobs behind it accounted for.
+TEST(WiredReceiver, LosslessShutdownReportsWhatAFailedWriteLoses) {
+    ReceiverLogScope logging{g_running};
+    for (const bool tail_only : {true, false}) {
+        SCOPED_TRACE(tail_only);
+        StdoutCaptureGuard capture;
+        auto gate = std::make_shared<RenderGate>();
+        if (tail_only) { gate->release(); }
+        ConcreteAudioRenderWorker audio{pcm_router_config(), gated_router(gate)};
+        ASSERT_TRUE(audio.ready());
+        const auto role = tail_only ? aa::protocol::ChannelRole::guidance_audio
+                                    : aa::protocol::ChannelRole::media_audio;
+        const auto start = steady_ns();
+        const std::uint64_t parents = tail_only ? 1 : 100; // more than the router takes at once
+        for (std::uint64_t k = 0; k < parents; ++k) {
+            ASSERT_TRUE(audio.submit({{role, k + 1, {start}}, std::vector<std::byte>(tail_only ? 6400 : 1920, std::byte{2})},
+                                     {role, 0, k + 1, 7}));
+        }
+        if (tail_only) { ASSERT_TRUE(audio.wait_idle(std::chrono::steady_clock::now() + std::chrono::seconds{2})); }
+        else { ASSERT_TRUE(gate->wait_writes(1)); }
+        {
+            std::lock_guard lock(gate->mutex);
+            gate->fail_write = true;
+        }
+        audio.stop();
+        gate->release();
+        EXPECT_FALSE(audio.finish());
+        const auto output = capture.release();
+        const auto report = audio.final_report();
+        ASSERT_TRUE(report);
+        // All of it is either retained or in the record.
+        const auto accepted = tail_only ? std::uint64_t{9'598} : 100U * 480U;
+        const auto lost = accepted - report->stats.frames_retained;
+        EXPECT_GT(lost, 0U);
+        EXPECT_NE(output.find("{\"event\":\"audio_stop_discarded\",\"role\":null,\"chunks\":" +
+                              std::to_string(parents) + ",\"frames\":" + std::to_string(lost)),
+                  std::string::npos) << lost << " " << output;
+    }
+}
+
+// Sol's delta review of d877a45: a write of another role fails during the stop. A
+// prompt's decoder tail was dropped uncounted once its slot had passed.
+TEST(WiredReceiver, LosslessShutdownReportsALateDecoderTailBehindAFailedWrite) {
+    ReceiverLogScope logging{g_running};
+    for (const auto held : {std::chrono::milliseconds{0}, std::chrono::milliseconds{400}}) {
+        SCOPED_TRACE(held.count());
+        StdoutCaptureGuard capture;
+        auto gate = std::make_shared<RenderGate>();
+        gate->release();
+        ConcreteAudioRenderWorker audio{pcm_router_config(), gated_router(gate)};
+        ASSERT_TRUE(audio.ready());
+        const auto media = aa::protocol::ChannelRole::media_audio;
+        const auto guidance = aa::protocol::ChannelRole::guidance_audio;
+        ASSERT_TRUE(audio.submit({{guidance, 1, {steady_ns()}}, std::vector<std::byte>(6400, std::byte{2})},
+                                 {guidance, 0, 1, 7}));
+        ASSERT_TRUE(audio.wait_idle(std::chrono::steady_clock::now() + std::chrono::seconds{2}));
+        std::size_t before = 0;
+        {
+            std::lock_guard lock(gate->mutex);
+            gate->released = false;
+            gate->fail_write = true;
+            before = gate->writes;
+        }
+        ASSERT_TRUE(audio.submit({{media, 2, {steady_ns()}}, std::vector<std::byte>(8192, std::byte{1})},
+                                 {media, 0, 1, 7}));
+        ASSERT_TRUE(gate->wait_writes(before + 1));
+        audio.stop();
+        std::this_thread::sleep_for(held);
+        gate->release();
+        EXPECT_FALSE(audio.finish());
+        const auto output = capture.release();
+        EXPECT_NE(output.find("{\"event\":\"audio_stop_discarded\",\"role\":null,\"chunks\":1,\"frames\":" +
+                              std::to_string(2'048 + 96)),
+                  std::string::npos) << output;
+    }
+}
+
+// Sol's delta review of d877a45: a resampler needs more than a frame or two before it
+// gives any output. d877a45 decoded the packets of a slot one by one and gave up on the
+// first (timeout after 502 ms, fatal). `alone`: each reaches the router on its own.
+TEST(WiredReceiver, LosslessWorkerPlaysVoicePacketsTooShortToResample) {
+    struct Case {
+        aa::protocol::ChannelRole role;
+        std::uint64_t packets;
+        bool alone;
+    };
+    const auto guidance = aa::protocol::ChannelRole::guidance_audio;
+    for (const Case c : {Case{guidance, 64, false}, Case{aa::protocol::ChannelRole::system_audio, 64, false},
+                         Case{guidance, 20, false}, Case{guidance, 400, false}, Case{guidance, 100, true}}) {
+        SCOPED_TRACE(std::to_string(c.packets) + (c.alone ? " alone" : "") + " role " +
+                     std::to_string(static_cast<unsigned>(c.role)));
+        ReceiverLogScope logging{g_running};
+        StdoutCaptureGuard capture;
+        auto gate = std::make_shared<RenderGate>();
+        gate->write_timeout = std::chrono::milliseconds{30'000};
+        if (c.alone) { gate->release(); }
+        ConcreteAudioRenderWorker audio{pcm_router_config(), gated_router(gate)};
+        ASSERT_TRUE(audio.ready());
+        const auto media = aa::protocol::ChannelRole::media_audio;
+        const auto start = steady_ns();
+        std::uint64_t sequence = 0;
+        if (!c.alone) {
+            ASSERT_TRUE(audio.submit({{media, ++sequence, {start}}, std::vector<std::byte>(8192, std::byte{1})},
+                                     {media, 0, 1, 7}));
+            ASSERT_TRUE(audio.take_completion(std::chrono::steady_clock::now() + std::chrono::milliseconds{100}));
+            ASSERT_TRUE(gate->wait_writes(1));
+        }
+        for (std::uint64_t k = 0; k < c.packets; ++k) {
+            const auto at = start + static_cast<std::int64_t>(k) * 62'500;
+            ASSERT_TRUE(audio.submit({{c.role, ++sequence, {at}}, std::vector<std::byte>(2, std::byte{2})},
+                                     {c.role, 0, 1'000 + k, 7}));
+            const auto done = audio.take_completion(std::chrono::steady_clock::now() + std::chrono::milliseconds{100});
+            ASSERT_TRUE(done);
+            EXPECT_EQ(done->sequence, 1'000 + k);
+            if (c.alone) { ASSERT_TRUE(audio.wait_idle(std::chrono::steady_clock::now() + std::chrono::seconds{2})) << k; }
+        }
+        gate->release();
+        ASSERT_TRUE(audio.wait_idle(std::chrono::steady_clock::now() + std::chrono::seconds{2}));
+        EXPECT_TRUE(audio.finish());
+        const auto output = capture.release();
+        const auto report = audio.final_report();
+        ASSERT_TRUE(report);
+        const auto &stats = report->stats;
+        // The resampler keeps two output frames of every stream.
+        EXPECT_EQ(stats.frames_decoded, (c.alone ? 0U : 2'048U) + c.packets * 3 - 2) << output;
+        EXPECT_EQ(stats.frames_decoded, stats.frames_retained) << output;
+        EXPECT_EQ(output.find("audio_stop_discarded"), std::string::npos) << output;
+        EXPECT_EQ(stats.playout_anchors, c.alone ? 1U : 2U) << output;
+        EXPECT_EQ(stats.playout_underruns, 0U) << output;
+    }
+}
+
+// Sol's delta review of d877a45: only a shared slot's first packet has an admission
+// record, which d877a45 also reported for a later one's failure.
+TEST(WiredReceiver, LosslessSharedPacketsFailureKeepsItsOwnAdmission) {
+    ReceiverLogScope logging{g_running};
+    for (const bool later : {false, true}) {
+        SCOPED_TRACE(later);
+        StdoutCaptureGuard capture;
+        auto gate = std::make_shared<RenderGate>();
+        ConcreteAudioRenderWorker audio{pcm_router_config(), gated_router(gate)};
+        ASSERT_TRUE(audio.ready());
+        const auto role = aa::protocol::ChannelRole::media_audio;
+        const auto start = steady_ns();
+        const auto submit = [&](std::uint64_t sequence, std::int64_t at, std::size_t bytes) {
+            ASSERT_TRUE(audio.submit({{role, sequence, {at}}, std::vector<std::byte>(bytes, std::byte{1})},
+                                     {role, 0, 1'000 + sequence, 7}));
+        };
+        ASSERT_NO_FATAL_FAILURE(submit(1, start, 8192));
+        ASSERT_TRUE(gate->wait_writes(1));
+        ASSERT_NO_FATAL_FAILURE(submit(2, later ? start : -1, 64));
+        ASSERT_NO_FATAL_FAILURE(submit(3, later ? -1 : start, 64));
+        EXPECT_EQ(audio.worker_observation_for_test().queue.queued_by_role[0], 2U); // shared
+        gate->release();
+        EXPECT_FALSE(audio.wait_idle(std::chrono::steady_clock::now() + std::chrono::seconds{2}) && !audio.failure());
+        const auto context = audio.failure_context();
+        ASSERT_TRUE(context);
+        EXPECT_EQ(context->origin, AudioFailureOrigin::router_submit);
+        ASSERT_TRUE(context->parent);
+        EXPECT_EQ(context->parent->message_sequence, later ? 3U : 2U);
+        EXPECT_EQ(context->parent->delivery.sequence, later ? 1'003U : 1'002U);
+        EXPECT_EQ(context->worker.admission.has_value(), !later);
+        if (context->worker.admission) {
+            EXPECT_EQ(context->worker.admission->parent.delivery, context->parent->delivery);
+        }
+        EXPECT_FALSE(audio.finish());
+        (void)capture.release();
+    }
+}
+
+// The receiver's teardown order: the session thread stops the worker, then the
+// session resets every AV channel, then the main thread finishes the worker. That
+// reset is no reason to drop what is playing out (07b82f0 cancelled all of it).
+TEST(WiredReceiver, LosslessShutdownPlaysOutThroughTheSessionsChannelReset) {
+    ReceiverLogScope logging{g_running};
+    for (const bool idle : {false, true}) { // idle: only the decoder holds something
+        SCOPED_TRACE(idle);
+        StdoutCaptureGuard capture;
+        auto gate = std::make_shared<RenderGate>();
+        if (idle) { gate->release(); }
+        ConcreteAudioRenderWorker audio{pcm_router_config(), gated_router(gate)};
+        ASSERT_TRUE(audio.ready());
+        const auto media = aa::protocol::ChannelRole::media_audio;
+        const auto guidance = aa::protocol::ChannelRole::guidance_audio;
+        const auto start = steady_ns();
+        ASSERT_TRUE(audio.submit({{guidance, 1, {start}}, std::vector<std::byte>(6400, std::byte{2})},
+                                 {guidance, 0, 1, 7}));
+        if (!idle) {
+            for (std::uint64_t k = 0; k < 4; ++k) {
+                ASSERT_TRUE(audio.submit({{media, k + 1, {start}}, std::vector<std::byte>(8192, std::byte{1})},
+                                         {media, 0, k + 1, 7}));
+            }
+            ASSERT_TRUE(gate->wait_writes(1)); // the sink is blocked at the stop
+        } else {
+            ASSERT_TRUE(audio.wait_idle(std::chrono::steady_clock::now() + std::chrono::seconds{2}));
+        }
+        audio.stop();
+        for (const auto role : {media, guidance, aa::protocol::ChannelRole::system_audio}) {
+            audio.invalidate(role, 1);
+        }
+        gate->release();
+        ASSERT_TRUE(audio.finish());
+        const auto output = capture.release();
+        const auto report = audio.final_report();
+        ASSERT_TRUE(report);
+        EXPECT_GE(report->stats.frames_retained, 9'598U + (idle ? 0U : 4U * 2048U)) << output;
+        EXPECT_EQ(report->stats.frames_decoded, report->stats.frames_retained) << output;
+        EXPECT_EQ(output.find("audio_stop_discarded"), std::string::npos) << output;
+    }
+}
+
+// Third review of #229, P2: playing out and the sink's end of stream share one 2 s
+// deadline. 07b82f0 started a write just before it and gave the end of stream 2 s
+// of its own: two writes of 1.75 s took finish() 3.5 s, plus the end of stream.
+TEST(WiredReceiver, LosslessShutdownSharesOneDeadlineAcrossWritesAndEndOfStream) {
+    ReceiverLogScope logging{g_running};
+    struct Case {
+        int write_ms;
+        int eos_ms;
+        bool plays_all;
+        bool clean;
+    };
+    for (const Case c : {Case{1750, 0, false, true},  // the next cannot end in time
+                         Case{300, 250, false, true}, // deep: cut with time left for the end of stream
+                         Case{20, 250, true, true},   // all of it plays
+                         Case{20, 5000, true, false}}) { // the end of stream never comes
+        SCOPED_TRACE(std::to_string(c.write_ms) + "/" + std::to_string(c.eos_ms));
+        StdoutCaptureGuard capture;
+        auto state = std::make_shared<SlowSinkState>();
+        state->write = std::chrono::milliseconds{c.write_ms};
+        state->eos = std::chrono::milliseconds{c.eos_ms};
+        ConcreteAudioRenderWorker audio{pcm_router_config(), [state](const auto &config) {
+            return aa::audio::detail::open_router_with_sink_for_test(
+                config, std::make_unique<SlowRenderSink>(state));
+        }};
+        ASSERT_TRUE(audio.ready());
+        const auto media = aa::protocol::ChannelRole::media_audio;
+        const auto start = steady_ns();
+        for (std::uint64_t k = 0; k < 12; ++k) {
+            ASSERT_TRUE(audio.submit({{media, k + 1, {start}}, std::vector<std::byte>(8192, std::byte{1})},
+                                     {media, 0, k + 1, 7}));
+            ASSERT_TRUE(audio.take_completion(std::chrono::steady_clock::now() + std::chrono::milliseconds{100}));
+        }
+        while (state->writes == 0 && steady_ns() - start < 1'000'000'000) { std::this_thread::yield(); }
+        const auto stopped = steady_ns();
+        const auto finished = audio.finish();
+        const auto took = steady_ns() - stopped;
+        EXPECT_LT(took, 2'150'000'000);
+        EXPECT_EQ(finished.has_value(), c.clean);
+        const auto output = capture.release();
+        const auto report = audio.final_report();
+        ASSERT_TRUE(report);
+        EXPECT_EQ(report->stats.frames_retained == 12U * 2048U, c.plays_all) << output;
+        EXPECT_EQ(output.find("{\"event\":\"audio_stop_discarded\",\"role\":null,\"chunks\":") == std::string::npos,
+                  c.plays_all) << output;
+        // No write started that its predecessor says could not end 400 ms before.
+        EXPECT_LE(state->last_write_started - stopped + c.write_ms * 1'000'000LL,
+                  std::max(1'600, c.write_ms) * 1'000'000LL + 50'000'000);
+        // The end of stream got what was left.
+        EXPECT_GE(state->drain_timeout_ms, 1);
+        EXPECT_LE(state->drain_timeout_ms, 2'000 - (state->last_write_started - stopped) / 1'000'000 - c.write_ms + 50);
+    }
+}
+
+// Third review of #229, P2: credits are granted on receipt up to the time budget at
+// any packet size. 07b82f0 ran out of its 4,400 slots at the 4,400th packet, 1.47 s
+// of 64-byte ones (16 frames), and withheld that credit. Nothing is lost, and the
+// slots stay bounded.
+TEST(WiredReceiver, LosslessWorkerGrantsOnReceiptAtAnyPacketSize) {
+    struct Case {
+        std::size_t bytes;
+        std::uint64_t packets;
+        std::size_t most_jobs;
+        std::size_t most_writes;
+    };
+    // Up to 1.85 s each, in an instant: the sink is blocked throughout. Every packet
+    // keeps its own placement, but they are written about 4 ms at a time: d877a45 wrote
+    // each on its own, too many to play in real time (it cut 70% of the 4 B case).
+    for (const Case c : {Case{64, 5'550, 600, 500}, Case{4, 24'000, 200, 150},
+                         Case{188, 1'880, 600, 600}, Case{192, 1'850, 1'850, 500}}) {
+        SCOPED_TRACE(c.bytes);
+        ReceiverLogScope logging{g_running};
+        StdoutCaptureGuard capture;
+        auto gate = std::make_shared<RenderGate>();
+        gate->write_timeout = std::chrono::milliseconds{30'000};
+        ConcreteAudioRenderWorker audio{pcm_router_config(), gated_router(gate)};
+        ASSERT_TRUE(audio.ready());
+        const auto role = aa::protocol::ChannelRole::media_audio;
+        const auto start = steady_ns();
+        std::uint64_t withheld = 0;
+        std::uint64_t sent = 0;
+        std::uint64_t frames = 0;
+        const auto send = [&](std::size_t bytes) {
+            const auto at = start + static_cast<std::int64_t>(frames) * 1'000'000'000 / 48'000;
+            frames += bytes / 4;
+            ++sent;
+            ASSERT_TRUE(audio.submit({{role, sent, {at}}, std::vector<std::byte>(bytes, std::byte{1})},
+                                     {role, 0, sent, 7}));
+            if (!audio.take_completion(std::chrono::steady_clock::now())) { ++withheld; }
+        };
+        send(c.bytes);
+        ASSERT_TRUE(gate->wait_writes(1));
+        while (sent < c.packets && withheld == 0) { ASSERT_NO_FATAL_FAILURE(send(c.bytes)); }
+        EXPECT_EQ(withheld, 0U) << sent;
+        const auto jobs = audio.worker_observation_for_test().queue.queued_by_role[0];
+        EXPECT_LE(jobs, c.most_jobs);
+        gate->release();
+        ASSERT_TRUE(audio.wait_idle(std::chrono::steady_clock::now() + std::chrono::seconds{30}));
+        EXPECT_FALSE(audio.failure());
+        ASSERT_TRUE(audio.finish());
+        const auto output = capture.release();
+        const auto report = audio.final_report();
+        ASSERT_TRUE(report);
+        EXPECT_EQ(output.find("audio_stall_bypass"), std::string::npos) << output;
+        EXPECT_LE(gate->writes, c.most_writes);
+        EXPECT_EQ(report->stats.frames_decoded, sent * c.bytes / 4) << output;
+        EXPECT_EQ(report->stats.frames_trimmed, 0U) << output;
+        EXPECT_EQ(report->stats.frames_decoded + report->stats.frames_stretched,
+                  report->stats.frames_retained + report->stats.frames_compressed) << output;
+    }
+}
+
+// The slots never run out before the time budget does, whatever mix of packet
+// sizes: a 1 ms packet always opens a slot, so its tiny neighbours must not
+// (07b82f0 withheld the credit at half the budget). A stop in between is not
+// joined. A 1.4 s budget keeps the test short.
+TEST(WiredReceiver, LosslessWorkerSlotsLastAsLongAsTheTimeBudget) {
+    ReceiverLogScope logging{g_running};
+    StdoutCaptureGuard capture;
+    auto gate = std::make_shared<RenderGate>();
+    gate->write_timeout = std::chrono::milliseconds{30'000};
+    auto config = pcm_router_config();
+    config.playout.emergency_backlog = aa::core::Nanoseconds{1'000'000'000};
+    config.sink_write_timeout = aa::core::Milliseconds{0};
+    ConcreteAudioRenderWorker audio{config, gated_router(gate)};
+    ASSERT_TRUE(audio.ready());
+    const auto role = aa::protocol::ChannelRole::media_audio;
+    const auto start = steady_ns();
+    const std::array<std::size_t, 2> sizes{192, 4};
+    std::uint64_t sent = 0;
+    std::size_t bytes = 0;
+    std::uint64_t generation = 0;
+    std::size_t withheld_at = 0;
+    while (withheld_at == 0 && bytes < 19'200 * 14) {
+        const auto size = sizes[sent % sizes.size()];
+        const auto at = start + static_cast<std::int64_t>(bytes) * 1'000'000'000 / 192'000;
+        ++sent;
+        bytes += size;
+        ASSERT_TRUE(audio.submit({{role, sent, {at}}, std::vector<std::byte>(size, std::byte{1})},
+                                 {role, generation, sent, 7}));
+        if (!audio.take_completion(std::chrono::steady_clock::now())) { withheld_at = bytes; }
+        if (sent == 3) { ASSERT_TRUE(gate->wait_writes(1)); }
+        if (sent == 1'000) { audio.invalidate(role, ++generation); }
+    }
+    // 1.4 s less the envelope the next credit reserves.
+    EXPECT_GE(withheld_at, 19'200U * 13U);
+    EXPECT_LE(withheld_at, 19'200U * 13U + 1'000U);
+    // Both sides of the stop: two streams.
+    gate->release();
+    ASSERT_TRUE(audio.wait_idle(std::chrono::steady_clock::now() + std::chrono::seconds{30}));
+    ASSERT_TRUE(audio.finish());
+    const auto report = audio.final_report();
+    ASSERT_TRUE(report);
+    EXPECT_EQ(report->stats.playout_anchors, 2U);
+    EXPECT_EQ(report->stats.frames_decoded, bytes / 4);
+    (void)capture.release();
+}
+
+// Bot review of #229 at 25df492: packets that share a job keep their receipts, so the
+// 2 s bound cuts by each packet's own. 25df492 took 100 single frames 3 ms apart as
+// one 2.08 ms job with the first one's receipt and cut them all. The sink blocks until the first waiting packet is `head_ms` old.
+TEST(WiredReceiver, LosslessBoundCutsOnlyTheStalePartOfSpacedShortPackets) {
+    struct Case {
+        std::size_t bytes;
+        std::int64_t spacing_ns;
+        std::uint64_t packets;
+        std::int64_t head_ms;
+        double cut_frames;
+        std::size_t most_jobs;
+    };
+    for (const Case c : {Case{4, 3'000'000, 100, 2'100, 34.0, 1},       // from 2,100 to 1,803 ms old
+                         Case{4, 1'500'000, 100, 2'090, 60.0, 1},
+                         Case{64, 333'333, 300, 2'020, 960.0, 25}}) { // contiguous: 4 ms to a job
+        SCOPED_TRACE(std::to_string(c.bytes) + " B, " + std::to_string(c.spacing_ns) + " ns apart");
+        ReceiverLogScope logging{g_running};
+        StdoutCaptureGuard capture;
+        auto gate = std::make_shared<RenderGate>();
+        gate->write_timeout = std::chrono::milliseconds{30'000};
+        const auto start = steady_ns();
+        std::atomic<std::int64_t> clock{start};
+        auto config = pcm_router_config();
+        config.clock = [&clock] { return aa::core::Nanoseconds{clock.load()}; };
+        ConcreteAudioRenderWorker audio{config, gated_router(gate)};
+        ASSERT_TRUE(audio.ready());
+        const auto role = aa::protocol::ChannelRole::media_audio;
+        const auto submit = [&](std::uint64_t sequence, std::int64_t at, std::size_t bytes) {
+            ASSERT_TRUE(audio.submit({{role, sequence, {at}}, std::vector<std::byte>(bytes, std::byte{1})},
+                                     {role, 0, sequence, 7}));
+            ASSERT_TRUE(audio.take_completion(std::chrono::steady_clock::now() + std::chrono::milliseconds{100}));
+        };
+        ASSERT_NO_FATAL_FAILURE(submit(1, start, 8192));
+        ASSERT_TRUE(gate->wait_writes(1));
+        const auto first = start + 10'000'000;
+        for (std::uint64_t k = 0; k < c.packets; ++k) {
+            ASSERT_NO_FATAL_FAILURE(submit(k + 2, first + static_cast<std::int64_t>(k) * c.spacing_ns, c.bytes));
+        }
+        EXPECT_LE(audio.worker_observation_for_test().queue.queued_by_role[0], c.most_jobs + 1);
+        clock = first + (c.head_ms - 20) * 1'000'000; // the retime adds its 20 ms of lead
+        gate->release();
+        ASSERT_TRUE(audio.wait_idle(std::chrono::steady_clock::now() + std::chrono::seconds{5}));
+        EXPECT_FALSE(audio.failure());
+        ASSERT_TRUE(audio.finish());
+        const auto output = capture.release();
+        const auto report = audio.final_report();
+        ASSERT_TRUE(report);
+        EXPECT_EQ(report->stats.playout_retimes, 1U) << output;
+        EXPECT_EQ(report->stats.frames_trimmed, report->stats.frames_overflowed) << output;
+        EXPECT_NEAR(static_cast<double>(report->stats.frames_overflowed), c.cut_frames, 1.0) << output;
+        EXPECT_EQ(report->stats.frames_decoded, report->stats.frames_retained + report->stats.frames_trimmed) << output;
+    }
+}
+
+// Sol's delta review of 25df492: two 47-frame packets behind 20 x 100 ms, around the
+// bound. One job with the first one's receipt kept the second 2,000.99 ms after its
+// own (equal stamps), and cut it 1,999.1 ms after it (57.0 and 60.9 ms).
+TEST(WiredReceiver, LosslessBoundGoesByEachSharedPacketsReceipt) {
+    struct Case {
+        std::int64_t first_us;
+        std::int64_t second_us;
+        double cut_frames;
+        std::int64_t marked_frames;
+    };
+    for (const Case c : {Case{59'050, 59'050, 92.0, 0}, Case{57'000, 60'900, 47.0, 47}}) {
+        SCOPED_TRACE(c.second_us);
+        ReceiverLogScope logging{g_running};
+        StdoutCaptureGuard capture;
+        auto gate = std::make_shared<RenderGate>();
+        gate->write_timeout = std::chrono::milliseconds{30'000};
+        const auto start = steady_ns();
+        auto config = pcm_router_config();
+        config.clock = [start] { return aa::core::Nanoseconds{start}; };
+        ConcreteAudioRenderWorker audio{config, gated_router(gate)};
+        ASSERT_TRUE(audio.ready());
+        const auto role = aa::protocol::ChannelRole::media_audio;
+        const auto submit = [&](std::uint64_t sequence, std::int64_t at, std::size_t bytes, std::byte value) {
+            ASSERT_TRUE(audio.submit({{role, sequence, {at}}, std::vector<std::byte>(bytes, value)},
+                                     {role, 0, sequence, 7}));
+            const auto done = audio.take_completion(std::chrono::steady_clock::now() + std::chrono::milliseconds{100});
+            ASSERT_TRUE(done);
+            EXPECT_EQ(done->sequence, sequence);
+        };
+        for (std::uint64_t k = 0; k < 20; ++k) { ASSERT_NO_FATAL_FAILURE(submit(k + 1, start, 19'200, std::byte{1})); }
+        ASSERT_TRUE(gate->wait_writes(1));
+        ASSERT_NO_FATAL_FAILURE(submit(21, start + c.first_us * 1'000, 188, std::byte{2}));
+        ASSERT_NO_FATAL_FAILURE(submit(22, start + c.second_us * 1'000, 188, std::byte{3}));
+        gate->release();
+        ASSERT_TRUE(audio.wait_idle(std::chrono::steady_clock::now() + std::chrono::seconds{5}));
+        ASSERT_TRUE(audio.finish());
+        const auto output = capture.release();
+        const auto report = audio.final_report();
+        ASSERT_TRUE(report);
+        EXPECT_NEAR(static_cast<double>(report->stats.frames_overflowed), c.cut_frames, 1.0) << output;
+        EXPECT_EQ(report->stats.frames_decoded, report->stats.frames_retained + report->stats.frames_overflowed);
+        std::int64_t marked = 0;
+        for (const auto &piece : gate->pcm) { marked += std::count(piece.begin(), piece.end(), std::byte{3}); }
+        EXPECT_EQ(marked / 4, c.marked_frames) << output;
+    }
+}
+
+// Bot review of #229 at 738aac0, P2: resampled voice keeps each source's receipt.
+// 16 kHz guidance or system packets of one frame each, 3 ms apart: `old_packets`
+// of them alone (too short to resample, so retired without output), then the rest
+// behind a blocked sink, in one 64-packet slot or more. 738aac0 gave the first
+// output of a decode to the earliest run that had any, and the audio of parents
+// that had none went by a later receipt: stale audio played past the 2 s bound.
+// Each packet's value says which it was, so every frame that plays is checked
+// against its own packet's receipt.
+TEST(WiredReceiver, LosslessBoundJudgesResampledVoiceByEachSourcesReceipt) {
+    struct Case {
+        aa::protocol::ChannelRole role;
+        double gain;
+        std::uint64_t old_packets;
+        std::uint64_t new_packets;
+        std::int64_t head_ms;
+        std::uint64_t cut_packets;
+    };
+    const auto guidance = aa::protocol::ChannelRole::guidance_audio;
+    const auto system = aa::protocol::ChannelRole::system_audio;
+    for (const Case c : {Case{guidance, 1.0, 20, 44, 2'030, 10}, Case{system, 0.5, 20, 44, 2'030, 10},
+                         Case{guidance, 1.0, 20, 108, 2'030, 10}, Case{guidance, 1.0, 39, 89, 2'090, 30},
+                         Case{guidance, 1.0, 0, 64, 2'100, 34}, Case{guidance, 1.0, 0, 128, 2'100, 34},
+                         Case{guidance, 1.0, 20, 44, 1'950, 0}}) {
+        SCOPED_TRACE(std::to_string(c.old_packets) + "+" + std::to_string(c.new_packets) + " role " +
+                     std::to_string(static_cast<unsigned>(c.role)) + " head " + std::to_string(c.head_ms));
+        ReceiverLogScope logging{g_running};
+        StdoutCaptureGuard capture;
+        auto gate = std::make_shared<RenderGate>();
+        gate->write_timeout = std::chrono::milliseconds{30'000};
+        const auto start = steady_ns();
+        std::atomic<std::int64_t> clock{start};
+        auto config = pcm_router_config();
+        config.clock = [&clock] { return aa::core::Nanoseconds{clock.load()}; };
+        ConcreteAudioRenderWorker audio{config, gated_router(gate)};
+        ASSERT_TRUE(audio.ready());
+        std::uint64_t sequence = 0;
+        const auto submit = [&](aa::protocol::ChannelRole role, std::int64_t at, std::vector<std::byte> payload) {
+            ++sequence;
+            ASSERT_TRUE(audio.submit({{role, sequence, {at}}, std::move(payload)}, {role, 0, sequence, 7}));
+            ASSERT_TRUE(audio.take_completion(std::chrono::steady_clock::now() + std::chrono::milliseconds{100}));
+        };
+        const auto first = start + 10'000'000;
+        const auto packet_at = [&](std::uint64_t k) { return first + static_cast<std::int64_t>(k) * 3'000'000; };
+        // Packet k is one frame of 1,000 + 100 k: a ramp, which resampling keeps.
+        const auto packet = [](std::uint64_t k) {
+            const auto value = static_cast<std::uint16_t>(1'000 + 100 * k);
+            return std::vector<std::byte>{std::byte(value & 0xFF), std::byte(value >> 8)};
+        };
+        for (std::uint64_t k = 0; k < c.old_packets; ++k) {
+            ASSERT_NO_FATAL_FAILURE(submit(c.role, packet_at(k), packet(k)));
+            ASSERT_TRUE(audio.wait_idle(std::chrono::steady_clock::now() + std::chrono::seconds{2})) << k;
+        }
+        EXPECT_EQ(gate->writes, 0U); // none of it has played
+        ASSERT_NO_FATAL_FAILURE(submit(aa::protocol::ChannelRole::media_audio, start, std::vector<std::byte>(8192)));
+        ASSERT_TRUE(gate->wait_writes(1));
+        for (std::uint64_t k = c.old_packets; k < c.old_packets + c.new_packets; ++k) {
+            ASSERT_NO_FATAL_FAILURE(submit(c.role, packet_at(k), packet(k)));
+        }
+        clock = first + (c.head_ms - 20) * 1'000'000; // the retime adds its 20 ms of lead
+        gate->release();
+        ASSERT_TRUE(audio.wait_idle(std::chrono::steady_clock::now() + std::chrono::seconds{5}));
+        EXPECT_FALSE(audio.failure());
+        ASSERT_TRUE(audio.finish());
+        const auto output = capture.release();
+        const auto report = audio.final_report();
+        ASSERT_TRUE(report);
+        const auto &stats = report->stats;
+        EXPECT_EQ(stats.playout_retimes, 1U) << output;
+        EXPECT_EQ(stats.frames_trimmed, stats.frames_overflowed) << output;
+        EXPECT_EQ(stats.frames_decoded, stats.frames_retained + stats.frames_overflowed) << output;
+        // The resampler shifts a frame by under one packet: a packet's age is
+        // known to within 3 ms.
+        EXPECT_NEAR(static_cast<double>(stats.frames_overflowed), static_cast<double>(c.cut_packets * 3), 4.0)
+            << output;
+        std::int64_t oldest_ms = INT64_MIN;
+        std::optional<std::uint64_t> first_packet;
+        std::int64_t played = 0;
+        for (std::size_t piece = 0; piece < gate->pcm.size(); ++piece) {
+            const auto &pcm = gate->pcm[piece];
+            for (std::size_t at = 0; at + 4 <= pcm.size(); at += 4) {
+                const auto sample = static_cast<std::int16_t>(static_cast<std::uint16_t>(pcm[at]) |
+                                                              static_cast<std::uint16_t>(pcm[at + 1]) << 8);
+                const auto level = static_cast<double>(sample) / c.gain;
+                if (level < 950.0) { continue; } // media (silence)
+                const auto k = static_cast<std::uint64_t>(std::max(0.0, std::round((level - 1'000.0) / 100.0)));
+                if (!first_packet) { first_packet = k; }
+                ++played;
+                const auto plays = gate->timestamps[piece].count + static_cast<std::int64_t>(at / 4) * 1'000'000'000 / 48'000;
+                oldest_ms = std::max(oldest_ms, (plays - packet_at(k)) / 1'000'000);
+            }
+        }
+        ASSERT_TRUE(first_packet) << output;
+        // Nothing plays more than the bound after its own packet's receipt, and
+        // only what had to go was cut: playing starts at the first packet inside it.
+        EXPECT_LE(oldest_ms, 2'003) << output;
+        EXPECT_NEAR(static_cast<double>(*first_packet), static_cast<double>(c.cut_packets), 1.0) << output;
+        EXPECT_GE(played + 4, static_cast<std::int64_t>((c.old_packets + c.new_packets - c.cut_packets) * 3 - 2))
+            << output;
+    }
+}
+
+// Bot review of #229 at 738aac0, P2: a fresh voice stream whose packets were all too
+// short to resample still plays when the stop comes after its playout target. 738aac0
+// dropped all of it as a late decoder tail although none of it had played.
+TEST(WiredReceiver, LosslessDelayedStopPlaysAVoiceStreamTooShortToResample) {
+    struct Case {
+        aa::protocol::ChannelRole role;
+        std::uint64_t packets;
+        std::int64_t stop_after_ms;
+        bool after_media;
+    };
+    const auto guidance = aa::protocol::ChannelRole::guidance_audio;
+    for (const Case c : {Case{guidance, 20, 100, false}, Case{aa::protocol::ChannelRole::system_audio, 20, 100, false},
+                         Case{guidance, 20, 500, false}, Case{guidance, 39, 500, false},
+                         Case{aa::protocol::ChannelRole::system_audio, 20, 1'900, false},
+                         Case{guidance, 20, 100, true}, Case{guidance, 1, 1'000, true}, Case{guidance, 20, 1'900, true}}) {
+        SCOPED_TRACE(std::to_string(c.packets) + " packets, stop " + std::to_string(c.stop_after_ms) + " ms" +
+                     (c.after_media ? " behind media" : ""));
+        ReceiverLogScope logging{g_running};
+        StdoutCaptureGuard capture;
+        auto gate = std::make_shared<RenderGate>();
+        gate->release();
+        const auto start = steady_ns();
+        std::atomic<std::int64_t> clock{start};
+        auto config = pcm_router_config();
+        config.clock = [&clock] { return aa::core::Nanoseconds{clock.load()}; };
+        gate->clock = [&clock] { return clock.load(); };
+        ConcreteAudioRenderWorker audio{config, gated_router(gate)};
+        ASSERT_TRUE(audio.ready());
+        std::uint64_t sequence = 0;
+        const auto submit = [&](aa::protocol::ChannelRole role, std::int64_t at, std::size_t bytes) {
+            ++sequence;
+            ASSERT_TRUE(audio.submit({{role, sequence, {at}}, std::vector<std::byte>(bytes, std::byte{2})},
+                                     {role, 0, sequence, 7}));
+            ASSERT_TRUE(audio.take_completion(std::chrono::steady_clock::now() + std::chrono::milliseconds{100}));
+        };
+        if (c.after_media) {
+            ASSERT_NO_FATAL_FAILURE(submit(aa::protocol::ChannelRole::media_audio, start, 8192));
+            ASSERT_TRUE(audio.wait_idle(std::chrono::steady_clock::now() + std::chrono::seconds{2}));
+        }
+        std::int64_t last = start;
+        for (std::uint64_t k = 0; k < c.packets; ++k) {
+            last = start + static_cast<std::int64_t>(k) * 62'500;
+            clock = last;
+            ASSERT_NO_FATAL_FAILURE(submit(c.role, last, 2));
+        }
+        // The worker is idle: nothing of the stream has played.
+        ASSERT_TRUE(audio.wait_idle(std::chrono::steady_clock::now() + std::chrono::seconds{2}));
+        const auto writes = gate->writes;
+        clock = last + c.stop_after_ms * 1'000'000;
+        audio.invalidate(c.role, 1); // AV_STOP
+        EXPECT_TRUE(gate->wait_writes(writes + 1)); // it plays at the stop, not only at shutdown
+        ASSERT_TRUE(audio.wait_idle(std::chrono::steady_clock::now() + std::chrono::seconds{2}));
+        EXPECT_FALSE(audio.failure());
+        ASSERT_TRUE(audio.finish());
+        const auto output = capture.release();
+        const auto report = audio.final_report();
+        ASSERT_TRUE(report);
+        const auto &stats = report->stats;
+        // All of it (the resampler keeps two output frames of every stream).
+        EXPECT_EQ(stats.frames_decoded, (c.after_media ? 2'048U : 0U) + c.packets * 3 - 2) << output;
+        EXPECT_EQ(stats.frames_decoded, stats.frames_retained) << output;
+        EXPECT_EQ(stats.frames_trimmed, 0U) << output;
+        // And it is heard: nothing of it is stamped before the clock it is written at.
+        std::optional<std::int64_t> first;
+        std::uint64_t audible = 0;
+        for (std::size_t piece = writes; piece < gate->pcm.size(); ++piece) {
+            const auto &pcm = gate->pcm[piece];
+            if (std::all_of(pcm.begin(), pcm.end(), [](std::byte b) { return b == std::byte{0}; })) { continue; }
+            if (!first) { first = gate->timestamps[piece].count; }
+            EXPECT_GE(gate->timestamps[piece].count, gate->clock_ns[piece]) << piece;
+            if (gate->timestamps[piece].count >= gate->clock_ns[piece]) { audible += pcm.size() / 4; }
+        }
+        EXPECT_EQ(audible, c.packets * 3 - 2) << output;
+        ASSERT_TRUE(first) << output;
+        // Right away: where media ended if that is still to come, else with the 20 ms of
+        // lead a retime gives. Not a depth after the stop.
+        EXPECT_LE(*first - clock.load(), 20'000'000) << output;
+        if (!c.after_media) { EXPECT_EQ(*first - clock.load(), 20'000'000) << output; }
+        EXPECT_EQ(stats.playout_overflows, 0U) << output;
+        EXPECT_EQ(output.find("audio_stop_discarded"), std::string::npos) << output;
+    }
+}
+
+// Bot review of #229 at 4f0bffb, P2: the same stream, stopped so late that some or all
+// of it is beyond the emergency bound when it plays. 4f0bffb took it to play 60 ms after
+// its receipt, reported no cut and wrote it at stamps long past. `spacing_us`: packets
+// that straddle the bound are cut up to the first one inside it.
+TEST(WiredReceiver, LosslessDelayedStopCutsWhatIsBeyondTheBoundBySourceReceipt) {
+    struct Case {
+        aa::protocol::ChannelRole role;
+        std::int64_t spacing_us;
+        std::int64_t plays_after_ms; // the first packet's receipt
+        bool after_media;
+        std::uint64_t cut_packets;
+    };
+    constexpr std::uint64_t kPackets = 20;
+    const auto guidance = aa::protocol::ChannelRole::guidance_audio;
+    const auto system = aa::protocol::ChannelRole::system_audio;
+    for (const Case c : {Case{guidance, 62, 2'120, false, 20}, Case{system, 62, 2'120, false, 20},
+                         Case{guidance, 62, 10'000, false, 20}, Case{guidance, 62, 2'120, true, 20},
+                         Case{guidance, 62, 10'000, true, 20}, Case{guidance, 3'000, 2'030, false, 10},
+                         Case{system, 3'000, 2'030, false, 10}, Case{guidance, 3'000, 2'030, true, 10},
+                         Case{guidance, 3'000, 1'990, false, 0}}) {
+        SCOPED_TRACE(std::to_string(c.spacing_us) + " us, plays after " + std::to_string(c.plays_after_ms) + " ms" +
+                     (c.role == system ? " system" : "") + (c.after_media ? " behind media" : ""));
+        ReceiverLogScope logging{g_running};
+        StdoutCaptureGuard capture;
+        auto gate = std::make_shared<RenderGate>();
+        gate->release();
+        const auto start = steady_ns();
+        std::atomic<std::int64_t> clock{start};
+        auto config = pcm_router_config();
+        std::atomic<std::uint64_t> clock_reads{0};
+        config.clock = [&] {
+            ++clock_reads;
+            return aa::core::Nanoseconds{clock.load()};
+        };
+        gate->clock = [&clock] { return clock.load(); };
+        ConcreteAudioRenderWorker audio{config, gated_router(gate)};
+        ASSERT_TRUE(audio.ready());
+        std::uint64_t sequence = 0;
+        const auto submit = [&](aa::protocol::ChannelRole role, std::int64_t at, std::vector<std::byte> payload) {
+            ++sequence;
+            ASSERT_TRUE(audio.submit({{role, sequence, {at}}, std::move(payload)}, {role, 0, sequence, 7}));
+            ASSERT_TRUE(audio.take_completion(std::chrono::steady_clock::now() + std::chrono::milliseconds{100}));
+        };
+        const auto media = aa::protocol::ChannelRole::media_audio;
+        if (c.after_media) {
+            ASSERT_NO_FATAL_FAILURE(submit(media, start, std::vector<std::byte>(8192)));
+            ASSERT_TRUE(audio.wait_idle(std::chrono::steady_clock::now() + std::chrono::seconds{2}));
+        }
+        const auto packet_at = [&](std::uint64_t k) {
+            return start + static_cast<std::int64_t>(k) * c.spacing_us * 1'000;
+        };
+        // Packet k is one frame of 1,000 + 100 k: a ramp, which resampling keeps.
+        for (std::uint64_t k = 0; k < kPackets; ++k) {
+            const auto value = static_cast<std::uint16_t>(1'000 + 100 * k);
+            clock = packet_at(k);
+            ASSERT_NO_FATAL_FAILURE(submit(c.role, packet_at(k), {std::byte(value & 0xFF), std::byte(value >> 8)}));
+        }
+        ASSERT_TRUE(audio.wait_idle(std::chrono::steady_clock::now() + std::chrono::seconds{2}));
+        const auto writes = gate->writes;
+        clock = start + (c.plays_after_ms - 20) * 1'000'000; // it plays with 20 ms of lead
+        const auto reads = clock_reads.load();
+        audio.invalidate(c.role, 1); // AV_STOP
+        // The worker is at it (a stream cut whole gives no write to wait for), and what
+        // plays (behind silence, after media) is written.
+        const auto until = std::chrono::steady_clock::now() + std::chrono::seconds{2};
+        while (clock_reads == reads && std::chrono::steady_clock::now() < until) { std::this_thread::yield(); }
+        ASSERT_NE(clock_reads, reads);
+        if (c.cut_packets != kPackets) {
+            std::unique_lock lock(gate->mutex);
+            ASSERT_TRUE(gate->cv.wait_for(lock, std::chrono::seconds{2}, [&] {
+                return std::any_of(gate->pcm.begin() + static_cast<std::ptrdiff_t>(writes), gate->pcm.end(),
+                                   [](const auto &pcm) {
+                                       return std::any_of(pcm.begin(), pcm.end(),
+                                                          [](std::byte b) { return b != std::byte{0}; });
+                                   });
+            }));
+        }
+        ASSERT_TRUE(audio.wait_idle(std::chrono::steady_clock::now() + std::chrono::seconds{2}));
+        EXPECT_FALSE(audio.failure());
+        const auto stopped = gate->writes;
+        // What comes next is not disturbed, also when all of it was cut.
+        clock += 100'000'000;
+        ASSERT_NO_FATAL_FAILURE(submit(media, clock, std::vector<std::byte>(8192, std::byte{1})));
+        ASSERT_TRUE(audio.wait_idle(std::chrono::steady_clock::now() + std::chrono::seconds{2}));
+        EXPECT_FALSE(audio.failure());
+        ASSERT_TRUE(audio.finish());
+        const auto output = capture.release();
+        const auto report = audio.final_report();
+        ASSERT_TRUE(report);
+        const auto &stats = report->stats;
+        const std::uint64_t media_frames = c.after_media ? 4'096 : 2'048;
+        EXPECT_EQ(stats.frames_decoded, media_frames + kPackets * 3 - 2) << output;
+        EXPECT_EQ(stats.frames_decoded, stats.frames_retained + stats.frames_overflowed) << output;
+        EXPECT_EQ(stats.frames_trimmed, stats.frames_overflowed) << output;
+        EXPECT_EQ(stats.playout_overflows, c.cut_packets == 0 ? 0U : 1U) << output;
+        if (c.cut_packets == kPackets) {
+            EXPECT_EQ(stats.frames_overflowed, kPackets * 3 - 2) << output;
+        } else {
+            EXPECT_NEAR(static_cast<double>(stats.frames_overflowed), static_cast<double>(c.cut_packets * 3), 4.0)
+                << output;
+        }
+        std::optional<std::uint64_t> first_packet;
+        const double gain = c.role == system ? 0.5 : 1.0;
+        for (std::size_t piece = writes; piece < stopped; ++piece) {
+            const auto &pcm = gate->pcm[piece];
+            for (std::size_t at = 0; at + 4 <= pcm.size(); at += 4) {
+                const auto sample = static_cast<std::int16_t>(static_cast<std::uint16_t>(pcm[at]) |
+                                                              static_cast<std::uint16_t>(pcm[at + 1]) << 8);
+                const auto level = static_cast<double>(sample) / gain;
+                if (level < 950.0) { continue; } // silence
+                const auto k = static_cast<std::uint64_t>(std::max(0.0, std::round((level - 1'000.0) / 100.0)));
+                const auto plays =
+                    gate->timestamps[piece].count + static_cast<std::int64_t>(at / 4) * 1'000'000'000 / 48'000;
+                if (!first_packet) {
+                    first_packet = k;
+                    EXPECT_NEAR(static_cast<double>(plays - gate->clock_ns[piece]), 20e6, 0.1e6) << output;
+                }
+                EXPECT_GE(gate->timestamps[piece].count, gate->clock_ns[piece]) << output;
+                // The resampler shifts a frame by under one packet.
+                EXPECT_LE(plays - packet_at(k), 2'000'000'000 + c.spacing_us * 1'000) << k;
+            }
+        }
+        EXPECT_EQ(first_packet.has_value(), c.cut_packets != kPackets) << output;
+        if (first_packet) {
+            EXPECT_NEAR(static_cast<double>(*first_packet), static_cast<double>(c.cut_packets), 1.0) << output;
+        }
+        std::optional<std::int64_t> next;
+        for (std::size_t piece = stopped; piece < gate->pcm.size() && !next; ++piece) {
+            if (gate->pcm[piece].front() != std::byte{0}) { next = gate->timestamps[piece].count; }
+        }
+        ASSERT_TRUE(next) << output;
+        EXPECT_NEAR(static_cast<double>(*next - clock.load()), 60e6, 0.1e6) << output;
+    }
+}
+
+// Bot review of #229 at 4f0bffb, P2: no timeline yet, and the first run's slot has already
+// passed when the worker gets to it. 4f0bffb wrote it at its historical slot.
+TEST(WiredReceiver, LosslessOverdueFirstPlacementGoesByTheCurrentClock) {
+    struct Case {
+        std::int64_t late_ms; // after the first chunk's receipt
+        std::uint64_t cut_frames;
+        bool foreign; // stamps of another clock: placed by them, as ever
+    };
+    for (const Case c : {Case{0, 0, false}, Case{500, 0, false}, Case{1'900, 0, false}, Case{2'100, 5'760, false},
+                         Case{2'100, 0, true}}) {
+        SCOPED_TRACE(std::to_string(c.late_ms) + (c.foreign ? " foreign" : ""));
+        ReceiverLogScope logging{g_running};
+        auto gate = std::make_shared<RenderGate>();
+        gate->release();
+        const std::int64_t received = 1'000'000'000'000;
+        std::int64_t clock = received;
+        auto config = pcm_router_config();
+        config.clock = [&clock] { return aa::core::Nanoseconds{clock}; };
+        gate->clock = [&clock] { return clock; };
+        auto opened = aa::audio::detail::open_router_with_sink_for_test(config, std::make_unique<GatedRenderSink>(gate));
+        ASSERT_TRUE(opened);
+        auto &router = opened.value();
+        const auto media = aa::protocol::ChannelRole::media_audio;
+        const std::vector<std::byte> pcm(9'600 * 4, std::byte{1}); // 200 ms
+        const std::int64_t spacing = 200'000'000;
+        for (std::int64_t k = 0; k < 2; ++k) {
+            const auto at = received + k * spacing;
+            // A foreign stamp is nowhere near the receiver's own receipt.
+            const auto input_at = c.foreign ? at + 1'000'000'000'000 : at;
+            if (c.foreign) { clock = input_at; }
+            ASSERT_TRUE(router.submit({{media, static_cast<std::uint64_t>(k + 1), {at}}, pcm},
+                                      aa::core::Nanoseconds{input_at}));
+        }
+        if (!c.foreign) { clock = received + c.late_ms * 1'000'000; }
+        for (;;) {
+            auto step = router.render_step();
+            ASSERT_TRUE(step);
+            if (!step.value().pending) { break; }
+        }
+        const auto &stats = router.report().stats;
+        EXPECT_EQ(stats.frames_overflowed, c.cut_frames);
+        EXPECT_EQ(stats.playout_overflows, c.cut_frames == 0 ? 0U : 1U);
+        EXPECT_EQ(stats.frames_retained, 2 * 9'600 - c.cut_frames);
+        ASSERT_FALSE(gate->timestamps.empty());
+        const bool overdue = c.late_ms != 0 && !c.foreign;
+        EXPECT_EQ(gate->timestamps.front().count, overdue ? clock + 20'000'000 : received + 60'000'000);
+        if (!c.foreign) { EXPECT_GE(gate->timestamps.front().count, gate->clock_ns.front()); }
+        auto next = gate->timestamps.front().count;
+        for (std::size_t piece = 0; piece < gate->pcm.size(); ++piece) {
+            EXPECT_NEAR(static_cast<double>(gate->timestamps[piece].count), static_cast<double>(next), 2.0) << piece;
+            next = gate->timestamps[piece].count
+                + static_cast<std::int64_t>(gate->pcm[piece].size() / 4) * 1'000'000'000 / 48'000;
+        }
+    }
+}
+
+// Sol review of #229 at 1549533: no frame is written at a time that has passed, and
+// each one plays within the emergency bound of its own receipt or is cut and counted.
+// - stop_before_render (P2): the stop drains voice parents that never had a render
+//   step, behind media that set the timeline. 1549533 wrote them 2.44 s in the past.
+// - after_whole_cut (P2): media after a first stream that was cut whole, the slot long
+//   passed. 1549533 took the cut's base for a schedule and wrote it 2.94 s in the past.
+// - grouped (P3): packets received together, stopped at the bound. 1549533 kept all of
+//   them because the first one was inside it.
+TEST(WiredReceiver, LosslessEveryFrameIsHeardOrCutByItsOwnReceipt) {
+    enum class Kind : std::uint8_t { stop_before_render, after_whole_cut, grouped };
+    struct Case {
+        Kind kind;
+        std::int64_t late_ms; // the stop (or the media render) after the receipt
+        bool all_cut;
+    };
+    constexpr std::uint64_t kPackets = 20;
+    constexpr std::uint64_t kVoiceFrames = kPackets * 3 - 2;
+    constexpr std::int64_t kBound = 2'000'000'000;
+    for (const Case c : {Case{Kind::stop_before_render, 500, false}, Case{Kind::stop_before_render, 1'900, false},
+                         Case{Kind::stop_before_render, 2'500, true}, Case{Kind::after_whole_cut, 1'000, false},
+                         Case{Kind::after_whole_cut, 3'000, true}, Case{Kind::grouped, 1'980, false}}) {
+        SCOPED_TRACE(std::to_string(static_cast<int>(c.kind)) + ", " + std::to_string(c.late_ms) + " ms");
+        ReceiverLogScope logging{g_running};
+        auto gate = std::make_shared<RenderGate>();
+        gate->release();
+        const std::int64_t t0 = 1'000'000'000'000;
+        std::int64_t clock = t0;
+        auto config = pcm_router_config();
+        config.clock = [&clock] { return aa::core::Nanoseconds{clock}; };
+        gate->clock = [&clock] { return clock; };
+        auto opened = aa::audio::detail::open_router_with_sink_for_test(config, std::make_unique<GatedRenderSink>(gate));
+        ASSERT_TRUE(opened);
+        auto &router = opened.value();
+        const auto media = aa::protocol::ChannelRole::media_audio;
+        const auto guidance = aa::protocol::ChannelRole::guidance_audio;
+        std::uint64_t sequence = 0;
+        const auto render = [&] {
+            for (int i = 0; i < 10'000; ++i) {
+                auto step = router.render_step();
+                ASSERT_TRUE(step);
+                if (!step.value().pending) { return; }
+            }
+            FAIL() << "render does not settle";
+        };
+        // Packet k is one frame of 1,000 + 100 k: a ramp, which resampling keeps.
+        std::int64_t voice_at = t0;
+        const std::int64_t spacing = c.kind == Kind::grouped ? 0 : 62'000;
+        const auto packet_at = [&](std::uint64_t k) { return voice_at + static_cast<std::int64_t>(k) * spacing; };
+        const auto submit_voice = [&] {
+            for (std::uint64_t k = 0; k < kPackets; ++k) {
+                const auto value = static_cast<std::uint16_t>(1'000 + 100 * k);
+                clock = packet_at(k);
+                ASSERT_TRUE(router.submit({{guidance, ++sequence, {packet_at(k)}},
+                                           std::vector<std::byte>{std::byte(value & 0xFF), std::byte(value >> 8)}},
+                                          aa::core::Nanoseconds{packet_at(k)}));
+            }
+        };
+        std::int64_t media_at = 0;
+        std::uint64_t media_frames = 0;
+        std::uint64_t expected_cut = 0;
+        if (c.kind == Kind::stop_before_render) {
+            // Media sets the timeline; the voice parents get no render step before the stop.
+            ASSERT_TRUE(router.submit({{media, ++sequence, {t0}}, std::vector<std::byte>(8192)}, aa::core::Nanoseconds{t0}));
+            media_frames += 2'048;
+            ASSERT_NO_FATAL_FAILURE(render());
+            voice_at = t0 + 200'000'000;
+            ASSERT_NO_FATAL_FAILURE(submit_voice());
+            clock = voice_at + c.late_ms * 1'000'000;
+            (void)router.end_stream(guidance);
+            ASSERT_NO_FATAL_FAILURE(render());
+            if (c.all_cut) { expected_cut = kVoiceFrames; }
+        } else if (c.kind == Kind::after_whole_cut) {
+            ASSERT_NO_FATAL_FAILURE(submit_voice());
+            clock = voice_at + 2'500'000'000;
+            (void)router.end_stream(guidance);
+            ASSERT_NO_FATAL_FAILURE(render());
+            ASSERT_EQ(router.report().stats.frames_overflowed, kVoiceFrames);
+            ASSERT_TRUE(gate->pcm.empty());
+            clock += 100'000'000;
+            media_at = clock;
+            ASSERT_TRUE(router.submit({{media, ++sequence, {media_at}}, std::vector<std::byte>(8192, std::byte{1})},
+                                      aa::core::Nanoseconds{media_at}));
+            media_frames += 2'048;
+            clock = media_at + c.late_ms * 1'000'000;
+            ASSERT_NO_FATAL_FAILURE(render());
+            expected_cut = kVoiceFrames + (c.all_cut ? 2'048 : 0);
+        } else {
+            ASSERT_NO_FATAL_FAILURE(submit_voice());
+            clock = voice_at + c.late_ms * 1'000'000;
+            (void)router.end_stream(guidance);
+            ASSERT_NO_FATAL_FAILURE(render());
+        }
+        const auto &stats = router.report().stats;
+        EXPECT_EQ(stats.frames_decoded, media_frames + kVoiceFrames);
+        EXPECT_EQ(stats.frames_decoded, stats.frames_retained + stats.frames_overflowed);
+        if (c.kind != Kind::grouped) { EXPECT_EQ(stats.frames_overflowed, expected_cut); }
+        EXPECT_EQ(stats.playout_overflows == 0, stats.frames_overflowed == 0);
+        // Each frame written: not in the past, and within the bound of its own receipt.
+        std::uint64_t voice_heard = 0;
+        std::uint64_t media_heard = 0;
+        for (std::size_t piece = 0; piece < gate->pcm.size(); ++piece) {
+            const auto &pcm = gate->pcm[piece];
+            const auto stamp = gate->timestamps[piece].count;
+            for (std::size_t at = 0; at + 4 <= pcm.size(); at += 4) {
+                const auto sample = static_cast<std::int16_t>(static_cast<std::uint16_t>(pcm[at]) |
+                                                              static_cast<std::uint16_t>(pcm[at + 1]) << 8);
+                if (sample == 0) { continue; }
+                const auto plays = stamp + static_cast<std::int64_t>(at / 4) * 1'000'000'000 / 48'000;
+                EXPECT_GE(stamp, gate->clock_ns[piece]) << piece;
+                if (sample == 257) { // media
+                    ++media_heard;
+                    EXPECT_LE(plays - media_at, kBound + 21'000) << piece;
+                    continue;
+                }
+                if (sample < 950) { continue; } // the resampler's ramp in from silence
+                ++voice_heard;
+                const auto k = std::min<std::uint64_t>(
+                    kPackets - 1, static_cast<std::uint64_t>(std::max(0.0, std::round((sample - 1'000.0) / 100.0))));
+                // The resampler shifts a frame by under one packet.
+                EXPECT_LE(plays - packet_at(k), kBound + spacing + 21'000) << "packet " << k;
+            }
+        }
+        if (c.kind == Kind::after_whole_cut) { EXPECT_EQ(media_heard, c.all_cut ? 0U : 2'048U); }
+        if (c.kind == Kind::stop_before_render) { EXPECT_NEAR(static_cast<double>(voice_heard), c.all_cut ? 0.0 : 58.0, 2.0); }
+        if (c.kind == Kind::grouped) {
+            // Received together: only the last packet is still inside the bound when it plays.
+            EXPECT_GT(stats.frames_overflowed, kVoiceFrames - 4);
+            EXPECT_LT(stats.frames_overflowed, kVoiceFrames);
+        }
+    }
+}
+
+// Sol re-check of #229 at 77d64cf, P2: media after a first stream that was cut whole,
+// planned by one step that only skipped the elapsed hole, then a 3 s pause before
+// the next step. 77d64cf wrote all 2,048 frames 2.98 s in the past from the stale
+// plan; they are 3 s past their receipt by then, so they are cut and counted.
+TEST(WiredReceiver, LosslessStalePlanAfterWholeCutIsCutNotWrittenInThePast) {
+    constexpr std::uint64_t kVoiceFrames = 58;
+    ReceiverLogScope logging{g_running};
+    auto gate = std::make_shared<RenderGate>();
+    gate->release();
+    const std::int64_t t0 = 1'000'000'000'000;
+    std::int64_t clock = t0;
+    auto config = pcm_router_config();
+    config.clock = [&clock] { return aa::core::Nanoseconds{clock}; };
+    gate->clock = [&clock] { return clock; };
+    auto opened = aa::audio::detail::open_router_with_sink_for_test(config, std::make_unique<GatedRenderSink>(gate));
+    ASSERT_TRUE(opened);
+    auto &router = opened.value();
+    const auto media = aa::protocol::ChannelRole::media_audio;
+    const auto guidance = aa::protocol::ChannelRole::guidance_audio;
+    std::uint64_t sequence = 0;
+    const auto render = [&] {
+        for (int i = 0; i < 10'000; ++i) {
+            auto step = router.render_step();
+            ASSERT_TRUE(step);
+            if (!step.value().pending) { return; }
+        }
+        FAIL() << "render does not settle";
+    };
+    for (std::uint64_t k = 0; k < 20; ++k) {
+        clock = t0 + static_cast<std::int64_t>(k) * 62'000;
+        ASSERT_TRUE(router.submit({{guidance, ++sequence, {clock}}, std::vector<std::byte>{std::byte{0xE8}, std::byte{0x03}}},
+                                  aa::core::Nanoseconds{clock}));
+    }
+    clock = t0 + 2'500'000'000;
+    (void)router.end_stream(guidance);
+    ASSERT_NO_FATAL_FAILURE(render());
+    ASSERT_EQ(router.report().stats.frames_overflowed, kVoiceFrames);
+    ASSERT_TRUE(gate->pcm.empty());
+    clock += 100'000'000;
+    const auto media_at = clock;
+    ASSERT_TRUE(router.submit({{media, ++sequence, {media_at}}, std::vector<std::byte>(8192, std::byte{1})},
+                              aa::core::Nanoseconds{media_at}));
+    clock = media_at + 1'000'000'000;
+    auto first = router.render_step();
+    ASSERT_TRUE(first);
+    ASSERT_TRUE(first.value().pending); // the elapsed hole was skipped, nothing written
+    ASSERT_TRUE(gate->pcm.empty());
+    clock += 3'000'000'000;
+    ASSERT_NO_FATAL_FAILURE(render());
+    const auto &stats = router.report().stats;
+    EXPECT_EQ(stats.frames_decoded, kVoiceFrames + 2'048);
+    EXPECT_EQ(stats.frames_decoded, stats.frames_retained + stats.frames_overflowed);
+    EXPECT_EQ(stats.frames_overflowed, kVoiceFrames + 2'048);
+    for (std::size_t piece = 0; piece < gate->pcm.size(); ++piece) {
+        EXPECT_GE(gate->timestamps[piece].count, gate->clock_ns[piece]) << piece;
+        const auto &pcm = gate->pcm[piece];
+        EXPECT_TRUE(std::all_of(pcm.begin(), pcm.end(), [](std::byte b) { return b == std::byte{0}; })) << piece;
+    }
+}
+
+// Sol re-check of #229 at 77d64cf, P3: 48 kHz mono voice, one frame a packet on the
+// 48 kHz clock, stopped at the first receipt + 1,980 ms: with the 20 ms lead each
+// frame plays exactly at its own 2 s bound. 77d64cf rounded the receipt slack down
+// to frames and cut one of them; 1549533 kept all 20.
+TEST(WiredReceiver, LosslessVoiceExactlyAtTheBoundIsKept) {
+    constexpr std::uint64_t kPackets = 20;
+    constexpr std::int64_t kBound = 2'000'000'000;
+    ReceiverLogScope logging{g_running};
+    auto gate = std::make_shared<RenderGate>();
+    gate->release();
+    const std::int64_t t0 = 1'000'000'000'000;
+    std::int64_t clock = t0;
+    auto config = pcm_router_config();
+    config.roles[aa::audio::role_index(aa::audio::Role::guidance)].input_format = aa::audio::AudioFormat{48000, 1, 16};
+    config.clock = [&clock] { return aa::core::Nanoseconds{clock}; };
+    gate->clock = [&clock] { return clock; };
+    auto opened = aa::audio::detail::open_router_with_sink_for_test(config, std::make_unique<GatedRenderSink>(gate));
+    ASSERT_TRUE(opened);
+    auto &router = opened.value();
+    const auto guidance = aa::protocol::ChannelRole::guidance_audio;
+    const auto render = [&] {
+        for (int i = 0; i < 10'000; ++i) {
+            auto step = router.render_step();
+            ASSERT_TRUE(step);
+            if (!step.value().pending) { return; }
+        }
+        FAIL() << "render does not settle";
+    };
+    const auto packet_at = [&](std::uint64_t k) {
+        return t0 + static_cast<std::int64_t>(k * 1'000'000'000 / 48'000);
+    };
+    for (std::uint64_t k = 0; k < kPackets; ++k) {
+        clock = packet_at(k);
+        ASSERT_TRUE(router.submit({{guidance, k + 1, {clock}}, std::vector<std::byte>{std::byte{0xE8}, std::byte{0x03}}},
+                                  aa::core::Nanoseconds{clock}));
+        ASSERT_NO_FATAL_FAILURE(render()); // retires the zero-output parent
+    }
+    clock = t0 + kBound - 20'000'000;
+    (void)router.end_stream(guidance);
+    ASSERT_NO_FATAL_FAILURE(render());
+    const auto &stats = router.report().stats;
+    EXPECT_EQ(stats.frames_decoded, kPackets);
+    EXPECT_EQ(stats.frames_overflowed, 0U);
+    EXPECT_EQ(stats.frames_retained, kPackets);
+    std::uint64_t heard = 0;
+    for (std::size_t piece = 0; piece < gate->pcm.size(); ++piece) {
+        const auto &pcm = gate->pcm[piece];
+        const auto stamp = gate->timestamps[piece].count;
+        EXPECT_GE(stamp, gate->clock_ns[piece]) << piece;
+        for (std::size_t at = 0; at + 4 <= pcm.size(); at += 4) {
+            if (pcm[at] == std::byte{0} && pcm[at + 1] == std::byte{0}) { continue; }
+            const auto plays = stamp + static_cast<std::int64_t>(at / 4 * 1'000'000'000 / 48'000);
+            EXPECT_LE(plays - packet_at(heard), kBound) << "frame " << heard;
+            ++heard;
+        }
+    }
+    EXPECT_EQ(heard, kPackets);
+}
+
+// Sol re-check of #229 at 89875dc, P3: the probe above with the stop and the
+// receipts of packets 2-20 one nanosecond later. Only the first frame is over
+// its bound, by 1 ns: 89875dc rounded that deficit down to no frames and kept
+// it. The smallest cut goes by the frame's actual output time: one frame.
+TEST(WiredReceiver, LosslessVoiceOneNanosecondOverTheBoundIsCut) {
+    constexpr std::uint64_t kPackets = 20;
+    constexpr std::int64_t kBound = 2'000'000'000;
+    ReceiverLogScope logging{g_running};
+    auto gate = std::make_shared<RenderGate>();
+    gate->release();
+    const std::int64_t t0 = 1'000'000'000'000;
+    std::int64_t clock = t0;
+    auto config = pcm_router_config();
+    config.roles[aa::audio::role_index(aa::audio::Role::guidance)].input_format = aa::audio::AudioFormat{48000, 1, 16};
+    config.clock = [&clock] { return aa::core::Nanoseconds{clock}; };
+    gate->clock = [&clock] { return clock; };
+    auto opened = aa::audio::detail::open_router_with_sink_for_test(config, std::make_unique<GatedRenderSink>(gate));
+    ASSERT_TRUE(opened);
+    auto &router = opened.value();
+    const auto guidance = aa::protocol::ChannelRole::guidance_audio;
+    const auto render = [&] {
+        for (int i = 0; i < 10'000; ++i) {
+            auto step = router.render_step();
+            ASSERT_TRUE(step);
+            if (!step.value().pending) { return; }
+        }
+        FAIL() << "render does not settle";
+    };
+    const auto packet_at = [&](std::uint64_t k) {
+        return t0 + static_cast<std::int64_t>(k * 1'000'000'000 / 48'000) + (k == 0 ? 0 : 1);
+    };
+    for (std::uint64_t k = 0; k < kPackets; ++k) {
+        clock = packet_at(k);
+        ASSERT_TRUE(router.submit({{guidance, k + 1, {clock}}, std::vector<std::byte>{std::byte{0xE8}, std::byte{0x03}}},
+                                  aa::core::Nanoseconds{clock}));
+        ASSERT_NO_FATAL_FAILURE(render()); // retires the zero-output parent
+    }
+    clock = t0 + kBound - 20'000'000 + 1;
+    (void)router.end_stream(guidance);
+    ASSERT_NO_FATAL_FAILURE(render());
+    const auto &stats = router.report().stats;
+    EXPECT_EQ(stats.frames_decoded, kPackets);
+    EXPECT_EQ(stats.frames_overflowed, 1U);
+    EXPECT_EQ(stats.frames_retained, kPackets - 1);
+    std::uint64_t heard = 1;
+    for (std::size_t piece = 0; piece < gate->pcm.size(); ++piece) {
+        const auto &pcm = gate->pcm[piece];
+        const auto stamp = gate->timestamps[piece].count;
+        EXPECT_GE(stamp, gate->clock_ns[piece]) << piece;
+        for (std::size_t at = 0; at + 4 <= pcm.size(); at += 4) {
+            if (pcm[at] == std::byte{0} && pcm[at + 1] == std::byte{0}) { continue; }
+            const auto plays = stamp + static_cast<std::int64_t>(at / 4 * 1'000'000'000 / 48'000);
+            EXPECT_LE(plays - packet_at(heard), kBound) << "frame " << heard;
+            ++heard;
+        }
+    }
+    EXPECT_EQ(heard, kPackets);
+}
+
+// Third review of #229, P2: an AV_STOP/START storm through the production worker.
+// 07b82f0 scheduled the last of 80 one-chunk streams 3.4 s after its receipt.
+TEST(WiredReceiver, LosslessStopStartStormStaysWithinTheEmergencyBound) {
+    ReceiverLogScope logging{g_running};
+    StdoutCaptureGuard capture;
+    auto gate = std::make_shared<RenderGate>();
+    ConcreteAudioRenderWorker audio{pcm_router_config(), gated_router(gate)};
+    ASSERT_TRUE(audio.ready());
+    const auto media = aa::protocol::ChannelRole::media_audio;
+    const std::vector<std::byte> pcm(8192, std::byte{1});
+    std::int64_t last = 0;
+    for (std::uint64_t k = 0; k < 80; ++k) {
+        last = steady_ns();
+        ASSERT_TRUE(audio.submit({{media, k + 1, {last}}, pcm}, {media, k, 1, 7})) << k;
+        ASSERT_TRUE(audio.take_completion(std::chrono::steady_clock::now() + std::chrono::milliseconds{100})) << k;
+        audio.invalidate(media, k + 1);
+    }
+    gate->release();
+    ASSERT_TRUE(audio.wait_idle(std::chrono::steady_clock::now() + std::chrono::seconds{3}));
+    EXPECT_FALSE(audio.failure());
+    ASSERT_TRUE(audio.finish());
+    const auto output = capture.release();
+    const auto report = audio.final_report();
+    ASSERT_TRUE(report);
+    ASSERT_FALSE(gate->timestamps.empty()) << output;
+    // 2 s after its content time: the start of its chunk at the earliest.
+    EXPECT_LE(gate->timestamps.back().count - last, 2'000'000'000 + 2048LL * 1'000'000'000LL / 48000LL);
+    EXPECT_GT(report->stats.frames_overflowed, 50'000U) << output;
+    EXPECT_EQ(report->stats.frames_decoded, report->stats.frames_retained + report->stats.frames_overflowed) << output;
+    EXPECT_NE(output.find("\"event\":\"audio_playout_overflow\""), std::string::npos) << output;
+    EXPECT_EQ(output.find("audio_stop_discarded"), std::string::npos) << output;
+}
+
+namespace {
+
+// Blocks one write for a while; every other returns at once.
+class StallingRenderSink final : public aa::audio::detail::ObservedAudioSink {
+  public:
+    StallingRenderSink(std::size_t write, std::chrono::milliseconds stall, std::atomic<std::size_t> &writes)
+        : stalled_(write), stall_(stall), writes_(writes) {}
+    aa::core::Result<void> write(const aa::audio::MixedChunk &) override {
+        if (++writes_ == stalled_) { std::this_thread::sleep_for(stall_); }
+        return {};
+    }
+    aa::core::Result<void> drain(aa::core::Milliseconds) override { return {}; }
+    aa::audio::SinkProbeStats probe_stats() const override { return {}; }
+    aa::audio::RenderBarrierStats render_stats() const override { return {}; }
+  private:
+    std::size_t stalled_;
+    std::chrono::milliseconds stall_;
+    std::atomic<std::size_t> &writes_;
+};
+
+} // namespace
+
+// Re-review of #229, P2: through a sink stall the video hold follows the audio
+// that is really heard: a frame whose audio sits in a blocked write waits for
+// it, and what follows keeps the offset the retimed audio plays with. Production
+// worker, outlet, release timer and a real IPC consumer; a video unit arrives
+// with every media chunk. 4a3f49f was 241 ms ahead after a 300 ms stall, with
+// three pairs over 150 ms.
+TEST(WiredReceiver, WiredVideoHoldStaysInSyncThroughASinkStall) {
+    constexpr std::int64_t kChunkNs = 2048LL * 1'000'000'000LL / 48000LL;
+    constexpr std::size_t kChunks = 40;
+    for (const int stall_ms : {0, 300, 600}) {
+        SCOPED_TRACE(stall_ms);
+        ReceiverLogScope logging{g_running};
+        StdoutCaptureGuard capture;
+        std::mutex mutex;
+        std::vector<aa::audio::WriteCompletion> writes;
+        std::atomic<std::size_t> written{0};
+        auto config = pcm_router_config();
+        config.on_write_completed = [&](const aa::audio::WriteCompletion &value) {
+            const std::lock_guard lock(mutex);
+            writes.push_back(value);
+        };
+        ConcreteAudioRenderWorker audio{config, [&](const auto &opened) {
+            return aa::audio::detail::open_router_with_sink_for_test(
+                opened, std::make_unique<StallingRenderSink>(
+                            stall_ms == 0 ? 0 : 9, std::chrono::milliseconds{stall_ms}, written));
+        }};
+        ASSERT_TRUE(audio.ready());
+        VideoOutlet outlet{[](const std::string &) {}};
+        std::chrono::milliseconds hold{};
+        bool follow = false;
+        aa::tools::configure_video_hold(outlet, audio,
+                                        {aa::audio::kWiredPlayoutDepth.count / 1'000'000, 0, std::nullopt},
+                                        follow, hold);
+        ASSERT_TRUE(follow);
+        outlet.start_release_timer();
+        auto pair = videotest::make_pair({});
+        ASSERT_TRUE(pair);
+        outlet.install(std::move(pair.value().producer));
+        std::vector<std::pair<std::int64_t, std::int64_t>> shown; // timestamp, received
+        std::thread consumer{[&] {
+            const auto until = std::chrono::steady_clock::now() + std::chrono::seconds{6};
+            while (shown.size() < kChunks && std::chrono::steady_clock::now() < until) {
+                const auto received = pair.value().consumer.receive(Milliseconds{100});
+                if (!received || received.value() != aa::ipc::ReceiveStatus::complete) { continue; }
+                shown.emplace_back(static_cast<std::int64_t>(pair.value().consumer.access_unit().timestamp_ns),
+                                   steady_ns());
+            }
+        }};
+        const std::vector<std::byte> pcm(8192, std::byte{1});
+        const auto start = steady_ns() + 10'000'000;
+        bool accepted = true;
+        for (std::uint64_t k = 0; k < kChunks; ++k) {
+            const auto at = start + static_cast<std::int64_t>(k) * kChunkNs;
+            std::this_thread::sleep_for(std::chrono::nanoseconds{at - steady_ns()});
+            const auto role = aa::protocol::ChannelRole::media_audio;
+            accepted = accepted && audio.submit({{role, k + 1, {at}}, pcm}, {role, 0, k + 1, 7});
+            accepted = accepted && outlet.on_message(
+                {{aa::protocol::ChannelRole::video, k + 1, {at}}, wiredtest::kVideoIdr});
+            (void)audio.take_completion(std::chrono::steady_clock::now());
+        }
+        consumer.join();
+        EXPECT_TRUE(accepted);
+        EXPECT_TRUE(audio.wait_idle(std::chrono::steady_clock::now() + std::chrono::seconds{3}));
+        outlet.close();
+        ASSERT_TRUE(audio.finish());
+        (void)capture.release();
+        ASSERT_EQ(shown.size(), kChunks);
+        const std::lock_guard lock(mutex);
+        // Pair every unit with the chunk of its content time, as the A/V
+        // collector does. The chunk is heard at its slot, or when the sink
+        // took it if that is later.
+        std::size_t over_50 = 0;
+        std::int64_t worst = 0;
+        std::size_t paired = 0;
+        for (const auto &[timestamp, received] : shown) {
+            const aa::audio::WriteCompletion *chunk = nullptr;
+            for (const auto &write : writes) {
+                const auto content = write.scheduled.count - write.playout_offset.count;
+                if (std::abs(content - timestamp) < 10'000'000) { chunk = &write; break; }
+            }
+            ASSERT_NE(chunk, nullptr) << timestamp - start;
+            ++paired;
+            const auto heard = std::max(chunk->scheduled.count, chunk->completed.count);
+            const auto skew = received - heard;
+            worst = std::max(worst, std::abs(skew));
+            if (std::abs(skew) > 50'000'000) { ++over_50; }
+        }
+        EXPECT_EQ(paired, kChunks);
+        EXPECT_LE(worst, 60'000'000) << worst;
+        EXPECT_LE(over_50, 1U); // none but for host scheduling
+        EXPECT_EQ(outlet.capped_holds(), 0U);
+        if (stall_ms != 0) {
+            EXPECT_GT(audio.current_playout_offset(), std::chrono::milliseconds{stall_ms - 60});
+            // What the blocked chunk itself was heard with, not its schedule.
+            EXPECT_GT(audio.playout_offset_at({start + 8 * kChunkNs + 1'000'000}),
+                      std::chrono::milliseconds{stall_ms - 10});
+        }
+    }
+}
+
+// Re-review of #229, P2: 16 chunks 1 ms apart are 682 ms deep. Wired keeps them
+// all, so its hold cap is 700 ms (4a3f49f: 400 ms, 282 ms of skew).
+TEST(WiredReceiver, WiredVideoHoldFollowsASixteenChunkBurst) {
+    ReceiverLogScope logging{g_running};
+    StdoutCaptureGuard capture;
+    auto gate = std::make_shared<RenderGate>();
+    gate->release();
+    ConcreteAudioRenderWorker audio{pcm_router_config(), gated_router(gate)};
+    ASSERT_TRUE(audio.ready());
+    VideoOutlet outlet{[](const std::string &) {}};
+    auto now = std::chrono::steady_clock::time_point{} + std::chrono::seconds{400};
+    VideoOutlet::IdrRecoveryHooks hooks;
+    hooks.clock = [&] { return now; };
+    outlet.set_idr_recovery(std::move(hooks));
+    auto pair = videotest::make_pair({});
+    ASSERT_TRUE(pair);
+    outlet.install(std::move(pair.value().producer));
+    std::chrono::milliseconds hold{};
+    bool follow = false;
+    aa::tools::configure_video_hold(outlet, audio,
+                                    {aa::audio::kWiredPlayoutDepth.count / 1'000'000, 0, std::nullopt},
+                                    follow, hold);
+    ASSERT_TRUE(follow);
+    const std::vector<std::byte> pcm(8192, std::byte{1});
+    const auto role = aa::protocol::ChannelRole::media_audio;
+    const auto arrival = steady_ns();
+    for (std::uint64_t seq = 1; seq <= 16; ++seq) {
+        ASSERT_TRUE(audio.submit({{role, seq, {arrival + static_cast<std::int64_t>(seq) * 1'000'000}}, pcm},
+                                 {role, 0, seq, 7}));
+    }
+    ASSERT_TRUE(audio.wait_idle(std::chrono::steady_clock::now() + std::chrono::seconds{2}));
+    // On-cadence chunks let the slewed report reach the full depth.
+    std::int64_t content = 0;
+    for (std::uint64_t seq = 17; seq <= 60; ++seq) {
+        content = arrival + 16'000'000 + static_cast<std::int64_t>(seq - 16) * 42'666'666;
+        ASSERT_TRUE(audio.submit({{role, seq, {content}}, pcm}, {role, 0, seq, 7}));
+        ASSERT_TRUE(audio.wait_idle(std::chrono::steady_clock::now() + std::chrono::seconds{2}));
+        if (audio.playout_offset_at({content}) > std::chrono::milliseconds{660}) { break; }
+    }
+    ASSERT_GT(audio.playout_offset_at({content}), std::chrono::milliseconds{660});
+    ASSERT_LT(audio.playout_offset_at({content}), std::chrono::milliseconds{700});
+    ASSERT_TRUE(outlet.on_message({{aa::protocol::ChannelRole::video, 1, {content}}, wiredtest::kVideoIdr}));
+    now += std::chrono::milliseconds{640};
+    ASSERT_TRUE(outlet.release_held());
+    EXPECT_EQ(outlet.delayed_units(), 1U); // still held: its audio plays later
+    now += std::chrono::milliseconds{60};
+    ASSERT_TRUE(outlet.release_held());
+    EXPECT_EQ(outlet.delayed_units(), 0U);
+    EXPECT_EQ(outlet.capped_holds(), 0U);
+    ASSERT_TRUE(audio.finish());
+    (void)capture.release();
+}
+
 TEST(WiredReceiver, WorkerStartupInflightAndOtherRolePendingNeverAuthorizeIdle) {
     ReceiverLogScope logging{g_running};
     for (const int scenario : {0, 1, 2}) {
@@ -6356,7 +8766,7 @@ TEST(WiredReceiver, WorkerStartupInflightAndOtherRolePendingNeverAuthorizeIdle) 
         auto gate = std::make_shared<RenderGate>();
         const auto base = steady_ns() - 10'000'000'000LL;
         std::atomic<std::int64_t> now{base + 5'000'000};
-        ConcreteAudioRenderWorker audio{pcm_router_config(), gated_router(gate),
+        ConcreteAudioRenderWorker audio{pcm_router_config(aa::audio::SinkBackend::pulse, aa::core::Nanoseconds{0}), gated_router(gate),
             [&] { return aa::core::Nanoseconds{now.load()}; }};
         ASSERT_TRUE(audio.ready());
         const auto role = aa::protocol::ChannelRole::media_audio;
@@ -6397,7 +8807,7 @@ TEST(WiredReceiver, WorkerPrematureReceiptCannotBecomeIdleDuringDelayedProcessin
     ConcreteAudioRenderWorker *worker = nullptr;
     const auto owner = std::this_thread::get_id();
     bool delay_receipt = false;
-    ConcreteAudioRenderWorker audio{pcm_router_config(), gated_router(gate), [&] {
+    ConcreteAudioRenderWorker audio{pcm_router_config(aa::audio::SinkBackend::pulse, aa::core::Nanoseconds{0}), gated_router(gate), [&] {
         const aa::core::Nanoseconds receipt{now.load()};
         if (std::this_thread::get_id() == owner && delay_receipt) {
             // Capture receipt before settlement, then let reconciliation finish
@@ -6435,7 +8845,7 @@ TEST(WiredReceiver, WorkerSettledIdleCannotReviveStoppedOrFailedRoute) {
         gate->release();
         const auto base = steady_ns() - 10'000'000'000LL;
         std::atomic<std::int64_t> now{base + 5'000'000};
-        ConcreteAudioRenderWorker audio{pcm_router_config(), first_open_only(gated_router(gate)),
+        ConcreteAudioRenderWorker audio{pcm_router_config(aa::audio::SinkBackend::pulse, aa::core::Nanoseconds{0}), first_open_only(gated_router(gate)),
             [&] { return aa::core::Nanoseconds{now.load()}; }};
         ASSERT_TRUE(audio.ready());
         const auto role = aa::protocol::ChannelRole::media_audio;
@@ -6463,7 +8873,9 @@ TEST(WiredReceiver, WorkerCapacityChargesReservationsUntilRenderAndRejectsOverfl
     for (const int scenario : {0, 1, 2}) {
         SCOPED_TRACE(scenario);
         auto gate = std::make_shared<RenderGate>();
-        ConcreteAudioRenderWorker audio{pcm_router_config(), gated_router(gate)};
+        ConcreteAudioRenderWorker audio{
+        pcm_router_config(aa::audio::SinkBackend::pulse, aa::core::Nanoseconds{0}),
+        gated_router(gate)};
         ASSERT_TRUE(audio.ready());
         const std::vector<std::byte> first(scenario == 0 ? 4U : 19200U, std::byte{1});
         const auto base = steady_ns();
@@ -6567,7 +8979,9 @@ TEST(WiredReceiver, WorkerCapacityChargesReservationsUntilRenderAndRejectsOverfl
 TEST(WiredReceiver, WorkerCopiesQueuedPcmAndHeaderAndDiscardsOnlyStaleRole) {
     ReceiverLogScope logging{g_running};
     auto gate = std::make_shared<RenderGate>();
-    ConcreteAudioRenderWorker audio{pcm_router_config(), gated_router(gate)};
+    ConcreteAudioRenderWorker audio{
+        pcm_router_config(aa::audio::SinkBackend::pulse, aa::core::Nanoseconds{0}),
+        gated_router(gate)};
     ASSERT_TRUE(audio.ready());
     using aa::protocol::ChannelRole;
     const auto base = steady_ns();
@@ -6610,7 +9024,9 @@ TEST(WiredReceiver, WorkerCopiesQueuedPcmAndHeaderAndDiscardsOnlyStaleRole) {
 TEST(WiredReceiver, WorkerInvalidationReleasesUndrainedReservationsWithoutEvictionOfNewGeneration) {
     ReceiverLogScope logging{g_running};
     auto gate = std::make_shared<RenderGate>();
-    ConcreteAudioRenderWorker audio{pcm_router_config(), gated_router(gate)};
+    ConcreteAudioRenderWorker audio{
+        pcm_router_config(aa::audio::SinkBackend::pulse, aa::core::Nanoseconds{0}),
+        gated_router(gate)};
     ASSERT_TRUE(audio.ready());
     const auto role = aa::protocol::ChannelRole::media_audio;
     const std::vector<std::byte> pcm(4, std::byte{1});
@@ -6648,7 +9064,9 @@ TEST(WiredReceiver, WorkerTerminalStopDiscardsQueuedTailAndFinalDrainFailureIsLa
     for (const bool fail_drain : {false, true}) {
         auto gate = std::make_shared<RenderGate>();
         gate->fail_drain = fail_drain;
-        ConcreteAudioRenderWorker audio{pcm_router_config(), gated_router(gate)};
+        ConcreteAudioRenderWorker audio{
+        pcm_router_config(aa::audio::SinkBackend::pulse, aa::core::Nanoseconds{0}),
+        gated_router(gate)};
         ASSERT_TRUE(audio.ready());
         const auto role = aa::protocol::ChannelRole::media_audio;
         const auto pcm = wiredtest::pcm_unit();
@@ -6692,7 +9110,9 @@ TEST(WiredReceiver, WorkerTimeoutHonoringAdapterStopsWithoutRenderingQueuedTail)
     ReceiverLogScope logging{g_running};
     auto gate = std::make_shared<RenderGate>();
     gate->write_timeout = std::chrono::milliseconds{30};
-    ConcreteAudioRenderWorker audio{pcm_router_config(), gated_router(gate)};
+    ConcreteAudioRenderWorker audio{
+        pcm_router_config(aa::audio::SinkBackend::pulse, aa::core::Nanoseconds{0}),
+        gated_router(gate)};
     ASSERT_TRUE(audio.ready());
     const auto role = aa::protocol::ChannelRole::media_audio;
     const auto pcm = wiredtest::pcm_unit();
@@ -7622,6 +10042,146 @@ TEST(WiredReceiver, DbusIdrPartialFocusRestoreFailureExitsImmediatelyWithoutLate
     EXPECT_EQ(run.output.find("\"to_state\":\"reconnecting\""), std::string::npos) << run.output;
 }
 
+// #240 review P2-1 / P3-4: a consumer stop ends the standalone wired session
+// but keeps the bus and the registration; StartProjection opens a new session.
+TEST(WiredReceiver, ConsumerStopEndsSessionAndStartProjectionResumes) {
+    namespace bus = aa::ipc::dbus_adapter;
+    char directory[] = "/tmp/wired-resume-XXXXXX";
+    const std::filesystem::path root{::mkdtemp(directory)};
+    const auto path = root / "approved.json";
+    aa::trust::ApprovedPhoneStore initial{path};
+    ASSERT_TRUE(initial.load().has_value());
+    const aa::trust::WiredIdentity identity{
+        "04e8", "6860", "SYNTHETIC", "TEST", "TEST", "SYNTHETIC", "1-2.1"};
+    ASSERT_TRUE(initial.approve(aa::trust::TransportIdentity{identity}).has_value());
+    runtime_phone = aa::app::wired_phone_identity(identity).value();
+    runtime_quiet = true;
+    runtime_links_every_attempt = true;
+    runtime_recovers = false;
+    runtime_connects.store(0);
+    runtime_ciphers.store(0);
+    runtime_waiting.store(false);
+    runtime_closed.store(false);
+    g_shutdown.store(false);
+    g_running.store(true);
+    std::vector<std::string> args{"receiver", "--port", "1-2.1", "--store", path.string(),
+        "--video-socket", (root / "video").string(), "--input-socket", (root / "input").string(),
+        "--duration-ms", "20000"};
+    std::vector<char *> argv;
+    for (auto &arg : args) { argv.push_back(arg.data()); }
+
+    capture_receiver_stdout();
+    int code = -1;
+    std::thread receiver([&] { code = wired_receiver_main(static_cast<int>(argv.size()), argv.data()); });
+    std::atomic<bool> watchdog_fired{false};
+    std::jthread watchdog([&](const std::stop_token &stop) {
+        std::mutex mutex;
+        std::condition_variable_any cv;
+        std::unique_lock lock(mutex);
+        cv.wait_for(lock, stop, std::chrono::seconds{15}, [] { return false; });
+        if (!stop.stop_requested()) {
+            watchdog_fired.store(true);
+            g_shutdown.store(true);
+            g_running.store(false);
+        }
+    });
+    const auto wait_for = [](const std::function<bool()> &done) {
+        const auto until = std::chrono::steady_clock::now() + std::chrono::seconds{4};
+        while (!done() && std::chrono::steady_clock::now() < until) {
+            std::this_thread::sleep_for(std::chrono::milliseconds{2});
+        }
+        return done();
+    };
+
+    const bool first_session = wait_for([] { return runtime_waiting.load(); });
+    bool registered = false, stopped = false, first_closed = false, listed = false;
+    bool owner_kept = false, started = false, second_session = false, second_closed = false;
+    bool restarted = false, third_session = false;
+    std::string state_after_stop;
+    auto client = bus::BusConnection::connect_session();
+    if (client && first_session) {
+        const aa::ipc::BusName consumer{"org.custom.AndroidAutoReceiverTest.Resume"};
+        const aa::ipc::BusName service{"org.custom.AndroidAutoReceiver"};
+        (void)client.value().request_name(consumer);
+        auto owner = client.value().get_name_owner(service);
+        const auto call = [&](const char *member,
+                              const std::function<void(bus::MessageWriter &)> &fill = {})
+            -> std::optional<bus::ParsedMessage> {
+            bus::MessageWriter writer;
+            writer.destination(service.value).path("/org/custom/AndroidAutoReceiver")
+                .interface_name("org.custom.AndroidAutoReceiver1").member(member);
+            if (fill) { fill(writer); }
+            auto serial = client.value().send_message(bus::MessageType::method_call, writer);
+            if (!serial) { return std::nullopt; }
+            auto reply = client.value().await_reply(serial.value(), owner.value());
+            if (!reply || reply.value().type != bus::MessageType::method_return) { return std::nullopt; }
+            return std::move(reply.value());
+        };
+        if (owner) {
+            registered = call("RegisterConsumer", [&](bus::MessageWriter &w) {
+                w.body_signature("s").put_string(consumer.value);
+            }).has_value();
+        }
+        if (registered) {
+            runtime_waiting.store(false);
+            stopped = call("StopProjection").has_value();
+            first_closed = wait_for([] { return runtime_closed.load(); });
+            // The bus, the registration and ListPhones survive between sessions.
+            std::this_thread::sleep_for(std::chrono::milliseconds{100});
+            listed = call("ListPhones").has_value();
+            const auto renewed = client.value().get_name_owner(service);
+            owner_kept = renewed && renewed.value().value == owner.value().value;
+            if (auto state = call("GetState")) {
+                bus::Cursor cursor{state->body};
+                if (auto text = cursor.read_string()) state_after_stop = text.value();
+            }
+            runtime_closed.store(false);
+            started = call("StartProjection").has_value();
+            second_session = wait_for([] {
+                return runtime_waiting.load() && runtime_connects.load() >= 2;
+            });
+            // Unregistering a started projection ends the session too (P3-4).
+            runtime_waiting.store(false);
+            (void)call("UnregisterConsumer");
+            second_closed = wait_for([] { return runtime_closed.load(); });
+            runtime_closed.store(false);
+            restarted = call("RegisterConsumer", [&](bus::MessageWriter &w) {
+                w.body_signature("s").put_string(consumer.value);
+            }).has_value() && call("StartProjection").has_value();
+            third_session = wait_for([] {
+                return runtime_waiting.load() && runtime_connects.load() >= 3;
+            });
+        }
+    }
+    g_shutdown.store(true);
+    g_running.store(false);
+    receiver.join();
+    watchdog.request_stop();
+    watchdog.join();
+    const auto output = captured_receiver_stdout();
+    runtime_links_every_attempt = false;
+    runtime_quiet = false;
+    g_shutdown.store(false);
+    std::filesystem::remove_all(root);
+
+    EXPECT_FALSE(watchdog_fired.load()) << output;
+    EXPECT_TRUE(first_session) << output;
+    EXPECT_TRUE(registered);
+    EXPECT_TRUE(stopped) << output;
+    EXPECT_TRUE(first_closed) << output;
+    EXPECT_TRUE(listed) << output;
+    EXPECT_TRUE(owner_kept);
+    EXPECT_EQ(state_after_stop, "stopped");
+    EXPECT_TRUE(started) << output;
+    EXPECT_TRUE(second_session) << output;
+    EXPECT_TRUE(second_closed) << output;
+    EXPECT_TRUE(restarted) << output;
+    EXPECT_TRUE(third_session) << output;
+    EXPECT_EQ(runtime_connects.load(), 3);
+    EXPECT_EQ(code, 0) << output;
+    EXPECT_NE(output.find("\"state\":\"waiting_for_start\""), std::string::npos) << output;
+}
+
 TEST(WiredReceiver, DbusIdrFirstSendFailureKeepsSessionActiveWithoutTeardown) {
     // Focus send #1 = AvSinkSetup(projected), #2 = transition native (fails).
     // First-send failure must keep the session alive until normal duration shutdown.
@@ -7717,7 +10277,9 @@ TEST(WiredReceiver, RuntimeDiagnosticsAndAudioReopenKeepTimingOnStalledStdout) {
     auto gate = std::make_shared<RenderGate>();
     gate->first_write_delay = std::chrono::milliseconds{0};
     gate->fail_first_write = true;
-    ConcreteAudioRenderWorker audio{pcm_router_config(), gated_router(gate)};
+    ConcreteAudioRenderWorker audio{
+        pcm_router_config(aa::audio::SinkBackend::pulse, aa::core::Nanoseconds{0}),
+        gated_router(gate)};
     ASSERT_TRUE(audio.ready());
 
     const auto role = aa::protocol::ChannelRole::media_audio;
@@ -8052,7 +10614,9 @@ TEST(WiredReceiver, WiredReceiverEndToEndKeepsAvAudioAndControlTimingDuringStdou
                 }));
         };
 
-        // 1. Video A/V gate (< 50 ms) + Input forwarding while stdout is blocked & full.
+        // 1. Input forwarding (< 50 ms) and video while stdout is blocked & full.
+        // Video leaves after the default hold (#228, kWiredPlayoutDepth), never
+        // before it and less than 50 ms after it.
         const std::size_t input_sent_before = count_sent_on_channel(104);
         const std::vector<std::byte> p_body{std::byte{0x00}, std::byte{0x00}, std::byte{0x00},
                                             std::byte{0x01}, std::byte{0x41}, std::byte{0x10}};
@@ -8100,18 +10664,6 @@ TEST(WiredReceiver, WiredReceiverEndToEndKeepsAvAudioAndControlTimingDuringStdou
         push_channel(99, av_data_message(0x4444, post_idr_body));
         push_channel(99, av_data_message(0x5555, post_p_body));
 
-        const auto video_deadline = LogClock::now() + std::chrono::milliseconds{500};
-        const auto v1 = receive_complete(video_deadline);
-        const auto v2 = v1 ? receive_complete(video_deadline) : std::nullopt;
-        if (!v1 || !v2) {
-            fail_child(101);
-        }
-        // Correlate: the two completed units are exactly the injected 0x4444
-        // IDR and 0x5555 P frame, in order, right after the warm-up unit.
-        if (v1->frame != warm_frame + 1 || !v1->idr || !ends_with(v1->payload, as_bytes(post_idr_body)) ||
-            v2->frame != warm_frame + 2 || v2->idr || v2->payload != as_bytes(post_p_body)) {
-            fail_child(110);
-        }
         {
             const auto input_deadline = LogClock::now() + std::chrono::milliseconds{500};
             bool input_done = false;
@@ -8139,9 +10691,28 @@ TEST(WiredReceiver, WiredReceiverEndToEndKeepsAvAudioAndControlTimingDuringStdou
                 fail_child(102);
             }
         }
-        const auto av_elapsed = LogClock::now() - t_av_start;
-        if (av_elapsed >= std::chrono::milliseconds{50}) {
+        if (LogClock::now() - t_av_start >= std::chrono::milliseconds{50}) {
             fail_child(103);
+        }
+        const auto video_deadline = t_av_start + std::chrono::milliseconds{500};
+        const auto v1 = receive_complete(video_deadline);
+        const auto v2 = v1 ? receive_complete(video_deadline) : std::nullopt;
+        if (!v1 || !v2) {
+            fail_child(101);
+        }
+        // Correlate: the two completed units are exactly the injected 0x4444
+        // IDR and 0x5555 P frame, in order, right after the warm-up unit.
+        if (v1->frame != warm_frame + 1 || !v1->idr || !ends_with(v1->payload, as_bytes(post_idr_body)) ||
+            v2->frame != warm_frame + 2 || v2->idr || v2->payload != as_bytes(post_p_body)) {
+            fail_child(110);
+        }
+        const auto video_elapsed = LogClock::now() - t_av_start;
+        const std::chrono::nanoseconds video_hold{aa::audio::kWiredPlayoutDepth.count};
+        if (video_elapsed < video_hold) {
+            fail_child(113);
+        }
+        if (video_elapsed >= video_hold + std::chrono::milliseconds{50}) {
+            fail_child(114);
         }
 
         // 2. Audio latency gate (< 200 ms) while stdout is blocked & full,
@@ -8854,4 +11425,377 @@ TEST(WiredReceiver, StdoutLogFinishAbandonsStalledSinkWithParkedRecords) {
         EXPECT_EQ(owned_probe.bytes.find("log_complete"), std::string::npos);
     }
     LogWriteProbe::active = nullptr;
+}
+
+TEST(WiredReceiver, ManagedWiredEntryPointDeliversFragmentedIdrAndSurvivesInPlaceReplacement) {
+    // Exercise the REAL production wired_receiver_main managed dispatch path
+    // (fd 3 video handoff + fd 4 input listener + --managed-by + fake USB):
+    // 1. Deliver a 32 KiB+ fragmented IDR under unequal negotiated limits.
+    // 2. Replace the consumer while consumer 1 is STILL OPEN and push a frame
+    //    before sending the replacement handoff over fd 3; verify the active
+    //    phone session does not fail or reconnect USB, then deliver a second
+    //    fragmented IDR to consumer 2.
+    // Re-exec self via fork()+execve() so earlier tests' detached threads never
+    // leave mutexes held across fork() (matching run_admission_child above).
+    if (std::getenv("AA_TEST_MANAGED_WIRED_CHILD") != nullptr) {
+        char directory[] = "/tmp/wired-managed-e2e-XXXXXX";
+        const char *created = ::mkdtemp(directory);
+        if (!created) { ::_exit(10); }
+        const std::filesystem::path root{created};
+        const auto store_path = root / "approved.json";
+        aa::trust::ApprovedPhoneStore store{store_path};
+        if (!store.load().has_value()) { ::_exit(11); }
+        const aa::trust::WiredIdentity identity{
+            "04e8", "6860", "SYNTHETIC", "TEST", "TEST", "SYNTHETIC", "1-2.1"};
+        const auto approved = store.approve(aa::trust::TransportIdentity{identity});
+        if (!approved.has_value()) { ::_exit(12); }
+
+        int handoff[2]{-1, -1};
+        if (::socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, handoff) != 0) {
+            ::_exit(13);
+        }
+        auto input_server = aa::ipc::InputServer::listen(
+            aa::ipc::InputSocketPath{(root / "input.sock").string()},
+            aa::ipc::InputServerOptions{aa::ipc::current_uid()});
+        if (!input_server.has_value()) { ::_exit(14); }
+
+        // Move parent-side handoff[0] and temporary duplicates above fd 4 before
+        // installing child fd 3 (handoff) and fd 4 (input listener).
+        const int handoff_parent = ::fcntl(handoff[0], F_DUPFD_CLOEXEC, 10);
+        const int handoff_child = ::fcntl(handoff[1], F_DUPFD_CLOEXEC, 10);
+        const int input_child = ::fcntl(input_server.value().native_handle(), F_DUPFD_CLOEXEC, 10);
+        ::close(handoff[0]);
+        ::close(handoff[1]);
+        if (handoff_parent < 0 || handoff_child < 0 || input_child < 0) { ::_exit(15); }
+        if (::dup2(handoff_child, 3) != 3 || ::dup2(input_child, 4) != 4) { ::_exit(16); }
+        ::close(handoff_child);
+        ::close(input_child);
+
+        const aa::ipc::VideoSocketPath video_path{(root / "video.sock").string()};
+        auto video_server = aa::ipc::VideoServer::listen(
+            video_path, aa::ipc::VideoServerOptions{{}, aa::ipc::current_uid()});
+        if (!video_server.has_value()) { ::_exit(17); }
+        aa::wireless_receiver::ManagedVideoBroker broker{};
+
+        const auto connect_consumer =
+            [&](aa::ipc::NegotiatedLimits limits) -> aa::core::Result<aa::ipc::VideoConsumer> {
+            const auto before = broker.generation();
+            aa::core::Result<aa::ipc::VideoConsumer> consumer{aa::Error{aa::ErrorCode::timeout}};
+            std::atomic<bool> done{false};
+            std::thread connector([&] {
+                consumer = aa::ipc::connect_video_consumer(
+                    video_path, {limits, aa::ipc::current_uid(), Milliseconds{2000}});
+                done.store(true, std::memory_order_release);
+            });
+            const auto deadline = LogClock::now() + std::chrono::seconds{4};
+            while (broker.generation() == before && !done.load(std::memory_order_acquire) &&
+                   LogClock::now() < deadline) {
+                if (!broker.has_pending_handshake(video_server.value())) {
+                    pollfd pfd{video_server.value().native_handle(), POLLIN, 0};
+                    (void)::poll(&pfd, 1, 20);
+                } else {
+                    std::this_thread::yield();
+                }
+                (void)broker.poll(video_server.value());
+            }
+            if (broker.generation() == before) {
+                (void)broker.poll(video_server.value());
+            }
+            connector.join();
+            if (!consumer) { return consumer; }
+            if (broker.generation() == before) { return aa::Error{aa::ErrorCode::timeout}; }
+            return consumer;
+        };
+
+        const auto recv_complete = [](aa::ipc::VideoConsumer &c) -> bool {
+            for (int i = 0; i < 64; ++i) {
+                auto step = c.receive(Milliseconds{2000});
+                if (!step.has_value()) { return false; }
+                if (step.value() == aa::ipc::ReceiveStatus::complete) { return true; }
+            }
+            return false;
+        };
+
+        runtime_phone = aa::app::wired_phone_identity(identity).value();
+        runtime_recovers = false;
+        runtime_quiet = false;
+        runtime_send_audio = false;
+        runtime_send_video = false;
+        runtime_connects.store(0);
+        runtime_ciphers.store(0);
+        g_shutdown.store(false);
+        g_running.store(true);
+        auto state = std::make_shared<AdmissionState>();
+        admission_link_state = state;
+
+        std::vector<std::string> args{
+            "aa-wired-receiver", "--no-bus",
+            "--managed-by", std::to_string(::getppid()),
+            "--port", "1-2.1",
+            "--managed-phone-id", std::to_string(approved.value().value),
+            "--store", store_path.string(),
+            "--audio-playout-ms", "0",
+            "--require-video-consumer",
+            "--duration-ms", "15000"};
+        std::vector<char *> argv;
+        for (auto &arg : args) { argv.push_back(arg.data()); }
+
+        int receiver_code = -1;
+        std::thread receiver([&] {
+            receiver_code = wired_receiver_main(static_cast<int>(argv.size()), argv.data());
+        });
+
+        auto fail_child = [&](int code) {
+            g_running.store(false);
+            {
+                std::lock_guard lock(state->mutex);
+                state->closed = true;
+                state->cv.notify_all();
+            }
+            ::close(handoff_parent);
+            if (receiver.joinable()) { receiver.join(); }
+            admission_link_state.reset();
+            (void)broker.release_connection(&video_server.value());
+            video_server.value().close();
+            input_server.value().close();
+            std::filesystem::remove_all(root);
+            ::_exit(code);
+        };
+
+        {
+            bool created = false;
+            {
+                std::unique_lock lock(state->mutex);
+                created = state->cv.wait_for(lock, std::chrono::seconds{3},
+                                             [&] { return state->created; });
+            }
+            if (!created) { fail_child(20); }
+        }
+
+        // Connect Consumer 1 with unequal limits (4 KiB datagram, 128 KiB AU)
+        // and send the handoff over fd 3.
+        aa::ipc::NegotiatedLimits custom{};
+        custom.max_datagram_payload = 4096U;
+        custom.max_access_unit_bytes = 128U * 1024U;
+        custom.socket_budget_bytes = 192U * 1024U;
+        auto consumer1 = connect_consumer(custom);
+        if (!consumer1.has_value()) { fail_child(21); }
+        if (!aa::tools::send_video_handoff_install(
+                handoff_parent, broker.client_fd(), broker.state_fd(), broker.limits())) {
+            fail_child(22);
+        }
+
+        // Negotiate fake USB session to active.
+        auto cipher = active_test_cipher();
+        const auto push_plain = [&](const std::vector<std::byte> &frame) {
+            std::lock_guard lock(state->mutex);
+            state->inbound.push_back(frame);
+            state->cv.notify_all();
+        };
+        const auto push_channel = [&](std::uint8_t channel, std::vector<std::byte> payload) {
+            auto frames = aa::transport::encode_message(
+                {channel, aa::transport::MessageKind::specific, std::move(payload)},
+                aa::transport::Encryption::encrypted, cipher.get());
+            if (!frames.has_value()) { fail_child(23); }
+            std::lock_guard lock(state->mutex);
+            for (auto &f : frames.value()) { state->inbound.push_back(std::move(f)); }
+            state->cv.notify_all();
+        };
+
+        namespace p = aa::protocol;
+        push_plain(wiredtest::control_frame(p::encode(p::VersionResponse{1, 6, 0}).value()));
+        push_plain(wiredtest::control_frame(p::encode(p::EncapsulatedSsl{{std::byte{1}}}).value()));
+        push_plain(wiredtest::discovery_request_frame());
+        push_plain(wiredtest::open_request_frame(99));
+        push_channel(99, p::encode(p::AvSinkSetup{p::AvSinkCodec::h264}).value());
+        push_channel(99, p::encode(p::AvSinkStart{-7, 0}).value());
+
+        // Build a 32 KiB+ fragmented H.264 IDR (9 datagrams at 4 KiB).
+        const auto make_idr = [](std::size_t size, std::uint8_t seed) {
+            std::vector<std::byte> body(size);
+            body[0] = std::byte{0x00};
+            body[1] = std::byte{0x00};
+            body[2] = std::byte{0x00};
+            body[3] = std::byte{0x01};
+            body[4] = std::byte{0x65};
+            for (std::size_t i = 5; i < size; ++i) {
+                body[i] = static_cast<std::byte>((i * 29U + seed) & 0xFFU);
+            }
+            return body;
+        };
+        const auto idr1 = make_idr(32U * 1024U + 111U, 0x17U);
+        push_channel(99, av_data_message(0x1000, idr1));
+
+        if (!recv_complete(consumer1.value())) { fail_child(24); }
+        if (consumer1.value().access_unit().payload.size() != idr1.size() ||
+            consumer1.value().rejected() != 0U) {
+            fail_child(25);
+        }
+        for (std::size_t i = 0; i < idr1.size(); ++i) {
+            if (consumer1.value().access_unit().payload[i] != std::to_integer<std::uint8_t>(idr1[i])) {
+                fail_child(26);
+            }
+        }
+
+        const auto count_ch99_data_acks = [&] {
+            std::size_t count = 0;
+            for (const auto &raw : state->sent) {
+                const auto f = aa::transport::decode_frame(raw);
+                if (!f.has_value() || f.value().header.channel != 99 ||
+                    f.value().header.kind != aa::transport::MessageKind::specific) {
+                    continue;
+                }
+                std::vector<std::byte> plain;
+                if (f.value().header.encryption == aa::transport::Encryption::encrypted) {
+                    auto opened = cipher->open(f.value().payload);
+                    if (!opened.has_value()) { continue; }
+                    plain = std::move(opened.value());
+                } else {
+                    plain.assign(f.value().payload.begin(), f.value().payload.end());
+                }
+                if (plain.size() >= 2 && plain[0] == std::byte{0x80} &&
+                    plain[1] == std::byte{0x04}) {
+                    ++count;
+                }
+            }
+            return count;
+        };
+
+        // Wait for idr1's specific AvMediaAck (0x8004) on channel 99 BEFORE
+        // queuing the gap frame, because recv_complete(consumer1) can finish
+        // before AvSink sends idr1's ACK.
+        {
+            bool acked_idr1 = false;
+            {
+                std::unique_lock lock(state->mutex);
+                acked_idr1 = state->cv.wait_for(lock, std::chrono::seconds{3},
+                                                [&] { return count_ch99_data_acks() >= 1U; });
+            }
+            if (!acked_idr1) { fail_child(26); }
+        }
+
+        // Connect Consumer 2 while Consumer 1 is STILL OPEN. Broker retires
+        // Consumer 1 immediately, BEFORE we forward Consumer 2 over fd 3.
+        auto consumer2 = connect_consumer(custom);
+        if (!consumer2.has_value()) { fail_child(27); }
+
+        // Push a frame over fake USB in the gap before fd 3 handoff is sent
+        // and wait until AvSink emits the NEXT channel-99 AvMediaAck (0x8004)
+        // in state->sent, proving video_outlet.on_message() actually ran against
+        // the retired borrowed producer, returned success, and kept the phone
+        // session live.
+        std::size_t acks_before_gap = 0;
+        {
+            std::lock_guard lock(state->mutex);
+            acks_before_gap = count_ch99_data_acks();
+        }
+        const auto gap_idr = make_idr(8192U, 0x44U);
+        push_channel(99, av_data_message(0x2000, gap_idr));
+        {
+            bool acked_gap = false;
+            {
+                std::unique_lock lock(state->mutex);
+                acked_gap = state->cv.wait_for(
+                    lock, std::chrono::seconds{3},
+                    [&] { return count_ch99_data_acks() > acks_before_gap; });
+            }
+            if (!acked_gap) { fail_child(28); }
+        }
+        const auto eof1 = consumer1.value().receive(Milliseconds{500});
+        if (eof1.has_value() || eof1.error().code() != aa::ErrorCode::transport_closed) {
+            fail_child(29);
+        }
+        if (!g_running.load() || runtime_connects.load() != 1) { fail_child(30); }
+
+        // Now forward Consumer 2 over fd 3 and send a second 32 KiB+ fragmented
+        // IDR. Consumer 2 receives it cleanly on the SAME phone session.
+        if (!aa::tools::send_video_handoff_install(
+                handoff_parent, broker.client_fd(), broker.state_fd(), broker.limits())) {
+            fail_child(31);
+        }
+        const auto idr2 = make_idr(32U * 1024U + 222U, 0x5BU);
+        const auto sent_deadline = LogClock::now() + std::chrono::seconds{3};
+        bool got_idr2 = false;
+        while (!got_idr2 && LogClock::now() < sent_deadline) {
+            push_channel(99, av_data_message(0x3000, idr2));
+            for (int step = 0; step < 32; ++step) {
+                auto rx = consumer2.value().receive(Milliseconds{50});
+                if (!rx.has_value()) {
+                    if (rx.error().code() == aa::ErrorCode::timeout) { break; }
+                    fail_child(32);
+                }
+                if (rx.value() == aa::ipc::ReceiveStatus::complete) {
+                    got_idr2 = true;
+                    break;
+                }
+            }
+        }
+        if (!got_idr2) { fail_child(33); }
+        if (consumer2.value().access_unit().payload.size() != idr2.size() ||
+            consumer2.value().rejected() != 0U) {
+            fail_child(34);
+        }
+        for (std::size_t i = 0; i < idr2.size(); ++i) {
+            if (consumer2.value().access_unit().payload[i] != std::to_integer<std::uint8_t>(idr2[i])) {
+                fail_child(35);
+            }
+        }
+        if (runtime_connects.load() != 1) { fail_child(36); }
+
+        // Closing the supervisor side of the handoff channel cleanly ends the
+        // managed wired worker with exit code 0.
+        ::close(handoff_parent);
+        receiver.join();
+        admission_link_state.reset();
+        (void)broker.release_connection(&video_server.value());
+        video_server.value().close();
+        input_server.value().close();
+        std::filesystem::remove_all(root);
+        ::_exit(receiver_code == 0 ? 0 : (40 + receiver_code));
+    }
+
+    std::string child_env = "AA_TEST_MANAGED_WIRED_CHILD=1";
+    std::vector<char *> environment;
+    for (char **entry = ::environ; *entry != nullptr; ++entry) {
+        environment.push_back(*entry);
+    }
+    environment.push_back(child_env.data());
+    environment.push_back(nullptr);
+    std::string executable = "/proc/self/exe";
+    std::string filter =
+        "--gtest_filter=WiredReceiver.ManagedWiredEntryPointDeliversFragmentedIdrAndSurvivesInPlaceReplacement";
+    std::string repeat = "--gtest_repeat=1";
+    char *child_argv[]{executable.data(), filter.data(), repeat.data(), nullptr};
+    std::fflush(nullptr);
+    const pid_t child = ::fork();
+    ASSERT_GE(child, 0);
+    if (child == 0) {
+        const int devnull = ::open("/dev/null", O_WRONLY);
+        if (devnull >= 0) {
+            (void)::dup2(devnull, STDOUT_FILENO);
+            ::close(devnull);
+        }
+        ::execve(executable.c_str(), child_argv, environment.data());
+        ::_exit(91);
+    }
+
+    int status = 0;
+    const auto deadline = LogClock::now() + std::chrono::seconds{15};
+    bool reaped = false;
+    while (LogClock::now() < deadline) {
+        const pid_t w = ::waitpid(child, &status, WNOHANG);
+        if (w == child) {
+            reaped = true;
+            break;
+        }
+        if (w < 0 && errno != EINTR) { break; }
+        std::this_thread::sleep_for(std::chrono::milliseconds{10});
+    }
+    if (!reaped) {
+        (void)::kill(child, SIGKILL);
+        while (::waitpid(child, &status, 0) < 0 && errno == EINTR) {}
+        FAIL() << "ManagedWiredEntryPoint child timed out";
+    }
+    ASSERT_TRUE(WIFEXITED(status)) << "child terminated abnormally, status=" << status;
+    EXPECT_EQ(WEXITSTATUS(status), 0) << "child failed at checkpoint " << WEXITSTATUS(status);
 }

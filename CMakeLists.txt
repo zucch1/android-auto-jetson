@@ -221,7 +221,7 @@ if(NOT CMAKE_CROSSCOMPILING)
     endforeach()
     add_test(NAME wired_qualification COMMAND "${Python3_EXECUTABLE}" -B
         -m unittest discover -s "${CMAKE_SOURCE_DIR}/tests/qualification" -v)
-    set_tests_properties(wired_qualification PROPERTIES TIMEOUT 120)
+    set_tests_properties(wired_qualification PROPERTIES TIMEOUT 180)
     if(NOT BUILD_TESTING)
         message(FATAL_ERROR "AA_DECODE_COVERAGE: native builds require BUILD_TESTING=ON")
     endif()
@@ -259,6 +259,33 @@ endif()
 # aa_harden_project_targets()).
 include(cmake/DebugInfoSplit.cmake)
 aa_split_debug_info_project_targets()
+if(NOT CMAKE_CROSSCOMPILING)
+    set(_aa_expect_split 0)
+    set(_aa_expect_inline_dwarf 0)
+    if(CMAKE_BUILD_TYPE MATCHES "^(Debug|RelWithDebInfo)$")
+        if(AA_ENABLE_ASAN OR NOT AA_SPLIT_DEBUG_INFO)
+            # ASan and explicit -DAA_SPLIT_DEBUG_INFO=OFF opt-outs keep DWARF
+            # inline. The fixture matrix still proves the module default is ON.
+            set(_aa_expect_inline_dwarf 1)
+        else()
+            # Split requested (the default): require it, so a missing objcopy
+            # fails loudly instead of silently leaving the binary unsplit.
+            set(_aa_expect_split 1)
+        endif()
+    endif()
+    add_test(NAME build_debug_info_split COMMAND "${Python3_EXECUTABLE}" -B -E
+        "${CMAKE_SOURCE_DIR}/tests/build/debug_info_split.py"
+        --cmake-module "${CMAKE_SOURCE_DIR}/cmake/DebugInfoSplit.cmake"
+        --binary "$<TARGET_FILE:aa_host_smoke>"
+        --expect-split "${_aa_expect_split}"
+        --expect-inline-dwarf "${_aa_expect_inline_dwarf}"
+        --objcopy "${CMAKE_OBJCOPY}"
+        --cmake "${CMAKE_COMMAND}"
+        --generator "${CMAKE_GENERATOR}")
+    set_tests_properties(build_debug_info_split PROPERTIES TIMEOUT 120)
+    unset(_aa_expect_split)
+    unset(_aa_expect_inline_dwarf)
+endif()
 include(cmake/DebPackage.cmake)
 include(cmake/SecurityHardening.cmake)
 include(cmake/HostTestScheduling.cmake)

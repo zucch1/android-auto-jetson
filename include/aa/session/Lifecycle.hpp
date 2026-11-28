@@ -18,8 +18,7 @@ namespace aa::session {
 
 // Caller-supplied phase budgets. These are NOT invented contract budgets: zero
 // means the caller did not bound that phase and the controller arms no deadline
-// for it. The mandated contract budgets (pairing 60 s, reconnect 5 s/15 s,
-// consumer grace 10 s) are fixed inside the controller and never overridable.
+// for it. Pairing (60 s) and consumer grace (10 s) are fixed.
 struct PhaseBudget final {
     core::Milliseconds discovery{0};
     core::Milliseconds connect{0};
@@ -27,11 +26,12 @@ struct PhaseBudget final {
     core::Milliseconds stop{0};
 };
 
-// Lifecycle configuration: caller phase budgets plus the link medium that
-// selects the contract reconnect budget.
+// Lifecycle configuration: caller phase budgets and link-specific reconnect
+// timing. The wired CLI can allow more time for physical USB re-enumeration.
 struct LifecycleConfig final {
     PhaseBudget phases{};
     LinkKind link{LinkKind::wired};
+    core::Milliseconds wired_reconnect{5'000};
 };
 
 // Session-thread-owned lifecycle policy controller (task 17). Bounded lifecycle

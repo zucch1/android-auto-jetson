@@ -632,11 +632,15 @@ class GstSink final : public detail::ObservedAudioSink {
 public:
     GstSink(SinkElements elements, AudioFormat format, core::Milliseconds write_timeout,
             GstElement* sink_element, bool drop_nonempty, bool drop_after_window,
-            std::function<void(const SinkWriteProgress&)> publish)
+            std::function<void(const SinkWriteProgress&)> publish, bool contiguous_stream = false)
         : pipeline_(elements.pipeline), appsrc_(elements.appsrc), sink_element_(sink_element),
           format_(format), write_timeout_(write_timeout),
           progress_(std::move(publish)), probe_(&handoff_, false, false) {
         handoff_.progress = &progress_;
+        // Only a ring-buffer element (GstAudioBaseSink: slave-method) keeps
+        // its own clock that stops while nothing drains it.
+        contiguous_stream_ = contiguous_stream && sink_element_ != nullptr
+            && g_object_class_find_property(G_OBJECT_GET_CLASS(sink_element_), "slave-method") != nullptr;
         (void)drop_nonempty;
         (void)drop_after_window;
         pending_drop_nonempty_ = drop_nonempty;
@@ -662,6 +666,10 @@ public:
         return outcome.result;
     }
 
+    void set_write_deadline(std::chrono::steady_clock::time_point until) override {
+        write_limit_ = until;
+    }
+
     // Bounded nonblocking enqueue (gate fix 3). ONE absolute deadline is
     // computed at entry and shared by queue admission, chain settlement and
     // the render handoff - never two stacked timeout windows. Capacity for the
@@ -676,7 +684,8 @@ public:
                                                   core::Milliseconds timeout,
                                                   bool readiness_probe) {
         const auto entered = std::chrono::steady_clock::now();
-        const auto deadline = entered + std::chrono::milliseconds(timeout.count);
+        auto deadline = entered + std::chrono::milliseconds(timeout.count);
+        if (!readiness_probe && write_limit_) { deadline = std::min(deadline, *write_limit_); }
         playback_slot_ = {};
         SinkWriteProgress value;
         value.readiness_probe = readiness_probe;
@@ -687,9 +696,7 @@ public:
         value.max_buffers = kAppsrcMaxBuffers;
         if (pts_origin_set_) {
             value.pts_origin_ns = pts_origin_ns_;
-            value.pts_ns = chunk.timestamp.count > pts_origin_ns_
-                ? static_cast<std::uint64_t>(chunk.timestamp.count) - static_cast<std::uint64_t>(pts_origin_ns_)
-                : 0;
+            value.pts_ns = chunk_pts(chunk.timestamp);
         }
         if (pipeline_ != nullptr && !released_) {
             const auto levels = appsrc_queue_levels();
@@ -904,6 +911,12 @@ public:
             std::min(deadline, std::chrono::steady_clock::now() + kPlaybackSlotWait);
         playback_slot_ = request_playback_slot(data_pts, slot_until);
         return outcome;
+    }
+
+    [[nodiscard]] bool hold_stream(core::Nanoseconds by) override {
+        if (!contiguous_stream_ || released_ || by.count <= 0) { return false; }
+        pts_hold_ns_ += by.count;
+        return true;
     }
 
     [[nodiscard]] std::optional<core::Nanoseconds> last_playback_slot() const override {
@@ -1148,6 +1161,7 @@ public:
             mapping_clock_ = nullptr;
         }
         pts_origin_set_ = false;
+        pts_hold_ns_ = 0;
         appsrc_ = nullptr;
         sink_element_ = nullptr;
         probe_id_ = 0;
@@ -1210,6 +1224,9 @@ public:
             return true;
         }
         pts_origin_set_ = false;
+        // A new epoch (re-PLAY, new clock) recalibrates the element's clock to
+        // the pipeline's: nothing it held before still applies.
+        pts_hold_ns_ = 0;
         const auto before = observation_time().count;
         const auto clock_now = gst_clock_get_time(clock);
         const auto after = observation_time().count;
@@ -1233,7 +1250,7 @@ public:
 
 private:
     [[nodiscard]] GstClockTime chunk_pts(core::Nanoseconds timestamp) const {
-        const std::int64_t delta = timestamp.count - pts_origin_ns_;
+        const std::int64_t delta = timestamp.count - pts_origin_ns_ - pts_hold_ns_;
         // Already-late schedules before pipeline running-time zero render at
         // zero; never wrap an unsigned PTS into the distant future.
         return static_cast<GstClockTime>(delta > 0 ? delta : 0);
@@ -1409,12 +1426,18 @@ private:
     gulong probe_id_{0};
     AudioFormat format_{};
     core::Milliseconds write_timeout_{2000};
+    // Earlier end of every later write (set_write_deadline).
+    std::optional<std::chrono::steady_clock::time_point> write_limit_{};
     WriteProgress progress_;
     mutable HandoffTracker handoff_{};
     PadProbe probe_;
     bool pending_drop_nonempty_{false};
     bool pending_drop_after_window_{false};
     GstClockTime last_buffer_pts_{0};
+    // Lossless playout (#228): the time this element's clock stood still in
+    // writes that blocked (hold_stream); later stamps are moved back by it.
+    bool contiguous_stream_{false};
+    std::int64_t pts_hold_ns_{0};
     GstClock* mapping_clock_{nullptr};
     GstClockTime mapping_base_{GST_CLOCK_TIME_NONE};
     bool pts_origin_set_{false};
@@ -1939,6 +1962,21 @@ static SinkOpenOutcome open_sink(const SinkOpenRequest& request, bool native_qua
         g_object_set(sink, "latency-time", static_cast<gint64>(21333), "provide-clock", FALSE,
                      nullptr);
     }
+    if (request.contiguous_stream
+        && g_object_class_find_property(G_OBJECT_GET_CLASS(sink), "slave-method") != nullptr) {
+        // #228 lossless playout. A pulsesink whose server stalls stops its own
+        // clock with it. Slaved (skew, the default), it then puts that clock
+        // right against the pipeline's: it drops the stall's worth of audio
+        // after the stall (stamps kept on), or waits it out in silence before
+        // later stamps (stamps moved), which blocked the next write as long
+        // and retimed again (live 1 s pause: 28 retimes, 6.3 s cut). Unslaved
+        // it plays on from where it stopped, and hold_stream() keeps the stamps
+        // contiguous. Measured with a private pipewire-pulse: 300 ms, 1 s and
+        // 1.6 s pauses lose nothing. Its device's drift from the system clock
+        // (about 2 ppm on the Jetson) is no longer corrected here: a slower
+        // device blocks writes later, which the router takes as a stall.
+        gst_util_set_object_arg(G_OBJECT(sink), "slave-method", "none");
+    }
 
     if (!request.target.empty()) {
         // Connection-target override (pulsesink `server`, pipewiresink
@@ -1963,7 +2001,8 @@ static SinkOpenOutcome open_sink(const SinkOpenRequest& request, bool native_qua
                                             request.write_timeout, sink,
                                             request.drop_nonempty_at_ingress,
                                             request.drop_nonempty_after_window,
-                                            request.on_write_progress);
+                                            request.on_write_progress,
+                                            request.contiguous_stream);
     if (!handle->attach_probe()) {
         handle->release();
         outcome.report.usable = false;

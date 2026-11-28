@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
+#include "../media_playout_options.hpp"
 #include <aa/audio/AudioRenderWorker.hpp>
 #include <aa/audio/AudioRouter.hpp>
 #include <aa/config/VideoProfiles.hpp>
@@ -27,7 +28,7 @@ inline constexpr bool kAllowHelperBusAddress = false;
 inline constexpr const char *usage =
     "usage: aa-wireless-receiver --store-dir PATH (--phone-id N | --pairing-only) [options]\n"
     "  PATH contains approved-phones.json; N selects an approved wireless phone.\n"
-    "  --pairing-only       run only the authenticated control/pairing API; no projection.\n"
+    "  --pairing-only       start in pairing mode; the consumer can enable projection.\n"
     "  --video-socket PATH   encoded video consumer socket\n"
     "  --input-socket PATH   normalized display input socket\n"
     "  --video-profiles WxH@FPS:CODEC,...  offered video profiles (same syntax as\n"
@@ -40,7 +41,7 @@ inline constexpr const char *usage =
     "  --idr-recovery auto|nudge|transition  IDR recovery strategy (default auto)\n"
     "  --audio-sink pulse|pipewire|automatic  audio routing element (default pulse)\n"
     "  --audio-catch-up-watermark-ms N        post-stall catch-up watermark in ms\n"
-    "                                         (0 disables catch-up, default 0; max 1000;\n"
+    "                                         (0 disables catch-up, default 0; else 20..200;\n"
     "                                         needs --audio-playout-ms 0)\n"
     "  --audio-playout-ms N   wireless audio playout buffer in ms: chunks play back to\n"
     "                       back N ms after the arrival that anchored the stream\n"
@@ -147,38 +148,21 @@ inline std::optional<Options> parse_options(int argc, const char *const *argv,
             else
                 return std::nullopt;
         } else if (arg == "--audio-catch-up-watermark-ms") {
-            std::uint64_t number{};
-            const auto [end, error] =
-                std::from_chars(value.data(), value.data() + value.size(), number);
-            if (error != std::errc{} || end != value.data() + value.size() || number > 1000)
+            if (!aa::tools::parse_audio_catch_up_watermark_ms(
+                    value, options.audio_catch_up_watermark_ms))
                 return std::nullopt;
-            options.audio_catch_up_watermark_ms = static_cast<std::int64_t>(number);
-        } else if (arg == "--audio-playout-ms" || arg == "--audio-max-unacked") {
-            std::uint64_t number{};
-            const auto [end, error] =
-                std::from_chars(value.data(), value.data() + value.size(), number);
-            if (error != std::errc{} || end != value.data() + value.size())
+        } else if (arg == "--audio-playout-ms") {
+            if (!aa::tools::parse_audio_playout_ms(value, options.audio_playout_ms))
                 return std::nullopt;
-            if (arg == "--audio-playout-ms") {
-                if (number > 180)
-                    return std::nullopt;
-                options.audio_playout_ms = static_cast<std::int64_t>(number);
-            } else {
-                if (number == 0 || number > audio::AudioCreditPolicy::kMaxWindow)
-                    return std::nullopt;
-                options.audio_max_unacked = static_cast<std::uint32_t>(number);
-            }
+        } else if (arg == "--audio-max-unacked") {
+            std::uint64_t number{};
+            if (!aa::tools::parse_uint64_strict(value, number) ||
+                number == 0 || number > audio::AudioCreditPolicy::kMaxWindow)
+                return std::nullopt;
+            options.audio_max_unacked = static_cast<std::uint32_t>(number);
         } else if (arg == "--video-delay-ms") {
-            if (value == "match") {
-                options.video_delay_ms.reset();
-            } else {
-                std::uint64_t number{};
-                const auto [end, error] =
-                    std::from_chars(value.data(), value.data() + value.size(), number);
-                if (error != std::errc{} || end != value.data() + value.size() || number > 180)
-                    return std::nullopt;
-                options.video_delay_ms = static_cast<std::int64_t>(number);
-            }
+            if (!aa::tools::parse_video_delay_ms(value, options.video_delay_ms))
+                return std::nullopt;
         } else if (arg == "--ap-channel") {
             std::uint32_t number{};
             const auto [end, error] =
@@ -212,12 +196,9 @@ inline std::optional<Options> parse_options(int argc, const char *const *argv,
         !std::filesystem::path{options.input_socket}.is_absolute() ||
         options.video_socket == options.input_socket)
         return std::nullopt;
-    // Catch-up trims audio the playout buffer exists to keep (rejected for
-    // wireless, 2026-11-20): it applies only to the arrival model.
-    if (options.audio_catch_up_watermark_ms > 0 && options.audio_playout_ms > 0)
-        return std::nullopt;
-    // F8: a video hold without a playout buffer only skews A/V.
-    if (options.video_delay_ms && *options.video_delay_ms > 0 && options.audio_playout_ms == 0)
+    if (!aa::tools::validate_playout_options({options.audio_playout_ms,
+                                              options.audio_catch_up_watermark_ms,
+                                              options.video_delay_ms}))
         return std::nullopt;
     aa::config::ensure_fallback_video_profile(options.video_profiles, options.exact_video_profiles);
     return options;
