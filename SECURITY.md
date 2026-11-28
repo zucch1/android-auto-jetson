@@ -2,13 +2,25 @@
 
 ## Supported versions and reporting
 
-This project is in pre-release development. It has no Google Android Auto
+None yet. This project is in pre-release development and has no tagged
+releases. It has no Google Android Auto
 certification or official SDK status. The implementation uses a
 reverse-engineered protocol, so undocumented behavior, phone updates or
 protocol changes can break compatibility and invalidate assumptions about
 message handling. Report undisclosed vulnerabilities
 privately through GitHub Security Advisories or contact the maintainer
-(`@zucch1`) through GitHub. Acknowledgement is best effort within seven days.
+(`@zucch1`) through GitHub; do not open public issues for undisclosed
+vulnerabilities. Acknowledgement is best effort within seven days.
+
+## Secrets policy
+
+- Never commit secrets: no tokens, no production private keys, no phone
+  identifiers or captures, no SSH material.
+- Protocol credentials shipped for compatibility (for example a public
+  reference head-unit credential) must be labeled public and accompanied by
+  documentation of their exposure and scope.
+- Local planning, evidence, and sysroot content (`.omo/`, `.local/`) stays
+  untracked by design; see `.gitignore`.
 
 ## TLS and credentials
 
@@ -57,17 +69,47 @@ presenting that descriptor tuple on the same port. USB descriptors can be
 spoofed by someone with physical access. Wireless enrolment binds a live
 Bluetooth peer and adapter to explicit numeric-comparison consent. The helper
 acknowledges the bond before the receiver persists approval. Subsequent
-wireless projection also requires the approved-peer handoff and the AP
-activation credential conveyed over the bonded Bluetooth link.
+wireless projection also requires the approved-peer handoff. Each AP activation
+generates a fresh in-memory SSID and 63-character WPA2 passphrase conveyed over
+the bonded Bluetooth link; that credential applies for the life of the active
+AP until deactivation, rekey or revocation (`ForgetPhone` or error-703
+revocation stops the AP, quarantines the interface and rotates
+`/var/lib/aa-system-helper/ap.credentials`). Wireless projection listens on the
+provisioned TCP port (default 5277) only while an approved activation is
+admitting. Before activating the AP, the helper installs the `inet
+aa_receiver_ap` nftables table (priority `-200`), which drops traffic to the
+projection TCP port from non-AP interfaces, permits only client DHCP (UDP
+68->67) and the projection TCP port on the AP interface, drops all other input
+on that interface, and drops forwarding to and from it.
 
 The receiver checks the session UID and registered consumer's D-Bus identity
-for consumer-authorized operations. Processes running as the trusted session
-UID are inside the security boundary. The production helper uses the fixed
-root-owned system bus socket and the client requires a root-owned helper.
+for consumer-authorized operations, including `StartProjection`,
+`SetProjectionMode`, `SetTransportEnabled`, `StopProjection`,
+`RequestAddPhone`, `ListPhones`, `ForgetPhone`, `RequestIdrRecovery` and
+`SetDisplayViewport`. Read-only status methods (`GetState`, `GetCapabilities`,
+`Ping`, `Introspect`) remain open before registration. The packaged
+`aa-receiver.service` starts with `--pairing-only` as a startup default, not an
+access control: a registered same-UID consumer can switch to `projection_ready`
+at runtime through `SetProjectionMode`. Processes running as the trusted
+session UID are inside the security boundary. The production helper uses the
+fixed root-owned system bus socket and the client requires a root-owned helper.
 Unix bus connections check the socket owner before authenticating and the
 built-in bus adapter checks the GUID when pinned in the address. The session
 bus still comes from the receiver's environment. If that environment is in
 scope for a deployment, pin the trusted session bus address and GUID.
+
+When supervising wired projection, the receiver spawns `aa-wired-receiver`
+(`--no-bus`) under the same UID (no privilege crossing), bound with
+`--managed-by`, `getppid()` and `PR_SET_PDEATHSIG` (`SIGKILL`). The supervisor
+accepts consumer connections on `video.sock` (enforcing `SO_PEERCRED`) and
+hands off the accepted socket over an `AF_UNIX` `SOCK_SEQPACKET` channel on fd
+3 (`SCM_RIGHTS`), alongside the inherited input listener on fd 4; the worker's
+`adopt_accepted` relies on the supervisor's peer check and does not
+re-authorize the consumer UID, and the helper's executable-digest check covers
+only the supervisor. Stream counters are shared between supervisor and worker
+only (never sent to the consumer) through a `0600` `memfd` sealed with
+`F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_SEAL` (not write-sealed, so both
+same-UID sides update counters) and checked for size and magic on adoption.
 
 The helper's packaged D-Bus policy denies calls by default. The operator
 provisions the session UID, receiver executable digest and a per-UID delivery
@@ -84,9 +126,11 @@ to runtime secrets. See [system-helper authorization](docs/system-helper.md).
 Treat phone bytes (USB, Bluetooth and Wi-Fi) and IPC frames as untrusted,
 including after device approval. Framing, protocol parsing, IPC dispatch and
 persistent-state parsing validate lengths, types and bounds before processing.
-Media and input use local sockets with peer checks. Admission limits and
-deadlines mitigate resource exhaustion. Compromised approved peers may still
-cause service degradation.
+Video and input use local sockets with `SO_PEERCRED` peer checks. Audio leaves
+through GStreamer `pulsesink` to the session's PulseAudio/PipeWire server
+without a receiver-side peer check, placing the audio sink inside the
+trusted-session boundary. Admission limits and deadlines mitigate resource
+exhaustion. Compromised approved peers may still cause service degradation.
 
 Structured diagnostics use field-level redaction and per-process pseudonyms
 for identifiers. These labels use noncryptographic hashes for in-run
@@ -131,7 +175,11 @@ python3 -B tools/tls/scan.py .
 ```
 
 CTest also selects the same profile with `-L '^security_hardening$'`. The
-fixtures cover authorized D-Bus, TLS and wired admission flows. They assert
+fixtures cover authorized D-Bus (`ControlService`, `AccessControl`,
+`CallBoundary`, `BusBoundary` and `BusSocketAuth`, including `StartProjection`,
+`SetProjectionMode` and `SetTransportEnabled`), production `TlsRecordCodec`
+(`transport_tls`) plus the compatibility handshake fixture, `VideoPeer` and
+`InputPeer` local-socket peer checks, and wired admission flows. They assert
 that unknown local peers and phones, malformed protobuf and insecure HU key
 permissions fail closed. The profile also checks seeded framing fuzz smoke,
 helper authorization, trust-store permissions, diagnostic redaction and

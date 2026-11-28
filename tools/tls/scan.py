@@ -77,8 +77,7 @@ MARKER: Final = re.compile(
     rb'-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----'
     rb'|-----BEGIN (?:[A-Z0-9]+ )*CERTIFICATE-----')
 GITHUB_TOKEN: Final = re.compile(
-    rb'(?<![A-Za-z0-9_])(?:gh[pousr]_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{82})'
-    rb'(?![A-Za-z0-9_])')
+    rb'(?:gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{82,})')
 PEM_BLOCK: Final = re.compile(
     rb'-----BEGIN (?:[A-Z0-9]+ )*(?:PRIVATE KEY|CERTIFICATE)-----'
     rb'(.*?)'
