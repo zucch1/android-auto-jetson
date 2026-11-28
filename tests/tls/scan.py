@@ -11,7 +11,9 @@ real source tree (it must prove absence), and binds the scanner digest denylist
 to the sanitization record in third_party/provenance/inventory.json. Negative
 mode plants credential-shaped material in a private fixture and requires
 rejection: private-key PEM blocks, certificate PEM blocks, the historical
-credential file names and planted copies under source-like directories.
+credential file names, token patterns and planted copies under source-like
+directories. Non-regular entries and symlinks have distinct rejections. A
+synthetic public reference exercises the exact path and SHA-256 pin.
 Reencodings mode is the adversarial bypass regression: it re-derives the
 recorded historical certificate/private key from the git blobs pinned in the
 sanitization record (read-only; the bytes match the recorded original_sha256
@@ -29,15 +31,18 @@ never produce a false absence proof.
 from pathlib import Path
 import base64
 import hashlib
+import importlib.util
 import json
+import os
 import subprocess
 import sys
 import tempfile
+from unittest.mock import patch
 
 
 def run(scanner: Path, target: Path) -> subprocess.CompletedProcess[str]:
     return subprocess.run([sys.executable, '-B', str(scanner), str(target)],
-                          capture_output=True, text=True, check=False)
+                          capture_output=True, text=True, check=False, timeout=30)
 
 
 def prove_absence(root: Path) -> None:
@@ -76,6 +81,15 @@ def plant_rejections(root: Path) -> None:
             'src/__pycache__/planted.pem': key,
             'third_party/aasdk/planted.pem': key,
             'third_party/compat-credentials/injected.key': key,
+            'third_party/compat-credentials/headunit.key': key,
+            'third_party/compat-credentials/headunit.crt': certificate,
+            'token-ghp.txt': b'token=' + b'ghp_' + b'a' * 36 + b'\n',
+            'token-gho.txt': b'q=1%3D' + b'gho_' + b'b' * 36 + b'\n',
+            'token-ghu.txt': b'{"t":"x\\n' + b'ghu_' + b'c' * 36 + b'"}\n',
+            'token-ghs-long.txt': b'ghs_' + b'd' * 64 + b'\n',
+            'token-ghr.txt': b'ghr_' + b'e' * 36 + b'\n',
+            'token.b64': base64.b64encode(b'github_pat_' + b'a' * 82),
+            'token-pat-long.txt': b'x\\n' + b'github_pat_' + b'f' * 96 + b'\n',
             'headunit.key': key,
             'anywhere/headunit.crt': certificate,
             'wrapped-cert.txt': b'prologue\n' + certificate + b'epilogue\n',
@@ -105,6 +119,12 @@ def plant_rejections(root: Path) -> None:
         result = run(scanner, fixture)
         assert result.returncode == 0, result
         (workspace / 'local').unlink()
+        fifo = fixture / 'non-regular'
+        os.mkfifo(fifo)
+        result = run(scanner, fixture)
+        assert result.returncode == 1, result
+        assert result.stdout == 'tls-key-scan: FAIL non-regular-source\n', result
+        fifo.unlink()
         historical = denied_digests(scanner)
         payload = b'synthetic stand-in for a digest-checked copy\n'
         assert hashlib.sha256(payload).hexdigest() not in historical, payload
@@ -112,6 +132,38 @@ def plant_rejections(root: Path) -> None:
         marker.write_bytes(payload)
         assert run(scanner, fixture).returncode == 0
         marker.unlink()
+        check_reference_pin(scanner, fixture, certificate)
+
+
+def check_reference_pin(scanner_path: Path, fixture: Path, certificate: bytes) -> None:
+    spec = importlib.util.spec_from_file_location('tls_reference_scan', scanner_path)
+    assert spec is not None and spec.loader is not None
+    scanner = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(scanner)
+
+    relative = Path('third_party/compat-credentials/public-test-reference.pem')
+    reference = fixture / relative
+    reference.parent.mkdir(parents=True, exist_ok=True)
+    digest = hashlib.sha256(certificate).hexdigest()
+    with patch.object(scanner, 'PUBLIC_COMPATIBILITY_REFERENCE', (relative, digest)):
+        assert scanner.rejection(fixture) == 'public-reference-missing'
+        reference.write_bytes(certificate)
+        assert scanner.rejection(fixture) is None
+
+        with patch.object(scanner, 'FORBIDDEN_DIGESTS', frozenset({digest})):
+            assert scanner.rejection(fixture) == 'credential-material-present'
+
+        for other in (fixture / relative.name, reference.with_name('copy.pem')):
+            other.write_bytes(certificate)
+            assert scanner.rejection(fixture) == 'credential-material-present'
+            other.unlink()
+
+        reference.write_bytes(certificate + b'\n')
+        assert scanner.rejection(fixture) == 'public-reference-digest-mismatch'
+        reference.unlink()
+
+    with patch.object(scanner, 'PUBLIC_COMPATIBILITY_REFERENCE', (Path(relative.name), digest)):
+        assert scanner.rejection(fixture) == 'invalid-public-reference-path'
 
 
 def invalid_root(root: Path, case: str) -> None:
@@ -240,7 +292,7 @@ def main() -> int:
     root = Path(sys.argv[1]).resolve()
     if '--negative' in sys.argv:
         plant_rejections(root)
-        print('tls-key-scan-negative: PASS planted-marker-name-cert-rejected')
+        print('tls-key-scan-negative: PASS credential-plants-and-special-entries-rejected')
         return 0
     if '--reencodings' in sys.argv:
         reencoding_rejections(root)

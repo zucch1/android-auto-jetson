@@ -19,7 +19,7 @@ copy of the historical public Android Auto head-unit credential:
 Exact removal identities (original Git blob IDs and SHA-256 digests) are
 recorded in `third_party/provenance/inventory.json` under
 `downstream_patches`, and the transformation is described in `PROVENANCE.md`.
-`tools/tls/scan.py` now enforces zero credential copies with no allowlist.
+`tools/tls/scan.py` now enforces zero credential copies with no active exception.
 
 ## Why it was removed
 

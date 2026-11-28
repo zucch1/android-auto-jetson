@@ -17,7 +17,7 @@ Deinitialization clears active state. TLS cannot substitute for the approved-pho
 
 `verified-peer-test-only` is an explicit constructor policy for tests, with
 OpenSSL peer verification requiring a peer certificate. The generic TCP/TLS
-adapter loads the system trust store and verifies the dialed DNS name or IP
+adapter loads the system trust store and verifies the dialed IP address
 on clients. Policy users supplying their own SSL context must populate its
 trust store explicitly (the memory-BIO tests pin their generated certificate).
 Unknown and
@@ -42,9 +42,8 @@ sentinel; parsing uses views rather than secret-bearing string copies. RAII
 cleanses the full allocation with `OPENSSL_cleanse` before release on successful
 loads and exceptions. OpenSSL owns the parsed private key for the session.
 This reduces residual copies; it cannot protect a live key from an authorized
-debugger. Deployments should disable core dumps (`LimitCORE=0` in the receiver's
-systemd unit, or `ulimit -c 0` for a manual launch). This repository currently
-ships no receiver service unit to apply that directive to.
+debugger. The packaged receiver systemd unit sets `LimitCORE=0`. Preserve
+that limit in custom units and use `ulimit -c 0` for manual launches.
 
 Files are bounded to 64 KiB. OpenSSL parses certificate and key, encrypted-key
 password prompts are disabled, the public/private components must match, and
@@ -95,13 +94,15 @@ symbols; bundled certificate/key files, install rules and Debian migration are
 removed. Checked OpenSSL buffer-length conversions reject oversized lengths.
 
 The repository marker scanner excludes only the root operational paths `.git`,
-`.omo`, `build` and `.local`. All other content, including `__pycache__`
+`.omo`, `.claude`, `build` and `.local`. All other content, including `__pycache__`
 directories at every depth and source directories named `build`, is scanned.
-The scanner allowlists nothing: any private-key or certificate PEM block, any
-file named `headunit.key`/`headunit.crt`, and any byte-identical copy of the
-removed credential (digest denylist bound to the provenance sanitization
-record) fail the scan, which must prove absence. Effective-stage scanning has
-no exceptions.
+The scanner allows at most one labeled public PEM reference by exact path
+and digest under `third_party/compat-credentials/`. That pin is unpopulated.
+Any key or certificate PEM block, any file named `headunit.key`/`headunit.crt`,
+selected GitHub token patterns, and copies of the removed credential
+(including supported re-encodings) fail the scan of the current tree. The
+historical credential digests are always denied. Effective-stage scanning
+has no exceptions.
 
 ## Executed host tests, not target acceptance
 
@@ -173,20 +174,16 @@ receiver as `{"event":"err","detail":"tls_cipher","reason":"..."}`.
 
 The generic TLS stream adapter is host/test transport; the live wired runtime
 uses its separate bounded link. Socket connect and accept use nonblocking I/O
-with a 10-second default and accept an explicit cancellation/deadline. DNS
-resolution through `getaddrinfo` remains synchronous; numeric endpoint addresses
-avoid that resolver wait. TLS handshake retains its existing whole-operation
-10-second deadline. TCP keepalive and a 30-second unacknowledged-data timeout
-are enabled. The timeout applies to unacknowledged data/probes; keepalive uses
-system probe timing and does not guarantee detection after 30 seconds idle. Writes and a frame after its first decrypted bytes share a
-30-second whole-frame deadline, so fragment progress does not restart the budget.
+with a 10-second default and accept an explicit cancellation or deadline.
+Connect and listen require nonempty numeric IP hosts, avoiding DNS lookup.
+The TLS handshake has a 10-second whole-operation deadline. The adapter
+enables TCP keepalive with system probe timing and sets a 30-second timeout
+for unacknowledged data and probes. Writes and reads each have a 30-second
+whole-frame deadline once started. Fragment progress does not reset it.
 
-The protocol code only answers phone `PingRequest`s (`WiredSession.cpp`); it
-does not schedule or negotiate a guaranteed ping interval. Consequently there
-is no safe universal idle cutoff for a quiet healthy phone. Generic stream
-callers with a known maximum peer ping interval can call
-`set_peer_ping_interval`: the idle deadline is **three intervals plus 10 seconds**
-of scheduling margin. It is deliberately opt-in; an unset cadence leaves the
-wait for a frame's first byte cancellation-bound. The clock can be injected for
-idle-expiry tests. A deployment-wide idle cutoff still needs a specified peer
-keepalive contract and phone qualification.
+Before the first decrypted byte of a frame, the default idle budget is 100
+seconds (three 30-second intervals plus 10 seconds of scheduling margin).
+Callers with a different peer cadence can use `set_peer_ping_interval` to set
+the interval. The clock can be injected for idle-expiry tests. This budget
+belongs to the generic TLS stream adapter. Production projection uses the
+separate AAP record codec and its session/link timers.
